@@ -14,10 +14,70 @@ index 578c371..8f35699 100644
  
  export async function navigateToDashboard(page: Page): Promise<void> {
 diff --git a/src/automation/pages/booking.ts b/src/automation/pages/booking.ts
-index 06ff03a..fef249e 100644
+index 06ff03a..aef7197 100644
 --- a/src/automation/pages/booking.ts
 +++ b/src/automation/pages/booking.ts
-@@ -24,6 +24,12 @@ export class BookingPage {
+@@ -1,6 +1,59 @@
+ import type { Page, Locator, Request, Response } from 'playwright';
+ import type { SessionDuration } from '../../schemas/session.js';
+ 
++/**
++ * 在 booking API 的响应里递归找 session id。
++ * 上游只认 body.sessionId / body.session.sessionId / body.id 三种平铺结构，
++ * 实测真实响应可能是更深或不同的嵌套，所以这里做通用递归：
++ *   1) 任意键名匹配 /session.*id/i 的字符串值
++ *   2) 任意同时含 {id, startTime} 的对象（Focusmate session 的典型形状）
++ */
++function extractSessionIdFromJson(text: string): string | undefined {
++  let body: unknown;
++  try {
++    body = JSON.parse(text);
++  } catch {
++    return undefined;
++  }
++
++  const seen = new Set<unknown>();
++  const looksLikeId = (v: unknown): v is string =>
++    typeof v === 'string' && /^[0-9a-zA-Z_-]{8,}$/.test(v);
++
++  const walk = (node: unknown): string | undefined => {
++    if (!node || typeof node !== 'object' || seen.has(node)) return undefined;
++    seen.add(node);
++
++    if (Array.isArray(node)) {
++      for (const item of node) {
++        const found = walk(item);
++        if (found) return found;
++      }
++      return undefined;
++    }
++
++    const obj = node as Record<string, unknown>;
++
++    // 形状 2: {id, startTime} —— 最可靠的 session 对象特征
++    if (looksLikeId(obj.id) && typeof obj.startTime === 'string') {
++      return obj.id;
++    }
++
++    for (const [k, v] of Object.entries(obj)) {
++      // 形状 1: 键名含 session 且以 id 结尾
++      if (/session.*id$/i.test(k) && looksLikeId(v)) return v;
++    }
++
++    for (const v of Object.values(obj)) {
++      const found = walk(v);
++      if (found) return found;
++    }
++    return undefined;
++  };
++
++  return walk(body);
++}
++
+ interface CapturedBookingRequest {
+   url: string;
+   method: string;
+@@ -24,6 +77,12 @@ export class BookingPage {
    // Captured API calls during booking
    private capturedRequests: CapturedBookingRequest[] = [];
  
@@ -30,7 +90,7 @@ index 06ff03a..fef249e 100644
    constructor(page: Page) {
      this.page = page;
  
-@@ -34,7 +40,8 @@ export class BookingPage {
+@@ -34,7 +93,8 @@ export class BookingPage {
  
      // The "Book N session(s)" button in the bottom bar after selecting slots
      this.confirmBookingButton = page.getByRole('button', { name: /^Book \d+ session/i })
@@ -40,7 +100,7 @@ index 06ff03a..fef249e 100644
    }
  
    /** Start capturing API requests to understand the booking flow. */
-@@ -81,7 +88,7 @@ export class BookingPage {
+@@ -81,7 +141,7 @@ export class BookingPage {
      await button.waitFor({ timeout: 10000 });
      await button.click();
      // Wait for the calendar grid to update after duration change
@@ -49,7 +109,7 @@ index 06ff03a..fef249e 100644
    }
  
    async selectTimeSlot(targetDate: Date): Promise<void> {
-@@ -116,11 +123,24 @@ export class BookingPage {
+@@ -116,11 +176,24 @@ export class BookingPage {
        await this.clickSlotByCoordinates(targetDate, hourLabel, slotIndex);
      }
  
@@ -79,7 +139,7 @@ index 06ff03a..fef249e 100644
        throw new Error(
          `Failed to select time slot for ${hourLabel}:${minutes.toString().padStart(2, '0')}. ` +
          `The "Book" button did not appear after clicking.`
-@@ -128,6 +148,15 @@ export class BookingPage {
+@@ -128,6 +201,15 @@ export class BookingPage {
      }
    }
  
@@ -95,7 +155,7 @@ index 06ff03a..fef249e 100644
    private async scrollToTime(hourLabel: string): Promise<void> {
      // Scroll the calendar to bring the target hour into view
      // Use string-based evaluate to avoid transpilation issues with page.evaluate
-@@ -212,6 +241,10 @@ export class BookingPage {
+@@ -212,6 +294,10 @@ export class BookingPage {
            const cellTime = new Date(timeAttr);
            const cellMinutes = cellTime.getHours() * 60 + cellTime.getMinutes();
            if (cellMinutes === targetMinutes) {
@@ -106,7 +166,7 @@ index 06ff03a..fef249e 100644
              await cell.click();
              return true;
            }
-@@ -289,6 +322,7 @@ export class BookingPage {
+@@ -289,6 +375,7 @@ export class BookingPage {
      const minuteOffset = (slotIndex * 15 / 60) * pixelsPerHour;
      const clickY = labelBox.y + minuteOffset + (pixelsPerHour / 8); // Small offset into the cell
  
@@ -114,7 +174,7 @@ index 06ff03a..fef249e 100644
      await this.page.mouse.click(clickX, clickY);
      // Wait for slot selection UI to react
      await this.page.waitForTimeout(600);
-@@ -333,16 +367,34 @@ export class BookingPage {
+@@ -333,46 +420,71 @@ export class BookingPage {
    }
  
    async confirmBooking(): Promise<void> {
@@ -153,7 +213,64 @@ index 06ff03a..fef249e 100644
 +    }
    }
  
-   async getConfirmationDetails(): Promise<{ sessionId?: string }> {
+-  async getConfirmationDetails(): Promise<{ sessionId?: string }> {
+-    // Try to extract session ID from captured API requests
++  /**
++   * 尝试确认预约结果。
++   *
++   * 返回 verified=true 才代表**拿到了证据**（真实 sessionId）。拿不到就返回
++   * verified=false —— 调用方必须把它当成"结果未知"，绝不能再像以前那样
++   * 伪造一个 `temp-<时间戳>` 冒充成功（那会让上层误以为订上了）。
++   */
++  async getConfirmationDetails(): Promise<{ sessionId?: string; verified: boolean }> {
++    // 预约请求落库需要时间，先等一会再找证据
++    await this.page.waitForTimeout(2000);
++
++    // 1) 捕获到的 API 响应（递归搜，兼容各种嵌套）
+     for (const req of this.capturedRequests) {
+-      if (req.responseBody) {
+-        try {
+-          const body = JSON.parse(req.responseBody);
+-          if (body.sessionId) return { sessionId: body.sessionId };
+-          if (body.session?.sessionId) return { sessionId: body.session.sessionId };
+-          if (body.id) return { sessionId: body.id };
+-        } catch {
+-          // Not JSON
+-        }
+-      }
++      if (!req.responseBody) continue;
++      const id = extractSessionIdFromJson(req.responseBody);
++      if (id) return { sessionId: id, verified: true };
+     }
+ 
+-    // Fallback: look for session link on the page
+-    const sessionLink = this.page.locator('a[href*="/session/"]');
++    // 2) 页面上的 /session/<id> 链接
+     try {
+-      const href = await sessionLink.first().getAttribute('href', { timeout: 3000 });
+-      if (href) {
+-        const match = href.match(/\/session\/([^/?]+)/);
+-        if (match) return { sessionId: match[1] };
+-      }
++      const href = await this.page
++        .locator('a[href*="/session/"]')
++        .first()
++        .getAttribute('href', { timeout: 3000 });
++      const match = href && href.match(/\/session\/([^/?]+)/);
++      if (match) return { sessionId: match[1], verified: true };
+     } catch {
+       // No link found
+     }
+ 
+-    return {};
++    // 3) 当前 URL 也可能是 /session/<id>
++    const urlMatch = this.page.url().match(/\/session\/([^/?]+)/);
++    if (urlMatch) return { sessionId: urlMatch[1], verified: true };
++
++    return { verified: false };
+   }
+ 
+   async isSlotAvailable(): Promise<boolean> {
 diff --git a/src/automation/pages/dashboard.ts b/src/automation/pages/dashboard.ts
 index 2879763..47787fc 100644
 --- a/src/automation/pages/dashboard.ts
@@ -180,6 +297,64 @@ index e0ee4fb..394898b 100644
    }
  
    async waitForLoginForm(): Promise<void> {
+diff --git a/src/schemas/session.ts b/src/schemas/session.ts
+index b85d3e3..5299ded 100644
+--- a/src/schemas/session.ts
++++ b/src/schemas/session.ts
+@@ -35,7 +35,12 @@ export const BookSessionOutput = z.object({
+   success: z.boolean(),
+   session: Session.optional(),
+   error: z.string().optional(),
+-  errorCode: z.string().optional()
++  errorCode: z.string().optional(),
++  /**
++   * 是否已从页面/API 响应拿到真实 sessionId 作为证据。
++   * false 表示"结果未知"（可能订上了也可能没有），调用方应自行用官方 API 复核。
++   */
++  verified: z.boolean().optional()
+ });
+ export type BookSessionOutput = z.infer<typeof BookSessionOutput>;
+ 
+diff --git a/src/tools/book-session.ts b/src/tools/book-session.ts
+index eddd2ce..f97dd0d 100644
+--- a/src/tools/book-session.ts
++++ b/src/tools/book-session.ts
+@@ -80,13 +80,16 @@ export function registerBookSessionTool(server: McpServer): void {
+ 
+             await bookingPage.confirmBooking();
+ 
+-            const { sessionId } = await bookingPage.getConfirmationDetails();
++            const { sessionId, verified } = await bookingPage.getConfirmationDetails();
+ 
+             const endTime = new Date(targetDate);
+             endTime.setMinutes(endTime.getMinutes() + parseInt(duration));
+ 
+             const session: Session = {
+-              id: sessionId || `temp-${Date.now()}`,
++              // 不再伪造 `temp-<Date.now()>`：拿不到真实 id 就留空字符串，
++              // 并用 verified=false 明确告诉调用方"结果未知"，由上层用
++              // 官方 API 复核（keep_session 就是这么做的）。
++              id: sessionId ?? '',
+               startTime: targetDate.toISOString(),
+               endTime: endTime.toISOString(),
+               duration: parseInt(duration),
+@@ -95,10 +98,14 @@ export function registerBookSessionTool(server: McpServer): void {
+               partnerName: null
+             };
+ 
+-            return session;
++            return { session, verified };
+           });
+ 
+-          const output: BookSessionOutput = { success: true, session: result };
++          const output: BookSessionOutput = {
++            success: true,
++            session: result.session,
++            verified: result.verified
++          };
+           return {
+             content: [{ type: 'text', text: JSON.stringify(output, null, 2) }]
+           };
 diff --git a/src/tools/cancel-session.ts b/src/tools/cancel-session.ts
 index bed0c60..b30d6e5 100644
 --- a/src/tools/cancel-session.ts

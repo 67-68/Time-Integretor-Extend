@@ -46,6 +46,7 @@
 """
 import argparse
 import datetime
+import fcntl
 import json
 import os
 import random
@@ -71,6 +72,7 @@ STATE_FILE = os.path.join(HERE, "temp", "keep_session-state.json")
 PID_FILE = os.path.join(HERE, "temp", "keep_session.pid")
 LOG_FILE = os.path.join(HERE, "temp", "keep_session.log")
 STOP_FILE = os.path.join(HERE, "temp", "keep_session.stop")  # 放这个文件 = 优雅退出
+LOCK_FILE = os.path.join(HERE, "temp", "keep_session.lock")  # 防 daemon 与手动 check 同时下单
 
 NODE_BIN_DIR = "/opt/homebrew/bin"
 # daemon 子进程用的解释器：优先系统 /usr/bin/python3（稳定），否则当前解释器
@@ -85,10 +87,52 @@ DAEMON_ENV["FOCUSMATE_MCP_JS"] = fm.MCP_SERVER_JS
 # ---------------------------------------------------------------- 日志 / 状态
 
 
-def log(msg, echo=True):
+class round_lock(object):
+    """文件锁：同一时刻只允许一个进程跑 run_once（daemon 与手动 check 互斥）。
+
+    拿不到锁就返回 False，调用方直接跳过本轮——比阻塞等待更合适，
+    因为下单本身要几十秒，等锁只会让手动 check 卡住。
+    """
+
+    def __init__(self):
+        self.fd = None
+
+    def __enter__(self):
+        try:
+            os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+            self.fd = open(LOCK_FILE, "w")
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.fd.write(str(os.getpid()))
+            self.fd.flush()
+            return True
+        except (OSError, BlockingIOError):
+            if self.fd:
+                try:
+                    self.fd.close()
+                except OSError:
+                    pass
+                self.fd = None
+            return False
+
+    def __exit__(self, *exc):
+        if self.fd:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                self.fd.close()
+            except OSError:
+                pass
+            self.fd = None
+        return False
+
+
+def log(msg, echo=True, to_file=True):
+    """写日志。to_file=False 时只打到 stdout（daemon 父进程的确认信息用它，
+    避免和已经在跑第一轮的孙进程抢同一个日志文件、导致行序错乱）。"""
     line = "%s %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
     if echo:
         print(line, flush=True)
+    if not to_file:
+        return
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -113,6 +157,12 @@ def notify(title, message):
 
 def today_str():
     return datetime.date.today().isoformat()
+
+
+def fmt_local_utc(dt):
+    """把本地 datetime 显示成 `MM-DD HH:MM 本地 (HH:MMZ)`，省得心算 -8h。"""
+    u = dt.astimezone(datetime.timezone.utc)
+    return "%s 本地 (%sZ)" % (dt.strftime("%m-%d %H:%M"), u.strftime("%H:%M"))
 
 
 def parse_iso(s):
@@ -232,11 +282,45 @@ def debounce():
     time.sleep(secs)
 
 
+def verify_slot_booked(slot, now, attempts=3, wait=4):
+    """订完后**以 API 为准**复核这场 session 是否真的存在。
+
+    为什么要复核：focusmate-mcp 的 book_session 抓不到真实 sessionId 时会
+    伪造 `temp-<毫秒时间戳>` 并照样返回 success:true（见其 booking.ts）。
+    也就是说 payload.success 不可信 —— API 才是 ground truth。
+
+    返回 (ok, detail)。ok=True 表示 API 里确实有这个 slot。
+    """
+    start = slot_dt(slot, now)
+    last = ""
+    for i in range(attempts):
+        time.sleep(wait)  # booking 落库有延迟，给几秒
+        try:
+            sessions = fetch_today_sessions(datetime.datetime.now().astimezone())
+        except Exception as e:
+            last = "复核时 API 出错: %s" % e
+            continue
+        if has_session_at(sessions, start):
+            return True, ""
+        last = "API 复核 %d 次仍未出现该 session" % (i + 1)
+        log("    [verify] 第 %d 次复核：API 里还没出现，%ds 后再试" % (i + 1, wait))
+    return False, last
+
+
 # ---------------------------------------------------------------- 核心一轮
 
 
 def run_once(dry_run=False):
-    """跑一轮完整检查+补订。幂等，可被 `run` 循环或 `check` 单次调用。"""
+    """跑一轮完整检查+补订（带文件锁）。daemon 与手动 check 互斥。"""
+    with round_lock() as got:
+        if not got:
+            log("  [lock] 另一轮正在跑（daemon 或手动 check），本轮跳过")
+            return 0
+        return _run_once_locked(dry_run=dry_run)
+
+
+def _run_once_locked(dry_run=False):
+    """真正干活的一轮。必须在持有 round_lock 时调用。"""
     now = datetime.datetime.now().astimezone()
     log("=== round start (dry_run=%s) %s ===" % (dry_run, now.strftime("%Y-%m-%d %H:%M:%S")))
 
@@ -252,17 +336,14 @@ def run_once(dry_run=False):
     state = load_state()
     changed = False
 
-    # 今天还没开始的 slot（now < T）才管；已经开始的不管
+    # 今天还没开始的 slot（now < T）才需要补订；已经过去的只做展示
     upcoming = []
+    past = []
     for slot in slots:
         start = slot_dt(slot, now)
-        if start > now:
-            upcoming.append((slot, start))
-    if not upcoming:
-        log("  今天没有还没开始的 slot（全部已过）")
-        return 0
+        (upcoming if start > now else past).append((slot, start))
 
-    # 一次 API 拿到今天全部 session
+    # 一次 API 拿到今天全部 session（即使没有 upcoming 也要拿，供 status 展示）
     sessions = None
     if not dry_run:
         try:
@@ -271,6 +352,34 @@ def run_once(dry_run=False):
         except Exception as e:
             log("  API 列 session 失败: %s（本轮跳过，下轮再试）" % e)
             return 1
+        # 记录快照，供 status 展示"今天实际有哪些 session"
+        state["api_snapshot"] = {
+            "at": now.isoformat(),
+            "sessions": [s.isoformat() for s in sessions],
+        }
+        changed = True
+
+    # 已过的 slot：不做任何补订，只把"今天到底有没有"记进 state，
+    # 让 status 能显示（否则 status 静默不显示，容易误以为一切正常）。
+    for slot, start in past:
+        key = slot["start"]
+        rec = state["slots"].get(key) or {}
+        if dry_run or sessions is None:
+            continue
+        if has_session_at(sessions, start):
+            if rec.get("status") != "booked":
+                state["slots"][key] = {"status": "booked", "duration": slot["duration"],
+                                       "attempts": rec.get("attempts", 0), "past": True}
+                changed = True
+        else:
+            if rec.get("status") != "missed":
+                log("  [已过] %s (%smin) 今天没有这场 session，已无法补订" % (key, slot["duration"]))
+                state["slots"][key] = {"status": "missed", "duration": slot["duration"],
+                                       "attempts": rec.get("attempts", 0), "past": True}
+                changed = True
+
+    if not upcoming:
+        log("  今天没有还没开始的 slot（全部已过）")
 
     for slot, start in upcoming:
         key = slot["start"]
@@ -323,7 +432,8 @@ def run_once(dry_run=False):
 
         # 真的去订
         attempts += 1
-        log("  %s 缺失，开始第 %d/%d 次预定..." % (key, attempts, MAX_ATTEMPTS))
+        log("  %s 缺失，开始第 %d/%d 次预定...（目标时间 %s，%smin）"
+            % (key, attempts, MAX_ATTEMPTS, fmt_local_utc(start), slot["duration"]))
         debounce()
         try:
             _target, start_iso = fm.resolve_target(key)
@@ -332,13 +442,21 @@ def run_once(dry_run=False):
             payload = {"success": False, "error": str(e), "errorCode": "EXCEPTION"}
 
         if payload.get("success"):
-            log("  %s 预定成功: %s" % (key, payload.get("session")))
-            state["slots"][key] = {"status": "booked", "duration": slot["duration"],
-                                   "attempts": attempts}
-            changed = True
-            continue
-
-        reason = payload.get("error") or payload.get("errorCode") or "未知错误"
+            sess = payload.get("session") or {}
+            log("  %s book_session 报成功 (id=%s)，开始 API 复核..."
+                % (key, sess.get("id")))
+            ok, detail = verify_slot_booked(slot, now)
+            if ok:
+                log("  %s 复核通过：API 确认该 session 已存在" % key)
+                state["slots"][key] = {"status": "booked", "duration": slot["duration"],
+                                       "attempts": attempts}
+                changed = True
+                continue
+            # 假成功：MCP 说订上了，API 查不到 → 按失败处理，走退避
+            reason = detail or "book_session 报成功但 API 查不到（疑似假成功）"
+            log("  %s 复核失败：%s" % (key, reason))
+        else:
+            reason = payload.get("error") or payload.get("errorCode") or "未知错误"
         next_retry = None
         if attempts < MAX_ATTEMPTS:
             wait = BACKOFF_MINUTES[min(attempts - 1, len(BACKOFF_MINUTES) - 1)]
@@ -419,7 +537,7 @@ def read_pid():
 def cmd_daemon_start(dry_run=False):
     old = read_pid()
     if old and pid_alive(old):
-        log("daemon 已在运行 (pid=%d)，不重复启动" % old)
+        log("daemon 已在运行 (pid=%d)，不重复启动" % old, to_file=False)
         return 1
     if os.path.exists(STOP_FILE):
         os.remove(STOP_FILE)
@@ -435,15 +553,19 @@ def cmd_daemon_start(dry_run=False):
             time.sleep(0.1)
             p = read_pid()
             if p and pid_alive(p):
-                log("daemon 已启动 (pid=%d)" % p)
+                log("daemon 已启动 (pid=%d)" % p, to_file=False)
                 return 0
-        log("daemon 启动后没读到 PID，请查日志")
+        log("daemon 启动后没读到 PID，请查日志", to_file=False)
         return 1
     # 第一层子进程
     os.setsid()
     if os.fork() > 0:
         os._exit(0)
     # 孙进程：真正的 daemon
+    try:
+        os.setpgid(0, 0)  # 自建进程组（pgid=pid），方便整组杀，避免 node/Chromium 子进程残留
+    except OSError:
+        pass
     with open(os.devnull, "rb") as devnull:
         os.dup2(devnull.fileno(), 0)
     out = open(LOG_FILE + ".daemon.out", "a")
@@ -477,10 +599,14 @@ def cmd_daemon_stop():
         return 0
     log("给 daemon(pid=%d) 发 SIGTERM..." % pid)
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as e:
-        log("杀进程失败: %s" % e)
-        return 1
+        # 先杀进程组（覆盖可能的 node/Chromium 子进程），失败再退回到单进程
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            log("杀进程失败: %s" % e)
+            return 1
     for _ in range(50):
         if not pid_alive(pid):
             log("daemon 已停止")
@@ -490,8 +616,24 @@ def cmd_daemon_stop():
                 pass
             return 0
         time.sleep(0.1)
-    log("daemon 没在 5s 内退出，仍存活 pid=%d" % pid)
-    return 1
+    log("daemon 没在 5s 内退出，发 SIGKILL")
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.3)
+    if pid_alive(pid):
+        log("SIGKILL 后仍存活，请手动处理 pid=%d" % pid)
+        return 1
+    log("daemon 已强制停止")
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    return 0
 
 
 def cmd_daemon_status():
@@ -533,16 +675,22 @@ def cmd_status():
 
     print("== today state ==")
     st = load_state()
+    snap = st.get("api_snapshot") or {}
+    snap_at = snap.get("at")
+    if snap_at:
+        print("  (API 快照 @%s，今天共 %d 场)"
+              % (snap_at[11:19], len(snap.get("sessions", []))))
     if st["slots"]:
         for k in sorted(st["slots"]):
             r = st["slots"][k]
             extra = ""
             if r.get("next_retry_at"):
-                extra = " retry@%s" % r["next_retry_at"]
+                extra = " retry@%s" % r["next_retry_at"][11:19]
             if r.get("last_error"):
                 extra += " err=%s" % r["last_error"]
-            print("  %s: %s attempts=%s%s" % (k, r.get("status") or "pending",
-                                              r.get("attempts", 0), extra))
+            tag = "[已过] " if r.get("past") else ""
+            print("  %s%s: %s attempts=%s%s" % (tag, k, r.get("status") or "pending",
+                                                r.get("attempts", 0), extra))
     else:
         print("  (空)")
 
@@ -561,7 +709,7 @@ def cmd_status():
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="确保今天的 Focusmate session 都存在（后台常驻）")
-    sub = ap.add_subparsers(dest="cmd")
+    sub = ap.add_subparsers(dest="cmd", metavar="{run,check,daemon,status}")
 
     p_run = sub.add_parser("run", help="前台常驻循环（Ctrl+C 退出，调试用）")
     p_run.add_argument("--dry-run", action="store_true")
@@ -575,9 +723,12 @@ def parse_args(argv=None):
 
     sub.add_parser("status", help="总览：daemon + data.csv + state + 日志尾")
 
-    # 内部入口：daemon 孙进程真正跑的就是它
+    # 内部入口：daemon 孙进程真正跑的就是它。不进 help（argparse 没有官方方式
+    # 隐藏子命令名，用 subparsers 的 metavar + 过滤方式最省事，这里只置空 help）。
     p_loop = sub.add_parser("_daemon_loop", help=argparse.SUPPRESS)
     p_loop.add_argument("--dry-run", action="store_true")
+    # 从 help 列表中彻底移除内部子命令（argparse 没有官方 hide，用它内部结构）
+    sub._choices_actions = [a for a in sub._choices_actions if a.dest != "_daemon_loop"]
 
     ap.set_defaults(cmd="status")
     return ap.parse_args(argv)

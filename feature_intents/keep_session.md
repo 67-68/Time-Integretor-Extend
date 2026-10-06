@@ -2,48 +2,94 @@
 
 ## 模块职责
 
-保证「今天应该有的 Focusmate session」一定存在。`data.csv` 是唯一的目标来源，
-模块负责在 session 开始前发现缺口并自动补订，同时把手动触发能力暴露给使用者。
+后台常驻，保证「今天该有的 Focusmate session」都订上。`data.csv` 是唯一目标来源。
+
+## 架构：daemon + 只读前台
+
+```
+keep_session daemon（后台常驻，脱离终端，PID 文件）
+  每 300s 一轮：读 data.csv → 一次 API 列今天 session → 补齐缺失的
+                → 写 state.json + 日志
+        ▲ 读 state.json / 日志
+        │
+keep_session status / （未来 TUI，只读）
+```
+
+- daemon 用双重 fork + setsid + setpgid 脱离终端，关终端不影响；`daemon stop` 按
+  进程组 SIGTERM（升级 SIGKILL），避免 node/Chromium 子进程残留。
+- daemon 不依赖 launchd/cron；进程内自己 sleep 循环。
+- 状态全部落盘，前台 TUI 只需读文件，不依赖 daemon 生命周期。
 
 ## 目标来源：data.csv
 
-每行 `HH:MM,duration`，`#` 注释与空行忽略，duration 只允许 25/50/75。
-语义是**仅今天**：文件描述的是「作息表」，只对运行当天生效，不做跨天补订。
-需要「只订某一天」时另行扩展格式，当前不引入日期维度。
+每行 `HH:MM,duration`，`#` 注释与空行忽略，duration ∈ {25,50,75}。
+语义**仅今天**：state 带 date，跨天自动重置，不做跨天补订。
 
-## 调度：LaunchAgent 频率驱动
+## 检查与补订（每轮）
 
-调度器只做一件事——按固定频率（15 分钟，与 Focusmate 的 15 分钟 slot 粒度对齐）
-唤醒 `keep_session.py check`。调度器**不做任何时间计算**，所有判定都在 `check` 内部，
-因为 launchd/cron 的休眠行为不可控，把逻辑放在脚本里才能在漏跑后自愈。
+1. 一次 `GET /v1/sessions` 拿到今天全部 session（只读、便宜）。
+2. 遍历今天**还没开始**（now < T）的 slot：
+   - API 有 → `booked`（若之前是别的状态，纠正过来）。
+   - API 没有：
+     - 若 state 以为是 `booked` → 判定为**手动取消**，回退重订，
+       并**重置尝试计数**（取消不是脚本的失败）。
+     - 若在退避期 → 等到点。
+     - 若已达上限 → `failed` + 通知，当天不再碰。
+     - 否则 → 下单。
 
-## 检查：窗口 + 幂等
+「提前订满」：不看「是否临近开始」，只看「还没开始且缺失」就订。
 
-- 窗口：`[T - CHECK_DDL_BEFORE_SESSION, T)`。到点即停止补救，避免订到已开始或过去的 slot。
-- 幂等：每次都重新拿「当前是否有 slot 命中窗口」来判定，不依赖上一次是否跑过。
-- 存在性检查走官方只读 API（`GET /v1/sessions`），不拉起浏览器，快且无副作用。
-- 只有确认不存在时才走预定，预定必须经过 focusmate-mcp 的浏览器自动化
-  （Focusmate 官方 API 是只读的，没有下单接口，这是物理约束，不是选择）。
+## 预定结果以 API 为准（关键）
 
-## 状态与失败退避
+`focusmate-mcp` 的 `book_session` 抓不到真实 sessionId 时会伪造
+`temp-<毫秒时间戳>` 并照样返回 `success: true`，造成"假成功"。因此本模块
+**不信任 `payload.success`**：报成功后会用官方 API 复核该 slot 是否真的出现
+（最多 3 次、间隔 4s，容忍落库延迟），复核不过就按失败走退避重试。
 
-- 状态文件只记当天：`{date, slots:{HH:MM: "booked"|"failed"}}`。日期不符即整体重置，
-  这是「仅今天」语义的实现方式，不需要额外的清理任务。
-- `booked` = 确认存在（自己订的，或本来就有的），后续不再动作。
-- `failed` = 当天该目标已尝试且失败，**不再重试**。这是刻意的：Focusmate 对
-  异常下单行为敏感，反复重试有风控风险。代价是当天可能漏一个 session，
-  这个代价由「立即弹系统通知」来兜底，把决策权交还给使用者。
+MCP 侧也已同步修复（`patches/focusmate-mcp.patch`）：不再伪造 id，改为返回
+`verified: boolean` 表示"是否拿到了证据"。但**复核的责任在上层**——API 才是
+ground truth，MCP 的自述永远只是线索。
 
-## 手动入口
+## 退避与防抖
 
-- `check`：跑一次检查，也是 LaunchAgent 实际调用的命令。
-- `check --dry-run`：只打印会做什么，不调 API 不预定，用于验证配置。
-- `install` / `uninstall`：管理 LaunchAgent（写 plist + launchctl load/unload）。
-  install 只加载不触发，避免装完立刻误订。
-- `status`：查看 launchd 加载状态、data.csv 解析结果、今日 state、日志尾部。
+- 失败最多 3 次；第 1 次失败等 5min，第 2 次等 15min，第 3 次转 `failed` + 通知。
+- 每次真正下单前随机 sleep 5±3 秒，避免规律性机器行为触发风控。
+- 检查（列 session）每轮都做，便宜；下单（起浏览器）贵且敏感，才需要退避限流。
+
+## 状态文件
+
+`temp/keep_session-state.json`：
+```json
+{"date":"2026-10-06",
+ "api_snapshot":{"at":"...","sessions":["..."]},
+ "slots":{"16:30":{"status":"booked|failed|null|missed","attempts":1,
+                   "next_retry_at":"...","last_error":"...","duration":"50","past":true}}}
+```
+- `status=null` 待订/退避中；`booked`/`failed` 为终态（failed 当天不再动）。
+- `status=missed` 只用于**已经过去**的 slot：确认今天没有这场 session，
+  已无法补订，但仍显式记录，避免 status 静默不显示让人误判。
+- `past=true` 标记该行对应的 slot 今天已经过去。
+- `api_snapshot` 是每轮 API 结果的落盘快照，供 status 展示"今天实际有哪些"。
+
+## 并发
+
+`temp/keep_session.lock`（fcntl.flock）：daemon 与手动 `check` 互斥。拿不到锁
+直接跳过本轮（非阻塞），因为下单要几十秒，阻塞等待只会让手动 check 卡住。
+
+## 日志
+
+daemon 的**父进程**（你直接运行 `daemon start` 的那个）只把启动确认打到
+stdout，不写共享日志——否则会和已经在跑第一轮的孙进程抢同一个文件、导致行序错乱。
+
+## 入口
+
+- `daemon start|stop|restart|status`：后台常驻管理。
+- `run`：前台常驻循环，Ctrl+C 退出（调试）。
+- `check [--dry-run]`：只跑一轮。
+- `status`：daemon + data.csv + state + 日志尾总览。
 
 ## 环境约束
 
-LaunchAgent 的运行环境极简，所有路径必须绝对化：node 在 `/opt/homebrew/bin`，
-python 用系统自带 `/usr/bin/python3`（版本固定、不受 homebrew 升级影响），
-PATH 通过 plist 的 EnvironmentVariables 注入。
+daemon 脱离终端后 PATH 极简，node 用 `/opt/homebrew/bin`，python 用系统
+`/usr/bin/python3`，`FOCUSMATE_MCP_JS` 显式注入。预留 `temp/keep_session.stop`
+文件可作为优雅停止开关。
