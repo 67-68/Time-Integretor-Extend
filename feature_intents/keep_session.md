@@ -22,8 +22,19 @@ keep_session status / （未来 TUI，只读）
 
 ## 目标来源：data.csv
 
-每行 `HH:MM,duration`，`#` 注释与空行忽略，duration ∈ {25,50,75}。
-语义**仅今天**：state 带 date，跨天自动重置，不做跨天补订。
+每行两种写法，`#` 注释与空行忽略，duration ∈ {25,50,75}：
+
+```
+HH:MM,duration            # 每天
+weekday,HH:MM,duration    # 只在 weekday 生效
+```
+
+- `weekday` ∈ `mon`..`sun`（也认 `周一`/`星期天` 这类写法）；留空或 `*` = 每天。
+  同一 (weekday, 时间) 重复的行会被去重并 warn。
+- 语义**仅今天**：只取「今天星期几 + 每天」的行；state 带 date，跨天自动重置，
+  不做跨天补订。旧的两列写法继续有效。
+- `data.csv` 通常由 `download_calendar.py populate` 从 iCloud 日历生成（一周计划），
+  也可以手写。这一层**完全解耦**：daemon 不碰日历，只读 csv。
 
 ## 检查与补订（每轮）
 
@@ -86,7 +97,18 @@ stdout，不写共享日志——否则会和已经在跑第一轮的孙进程�
 - `daemon start|stop|restart|status`：后台常驻管理。
 - `run`：前台常驻循环，Ctrl+C 退出（调试）。
 - `check [--dry-run]`：只跑一轮。
-- `status`：daemon + data.csv + state + 日志尾总览。
+- `status`：daemon + data.csv（按星期分组，标出今天的）+ state + 日志尾总览。
+
+## 与 download_calendar 的关系
+
+```
+download_calendar.py populate   ──▶ data.csv ──▶ keep_session daemon（每天只取今天那几行）
+   （手动，一周一次）                  （计划）        （后台，自动补订）
+```
+
+- `populate` **只生成计划、不下单**，且只能手动触发；daemon 永远不会自己去拉日历。
+- 改了日历就重跑一次 `populate`，daemon 下一轮自然读到新 csv。
+- **改了 csv 格式/解析要重启 daemon**（旧进程内存里还是旧代码）。
 
 ## 环境约束
 

@@ -19,7 +19,9 @@
 决策（已锁定）
 --------------
 - 调度：进程内 sleep 循环，每 300s 一轮。不用 LaunchAgent（daemon 自己常驻）。
-- 目标语义：仅今天。data.csv 只对运行当天生效，state 里带 date，跨天自动重置。
+- 目标语义：仅今天。data.csv 每行可选带 weekday（mon..sun；留空或 `*` = 每天），
+  本模块只取「今天星期几 + 每天」的行；state 里带 date，跨天自动重置。
+  data.csv 通常由 download_calendar.py `populate` 从日历生成（一周计划），也可手写。
 - 「提前订满」：遍历今天**所有还没开始**的 slot（now < T），没有 session 就订。
   不做「只在前 5 分钟才订」——那是旧版逻辑，已废弃。
 - 检查走官方只读 API（GET /v1/sessions），一次调用拿到当天全部 session，
@@ -204,23 +206,63 @@ def save_state(st):
 # ---------------------------------------------------------------- data.csv
 
 
-def load_slots(path=None):
-    """解析 data.csv：每行 `HH:MM,duration`，# 注释与空行忽略。
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+WEEKDAY_ALIASES = {
+    "mon": "mon", "tue": "tue", "wed": "wed", "thu": "thu",
+    "fri": "fri", "sat": "sat", "sun": "sun",
+    "周一": "mon", "周二": "tue", "周三": "wed", "周四": "thu",
+    "周五": "fri", "周六": "sat", "周日": "sun", "周天": "sun",
+    "星期一": "mon", "星期二": "tue", "星期三": "wed", "星期四": "thu",
+    "星期五": "fri", "星期六": "sat", "星期日": "sun", "星期天": "sun",
+}
+EVERY_DAY = ("", "*", "每", "每天", "daily", "all", "every")
 
-    返回 [{"start":"16:30","duration":"50","hour":16,"minute":30}, ...]
+
+def normalize_weekday(raw):
+    """'mon' / '周一' / '星期一' / '*' / '' → 'mon'|...|'*'；认不出来返回 None。"""
+    v = (raw or "").strip().lower()
+    if v in EVERY_DAY:
+        return "*"
+    return WEEKDAY_ALIASES.get(v)
+
+
+def today_weekday(now=None):
+    return WEEKDAYS[(now or datetime.datetime.now()).weekday()]
+
+
+def load_slots(path=None, weekday=None):
+    """解析 data.csv。
+
+    每行两种写法（`#` 注释、空行忽略）：
+        HH:MM,duration              —— 每天
+        weekday,HH:MM,duration      —— 只在 weekday 生效
+    weekday ∈ mon..sun（也认 周一/星期天 这类写法）；`*` 或留空 = 每天。
+
+    weekday 参数非 None 时只返回「该星期几 + 每天」的行——check 走的就是这条。
+    返回 [{"weekday","start","duration","hour","minute"}, ...]，按 (weekday, 时间) 排序。
     """
     path = path or os.path.join(HERE, fm.SESSION_REGISTRATION_PATH)
     slots = []
+    seen = set()
     with open(path, encoding="utf-8") as f:
         for lineno, raw in enumerate(f, 1):
             line = raw.split("#", 1)[0].strip()
             if not line:
                 continue
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
-                log("  [warn] data.csv:%d 格式不对（要 HH:MM,duration），已跳过: %r" % (lineno, raw.strip()))
+            if len(parts) == 2:
+                day, hhmm, duration = "*", parts[0], parts[1]
+            elif len(parts) == 3:
+                day, hhmm, duration = parts[0], parts[1], parts[2]
+            else:
+                log("  [warn] data.csv:%d 格式不对（要 [weekday,]HH:MM,duration），已跳过: %r"
+                    % (lineno, raw.strip()))
                 continue
-            hhmm, duration = parts[0], parts[1]
+            day = normalize_weekday(day)
+            if day is None:
+                log("  [warn] data.csv:%d 星期几认不出来（要 mon..sun / 周一..周日 / *），已跳过: %r"
+                    % (lineno, raw.strip()))
+                continue
             try:
                 t = datetime.datetime.strptime(hhmm, "%H:%M")
             except ValueError:
@@ -229,8 +271,17 @@ def load_slots(path=None):
             if duration not in ("25", "50", "75"):
                 log("  [warn] data.csv:%d 时长只能是 25/50/75，已跳过: %r" % (lineno, duration))
                 continue
-            slots.append({"start": hhmm, "duration": duration,
+            if weekday is not None and day not in ("*", weekday):
+                continue
+            key = (day, hhmm)
+            if key in seen:
+                log("  [warn] data.csv:%d 重复的 %s %s，已跳过" % (lineno, day, hhmm))
+                continue
+            seen.add(key)
+            slots.append({"weekday": day, "start": hhmm, "duration": duration,
                           "hour": t.hour, "minute": t.minute})
+    slots.sort(key=lambda s: (WEEKDAYS.index(s["weekday"]) if s["weekday"] in WEEKDAYS else -1,
+                              s["hour"], s["minute"]))
     return slots
 
 
@@ -325,12 +376,12 @@ def _run_once_locked(dry_run=False):
     log("=== round start (dry_run=%s) %s ===" % (dry_run, now.strftime("%Y-%m-%d %H:%M:%S")))
 
     try:
-        slots = load_slots()
+        slots = load_slots(weekday=today_weekday(now))
     except OSError as e:
         log("  data.csv 读不到: %s" % e)
         return 1
     if not slots:
-        log("  data.csv 里没有有效目标")
+        log("  data.csv 里没有今天（%s）的目标" % today_weekday(now))
         return 0
 
     state = load_state()
@@ -666,10 +717,16 @@ def cmd_daemon(action, dry_run=False):
 
 def cmd_status():
     cmd_daemon_status()
-    print("== data.csv ==")
+    print("== data.csv（每周计划）==")
     try:
-        for s in load_slots():
-            print("  %s  %smin" % (s["start"], s["duration"]))
+        all_slots = load_slots()
+        twd = today_weekday()
+        if not all_slots:
+            print("  (空)")
+        for s in all_slots:
+            day = s["weekday"]
+            mark = " ◀今天(%s)" % twd if day in ("*", twd) else ""
+            print("  %-4s %s  %smin%s" % (day, s["start"], s["duration"], mark))
     except OSError as e:
         print("  读取失败: %s" % e)
 
