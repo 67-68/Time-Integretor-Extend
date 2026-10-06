@@ -1,0 +1,195 @@
+diff --git a/src/automation/browser.ts b/src/automation/browser.ts
+index 578c371..8f35699 100644
+--- a/src/automation/browser.ts
++++ b/src/automation/browser.ts
+@@ -89,8 +89,8 @@ async function checkAuthAndNavigate(page: Page, targetUrl: string): Promise<void
+     throw new AuthExpiredError('Session expired. Please run focusmate_auth to log in again.');
+   }
+ 
+-  // Wait for the page to be interactive
+-  await page.waitForLoadState('networkidle');
++  // Firebase 有长连接，networkidle 永远等不到；等 SPA 渲染一会即可
++  await page.waitForTimeout(2000);
+ }
+ 
+ export async function navigateToDashboard(page: Page): Promise<void> {
+diff --git a/src/automation/pages/booking.ts b/src/automation/pages/booking.ts
+index 06ff03a..fef249e 100644
+--- a/src/automation/pages/booking.ts
++++ b/src/automation/pages/booking.ts
+@@ -24,6 +24,12 @@ export class BookingPage {
+   // Captured API calls during booking
+   private capturedRequests: CapturedBookingRequest[] = [];
+ 
++  // 第一次点击格子的坐标；用于原地补点（用户实测第二次点击即预约）
++  private lastClickPoint: { x: number; y: number } | null = null;
++
++  // 是否已经通过“原地二次点击”完成预约（此时 confirmBooking 不应再点底部栏）
++  bookedInSlot = false;
++
+   constructor(page: Page) {
+     this.page = page;
+ 
+@@ -34,7 +40,8 @@ export class BookingPage {
+ 
+     // The "Book N session(s)" button in the bottom bar after selecting slots
+     this.confirmBookingButton = page.getByRole('button', { name: /^Book \d+ session/i })
+-      .or(page.getByRole('button', { name: 'Book', exact: true }));
++      .or(page.getByRole('button', { name: 'Book', exact: true }))
++      .or(page.getByRole('button', { name: /^Book/i }));
+   }
+ 
+   /** Start capturing API requests to understand the booking flow. */
+@@ -81,7 +88,7 @@ export class BookingPage {
+     await button.waitFor({ timeout: 10000 });
+     await button.click();
+     // Wait for the calendar grid to update after duration change
+-    await this.page.waitForLoadState('networkidle');
++    await this.page.waitForTimeout(2000);
+   }
+ 
+   async selectTimeSlot(targetDate: Date): Promise<void> {
+@@ -116,11 +123,24 @@ export class BookingPage {
+       await this.clickSlotByCoordinates(targetDate, hourLabel, slotIndex);
+     }
+ 
+-    // Wait for the "Book" button to appear (indicates slot was selected)
+-    try {
+-      await this.confirmBookingButton.waitFor({ timeout: 5000 });
+-    } catch {
+-      // Take a diagnostic screenshot
++    // 第一次点击后，Book 按钮应出现在格子原位 + 底部栏（"Book 1 Session"）。
++    // 底部栏按钮有时渲染慢/可访问名不匹配，先等 8s。
++    const appeared = await this.waitForConfirmButton(8000);
++
++    if (!appeared && this.lastClickPoint) {
++      // 用户实测：原地再点一次即可完成预约
++      await this.page.mouse.click(this.lastClickPoint.x, this.lastClickPoint.y);
++      await this.page.waitForTimeout(1000);
++
++      // 补点后如果底部栏按钮出现了，说明刚才只是选中格子，交给 confirmBooking 点；
++      // 没出现则视为补点已经直接完成预约。
++      const appearedAfterSecond = await this.waitForConfirmButton(3000);
++      if (!appearedAfterSecond) {
++        this.bookedInSlot = true;
++      }
++    }
++
++    if (!appeared && !this.bookedInSlot && !(await this.confirmBookingButton.first().isVisible().catch(() => false))) {
+       throw new Error(
+         `Failed to select time slot for ${hourLabel}:${minutes.toString().padStart(2, '0')}. ` +
+         `The "Book" button did not appear after clicking.`
+@@ -128,6 +148,15 @@ export class BookingPage {
+     }
+   }
+ 
++  private async waitForConfirmButton(timeout: number): Promise<boolean> {
++    try {
++      await this.confirmBookingButton.first().waitFor({ state: 'visible', timeout });
++      return true;
++    } catch {
++      return false;
++    }
++  }
++
+   private async scrollToTime(hourLabel: string): Promise<void> {
+     // Scroll the calendar to bring the target hour into view
+     // Use string-based evaluate to avoid transpilation issues with page.evaluate
+@@ -212,6 +241,10 @@ export class BookingPage {
+           const cellTime = new Date(timeAttr);
+           const cellMinutes = cellTime.getHours() * 60 + cellTime.getMinutes();
+           if (cellMinutes === targetMinutes) {
++            const box = await cell.boundingBox().catch(() => null);
++            if (box) {
++              this.lastClickPoint = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
++            }
+             await cell.click();
+             return true;
+           }
+@@ -289,6 +322,7 @@ export class BookingPage {
+     const minuteOffset = (slotIndex * 15 / 60) * pixelsPerHour;
+     const clickY = labelBox.y + minuteOffset + (pixelsPerHour / 8); // Small offset into the cell
+ 
++    this.lastClickPoint = { x: clickX, y: clickY };
+     await this.page.mouse.click(clickX, clickY);
+     // Wait for slot selection UI to react
+     await this.page.waitForTimeout(600);
+@@ -333,16 +367,34 @@ export class BookingPage {
+   }
+ 
+   async confirmBooking(): Promise<void> {
+-    // The "Book N session" button appears in the bottom bar after slot selection
+-    const isVisible = await this.confirmBookingButton.isVisible().catch(() => false);
++    if (this.bookedInSlot) {
++      // 已在格子里通过原地二次点击完成预约，无需再点底部栏
++      await this.page.waitForTimeout(1000);
++      return;
++    }
++
++    // 选中格子后会出现两个 Book 按钮（格子内的 "Book" + 底部栏 "Book N Session"）。
++    // confirmBookingButton 是 .or() 定位器，会同时匹配两个元素，Playwright 严格模式
++    // 下 isVisible()/click()/waitFor() 都会抛 strict mode violation（被 catch 吞掉后
++    // 表现为“按钮不可见”），所以这里必须 .first() 或者挑底部栏那个。
++    const bottomBar = this.page.getByRole('button', { name: /^Book \d+ session/i });
++    const btn = (await bottomBar.count().catch(() => 0)) > 0
++      ? bottomBar.first()
++      : this.confirmBookingButton.first();
++
++    const isVisible = await btn.isVisible().catch(() => false);
+     if (!isVisible) {
+       throw new Error('"Book" button not visible — slot selection may have failed');
+     }
+ 
+-    await this.confirmBookingButton.click();
++    await btn.click();
+ 
+-    // Wait for the booking to be processed (button disappears)
+-    await this.confirmBookingButton.waitFor({ state: 'hidden', timeout: 15000 });
++    // 等待预约处理完成：Book 按钮消失（最多 15s，超时不致命，后续靠响应解析 sessionId）
++    const deadline = Date.now() + 15000;
++    while (Date.now() < deadline) {
++      if (!(await btn.isVisible().catch(() => false))) return;
++      await this.page.waitForTimeout(500);
++    }
+   }
+ 
+   async getConfirmationDetails(): Promise<{ sessionId?: string }> {
+diff --git a/src/automation/pages/dashboard.ts b/src/automation/pages/dashboard.ts
+index 2879763..47787fc 100644
+--- a/src/automation/pages/dashboard.ts
++++ b/src/automation/pages/dashboard.ts
+@@ -21,7 +21,7 @@ export class DashboardPage {
+   async goto(): Promise<void> {
+     await this.page.goto('https://app.focusmate.com/dashboard');
+     // Wait for the page to be interactive
+-    await this.page.waitForLoadState('networkidle');
++    await this.page.waitForTimeout(2000);
+   }
+ 
+   async waitForLoad(): Promise<void> {
+diff --git a/src/automation/pages/login.ts b/src/automation/pages/login.ts
+index e0ee4fb..394898b 100644
+--- a/src/automation/pages/login.ts
++++ b/src/automation/pages/login.ts
+@@ -38,7 +38,7 @@ export class LoginPage {
+ 
+   async goto(): Promise<void> {
+     await this.page.goto('https://app.focusmate.com/login');
+-    await this.page.waitForLoadState('networkidle');
++    await this.page.waitForTimeout(1500);
+   }
+ 
+   async waitForLoginForm(): Promise<void> {
+diff --git a/src/tools/cancel-session.ts b/src/tools/cancel-session.ts
+index bed0c60..b30d6e5 100644
+--- a/src/tools/cancel-session.ts
++++ b/src/tools/cancel-session.ts
+@@ -49,7 +49,7 @@ export function registerCancelSessionTool(server: McpServer): void {
+             }
+ 
+             // Wait for the page to load
+-            await page.waitForLoadState('networkidle');
++            await page.waitForTimeout(2000);
+ 
+             // Find the session card and its cancel/clear button
+             // Strategy 1: Look for a session card that links to this session ID
