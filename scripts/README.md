@@ -12,8 +12,13 @@
 | `set_quiet.mjs` | 开/关 session 的 quiet mode | 内部 API `PUT /v1/session/` |
 | `add_task.mjs` | 给 session 挂一个 task | DOM 自动化（点界面） |
 | `cancel.mjs` | 取消 session | 内部 API `DELETE /v1/session/{id}` |
+| `bridge.mjs` | **常驻**桥：一个 Chromium + JSON 行协议，给 `warden.py` 用 | 复用上面同一套内部 API |
 
 `_lib.mjs` 是共用底座（起浏览器、取 token、调内部 API、按时间找 session、CLI 解析）。
+
+> 上面四个 `.mjs` 是「一个脚本干一件事」的 CLI，每次调用冷启动一个 Chromium
+> （~10s）。要**连着**改好几场就用 `bridge.mjs`（常驻，热命令 ~2s），
+> 交互式界面见根目录的 [`warden.py`](../warden.py)（`python3 warden.py`）。
 
 ---
 
@@ -88,6 +93,45 @@ node scripts/cancel.mjs --start 18:00 --yes     # 真取消
 - ⚠️ **破坏性操作**：不加 `--yes` 只预览（退出码 3）。
 - 已匹配到 partner 的 session 网页上会多一步二次确认；API 没有这一步，直接取消。
 - `--source <枚举>` 是埋点参数，默认 `nowSessionsSidebar`，可选值见 `_lib.mjs` 的 `CANCEL_SOURCES`。
+
+---
+
+## 5. bridge — 常驻操作桥
+
+给 `warden.py` 用的**常驻**进程：浏览器留在内存里，命令走 stdin/stdout 的 JSON 行，
+单条热命令 ~1-2s（对比 CLI 的冷启动 ~10s）。
+
+```bash
+node scripts/bridge.mjs            # 手动玩；一般由 warden.py 自动起
+```
+
+协议（每行一个 JSON）：
+
+```
+stdin    {"id":1,"cmd":"snapshot"}
+stdout   {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
+         {"event":"ready|idle-closed|fatal"}     # 事件帧，没有 id
+```
+
+命令：
+
+| cmd | 参数 | 说明 |
+|---|---|---|
+| `ping` | — | 探活（不启动浏览器） |
+| `snapshot` | `date?` | 列某天（默认今天）的 session |
+| `title` | `startMs` `meetingId?` `title` | 改标题 |
+| `mute` | `startMs` `meetingId?` `quiet` | 开/关 quiet mode |
+| `cancel` | `startMs` `meetingId?` `source?` | **破坏性**，调用方负责把关 |
+| `release` | — | 只关浏览器、进程留着（把 profile 让给 daemon） |
+| `shutdown` | — | 关浏览器并退出 |
+
+> ⚠️ **信封的 `id`（请求号）和 session 身份是两回事**，后者一律用 `meetingId`。
+> 两者都叫 `id` 时，调用方 `req.update(kw)` 会把请求号覆盖掉，桥照常执行、
+> 响应也发出去，但调用方永远等不到 —— 表现为「卡死」，而**写入其实已经生效**。
+> 这个坑踩过一次，`Bridge.call()` 现在见到 `id` 直接抛错。
+
+环境变量：`WARDEN_BRIDGE_IDLE_MS`（空闲多少 ms 放开浏览器，默认 120000，0=不放开）、
+`WARDEN_BRIDGE_HEADED=1`（有头）、`FOCUSMATE_PROFILE_DIR`（profile 目录）。
 
 ---
 

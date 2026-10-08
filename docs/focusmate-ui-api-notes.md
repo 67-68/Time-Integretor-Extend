@@ -492,6 +492,11 @@ Playwright 起应用（已登录）→ 在页面里 `page.evaluate()` 发 `fetch
 四个都用 Playwright 开已登录页面 → 在**页面上下文里**取 token / 发请求 / 点界面，
 所以对外表现和官方前端一致。
 
+**常驻桥 + TUI**：同一套内部 API 另有 `scripts/bridge.mjs`（常驻 Chromium，
+stdin/stdout JSON 行协议）和根目录的 `warden.py`（rich TUI，看板 + 启停 daemon +
+看图改 session）。设计取舍与命令表见 [`../feature_intents/warden.md`](../feature_intents/warden.md)。
+动机是冷启动太贵：实测同一账号下**冷启动+snapshot ≈ 9.7s，热路径命令 ≈ 1.9s**。
+
 **踩过的坑（写脚本时会再遇到）：**
 
 1. 沙箱/权限：Chromium 必须能写 profile 目录，否则页面渲染空白（router-outlet 空）。
@@ -524,6 +529,7 @@ Playwright 起应用（已登录）→ 在页面里 `page.evaluate()` 发 `fetch
 | `probe_addtask_btn.mjs` | 定位 "Add task" 的真实元素（p-button-label） |
 | `list_meetings.mjs` | 列出所有 session（本地时间/partner/title/quiet），给脚本挑目标用 |
 | `tasks_api.mjs` | `list` / `delete <id>` task（清理 add_task 的测试数据用） |
+| `test_warden.py` | warden.py 回归测试：密码复杂度/存取/权限、命令解析、cancel 阻力<br>（`python3 test/test_warden.py`；不联网、不写仓库文件） |
 
 用法：
 

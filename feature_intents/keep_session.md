@@ -115,3 +115,34 @@ download_calendar.py populate   ──▶ data.csv ──▶ keep_session daemon
 daemon 脱离终端后 PATH 极简，node 用 `/opt/homebrew/bin`，python 用系统
 `/usr/bin/python3`，`FOCUSMATE_MCP_JS` 显式注入。预留 `temp/keep_session.stop`
 文件可作为优雅停止开关。
+
+## 已知问题：可能残留「旧版 daemon」（2026-10-08 发现）
+
+**现象**：日志里两种轮次交替出现，各约 5 分钟一轮、彼此错开约 2 分钟：
+
+```
+19:02:19   今天已有 10 个 session      ← 正常
+19:04:21   data.csv 里没有有效目标      ← 坏的那个
+19:07:20   今天已有 10 个 session
+19:09:21   data.csv 里没有有效目标
+```
+
+**根因**：有两个 daemon 进程在跑。坏的那个是 `5716098`（「data.csv 支持 weekday 列」）
+**之前**启动的、一直没重启，内存里还是旧的 `load_slots` —— 它把三列行
+`tue,22:15,50` 当成 `HH:MM,duration` 解析，于是 `hhmm = 'tue'`，
+于是逐行 `[warn] data.csv:N 时间格式不对，已跳过: 'tue'`，最后
+「data.csv 里没有有效目标」。这个报错签名就是「旧代码 + 三列 csv」的指纹。
+
+**为什么没出大事**：旧进程找不到任何 slot 就直接返回，**不会下单**，所以它只是刷噪声，
+真正的补订由新进程照常完成。（但 `daemon stop` 只会按 PID 文件杀掉其中一个。）
+
+**自查**：
+
+```bash
+pgrep -fl "keep_session.py _daemon_loop"     # 应该只有一行
+python3 keep_session.py status               # 日志尾如果一直刷「没有有效目标」就是它
+```
+
+**修**：把多出来的旧进程杀干净，再 `python3 keep_session.py daemon restart`。
+注意 `keep_session.py` 是**启动时**把代码读进内存的，改了 `load_slots` 之类的
+解析逻辑必须重启 daemon 才生效 —— 光改文件不够。这条对 `data.csv` 换格式同理。

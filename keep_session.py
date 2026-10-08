@@ -633,7 +633,11 @@ def cmd_daemon_start(dry_run=False):
         cmd_run(dry_run=dry_run)
     finally:
         try:
-            os.remove(PID_FILE)
+            # 只删「自己那条」记录。孤儿 daemon（比如 pid 文件被删过、restart 杀不到的那个）
+            # 退出时如果无脑 os.remove，会把**别人**（当前正在跑的 daemon）的 pid 记录抹掉，
+            # 于是 status 说没在跑、daemon start 又启一个。实测踩过。
+            if read_pid() == os.getpid():
+                os.remove(PID_FILE)
         except OSError:
             pass
     os._exit(0)
