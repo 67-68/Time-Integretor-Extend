@@ -2,24 +2,29 @@
 
 ## 模块职责
 
-一个 rich TUI（`warden.py`），把散落的三块东西收进一个界面：daemon 状态、今天的
-session 列表、以及对单个 session 的写操作（静音 / 标题 / 取消）。
+一个 rich TUI（`warden.py`），把散落的东西收进一个界面：daemon 状态、**任意一天**的
+契约表（data.csv 计划 × API 上真实存在的 session）、以及对单场的写操作（静音 / 标题 / 创建 / 取消）。
 
-定位是**看板 + 审讯台**，不是自动化中枢：它不替代 daemon，也不做定时。
-daemon 负责「保证订上」，warden 负责「随时看得见、随时能改」。
+定位是**看板 + 审讯台**，不是自动化中枢：它不替代 daemon，也不做定时，**也不重写业务逻辑**
+—— 下单和启停走 `keep_session.py` 子进程（薄封装），CSV 解析/编辑走 `schedule.py`。
+daemon 负责「保证订上」，warden 负责「随时看得见、随时能改、想取消得付出代价」。
 
 ## 架构
 
 ```
   warden.py (rich TUI)
      │
-     │ 1) 只读文件：temp/keep_session-{state.json,pid,log}
-     │    → daemon Running/Stopped、今日计划落地情况
+     │ 1) 只读文件：temp/keep_session-state.json / .pid / .log
+     │             temp/warden-sins.json / keep_session-verdicts.json
+     │    → daemon Running/Stopped、未认罪的罪、已放弃的场次
      │
-     │ 2) 子进程：python3 keep_session.py daemon start|stop
-     │    → 启停走现成 CLI，不在自己进程里 fork
+     │ 2) 读写 data.csv（控制面）──> schedule.py（解析/序列化/增删的唯一实现）
+     │    → day 切换看哪天、session 加一场、草稿区 cancel 删一场
      │
-     └──3) JSON 行（stdin/stdout）──> scripts/bridge.mjs
+     │ 3) 子进程：python3 keep_session.py check | daemon start | stop
+     │    → 下单和启停都走现成 CLI，不在自己进程里 fork、也不重写
+     │
+     └──4) JSON 行（stdin/stdout）──> scripts/bridge.mjs
                                         └── Playwright ──> 常驻 Chromium
                                             └── 内部 API（PUT/DELETE，裸 Firebase token）
 ```
@@ -31,30 +36,35 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
 为什么是**常驻**而不是「每条命令起一个」：见上面那组数字。代价是要管子进程
 生命周期（见「踩过的坑」）。
 
-## 四个概念（以及被砍掉的那个）
+## 三层摩擦（这套系统真正的规则）
 
-项目原本提了五个概念，其中一个按用户要求**不实现**：
+「能不能自由改动」不取决于操作，取决于**那一场在哪个区**。判据是滚动 24 小时窗口
+（`schedule.window`，见 `feature_intents/schedule.md`）：
 
-| 概念 | 实现 |
-|---|---|
-| The Warden Status | 看板头部：daemon Running/Stopped + pid + 日志尾；`start` / `stop` |
-| The Contract Table | `rich.table`：ID / 时间 / 时长 / 状态 / 静音 / 伙伴 / 标题 |
-| The Interrogation Prompt | 死循环 `input()`，极简命令（见下） |
-| ~~Panic Action~~ | **已砍**。"一键强行触发倒计时"是个错误设计 —— 它会把 daemon 的节奏和日历契约一起绕过，且和 `cancel` 的阻力设计自相矛盾。 |
+| 层 | 判据 | 代价 |
+|---|---|---|
+| 草稿区 | `start > now+24h` | 零阻力：`session` 加、`cancel` 删，直接改 data.csv |
+| 执行区 | `now < start ≤ now+24h` | `cancel` 必须**一字不差敲完 152 字宣言** |
+| 罪案区 | state 说 booked、API 里查不到 | **全局锁死**：除宣言外任何命令都不受理（含 `session` / `day` / `stop`）；罪落盘，关掉重开照样锁 |
+| 过去 | `start ≤ now` | 只能看：不取消也不补订 |
+
+项目原本提的五个概念里，**Panic Action 按用户要求不实现** ——「一键强行触发倒计时」
+会绕过 daemon 的节奏和契约窗口，且和取消的阻力设计自相矛盾。
 
 ## 命令
 
 ```
+day / day -1 / day 0 / day 1 / day 2026-10-11   切换看哪一天（草稿区随便看）
+session HH:MM LEN   创建一场：先写 data.csv，再立刻触发一轮 check（LEN ∈ 25/50/75）
+cancel N            取消：草稿区直接删契约行；执行区敲宣言；过去直接拒
 mute 3              把 #3 静音（不写 on/off 就是取反）
 mute 3 on|off       显式开/关
 title 2 "Math Past Paper"
 title 2 ""          清空标题
-cancel 1            → 地狱级阻力流程（见下）
-refresh / r         重新拉列表（ID 会重编号）
+refresh / r         重新拉选中那天的 session（ID 会重编号）
 start               启动 daemon（先让 bridge 放开浏览器）
-stop                停用 daemon（要密码）
+stop                停用 daemon（**要敲宣言**）
 status / s          重画看板
-set-password        改停用密码
 help / quit
 ```
 
@@ -65,32 +75,33 @@ help / quit
 `startMs` 找到那一场，再核对 `meetingId` 是否一致，不一致直接中止、不做任何写。
 这是防「ID 漂移」和「表过期」的闸门。
 
-## 停用 daemon 的密码
+表格把**契约和现实合并**成一行行：契约有 + API 有 = 已订（有 id、能改）；
+契约有 + API 没有 = `缺`（草稿区里是正常的「还没吃进去」）；API 有 + 契约没有 = `计划外`。
+拿不到 bridge 时用 state.json 快照兜底，此时**不给「缺/已订」的结论**（快照里没有 id），
+一律标 `快照`。
 
-用户要求「停用必须输入复杂密码」。设计：
+## 宣言闸门（The Walk of Shame）
 
-- 首次 `stop` 时引导设置；之后每次 `stop` 都要验。
-- 规则：**≥12 字符，且 小写/大写/数字/符号 至少占 3 类**。
-- 存储：PBKDF2-HMAC-SHA256（26 万次迭代）+ 16 字节随机盐，落
-  `temp/warden.json`，文件权限 `0600`。**明文不落盘。**
-  `temp/` 已在 `.gitignore`，所以密码哈希不进 git。
-- 最多试 3 次，每次失败间隔 2s。失败**绝不**调用 stop。
-- 忘了密码：删掉 `temp/warden.json` 重设即可。这是防**误触**的摩擦，不是防外人
-  —— 能碰到这个仓库的人本来就能删文件。
+密码系统已按用户要求**整个删除**（`password_problems` / PBKDF2 / `temp/warden.json` /
+`--set-password` 全没了）。取而代之：**停 daemon 和取消 session 共用同一道宣言闸门**。
 
-## cancel 的「地狱级阻力」
+- 宣言 152 字符 = 用户原文 99 字一字未改 + 补写 53 字（「补到 ~150」时用户点头的那两句）。
+- 比对规则：`strip()` 掉前导/尾随空白后**逐字比较**。少一个标点、把全角 `，` 敲成半角 `,`、
+  中间多一个字，全部不通过。
+- 不通过 = **鸣笛**（终端 `\a`）+ 指出第一个不一致的位置和字数差 + 继续问，**没有次数上限**。
+- Ctrl+C / EOF = 放弃，什么都不做。
+- 判据只有一处实现（`check_declaration()`），测试覆盖整段/少字/多字/半角/空白。
 
-`cancel` 是全套里唯一不可逆的操作，且**走内部 API 会绕过网页那层二次确认**，
-所以阻力全部加在 TUI 侧：
+## 认罪之后：宣言是有牙齿的
 
-1. 先打一整块红色面板：目标场次、标题、**是否已匹配 partner**。
-2. 如果已匹配，明确写出后果（对方被放鸽子 / 你 attRate 会掉）。
-3. 要求**手打该场次的开始时间**（如 `19:00`）才能继续 —— 任何其它输入都放弃。
-   这一步的意义是逼你确认「我要取消的到底是哪一场」，而不是无脑敲 y。
-4. **6 秒冷静期**倒计时，期间 Ctrl+C 随时可中止。
-5. 才真的发 `DELETE`。
+`confess()` 在敲对宣言之后做三件事：
 
-已结束的场次直接拒绝（Focusmate 也不允许）。
+1. 把每一笔罪的 slot 写进 `temp/keep_session-verdicts.json` 的 `abandoned`
+   → **daemon 从此不再重订这一场**（否则宣言只是表演）。
+2. 如果它已经被 daemon 重订回来了 → 通过 bridge 再取消掉一次（「放弃」必须是真的）。
+3. 罪从 `warden-sins.json` 挪进 `warden-sins.jsonl`（只增不删的账本）。
+
+已经过去的罪只判放弃、不动 API（取消过去的场次没意义）。
 
 ## 和 daemon 抢 Chromium profile
 
@@ -140,12 +151,22 @@ stdout  每行： {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 3. **刷新失败不要覆盖好数据**。`refresh()` 出错时如果拿 state.json 退化快照去覆盖
    已有行，那些行没有 session id，后续 mute/title/cancel 全都做不了。
    现在：已有好数据就保留，只报错。
-4. **state.json 的快照含跨天数据**。daemon 用 UTC 日界查，会带上本地上一天的
+4. **state.json 的快照含跨天数据**。旧 daemon 用 UTC 日界查，会带上本地上一天的
    23:15。退化快照必须按本地日期再滤一遍，否则表里混进昨天的场次。
-5. **rich 的 `Text()` 不解析 markup**。`Text("[bold]▶[/]")` 会把方括号原样打出来。
+   现在快照本来就是 24 小时窗口的内容，按选中那天过滤。
+5. **快照里没有 id，不能说「缺」**。离线/`--status` 模式下拿 state.json 快照兜底时，
+   所有计划行都显示「缺」——那是**假信息**（快照根本看不出订没订）。
+   现在引入 `authoritative`（只有 bridge 拉的才算真数据），快照模式一律标 `快照`。
+6. **离线/`--status` 路径忘了读 data.csv**。`paint()` 不重读契约表的话，
+   表格会退化成「全是计划外」、窗口说「一条契约都没有」。现在 `paint()` 和
+   `_fallback_rows()` 都先 `reload_entries()`。
+7. **rich 的 `Text()` 不解析 markup**。`Text("[bold]▶[/]")` 会把方括号原样打出来。
    要么用 `console.print`（解析 markup），要么用 `Text.append(style=)`。
-6. `Table.grid_from_rows` 不存在；`[[...]]` 这种转义在长行里容易渲染成 `[]`。
+8. `Table.grid_from_rows` 不存在；`[[...]]` 这种转义在长行里容易渲染成 `[]`。
    少用转义，直接换措辞。
+9. **state 的 key 剪枝不能用字符串比较**。旧格式的 key 是 `"20:00"`，而
+   `"20:00" > "2026-10-08"` 在字典序上**成立**（`:` 排在数字后面），会把旧记录留下来。
+   现在按 `date.fromisoformat(k[:10])` 判。
 
 ## 依赖
 
@@ -160,10 +181,18 @@ python3 warden.py install-deps
 ## 未验证 / 待办
 
 - **`stop` 的 `keep_session.py daemon stop` 子进程路径没有在真 daemon 上跑过**
-  （怕把正在跑的 daemon 停掉影响今天的场次）。`start` / 密码闸 / 参数拼装都有测试。
+  （怕把正在跑的 daemon 停掉影响今天的场次）。`start` / 宣言闸 / 参数拼装都有测试。
 - 交互式 TUI 只在**管道 stdin** 下测过；没在真 TTY 上人工敲过（沙箱里没 TTY）。
-  特别是 `getpass` 在真 TTY 下的回显行为。
+  特别是 152 字宣言在真 TTY 下的粘贴/回显行为。
+- **`session` 的"立刻触发一轮 check"没在真账号上跑过**（那会真下单）。它调的是
+  现成的 `keep_session.py check`，路径本身是通的，但没实地验证过。
 - 表格默认不自动刷新。如果发现「数字看漂」，考虑加一个只读的轻量刷新
   （不走浏览器），但会拉长占锁时间。
-- `cancel` 的冷静期秒数（`CANCEL_COOLDOWN`）目前硬编码 6s。
 - 真 TTY 下 `Console.clear()` 的表现没验证；不好用就 `--no-clear`。
+
+## 已删除的历史设计（别再抄回来）
+
+- **停用密码**：曾经有「≥12 字符 + 3 类字符」的密码，PBKDF2 存 `temp/warden.json`。
+  用户要求删掉，改成和取消共用的宣言闸门。
+- **cancel 的地狱级阻力**：曾经是「红面板 → 手打开始时间 → 6 秒冷静期 → DELETE」。
+  现在按区分层：草稿区零阻力、执行区敲宣言。`CANCEL_COOLDOWN` 常量已删。

@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-"""keep_session.py —— 后台常驻，确保 data.csv 里列的今天的 Focusmate session 都存在。
+"""keep_session.py —— 后台常驻，把「未来 24 小时」的契约死死锁进 Focusmate。
 
 架构（改动前先读这里）
 ----------------------
-    ┌─ keep_session daemon（后台常驻，脱离终端）──────────────┐
-    │  每 LOOP_INTERVAL=300s 醒一次：                          │
-    │    读 data.csv → 一次 API 列出今天所有 session →          │
-    │    补齐缺失的（带防抖 + 指数退避）→ 写 state.json + 日志   │
-    └──────────────────────────────────────────────────────────┘
-                        ▲ 读 state.json / 日志（未来 TUI）
-                        │
-        keep_session status / log    ← 前台只读，随时开随时关
+    ┌─ keep_session daemon（后台常驻，脱离终端）────────────────────┐
+    │  每 LOOP_INTERVAL=300s 醒一次：                               │
+    │    data.csv → 切出 (now, now+24h] 的执行区 → 一次 API 列出窗口 │
+    │    内的 session → 补齐缺失的（防抖 + 指数退避）→ 写 state+日志 │
+    └───────────────────────────────────────────────────────────────┘
+        ▲ 读 state / verdicts / sins / 日志（warden TUI 只读文件）
+        │
+        keep_session status / check    ← 前台，随时开随时关
+
+窗口语义（核心）
+----------------
+    「执行区」= (now, now+24h]    ← 只订这里面的；取消要过 warden 的宣言闸门
+    「草稿区」= now+24h 之后      ← 还是草稿，人手随便改 data.csv
+    「过去」  = 今天已开始的       ← 只对账：记 booked / missed / sin，不补订
+
+滚动 24 小时意味着**每天傍晚就把第二天早上的场次订掉了**（＝「T+1 锁入」），
+而且不需要 23:59 的定时任务：机器合盖睡了也没事，醒来那一轮会把窗口重新填满。
 
 两种前台入口（都不常驻）：
 - `run`   前台常驻循环，stdout 直接看日志，Ctrl+C 干净退出（调试用）
@@ -19,20 +28,20 @@
 决策（已锁定）
 --------------
 - 调度：进程内 sleep 循环，每 300s 一轮。不用 LaunchAgent（daemon 自己常驻）。
-- 目标语义：仅今天。data.csv 每行可选带 weekday（mon..sun；留空或 `*` = 每天），
-  本模块只取「今天星期几 + 每天」的行；state 里带 date，跨天自动重置。
-  data.csv 通常由 download_calendar.py `populate` 从日历生成（一周计划），也可手写。
-- 「提前订满」：遍历今天**所有还没开始**的 slot（now < T），没有 session 就订。
-  不做「只在前 5 分钟才订」——那是旧版逻辑，已废弃。
-- 检查走官方只读 API（GET /v1/sessions），一次调用拿到当天全部 session，
+- 目标语义：滚动 24 小时窗口（见上）。data.csv 的解析/编辑全在 schedule.py，
+  本模块不重复实现一遍 —— daemon 和 TUI 必须共用同一份语义。
+- 检查走官方只读 API（GET /v1/sessions），一次调用拿到窗口内全部 session，
   所以「列一遍看谁没订」很便宜，可以每轮都做。
 - 预定必须走 focusmate-mcp 浏览器自动化（Focusmate 官方 API 只读，无下单接口）。
 - 失败退避：最多 3 次尝试，指数退避（5min → 15min），第 3 次失败转 failed + 通知。
 - 防抖：每次真正下单前随机 sleep DEBOUNCE_BASE ± DEBOUNCE_JITTER 秒（5±3），
   避免规律性的机器行为。
-- 手动取消自动重订：每轮以 API 为准——API 里没有、且 state 以为是 booked，
-  说明你在 Focusmate 手动取消了，回退为待订并**重置重试计数**（这不是脚本的失败）。
-- 状态全部落盘（state.json），前台 TUI 只需读文件，不依赖 daemon 生命周期。
+- 手动取消：自动重订（守擂），**并且记一笔 sin**——API 里没有、而 state 以为是
+  booked，说明你在 Focusmate 手动取消了。机器读不了你的心，所以它继续重订；
+  罪记录进 warden-sins.json，warden TUI 会因此**锁死**，直到你敲完 152 字宣言。
+- 认罪后的判决（keep_session-verdicts.json 的 abandoned）：TUI 认罪时把这个
+  slot 判成「已放弃」，daemon 从此不再重订它 —— 这才是宣言真正的牙齿。
+- 状态全部落盘（state / verdicts / sins），前台 TUI 只读文件，不依赖 daemon 生命周期。
 
 用法：
     python3 keep_session.py daemon start      # 后台常驻（脱离终端，关终端不影响）
@@ -63,18 +72,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import main as fm  # noqa: E402  复用 resolve_target / mcp_call / book_once / TOKEN
+import schedule as sch  # noqa: E402  data.csv 的解析/编辑：唯一实现（TUI 也 import 它）
 
 LOOP_INTERVAL = 300            # daemon 每轮间隔（秒）
 DEBOUNCE_BASE = 5              # 下单前基础等待（秒）
 DEBOUNCE_JITTER = 3            # 随机抖动 ±（秒）
 MAX_ATTEMPTS = 3               # 单个 slot 当天最多尝试预定次数
 BACKOFF_MINUTES = [5, 15]      # 第 1、2 次失败后的等待（分钟）；第 3 次失败即放弃
+WINDOW_HOURS = sch.WINDOW_HOURS  # 执行区长度：滚动 24 小时（改这里就改了命运）
 
 STATE_FILE = os.path.join(HERE, "temp", "keep_session-state.json")
 PID_FILE = os.path.join(HERE, "temp", "keep_session.pid")
 LOG_FILE = os.path.join(HERE, "temp", "keep_session.log")
 STOP_FILE = os.path.join(HERE, "temp", "keep_session.stop")  # 放这个文件 = 优雅退出
 LOCK_FILE = os.path.join(HERE, "temp", "keep_session.lock")  # 防 daemon 与手动 check 同时下单
+VERDICTS_FILE = os.path.join(HERE, "temp", "keep_session-verdicts.json")  # 认罪判决
+SINS_FILE = os.path.join(HERE, "temp", "warden-sins.json")        # 待认罪的罪
+SINS_ARCHIVE = os.path.join(HERE, "temp", "warden-sins.jsonl")    # 认过的罪（只增不删）
 
 NODE_BIN_DIR = "/opt/homebrew/bin"
 # daemon 子进程用的解释器：优先系统 /usr/bin/python3（稳定），否则当前解释器
@@ -177,9 +191,10 @@ def parse_iso(s):
 
 
 def load_state():
-    """返回 {date, slots:{HH:MM: {status, attempts, next_retry_at, last_error, duration}}}。
+    """返回 {date, slots:{"2026-10-09T09:00": {status, attempts, duration, ...}}}。
 
-    日期不是今天就整体重置（「仅今天」语义，无需清理任务）。
+    key 带日期：滚动窗口同时管今天和明天，所以不能「不是今天就整体重置」。
+    改成**剪枝** —— 丢掉今天以前的记录，今天/明天的留着。跨天自动瘦身，无需清理任务。
     """
     fresh = {"date": today_str(), "slots": {}}
     try:
@@ -187,11 +202,26 @@ def load_state():
             st = json.load(f)
     except (OSError, ValueError):
         return fresh
-    if not isinstance(st, dict) or st.get("date") != today_str():
+    if not isinstance(st, dict):
         return fresh
     st.setdefault("slots", {})
     if not isinstance(st["slots"], dict):
         st["slots"] = {}
+    # 只留"今天及以后"的记录。**别用字符串比较**：旧格式的 key 是 "20:00"，
+    # 而 "20:00" > "2026-10-08" 在字典序上成立（':' 排在数字后面），会漏进来。
+    today = datetime.date.today()
+    keep = {}
+    for k, v in st["slots"].items():
+        if not isinstance(k, str) or len(k) < 16 or k[4] != "-" or k[10] != "T":
+            continue
+        try:
+            kd = datetime.date.fromisoformat(k[:10])
+        except ValueError:
+            continue
+        if kd >= today:
+            keep[k] = v
+    st["slots"] = keep
+    st["date"] = today_str()
     return st
 
 
@@ -203,106 +233,139 @@ def save_state(st):
     os.replace(tmp, STATE_FILE)
 
 
-# ---------------------------------------------------------------- data.csv
+# ---------------------------------------------------------------- 判决 / 罪
 
 
-WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-WEEKDAY_ALIASES = {
-    "mon": "mon", "tue": "tue", "wed": "wed", "thu": "thu",
-    "fri": "fri", "sat": "sat", "sun": "sun",
-    "周一": "mon", "周二": "tue", "周三": "wed", "周四": "thu",
-    "周五": "fri", "周六": "sat", "周日": "sun", "周天": "sun",
-    "星期一": "mon", "星期二": "tue", "星期三": "wed", "星期四": "thu",
-    "星期五": "fri", "星期六": "sat", "星期日": "sun", "星期天": "sun",
-}
-EVERY_DAY = ("", "*", "每", "每天", "daily", "all", "every")
+def _load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            got = json.load(f)
+    except (OSError, ValueError):
+        return default
+    return got if isinstance(got, dict) else default
 
 
-def normalize_weekday(raw):
-    """'mon' / '周一' / '星期一' / '*' / '' → 'mon'|...|'*'；认不出来返回 None。"""
-    v = (raw or "").strip().lower()
-    if v in EVERY_DAY:
-        return "*"
-    return WEEKDAY_ALIASES.get(v)
+def _save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
-def today_weekday(now=None):
-    return WEEKDAYS[(now or datetime.datetime.now()).weekday()]
+def load_verdicts():
+    """认罪判决：{"abandoned": {"2026-10-09T09:00": {...}}}。
 
-
-def load_slots(path=None, weekday=None):
-    """解析 data.csv。
-
-    每行两种写法（`#` 注释、空行忽略）：
-        HH:MM,duration              —— 每天
-        weekday,HH:MM,duration      —— 只在 weekday 生效
-    weekday ∈ mon..sun（也认 周一/星期天 这类写法）；`*` 或留空 = 每天。
-
-    weekday 参数非 None 时只返回「该星期几 + 每天」的行——check 走的就是这条。
-    返回 [{"weekday","start","duration","hour","minute"}, ...]，按 (weekday, 时间) 排序。
+    abandoned = 你在 TUI 里敲完宣言、正式放弃的那一场。daemon 读它并且**永不重订**
+    —— 否则宣言就只是一段表演。只有 warden 认罪时才会写它，daemon 自己绝不判。
     """
-    path = path or os.path.join(HERE, fm.SESSION_REGISTRATION_PATH)
-    slots = []
-    seen = set()
-    with open(path, encoding="utf-8") as f:
-        for lineno, raw in enumerate(f, 1):
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) == 2:
-                day, hhmm, duration = "*", parts[0], parts[1]
-            elif len(parts) == 3:
-                day, hhmm, duration = parts[0], parts[1], parts[2]
-            else:
-                log("  [warn] data.csv:%d 格式不对（要 [weekday,]HH:MM,duration），已跳过: %r"
-                    % (lineno, raw.strip()))
-                continue
-            day = normalize_weekday(day)
-            if day is None:
-                log("  [warn] data.csv:%d 星期几认不出来（要 mon..sun / 周一..周日 / *），已跳过: %r"
-                    % (lineno, raw.strip()))
-                continue
-            try:
-                t = datetime.datetime.strptime(hhmm, "%H:%M")
-            except ValueError:
-                log("  [warn] data.csv:%d 时间格式不对，已跳过: %r" % (lineno, hhmm))
-                continue
-            if duration not in ("25", "50", "75"):
-                log("  [warn] data.csv:%d 时长只能是 25/50/75，已跳过: %r" % (lineno, duration))
-                continue
-            if weekday is not None and day not in ("*", weekday):
-                continue
-            key = (day, hhmm)
-            if key in seen:
-                log("  [warn] data.csv:%d 重复的 %s %s，已跳过" % (lineno, day, hhmm))
-                continue
-            seen.add(key)
-            slots.append({"weekday": day, "start": hhmm, "duration": duration,
-                          "hour": t.hour, "minute": t.minute})
-    slots.sort(key=lambda s: (WEEKDAYS.index(s["weekday"]) if s["weekday"] in WEEKDAYS else -1,
-                              s["hour"], s["minute"]))
-    return slots
+    v = _load_json(VERDICTS_FILE, {})
+    v.setdefault("abandoned", {})
+    if not isinstance(v["abandoned"], dict):
+        v["abandoned"] = {}
+    return v
 
 
-def slot_dt(slot, now):
-    """slot 的今天的本地 datetime（用 now 的时区）。"""
-    return now.replace(hour=slot["hour"], minute=slot["minute"], second=0, microsecond=0)
+def save_verdicts(v):
+    _save_json(VERDICTS_FILE, v)
+
+
+def is_abandoned(key, verdicts=None):
+    return bool((verdicts if verdicts is not None else load_verdicts())["abandoned"].get(key))
+
+
+def mark_abandoned(key, why="walk-of-shame", note=""):
+    v = load_verdicts()
+    if key in v["abandoned"]:
+        return v["abandoned"][key]
+    rec = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
+           "why": why, "note": note}
+    v["abandoned"][key] = rec
+    save_verdicts(v)
+    return rec
+
+
+def load_sins():
+    """待认罪的罪：{"sins": [{key, what, at, note}]}。"""
+    s = _load_json(SINS_FILE, {})
+    s.setdefault("sins", [])
+    if not isinstance(s["sins"], list):
+        s["sins"] = []
+    return s
+
+
+def record_sin(key, what, note=""):
+    """记一笔罪。幂等：同一 (key, what) 只记一次。
+
+    触发点只有一个 —— state 以为是 booked，但 API 里查不到，也就是
+    **你在 Focusmate 手动取消了**。daemon 照旧重订（守擂，机器读不了你的心），
+    同时把罪落盘，等 TUI 锁死你来收。
+    """
+    s = load_sins()
+    for old in s["sins"]:
+        if old.get("key") == key and old.get("what") == what:
+            return None
+    rec = {"key": key, "what": what, "note": note,
+           "at": datetime.datetime.now().isoformat(timespec="seconds")}
+    s["sins"].append(rec)
+    _save_json(SINS_FILE, s)
+    log("  ⚠ 记下一笔罪：%s（%s）—— 等 warden 来收" % (key, what))
+    notify("Focusmate session 被手动取消",
+           "%s 在 API 里不见了（%s）。daemon 会重订，TUI 会锁死直到你敲完宣言。"
+           % (key, what))
+    return rec
+
+
+def clear_sins(keys=None):
+    """认罪：把罪从「待认罪」挪进 archive（.jsonl，只增不删 = 历史即罪证）。
+
+    keys=None 表示清掉全部。返回清掉几条。
+    """
+    s = load_sins()
+    keep, gone = [], []
+    for rec in s["sins"]:
+        (gone if keys is None or rec.get("key") in keys else keep).append(rec)
+    if not gone:
+        return 0
+    s["sins"] = keep
+    _save_json(SINS_FILE, s)
+    os.makedirs(os.path.dirname(SINS_ARCHIVE), exist_ok=True)
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    with open(SINS_ARCHIVE, "a", encoding="utf-8") as f:
+        for rec in gone:
+            f.write(json.dumps(dict(rec, confessed=stamp), ensure_ascii=False) + "\n")
+    return len(gone)
+
+
+# ---------------------------------------------------------------- data.csv
+# 解析/编辑全在 schedule.py —— daemon 和 TUI 共用**同一份实现**，这里只做转发。
+# 谁也别在本文件里再写一套"哪一行算一个 slot"，那是双份真源的开始。
+
+WEEKDAYS = sch.WEEKDAYS                      # 老名字，其它模块还在 import
+WEEKDAY_ALIASES = sch.WEEKDAY_ALIASES
+EVERY_DAY = sch.EVERY_DAY
+normalize_weekday = sch.normalize_weekday
+today_weekday = sch.today_weekday
+load_slots = sch.load_slots                  # 兼容老调用（test_download_calendar.py 用）
+load_entries = sch.load_entries
+day_slots = sch.day_slots
+slot_datetime = sch.slot_datetime
+key_of = sch.key_of
 
 
 # ---------------------------------------------------------------- 只读 API
 
 
-def fetch_today_sessions(now):
-    """一次 API 调用，返回今天所有 session 的 start time（本地时区的 datetime 集合）。
+def fetch_sessions(now, until):
+    """一次 API 调用，返回 [now 当天 00:00, until] 之间所有 session（**本地 naive** 时间）。
 
+    窗口跨天（今天+明天），所以不能再"只捞今天"——一次捞够，反正只读接口很便宜。
     出错就抛异常，由调用方决定这一轮怎么办。
     """
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(datetime.timezone.utc)
-    day_end = now.replace(hour=23, minute=59, second=59, microsecond=0).astimezone(datetime.timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     url = "https://api.focusmate.com/v1/sessions?start=%s&end=%s" % (
-        urllib.parse.quote(day_start.isoformat()),
-        urllib.parse.quote(day_end.isoformat()),
+        urllib.parse.quote(day_start.astimezone(datetime.timezone.utc).isoformat()),
+        urllib.parse.quote(until.astimezone(datetime.timezone.utc).isoformat()),
     )
     req = urllib.request.Request(url, headers={"X-API-Key": fm.TOKEN})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -316,7 +379,7 @@ def fetch_today_sessions(now):
             got = datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
         except ValueError:
             continue
-        out.append(got.astimezone(now.tzinfo).replace(second=0, microsecond=0))
+        out.append(got.astimezone().replace(tzinfo=None, second=0, microsecond=0))
     return out
 
 
@@ -333,21 +396,21 @@ def debounce():
     time.sleep(secs)
 
 
-def verify_slot_booked(slot, now, attempts=3, wait=4):
+def verify_slot_booked(start, attempts=3, wait=4):
     """订完后**以 API 为准**复核这场 session 是否真的存在。
 
     为什么要复核：focusmate-mcp 的 book_session 抓不到真实 sessionId 时会
-    伪造 `temp-<毫秒时间戳>` 并照样返回 success:true（见其 booking.ts）。
-    也就是说 payload.success 不可信 —— API 才是 ground truth。
+    照样返回 success:true（见其 booking.ts）。也就是说 payload.success 不可信
+    —— API 才是 ground truth。
 
     返回 (ok, detail)。ok=True 表示 API 里确实有这个 slot。
     """
-    start = slot_dt(slot, now)
     last = ""
     for i in range(attempts):
         time.sleep(wait)  # booking 落库有延迟，给几秒
         try:
-            sessions = fetch_today_sessions(datetime.datetime.now().astimezone())
+            now = datetime.datetime.now()
+            sessions = fetch_sessions(now, now + datetime.timedelta(hours=WINDOW_HOURS))
         except Exception as e:
             last = "复核时 API 出错: %s" % e
             continue
@@ -371,49 +434,64 @@ def run_once(dry_run=False):
 
 
 def _run_once_locked(dry_run=False):
-    """真正干活的一轮。必须在持有 round_lock 时调用。"""
-    now = datetime.datetime.now().astimezone()
+    """真正干活的一轮。必须在持有 round_lock 时调用。
+
+    只管 (now, now+24h] 的执行区：订满它、对账已经过去的、记罪、认判决。
+    """
+    now = datetime.datetime.now()        # 本地 naive —— schedule.py 的窗口语义就用这个
     log("=== round start (dry_run=%s) %s ===" % (dry_run, now.strftime("%Y-%m-%d %H:%M:%S")))
 
-    try:
-        slots = load_slots(weekday=today_weekday(now))
-    except OSError as e:
-        log("  data.csv 读不到: %s" % e)
-        return 1
-    if not slots:
-        log("  data.csv 里没有今天（%s）的目标" % today_weekday(now))
-        return 0
+    entries, warnings = load_entries()
+    for wmsg in warnings:
+        log("  [warn] %s" % wmsg)
+
+    win = sch.window(entries, now, hours=WINDOW_HOURS)
+    horizon = win["horizon"]
+    due, past = win["due"], win["past"]
+    log("  窗口 %s → %s：执行区 %d 场、已开始 %d 场"
+        % (now.strftime("%m-%d %H:%M"), horizon.strftime("%m-%d %H:%M"), len(due), len(past)))
+    if not due and not past:
+        log("  [warn] 未来 %d 小时里**一条契约都没有** —— 不是放假就是 data.csv 断了档，"
+            "去 warden 敲 `day 0` / `day 1` 看一眼" % WINDOW_HOURS)
 
     state = load_state()
+    verdicts = load_verdicts()
     changed = False
 
-    # 今天还没开始的 slot（now < T）才需要补订；已经过去的只做展示
-    upcoming = []
-    past = []
-    for slot in slots:
-        start = slot_dt(slot, now)
-        (upcoming if start > now else past).append((slot, start))
+    # 认过罪的：永不重订（这是宣言真正的牙齿）。daemon 自己绝不判，只读判决。
+    abandoned = [(key_of(day, slot), (day, slot, start)) for day, slot, start in due
+                 if is_abandoned(key_of(day, slot), verdicts)]
+    if abandoned:
+        drop = set(k for k, _ in abandoned)
+        due = [(day, slot, start) for day, slot, start in due
+               if key_of(day, slot) not in drop]
+        for key, (_day, slot, _start) in abandoned:
+            rec = state["slots"].get(key) or {}
+            if rec.get("status") != "abandoned":
+                log("  %s 被 warden 判为「已放弃」（你认过罪），不再重订" % key)
+                state["slots"][key] = {"status": "abandoned", "duration": slot["duration"],
+                                       "attempts": rec.get("attempts", 0)}
+                changed = True
 
-    # 一次 API 拿到今天全部 session（即使没有 upcoming 也要拿，供 status 展示）
+    # 一次 API 拿到窗口内全部 session（即使 due 为空也要拿，供 status/TUI 展示）
     sessions = None
     if not dry_run:
         try:
-            sessions = fetch_today_sessions(now)
-            log("  今天已有 %d 个 session" % len(sessions))
+            sessions = fetch_sessions(now, horizon)
+            log("  窗口内 API 里已有 %d 场 session" % len(sessions))
         except Exception as e:
             log("  API 列 session 失败: %s（本轮跳过，下轮再试）" % e)
             return 1
-        # 记录快照，供 status 展示"今天实际有哪些 session"
         state["api_snapshot"] = {
-            "at": now.isoformat(),
+            "at": now.isoformat(timespec="seconds"),
+            "horizon": horizon.isoformat(timespec="seconds"),
             "sessions": [s.isoformat() for s in sessions],
         }
         changed = True
 
-    # 已过的 slot：不做任何补订，只把"今天到底有没有"记进 state，
-    # 让 status 能显示（否则 status 静默不显示，容易误以为一切正常）。
-    for slot, start in past:
-        key = slot["start"]
+    # 已经开始的：不补订，只把"到底有没有"记进 state（让 status / TUI 能看出来）
+    for day, slot, start in past:
+        key = key_of(day, slot)
         rec = state["slots"].get(key) or {}
         if dry_run or sessions is None:
             continue
@@ -424,22 +502,24 @@ def _run_once_locked(dry_run=False):
                 changed = True
         else:
             if rec.get("status") != "missed":
-                log("  [已过] %s (%smin) 今天没有这场 session，已无法补订" % (key, slot["duration"]))
+                log("  [已过] %s (%smin) 没有这场 session，已经来不及补订了" % (key, slot["duration"]))
+                if rec.get("status") == "booked":
+                    # 订过、然后消失了、而且已经开过了：这是硬罪（你没去 / 你事后取消）
+                    record_sin(key, "booked-but-missing-past",
+                               "已过时间才发现 API 里没有（原记录：booked）")
                 state["slots"][key] = {"status": "missed", "duration": slot["duration"],
                                        "attempts": rec.get("attempts", 0), "past": True}
                 changed = True
 
-    if not upcoming:
-        log("  今天没有还没开始的 slot（全部已过）")
-
-    for slot, start in upcoming:
-        key = slot["start"]
+    for day, slot, start in due:
+        key = key_of(day, slot)
         rec = state["slots"].get(key) or {}
         status = rec.get("status")
 
         if dry_run:
             present = "?" if sessions is None else ("有" if has_session_at(sessions or [], start) else "无")
-            log("  [dry-run] %s (%smin) 在 API 中: %s；state=%s" % (key, slot["duration"], present, status or "无记录"))
+            log("  [dry-run] %s (%smin) 在 API 中: %s；state=%s"
+                % (key, slot["duration"], present, status or "无记录"))
             continue
 
         present = has_session_at(sessions, start)
@@ -455,13 +535,16 @@ def _run_once_locked(dry_run=False):
 
         # API 没有该 session
         if status == "booked":
-            # 我们以为是 booked，但 API 说没有 → 你手动取消了 → 重新订，重置尝试次数
-            log("  %s 原以为已订，但 API 查不到（疑似手动取消），重新预定" % key)
+            # 我们以为是 booked，但 API 说没有 → 你手动取消了。
+            # 守擂：照旧重订（机器读不了你的心）；但记一笔罪，TUI 会锁死你来收。
+            log("  %s 原以为已订，但 API 查不到（疑似你手动取消）→ 记罪 + 重新预定" % key)
+            record_sin(key, "booked-but-missing",
+                       "daemon 在 %s 的这轮检查里发现它消失了" % now.strftime("%m-%d %H:%M"))
             rec = {"duration": slot["duration"], "attempts": 0, "status": None}
             state["slots"][key] = rec
             changed = True
         elif status == "failed":
-            log("  %s 已达重试上限，今天不再尝试" % key)
+            log("  %s 已达重试上限，不再尝试" % key)
             continue
 
         # 该订了吗？（退避等待）
@@ -476,7 +559,7 @@ def _run_once_locked(dry_run=False):
             state["slots"][key] = {"status": "failed", "duration": slot["duration"],
                                    "attempts": attempts, "last_error": rec.get("last_error")}
             notify("Focusmate 预定失败",
-                   "%s (%smin) 尝试 %d 次仍失败，今天不再重试。原因：%s"
+                   "%s (%smin) 尝试 %d 次仍失败，不再重试。原因：%s"
                    % (key, slot["duration"], attempts, rec.get("last_error") or "未知"))
             changed = True
             continue
@@ -486,17 +569,18 @@ def _run_once_locked(dry_run=False):
         log("  %s 缺失，开始第 %d/%d 次预定...（目标时间 %s，%smin）"
             % (key, attempts, MAX_ATTEMPTS, fmt_local_utc(start), slot["duration"]))
         debounce()
+        # 直接用算好的 start（带日期），不走 fm.resolve_target 的"过了就顺延到明天"猜谜：
+        # 窗口里同时有今天和明天的场次时，那种猜法会挑错日子。
+        start_iso = start.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         try:
-            _target, start_iso = fm.resolve_target(key)
             payload = fm.book_once(start_iso, slot["duration"])
         except Exception as e:
             payload = {"success": False, "error": str(e), "errorCode": "EXCEPTION"}
 
         if payload.get("success"):
             sess = payload.get("session") or {}
-            log("  %s book_session 报成功 (id=%s)，开始 API 复核..."
-                % (key, sess.get("id")))
-            ok, detail = verify_slot_booked(slot, now)
+            log("  %s book_session 报成功 (id=%s)，开始 API 复核..." % (key, sess.get("id")))
+            ok, detail = verify_slot_booked(start)
             if ok:
                 log("  %s 复核通过：API 确认该 session 已存在" % key)
                 state["slots"][key] = {"status": "booked", "duration": slot["duration"],
@@ -514,9 +598,9 @@ def _run_once_locked(dry_run=False):
             next_retry = now + datetime.timedelta(minutes=wait)
             log("  %s 第 %d 次失败: %s（%d 分钟后重试）" % (key, attempts, reason, wait))
         else:
-            log("  %s 第 %d 次失败: %s（已达上限，今天不再试）" % (key, attempts, reason))
+            log("  %s 第 %d 次失败: %s（已达上限，不再试）" % (key, attempts, reason))
             notify("Focusmate 预定失败",
-                   "%s (%smin) 尝试 %d 次仍失败：%s。今天不再重试。"
+                   "%s (%smin) 尝试 %d 次仍失败：%s。不再重试。"
                    % (key, slot["duration"], attempts, reason))
         state["slots"][key] = {
             "status": None if next_retry else "failed",
@@ -721,25 +805,51 @@ def cmd_daemon(action, dry_run=False):
 
 def cmd_status():
     cmd_daemon_status()
-    print("== data.csv（每周计划）==")
-    try:
-        all_slots = load_slots()
-        twd = today_weekday()
-        if not all_slots:
-            print("  (空)")
-        for s in all_slots:
-            day = s["weekday"]
-            mark = " ◀今天(%s)" % twd if day in ("*", twd) else ""
-            print("  %-4s %s  %smin%s" % (day, s["start"], s["duration"], mark))
-    except OSError as e:
-        print("  读取失败: %s" % e)
+    now = datetime.datetime.now()
+    print("== data.csv（契约表）==")
+    entries, warnings = load_entries()
+    print("  %s：%d 条规则" % (sch.data_csv_path(), len(entries)))
+    for wmsg in warnings:
+        print("  [warn] %s" % wmsg)
+    win = sch.window(entries, now, hours=WINDOW_HOURS)
+    print("  执行区 (now, now+%dh]：%s → %s"
+          % (WINDOW_HOURS, now.strftime("%m-%d %H:%M"), win["horizon"].strftime("%m-%d %H:%M")))
+    if not win["due"] and not win["past"]:
+        print("    ⚠ 窗口里**一条契约都没有** —— 不是放假就是断了档")
+    for day, slot, start in win["due"]:
+        print("    [待订/已订] %s %smin" % (key_of(day, slot), slot["duration"]))
+    if win["past"]:
+        print("    [已开始] %d 场（只对账，不补订）" % len(win["past"]))
+    draft = 0
+    for i in range(1, 8):
+        day = now.date() + datetime.timedelta(days=i)
+        for slot in day_slots(entries, day):
+            if sch.slot_datetime(slot, day) > win["horizon"]:
+                draft += 1
+    print("  草稿区（>%dh）：未来 7 天还有 %d 场没进执行区" % (WINDOW_HOURS, draft))
 
-    print("== today state ==")
+    print("== 罪 / 判决 ==")
+    sins = load_sins()["sins"]
+    if sins:
+        print("  ⚠ 待认罪 %d 笔（warden 会锁死）：" % len(sins))
+        for rec in sins:
+            print("    %s  %s  %s" % (rec.get("at", "")[11:19], rec.get("key"), rec.get("what")))
+    else:
+        print("  待认罪：无")
+    ab = load_verdicts()["abandoned"]
+    if ab:
+        print("  已放弃 %d 场（daemon 永不重订）：" % len(ab))
+        for k in sorted(ab):
+            print("    %s  %s" % (k, ab[k].get("at", "")[:16]))
+    else:
+        print("  已放弃：无")
+
+    print("== 窗口内 state ==")
     st = load_state()
     snap = st.get("api_snapshot") or {}
     snap_at = snap.get("at")
     if snap_at:
-        print("  (API 快照 @%s，今天共 %d 场)"
+        print("  (API 快照 @%s，窗口内 %d 场)"
               % (snap_at[11:19], len(snap.get("sessions", []))))
     if st["slots"]:
         for k in sorted(st["slots"]):

@@ -2,53 +2,81 @@
 
 ## 模块职责
 
-后台常驻，保证「今天该有的 Focusmate session」都订上。`data.csv` 是唯一目标来源。
+后台常驻，保证「**未来 24 小时**该有的 Focusmate session」都订上 —— 也就是每天傍晚
+就把它第二天早上的场次订掉（T+1 锁入）。`data.csv` 是唯一目标来源。
+
+同时它是**守擂的人**：你手动取消的场次它照旧重订（机器读不了你的心），但会记一笔罪；
+只有 warden TUI 里敲完 152 字宣言写下的判决（`abandoned`）才让它收手。
 
 ## 架构：daemon + 只读前台
 
 ```
 keep_session daemon（后台常驻，脱离终端，PID 文件）
-  每 300s 一轮：读 data.csv → 一次 API 列今天 session → 补齐缺失的
-                → 写 state.json + 日志
-        ▲ 读 state.json / 日志
+  每 300s 一轮：读 data.csv → 切出 (now, now+24h] 执行区 → 一次 API 列窗口内 session
+                → 补齐缺失的（守擂）/ 记罪 / 认判决 → 写 state.json + 日志
+        ▲ 读 state.json / verdicts / sins / 日志
         │
-keep_session status / （未来 TUI，只读）
+keep_session status / warden.py（TUI：只读文件 + 子进程调 check）
 ```
 
 - daemon 用双重 fork + setsid + setpgid 脱离终端，关终端不影响；`daemon stop` 按
   进程组 SIGTERM（升级 SIGKILL），避免 node/Chromium 子进程残留。
-- daemon 不依赖 launchd/cron；进程内自己 sleep 循环。
+- daemon 不依赖 launchd/cron；进程内自己 sleep 循环（「23:59 醒来」这种事不需要定时器：
+  滚动窗口天然覆盖）。
 - 状态全部落盘，前台 TUI 只需读文件，不依赖 daemon 生命周期。
+- **它是个瞎子**：只读 csv 里窗口那一块，不关心你 30 天后的计划，也不碰日历。
 
 ## 目标来源：data.csv
 
-每行两种写法，`#` 注释与空行忽略，duration ∈ {25,50,75}：
+格式、解析规则、编辑接口**全部在 `schedule.py`**（见 `feature_intents/schedule.md`）——
+daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第二套「哪一行算一个 slot」。
+
+语义是**滚动 24 小时窗口**，不是「仅今天」：
 
 ```
-HH:MM,duration            # 每天
-weekday,HH:MM,duration    # 只在 weekday 生效
+   ────────┬────────────────┬─────────────────────────▶ 时间
+          now            now+24h
+    「过去」  │   「执行区」     │      「草稿区」
+   只对账     │  daemon 订满     │    零改动阻力
+   不补订     │                 │
 ```
 
-- `weekday` ∈ `mon`..`sun`（也认 `周一`/`星期天` 这类写法）；留空或 `*` = 每天。
-  同一 (weekday, 时间) 重复的行会被去重并 warn。
-- 语义**仅今天**：只取「今天星期几 + 每天」的行；state 带 date，跨天自动重置，
-  不做跨天补订。旧的两列写法继续有效。
-- `data.csv` 通常由 `download_calendar.py populate` 从 iCloud 日历生成（一周计划），
-  也可以手写。这一层**完全解耦**：daemon 不碰日历，只读 csv。
+于是每天傍晚，第二天早上的场次自动进入执行区被订掉（「T+1 锁入」），
+**不需要 23:59 的定时任务**：机器合盖睡过点也没事，醒来那一轮会把窗口重新填满。
+
+`data.csv` 通常由 `download_calendar.py populate` 从 iCloud 日历生成（一周计划），
+也可以手写、也可以在 warden TUI 里改。这一层**完全解耦**：daemon 不碰日历，只读 csv。
 
 ## 检查与补订（每轮）
 
-1. 一次 `GET /v1/sessions` 拿到今天全部 session（只读、便宜）。
-2. 遍历今天**还没开始**（now < T）的 slot：
+1. `schedule.window(entries, now)` 切出执行区 `due` 和已开始的 `past`。
+2. 执行区里被 warden 判过 `abandoned`（认罪放弃）的 slot：**跳过，永不重订**。
+3. 一次 `GET /v1/sessions` 拿到窗口内全部 session（只读、便宜），落盘成 `api_snapshot`。
+4. 遍历 `past`：只对账 —— API 有记 `booked`，没有记 `missed`。
+   若**原来记的是 booked**（订过又消失、而且已经开过了）→ 记一笔硬罪。
+5. 遍历 `due`（按开始时间先后）：
    - API 有 → `booked`（若之前是别的状态，纠正过来）。
    - API 没有：
-     - 若 state 以为是 `booked` → 判定为**手动取消**，回退重订，
-       并**重置尝试计数**（取消不是脚本的失败）。
+     - 若 state 以为是 `booked` → 判定为**手动取消**：**记一笔 sin**（warden 会因此锁死），
+       然后照旧重订并**重置尝试计数**（守擂；机器读不了你的心）。
      - 若在退避期 → 等到点。
-     - 若已达上限 → `failed` + 通知，当天不再碰。
+     - 若已达上限 → `failed` + 通知，不再碰。
      - 否则 → 下单。
 
-「提前订满」：不看「是否临近开始」，只看「还没开始且缺失」就订。
+「提前订满」：不看「是否临近开始」，只看「还没开始且缺失」就订（现在范围是整个窗口）。
+
+## 罪与判决（daemon 和 TUI 的接口）
+
+daemon **只记罪、只读判决，自己绝不判**。两个小文件就是全部协议：
+
+- `temp/warden-sins.json`：`{"sins":[{"key":"2026-10-09T09:00","what":"booked-but-missing","at":...}]}`
+  —— 「state 说订过、API 说没有」的流水。幂等（同一 key+what 只记一次），
+  同时弹一条 macOS 通知。`what` 有两档：`booked-but-missing`（还没开始，会重订）、
+  `booked-but-missing-past`（已经开过了，重订不了了 —— 这是硬罪）。
+- `temp/keep_session-verdicts.json`：`{"abandoned":{"2026-10-09T09:00":{...}}}`
+  —— warden 敲完 152 字宣言后写的判决。daemon 每轮读它并跳过这些 slot。
+  这是宣言真正的牙齿：没有它，「认罪」就只是一段表演，5 分钟后 daemon 又订回来了。
+- `temp/warden-sins.jsonl`：只增不删的账本（认过的罪归档到这儿，历史即罪证）。
 
 ## 预定结果以 API 为准（关键）
 
@@ -71,16 +99,21 @@ ground truth，MCP 的自述永远只是线索。
 
 `temp/keep_session-state.json`：
 ```json
-{"date":"2026-10-06",
- "api_snapshot":{"at":"...","sessions":["..."]},
- "slots":{"16:30":{"status":"booked|failed|null|missed","attempts":1,
-                   "next_retry_at":"...","last_error":"...","duration":"50","past":true}}}
+{"date":"2026-10-09",
+ "api_snapshot":{"at":"...","horizon":"...","sessions":["..."]},
+ "slots":{"2026-10-09T09:00":{"status":"booked|failed|null|missed|abandoned",
+                              "attempts":1,"next_retry_at":"...","last_error":"...",
+                              "duration":"50","past":true}}}
 ```
-- `status=null` 待订/退避中；`booked`/`failed` 为终态（failed 当天不再动）。
-- `status=missed` 只用于**已经过去**的 slot：确认今天没有这场 session，
-  已无法补订，但仍显式记录，避免 status 静默不显示让人误判。
-- `past=true` 标记该行对应的 slot 今天已经过去。
-- `api_snapshot` 是每轮 API 结果的落盘快照，供 status 展示"今天实际有哪些"。
+- **key 带日期**（`YYYY-MM-DDTHH:MM`）：窗口同时管今天和明天，纯 `"HH:MM"` 会串味。
+- 跨天不再「整体重置」，改成**剪枝**：只丢掉今天以前的记录。
+  注意别用字符串比较（旧 key `"20:00"` 在字典序上大于 `"2026-10-08"`，会被留下来）。
+- `status=null` 待订/退避中；`booked`/`failed` 为终态（failed 不再动）。
+- `status=missed` 只用于**已经过去**的 slot：确认今天没有这场 session，已无法补订，
+  但仍显式记录，避免 status 静默不显示让人误判。
+- `status=abandoned` = warden 认罪放弃，daemon 跳过（见上「罪与判决」）。
+- `past=true` 标记该行对应的 slot 已经过去。
+- `api_snapshot` 是每轮 API 结果的落盘快照，供 status / TUI 离线兜底展示。
 
 ## 并发
 
@@ -97,7 +130,7 @@ stdout，不写共享日志——否则会和已经在跑第一轮的孙进程�
 - `daemon start|stop|restart|status`：后台常驻管理。
 - `run`：前台常驻循环，Ctrl+C 退出（调试）。
 - `check [--dry-run]`：只跑一轮。
-- `status`：daemon + data.csv（按星期分组，标出今天的）+ state + 日志尾总览。
+- `status`：daemon + 契约表（执行区/草稿区分开列）+ 罪与判决 + 窗口内 state + 日志尾。
 
 ## 与 download_calendar 的关系
 
