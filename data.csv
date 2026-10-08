@@ -1,1 +1,28 @@
-# 每日目标 session（仅当天生效）：HH:MM,duration
+# 每日目标 session（weekday,HH:MM,duration；weekday 留空或 * 表示每天）
+# 由 download_calendar.py populate 生成 @ 2026-10-06 21:44:13
+# 来源：CalDAV · https://caldav.icloud.com（amongus6768@icloud.com）
+tue,22:15,50
+wed,19:00,50
+wed,20:00,50
+wed,21:00,25
+wed,22:15,50
+thu,10:30,50
+thu,11:30,50
+thu,16:30,50
+thu,17:30,25
+thu,19:00,50
+thu,20:00,50
+thu,21:00,25
+thu,22:15,50
+fri,08:00,50
+fri,09:00,25
+sat,09:30,50
+sun,14:30,50
+mon,11:15,50
+mon,15:15,50
+mon,16:15,50
+mon,17:15,50
+mon,19:00,50
+mon,20:00,50
+mon,21:00,25
+mon,22:15,50
