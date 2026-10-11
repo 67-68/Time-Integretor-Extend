@@ -20,9 +20,11 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
      │
      │ 2) 读写 data.csv（控制面）──> schedule.py（解析/序列化/增删的唯一实现）
      │    → day 切换看哪天、session 加一场、草稿区 cancel 删一场
+     │    → 时间可写 `HH:MM,duration`，也可写 `HH:MM-HH:MM` 区间（时长由区间推出）
      │
      │ 3) 子进程：python3 keep_session.py check | daemon start | stop
-     │    → 下单和启停都走现成 CLI，不在自己进程里 fork、也不重写
+     │            python3 download_calendar.py populate      ← sync：日历 → data.csv
+     │    → 下单/启停/拉日历都走现成 CLI，不在自己进程里 fork、也不重写
      │
      └──4) JSON 行（stdin/stdout）──> scripts/bridge.mjs
                                         └── Playwright ──> 常驻 Chromium
@@ -56,17 +58,25 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
 ```
 day / day -1 / day 0 / day 1 / day 2026-10-11   切换看哪一天（草稿区随便看）
 session HH:MM LEN   创建一场：先写 data.csv，再立刻触发一轮 check（LEN ∈ 25/50/75）
+session HH:MM-HH:MM 同上，但用起点–终点：11:15-12:05 → 写入 11:15 + 50min
+                    （11:15 12:05 / 11:15 - 12:05 / "11:15 - 12:05" 都认）
 cancel N            取消：草稿区直接删契约行；执行区敲宣言；过去直接拒
 mute 3              把 #3 静音（不写 on/off 就是取反）
 mute 3 on|off       显式开/关
 title 2 "Math Past Paper"
 title 2 ""          清空标题
+sync [--days N]     跑 download_calendar.py populate：日历 → 覆盖 data.csv
 refresh / r         重新拉选中那天的 session（ID 会重编号）
 start               启动 daemon（先让 bridge 放开浏览器）
 stop                停用 daemon（**要敲宣言**）
 status / s          重画看板
 help / quit
 ```
+
+`sync` 不重写日历逻辑：薄封装 `download_calendar.py populate`（`--days` 等参数原样透传），
+写完重读 data.csv。它**会覆盖 data.csv**（download_calendar 自己备份到 `temp/data.csv.bak`，
+且一个 session 都没切出来时会拒绝覆盖）。和 cancel/stop 不同，sync 不需要敲宣言 ——
+它是「重新拉目标」，不是「放弃目标」。
 
 **ID 是「当前这张表里的行号」**，按时间排序，每次 refresh 重新编号。所以
 命令里的 N 只对「你现在看到的这张表」有效 —— 表在屏幕上是显式的，看完再敲。
@@ -186,6 +196,9 @@ python3 warden.py install-deps
   特别是 152 字宣言在真 TTY 下的粘贴/回显行为。
 - **`session` 的"立刻触发一轮 check"没在真账号上跑过**（那会真下单）。它调的是
   现成的 `keep_session.py check`，路径本身是通的，但没实地验证过。
+- **`sync` 没在真日历上端到端跑过**（那会覆盖 data.csv）。它薄封装
+  `download_calendar.py populate`；子进程路径/参数透传/失败提示都有测试，
+  `populate` 本身另有 `test_download_calendar.py`。
 - 表格默认不自动刷新。如果发现「数字看漂」，考虑加一个只读的轻量刷新
   （不走浏览器），但会拉长占锁时间。
 - 真 TTY 下 `Console.clear()` 的表现没验证；不好用就 `--no-clear`。

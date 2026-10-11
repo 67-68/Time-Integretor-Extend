@@ -96,6 +96,23 @@ def run(*args):
                           cwd=ROOT, capture_output=True, text=True)
 
 
+def run_no_config(*args):
+    """把 temp/calendar.json 临时挪开再跑（模拟「没配置」），跑完放回。
+
+    不这么做的话，在一台**有配置**的机器上跑测试时，这条 populate 会真的连日历、
+    覆盖仓库里的 data.csv —— 测试绝不能碰真数据。
+    """
+    hold = None
+    if os.path.exists(dc.CONFIG_FILE):
+        hold = dc.CONFIG_FILE + ".test-hold"
+        os.replace(dc.CONFIG_FILE, hold)
+    try:
+        return run(*args)
+    finally:
+        if hold:
+            os.replace(hold, dc.CONFIG_FILE)
+
+
 def test_carve():
     TZ = dc.LOCAL_TZ
 
@@ -120,6 +137,9 @@ def test_carve():
     check("重叠两段先合并", carve([(T(14, 0), T(15, 0)), (T(14, 30), T(17, 0))]),
           [("14:00", 50), ("15:00", 50), ("16:00", 50)])
     check("非 quarter 起点 9:03 → 9:15", carve([(T(9, 3), T(10, 5))]), [("09:15", 50)])
+    check("11:15-12:05 恰好一场 50min", carve([(T(11, 15), T(12, 5))]), [("11:15", 50)])
+    check("11:15-12:30 → 11:15(50)，剩 25min 塞不下", carve([(T(11, 15), T(12, 30))]),
+          [("11:15", 50)])
 
 
 def test_plan_week():
@@ -137,6 +157,26 @@ def test_plan_week():
           [("21:30", 50), ("22:30", 25)])
     check("不会有 session 早于 now", all(s > now for p in plans for s, _ in p.sessions), True)
     check("上课分组被忽略", [(s.strftime("%H:%M"), d) for s, d in plans[1].sessions], [])
+
+    # 跨午夜：23:15–00:05 必须是 50min（不能被午夜劈成 23:15–23:40 的 25min）
+    night = [dc.CalEvent(T(6, 23, 15), T(7, 0, 5), "自习")]
+    p_night = dc.plan_week(night, datetime.date(2026, 10, 6), 2, ["上课", "休息"], [], False, now)
+    check("23:15–00:05 跨午夜 → 50min（归起始那天）",
+          [(s.strftime("%H:%M"), d) for s, d in p_night[0].sessions], [("23:15", 50)])
+    check("跨午夜的场次不会在第二天重复算一份", p_night[1].sessions, [])
+    check("22:15–00:05 → 22:15(50) + 23:15(50)",
+          [(s.strftime("%H:%M"), d) for s, d in dc.plan_week(
+              [dc.CalEvent(T(6, 22, 15), T(7, 0, 5), "自习")],
+              datetime.date(2026, 10, 6), 2, ["上课", "休息"], [], False, now)[0].sessions],
+          [("22:15", 50), ("23:15", 50)])
+
+    # 跨午夜 + 多场：午夜后的场次要归到**第二天**（否则 csv 的 weekday 会写错）
+    wide = [dc.CalEvent(T(6, 22, 15), T(7, 1, 0), "自习")]
+    p_wide = dc.plan_week(wide, datetime.date(2026, 10, 6), 2, ["上课", "休息"], [], False, now)
+    check("跨午夜多场：午夜前归今天",
+          [(s.strftime("%H:%M"), d) for s, d in p_wide[0].sessions], [("22:15", 50), ("23:15", 50)])
+    check("跨午夜多场：午夜后归明天",
+          [(s.strftime("%H:%M"), d) for s, d in p_wide[1].sessions], [("00:15", 25)])
 
     # 分组过滤语义
     ev = dc.CalEvent(T(7, 9, 0), T(7, 12, 0), "上课")
@@ -162,7 +202,7 @@ def test_cli(ics_args):
     check("md 把 <25min 的段单独列进 details", "太短被丢掉的时间段（1" in md, True)
     check("md 列出被忽略的上课事件", "`上课` 09:00–12:00" in md, True)
 
-    check("没配置 + 不联网 → 报错退出 1", run("populate", "--days", "1").returncode, 1)
+    check("没配置 + 不联网 → 报错退出 1", run_no_config("populate", "--days", "1").returncode, 1)
     check("全被过滤掉 → 守卫拦住（退出 1）",
           run("populate", *ics_args, "--days", "1", "--ignore", "自习").returncode, 1)
     check("--days 0 被拒", run("fetch", "--days", "0").returncode, 1)
@@ -178,6 +218,16 @@ def test_csv_compat():
         finally:
             os.unlink(path)
 
+    def rows(text, **kw):
+        """和 slots 一样，但连 duration 一起返回（区间写法要验推出的时长）。"""
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8") as f:
+            f.write(text)
+            path = f.name
+        try:
+            return [(s["weekday"], s["start"], s["duration"]) for s in ks.load_entries(path, **kw)[0]]
+        finally:
+            os.unlink(path)
+
     check("旧两列格式仍可读", slots("# old\n16:30,50\n"), [("*", "16:30")])
     new = "# new\ntue,21:30,25\nwed,16:30,50\n*,12:00,50\n",
     check("新三列 + 每天行", slots(*new), [("*", "12:00"), ("tue", "21:30"), ("wed", "16:30")])
@@ -185,6 +235,18 @@ def test_csv_compat():
     check("按星期过滤 mon", slots(*new, weekday="mon"), [("*", "12:00")])
     check("中文星期别名", slots("# x\n周三,09:00,25\n"), [("wed", "09:00")])
     check("缺口时间被 warn 跳过", slots("# x\n9:60,25\n"), [])
+
+    # 起点–终点区间：11:15-12:05 → 11:15 起、50min（时长由区间推出）
+    check("区间 weekday,HH:MM-HH:MM", rows("# x\nmon,11:15-12:05\n"), [("mon", "11:15", "50")])
+    check("区间没有 weekday = 每天", rows("# x\n11:15-12:05\n"), [("*", "11:15", "50")])
+    check("区间两边带空格 / 波浪号都认",
+          rows("# x\nmon,11:15 - 12:05\ntue,11:15~12:05\n"),
+          [("mon", "11:15", "50"), ("tue", "11:15", "50")])
+    check("跨午夜的区间 23:30-00:20 = 50min",
+          rows("# x\nmon,23:30-00:20\n"), [("mon", "23:30", "50")])
+    check("区间时长不是 25/50/75 → 跳过", slots("# x\nmon,11:15-12:00\n"), [])
+    check("规范写法和区间写法等价",
+          slots("# x\nmon,11:15,50\n"), slots("# x\nmon,11:15-12:05\n"))
 
 
 def main():

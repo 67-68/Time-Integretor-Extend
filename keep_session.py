@@ -522,6 +522,17 @@ def _run_once_locked(dry_run=False):
                 % (key, slot["duration"], present, status or "无记录"))
             continue
 
+        # 计划时长变了（sync 重生成 / 手改 data.csv）＝ 这是**另一个目标**，老记录作废重来。
+        # 否则改了计划 daemon 也不动：25min 试失败后改成 50min，会永远卡在 failed 上。
+        # 只作废还没订上的（failed / 退避中 / 待订）；booked 不动 —— 已订那场改不了时长。
+        if (rec.get("duration") not in (None, str(slot["duration"]))
+                and status in (None, "failed")):
+            log("  %s 计划时长 %s → %s，老状态作废，重新评估"
+                % (key, rec.get("duration"), slot["duration"]))
+            state["slots"].pop(key, None)
+            rec, status = {}, None
+            changed = True
+
         present = has_session_at(sessions, start)
 
         if present:

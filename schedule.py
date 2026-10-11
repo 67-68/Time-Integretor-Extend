@@ -20,7 +20,13 @@
     weekday,HH:MM,duration      —— 只在 weekday 生效（mon..sun，也认 周一/星期一）
     *,HH:MM,duration            —— 同「每天」
 
-- duration 只能是 25/50/75（Focusmate 只认这几种）
+也可以把「起点–终点」写成区间，时长由区间推出（更贴近日历/看板上的写法）：
+
+    weekday,HH:MM-HH:MM         —— 如 mon,11:15-12:05 → 11:15 起、50 分钟
+    HH:MM-HH:MM                 —— 每天，如 11:15-12:05
+
+- duration 只能是 25/50/75（Focusmate 只认这几种）；区间长度也必须是 25/50/75
+- 区间分隔符 `-` / `~` / `至` 都认，两边带不带空格都行
 - 行内 `#` 之后的都是注释（`thu,19:00,50  # 数学` 合法）
 - 同一 (weekday, HH:MM) 重复出现：后面的忽略 + 给 warning
 - 同一个日期上不同写法撞车（`fri,09:00` 和 `*,09:00`）：
@@ -120,6 +126,34 @@ def fmt_hhmm(hour, minute):
     return "%02d:%02d" % (hour, minute)
 
 
+# 起点–终点区间的写法：11:15-12:05 / 11:15 - 12:05 / 11:15~12:05 / 11:15至12:05
+RANGE_SEPARATORS = ("-", "－", "–", "—", "~", "～", "至", "到")
+
+
+def parse_hhmm_range(raw):
+    """把 '11:15-12:05' / '11:15 - 12:05' 解析成 (起点 'HH:MM', 时长字符串)。
+
+    时长必须是 Focusmate 认的 25/50/75 分钟；跨午夜（23:30-00:20）按 +24h 算。
+    **不是区间**（没有分隔符 / 两端不是 HH:MM / 时长不合法）→ 返回 None，
+    好让调用方回落去当普通 HH:MM 处理，而不是把单独的 11:15 误判成区间。
+    """
+    s = (raw or "").strip()
+    for sep in RANGE_SEPARATORS[1:]:
+        s = s.replace(sep, RANGE_SEPARATORS[0])
+    if s.count(RANGE_SEPARATORS[0]) != 1:
+        return None
+    left, right = (p.strip() for p in s.split(RANGE_SEPARATORS[0]))
+    a, b = parse_hhmm(left), parse_hhmm(right)
+    if a is None or b is None:
+        return None
+    minutes = (b[0] * 60 + b[1]) - (a[0] * 60 + a[1])
+    if minutes <= 0:
+        minutes += 24 * 60                      # 跨午夜
+    if str(minutes) not in DURATIONS:
+        return None
+    return fmt_hhmm(*a), str(minutes)
+
+
 def slot_datetime(slot, day):
     """slot 在 day 这一天的本地 datetime（naive 本地时间，和 now 同源）。"""
     return datetime.datetime(day.year, day.month, day.day, slot["hour"], slot["minute"])
@@ -153,12 +187,19 @@ def parse_text(text, weekday=None, filename="data.csv"):
         if not line:
             continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) == 2:
-            day, hhmm, duration = "*", parts[0], parts[1]
-        elif len(parts) == 3:
+        if len(parts) == 3:
             day, hhmm, duration = parts[0], parts[1], parts[2]
+        elif len(parts) == 2:
+            if normalize_weekday(parts[0]) is not None and parse_hhmm(parts[0]) is None:
+                # "mon,11:15-12:05" / "mon,11:15"：星期几 + 时间（时长可由区间给出）
+                day, hhmm, duration = parts[0], parts[1], None
+            else:
+                day, hhmm, duration = "*", parts[0], parts[1]
+        elif len(parts) == 1:
+            # "11:15-12:05"：每天，区间自带时长
+            day, hhmm, duration = "*", parts[0], None
         else:
-            warnings.append("%s:%d 格式不对（要 [weekday,]HH:MM,duration），已跳过: %r"
+            warnings.append("%s:%d 格式不对（要 [weekday,]HH:MM,duration 或 [weekday,]HH:MM-HH:MM），已跳过: %r"
                             % (filename, lineno, raw.strip()))
             continue
         norm = normalize_weekday(day)
@@ -166,10 +207,25 @@ def parse_text(text, weekday=None, filename="data.csv"):
             warnings.append("%s:%d 星期几认不出来（要 mon..sun / 周一..周日 / *），已跳过: %r"
                             % (filename, lineno, raw.strip()))
             continue
-        got = parse_hhmm(hhmm)
-        if got is None:
-            warnings.append("%s:%d 时间格式不对，已跳过: %r" % (filename, lineno, hhmm))
+        rng = parse_hhmm_range(hhmm)
+        if rng is not None:
+            hhmm, range_duration = rng
+            if duration is not None and duration.strip() and duration.strip() != range_duration:
+                warnings.append("%s:%d 区间 %s 和时长 %s 对不上，按区间算（%s）"
+                                % (filename, lineno, hhmm, duration.strip(), range_duration))
+            duration = range_duration
+        else:
+            got = parse_hhmm(hhmm)
+            if got is None:
+                warnings.append("%s:%d 时间格式不对（要 HH:MM 或 HH:MM-HH:MM），已跳过: %r"
+                                % (filename, lineno, hhmm))
+                continue
+            hhmm = fmt_hhmm(*got)
+        if duration is None or not str(duration).strip():
+            warnings.append("%s:%d 缺少时长（要 duration，或写成 HH:MM-HH:MM 区间），已跳过: %r"
+                            % (filename, lineno, raw.strip()))
             continue
+        duration = str(duration).strip()
         if duration not in DURATIONS:
             warnings.append("%s:%d 时长只能是 25/50/75，已跳过: %r" % (filename, lineno, duration))
             continue
@@ -180,7 +236,8 @@ def parse_text(text, weekday=None, filename="data.csv"):
             warnings.append("%s:%d 重复的 %s %s，已跳过" % (filename, lineno, norm, hhmm))
             continue
         seen.add(key)
-        slots.append({"weekday": norm, "start": fmt_hhmm(*got), "duration": duration,
+        got = parse_hhmm(hhmm)                  # 到这里 hhmm 一定是规范的 HH:MM
+        slots.append({"weekday": norm, "start": hhmm, "duration": duration,
                       "hour": got[0], "minute": got[1], "lineno": lineno,
                       "raw": raw.rstrip("\n")})
     slots.sort(key=lambda s: (WEEKDAYS.index(s["weekday"]) if s["weekday"] in WEEKDAYS else -1,
@@ -294,15 +351,21 @@ def _row_sort_key(weekday, hhmm):
 def add_row(path=None, weekday="*", hhmm="", duration="50"):
     """插一行（按 weekday+时间排好序插进去，保持文件整洁）。
 
+    hhmm 可以是 'HH:MM'，也可以是 'HH:MM-HH:MM' 区间（区间自带时长，覆盖 duration）。
     返回插到了第几行（1 起）。参数不合法 / 已存在 → ValueError（给 TUI 直接显示）。
     """
     path = data_csv_path(path)
     norm = normalize_weekday(weekday)
     if norm is None:
         raise ValueError("星期几认不出来：%r（要 mon..sun / 周一..周日 / *）" % weekday)
+    rng = parse_hhmm_range(hhmm)
+    if rng is not None:
+        hhmm, duration = rng                     # 区间自带时长（如 11:15-12:05 → 50）
+        if duration not in DURATIONS:
+            raise ValueError("区间时长只能是 25/50/75，给了 %r" % duration)
     got = parse_hhmm(hhmm)
     if got is None:
-        raise ValueError("时间格式不对：%r（要 HH:MM，如 19:00）" % hhmm)
+        raise ValueError("时间格式不对：%r（要 HH:MM 或 HH:MM-HH:MM，如 11:15-12:05）" % hhmm)
     hhmm = fmt_hhmm(*got)
     duration = str(duration).strip()
     if duration not in DURATIONS:

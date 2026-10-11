@@ -507,8 +507,21 @@ def grouped_out(ev, ignore, use):
 
 
 def plan_week(events, start_date, days, ignore, use, include_all_day, now):
-    """把事件按天切成 session 计划。今天只保留还没开始的。"""
+    """把事件切成 session 计划。今天只保留还没开始的。
+
+    session 是在**整条时间轴上**一次切完的，**允许跨午夜**（23:15–00:05 这种 50min
+    session 必须能切出来），再按 session 的**起始日期**归到那一天。
+
+    为什么不能按天各自切：午夜会把一个连续的空闲段劈成「23:15–00:00（45min）」和
+    「00:00–00:05（5min）」，前者只能切出 25min；而且相邻两天各切一份会重复预订。
+    """
     plans = []
+    horizon_start = datetime.datetime.combine(
+        start_date, datetime.time.min).replace(tzinfo=LOCAL_TZ)
+    horizon_end = horizon_start + datetime.timedelta(days=days)
+
+    # 1) 每天的**报告**桶（给人看的 md：可用时间段 / 太短 / 被忽略 / 全天事件）。
+    #    这里仍按天截断（报告是「这一天看到什么」），真正的 session 见下面第 2 步。
     for i in range(days):
         day = start_date + datetime.timedelta(days=i)
         d0 = datetime.datetime.combine(day, datetime.time.min).replace(tzinfo=LOCAL_TZ)
@@ -523,8 +536,12 @@ def plan_week(events, start_date, days, ignore, use, include_all_day, now):
             if ev.all_day and not include_all_day:
                 allday.append(ev)
                 continue
+            if ev.start < d0 and d0 > horizon_start:
+                # 跨午夜事件的后半截：前一天已经报过/切过了，别在这儿当成新窗口
+                # （也不要在「太短」里留一条 00:00–00:05 的碎片）
+                continue
             s = max(ev.start, d0)
-            e = min(ev.end, d1)
+            e = ev.end                            # 不按午夜截：跨午夜的窗口按真实终点显示
             if day == now.date():
                 s = max(s, now)                       # 今天：已经过去的时段不再排
             if e <= s:
@@ -532,11 +549,31 @@ def plan_week(events, start_date, days, ignore, use, include_all_day, now):
             windows.append((s, e))
         merged = merge_windows(windows)
         keep = lambda w: (w[1] - w[0]).total_seconds() >= MIN_DURATION * 60      # noqa: E731
-        usable = [w for w in merged if keep(w)]
-        short = [w for w in merged if not keep(w)]        # <25min，Focusmate 订不了
-        sessions = [x for x in carve(usable) if x[0] > now]
-        plans.append(DayPlan(date=day, windows=usable, sessions=sessions,
-                             ignored=ignored, all_day=allday, short=short))
+        plans.append(DayPlan(date=day, windows=[w for w in merged if keep(w)],
+                             ignored=ignored, all_day=allday,
+                             short=[w for w in merged if not keep(w)]))
+
+    # 2) session：整条时间轴切一次。起点按 horizon / now 截，**终点不截**（允许跨午夜），
+    #    切出来的 session 按起始日期分给对应的那几天；跑出计划范围的不写。
+    free = []
+    for ev in events:
+        if grouped_out(ev, ignore, use):
+            continue
+        if ev.all_day and not include_all_day:
+            continue
+        s = max(ev.start, horizon_start)
+        if ev.end <= s:
+            continue
+        free.append((s, ev.end))
+    carveable = []
+    for s, e in merge_windows(free):
+        if e <= now:
+            continue
+        carveable.append((max(s, now), e))          # 今天：已经过去的时段不再排
+    for start, dur in carve(carveable):
+        if not (horizon_start <= start < horizon_end):
+            continue
+        plans[(start.date() - start_date).days].sessions.append((start, dur))
     return plans
 
 

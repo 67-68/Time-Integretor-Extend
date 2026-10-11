@@ -8,7 +8,8 @@
 2. The Contract Table  某一天的表：ID | 时间 | 状态 | 静音与否 | 标题 | 契约。
                        用 `day -1 / day 0 / day 1` 切换看哪天。
 3. The Interrogation   死循环 input，极简命令：
-                       mute 3 / title 2 "文本" / session 09:00 50 / cancel 1 / day 1
+                       mute 3 / title 2 "文本" / session 09:00 50 / session 11:15-12:05
+                       cancel 1 / day 1 / sync
 4. Panic Action        —— 已按你的要求删掉。没有这个功能。
 
 三层摩擦（这套系统真正的规则）
@@ -30,8 +31,9 @@
        └── 子进程 ──> keep_session.py check | daemon start | stop（薄封装，不重写业务）
 
 - 写操作（mute / title / cancel）全部走 bridge（内部 API，见 docs/…-notes.md）。
-- daemon 的启停、以及 `session` 之后的立刻下单，都走 keep_session.py 子进程
+- daemon 的启停、`session` 之后的立刻下单，都走 keep_session.py 子进程
   （不 fork 在自己身上，也不在 TUI 里重写"怎么下单"）。
+- `sync` 走 download_calendar.py 子进程（日历 → data.csv），TUI 不重写日历逻辑。
 - **daemon 和 bridge 抢同一个 Chromium profile**：所以 `start` / `session` 之前会先让
   bridge 释放浏览器；bridge 自己也会在空闲 WARDEN_BRIDGE_IDLE_MS 后自动放开。
 
@@ -45,6 +47,7 @@
     python3 warden.py                          # 交互 TUI
     python3 warden.py --no-clear               # 别清屏（留滚动历史）
     python3 warden.py --exec "day 1; session 09:00 50"   # 跑完命令就退（`;` 分隔）
+    python3 warden.py --exec "sync"            # 拉日历重生成 data.csv 后退出
     python3 warden.py --day 1                  # 一进来就看明天
     python3 warden.py --status                 # 只打一次看板然后退出
 
@@ -61,6 +64,7 @@ import datetime
 import json
 import os
 import queue
+import re
 import shlex
 import subprocess
 import sys
@@ -437,7 +441,7 @@ class Warden(object):
             self.console.print(self.render_messages())
         self.console.print(
             "[dim]命令：[/][bold]mute[/] N on|off · [bold]title[/] N \"文本\" · "
-            "[bold]session[/] HH:MM LEN · [bold]cancel[/] N · [bold]day[/] -1/0/1 · "
+            "[bold]session[/] HH:MM LEN · [bold]sync[/] · [bold]cancel[/] N · [bold]day[/] -1/0/1 · "
             "[bold]refresh[/] · [bold]start[/] · [bold]stop[/] · [bold]help[/] · [bold]quit[/]"
         )
 
@@ -1084,18 +1088,18 @@ class Warden(object):
         return True
 
     def cmd_session(self, args):
-        """session HH:MM LEN —— 创建一场：先写进契约表（data.csv），再立刻触发一轮 check。
+        """session HH:MM LEN / session HH:MM-HH:MM —— 创建一场：先写进契约表（data.csv），
+        再立刻触发一轮 check。
 
+        起点–终点的写法（如 `session 11:15-12:05`）会推出时长（这里是 50）。
         写出去的是**星期几**规则（data.csv 的格式），所以会影响所有同星期几的周。
         创建零阻力 —— 有阻力的是**取消**。
         下单本身不在这里实现：薄封装 keep_session.py check，业务逻辑一份就够。
         """
-        if len(args) < 2:
-            raise ValueError("用法：session HH:MM LEN（如 session 09:00 50；LEN 只能 25/50/75）")
-        hhmm, dur = args[0], args[1]
+        hhmm, dur = parse_session_spec(args)     # 不合法会抛 ValueError（给人话提示）
         day = self.sel_date
         weekday = sch.weekday_of_day(day)
-        lineno = sch.add_row(None, weekday, hhmm, dur)     # 不合法会抛 ValueError
+        lineno = sch.add_row(None, weekday, hhmm, dur)
         self.reload_entries()
         self.say("✅ 契约表已写：data.csv 第 %d 行 %s,%s,%s" % (lineno, weekday, hhmm, dur), "ok")
         self.say("   按星期几重复 → 以后每个%s都会有这一场。"
@@ -1120,6 +1124,30 @@ class Warden(object):
         else:
             self.had_error = True
             self.say("❌ check 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
+        self.refresh()
+        return True
+
+    def cmd_sync(self, args):
+        """sync [download_calendar 的参数] —— 调 download_calendar.py populate，把日历
+        重新切成 data.csv（会覆盖 data.csv；旧文件备份到 temp/data.csv.bak）。
+
+        这里**不重写**日历逻辑：薄封装 download_calendar.py，和 schedule.py 一样是唯一真源。
+        `sync --days 3` 之类的参数原样透传给 populate。
+        """
+        self.say("sync：跑 download_calendar.py populate "
+                 "（重新拉日历 → 覆盖 data.csv，旧文件备份到 temp/data.csv.bak）…", "cmd")
+        rc, out, err = run_download_calendar("populate", *args, timeout=300)
+        for line in (out or "").splitlines()[-25:]:
+            self.say(line)
+        if rc != 0:
+            self.had_error = True
+            self.say("❌ sync 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
+            if not (err or out):
+                self.say("   （download_calendar.py 没有输出；先跑 "
+                         "python3 download_calendar.py status 看配置/依赖）", "warn")
+            return False
+        self.say("✅ data.csv 已同步（日历 → 契约表）。", "ok")
+        self.reload_entries()
         self.refresh()
         return True
 
@@ -1185,9 +1213,11 @@ class Warden(object):
         for cmd, desc in [
             ("day -1|0|1|YYYY-MM-DD", "切换看哪一天（草稿区随便看）"),
             ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
+            ("session HH:MM-HH:MM", "同上，但用起点–终点（如 11:15-12:05 → 50min）"),
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
             ("mute N on|off", "把 #N 静音；不写 on/off 就是取反"),
             ('title N "文本"', '把 #N 的标题改成文本；title N "" 清空'),
+            ("sync [--days N]", "跑 download_calendar.py populate：日历 → 覆盖 data.csv"),
             ("refresh  (r)", "重新拉选中那天的 session（会重编号）"),
             ("start", "启动 daemon（会先让 bridge 放开浏览器）"),
             ("stop", "停用 daemon（和取消一样要敲宣言）"),
@@ -1263,6 +1293,8 @@ class Warden(object):
                 self.cmd_day(args)
             elif cmd == "session":
                 self.cmd_session(args)
+            elif cmd == "sync":
+                self.cmd_sync(args)
             elif cmd == "mute":
                 self.cmd_mute(args)
             elif cmd in ("title", "t"):
@@ -1341,6 +1373,69 @@ def run_keep_session(*args, **kw):
     except subprocess.TimeoutExpired:
         return 1, "", "超时"
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def run_download_calendar(*args, **kw):
+    """用子进程跑 download_calendar.py（拉日历 → data.csv）。"""
+    cmd = [sys.executable, os.path.join(HERE, "download_calendar.py")] + [str(a) for a in args]
+    try:
+        p = subprocess.run(cmd, cwd=HERE, capture_output=True, text=True,
+                           timeout=kw.get("timeout", 300))
+    except subprocess.TimeoutExpired:
+        return 1, "", "超时"
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+# ---------------------------------------------------------------- session 参数解析
+
+
+def parse_session_spec(args):
+    """把 `session` 命令的参数解析成 (起点 'HH:MM', 时长 '25|50|75')。
+
+    同一场 11:15–12:05 的几种写法都认（时长由区间推出）：
+
+        session 11:15 50            ← 原写法：起点 + 时长
+        session 11:15-12:05         ← 起点–终点
+        session 11:15 - 12:05       ← 中间的短横线是单独一个 token
+        session 11:15 12:05         ← 空格分隔的起点/终点
+        session "11:15 - 12:05"     ← 整个区间当一个 token
+    """
+    toks = [str(a).strip() for a in args if str(a).strip()]
+    usage = ("用法：session HH:MM LEN（LEN ∈ 25/50/75），"
+             "或 session HH:MM-HH:MM（如 session 11:15-12:05）")
+    if not toks:
+        raise ValueError(usage)
+
+    # 候选区间串：把各种写法归一成 "起点-终点" 再交给 schedule.parse_hhmm_range
+    candidates = [" ".join(toks)]
+    if len(toks) == 2 and sch.parse_hhmm(toks[1]) is not None:
+        candidates.append("%s-%s" % (toks[0], toks[1]))
+    if len(toks) == 3 and toks[1] in sch.RANGE_SEPARATORS:
+        candidates.append("%s-%s" % (toks[0], toks[2]))
+    range_like = False
+    range_re = r"\d{1,2}:\d{2}\s*[-\u2013\u2014~\uff5e\u81f3\u5230]\s*\d{1,2}:\d{2}"
+    for spec in candidates:
+        rng = sch.parse_hhmm_range(spec)
+        if rng:
+            return rng
+        if re.search(range_re, spec):
+            range_like = True
+
+    # 长得像区间但时长不合法（不是 25/50/75）→ 给明确提示，别让人猜
+    if range_like:
+        raise ValueError("区间不合法：%r（起点/终点要 HH:MM，时长只能是 25/50/75 分钟）"
+                         % " ".join(toks))
+
+    # 回退：原写法 HH:MM LEN
+    if len(toks) == 2 and toks[1] in sch.DURATIONS:
+        got = sch.parse_hhmm(toks[0])
+        if got is None:
+            raise ValueError("时间格式不对：%r（要 24 小时制 HH:MM，如 11:15）" % toks[0])
+        return sch.fmt_hhmm(*got), toks[1]
+
+    if len(toks) == 1:
+        raise ValueError(usage + "；只给了 %r，没说时长" % toks[0])
+    raise ValueError("时长只能是 25/50/75（LEN 位置给了 %r）；%s" % (toks[1], usage))
 
 
 # ---------------------------------------------------------------- CLI

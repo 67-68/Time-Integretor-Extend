@@ -368,6 +368,67 @@ for bad, note in [("session 22:00 40", "25/50/75"),
     check_true("非法 session 给了提示：%s" % bad,
                any(note in m[2] for m in wd.messages))
 
+# 起点–终点：11:15-12:05 → 50min。所有等价写法都要认。
+print("== session：起点–终点区间（11:15-12:05 → 50min）==")
+for spec in (["11:15-12:05"], ["11:15", "-", "12:05"], ["11:15", "12:05"],
+             ["11:15 - 12:05"], ["23:30-00:20"]):
+    check("区间解析：%r" % (spec,), w.parse_session_spec(spec),
+          ("23:30", "50") if spec == ["23:30-00:20"] else ("11:15", "50"))
+check("区间时长必须是 25/50/75",
+      w.parse_session_spec(["11:15", "50"]), ("11:15", "50"))
+try:
+    w.parse_session_spec(["11:15", "12:00"])
+    check("45min 区间应该被拒", False, True)
+except ValueError as e:
+    check_true("45min 区间被拒", "区间不合法" in str(e))
+
+write_csv(["# test schedule", "%s,21:00,25" % TODAY_WD])
+clear_state()
+ran = []
+wd = mkwarden()
+wd.reload_entries()
+check("session 11:15-12:05 写进去了", wd.cmd_session(["11:15-12:05"]), True)
+check("契约表里是规范的 HH:MM,duration（不是区间）",
+      "%s,11:15,50" % TODAY_WD in sch.read_text(), True)
+ents, _ = sch.load_entries()
+check_true("区间推出 50 分钟",
+           any(e["weekday"] == TODAY_WD and e["start"] == "11:15" and e["duration"] == "50"
+               for e in ents))
+
+# ---------------------------------------------------------------- sync 命令
+
+print("== sync：调 download_calendar.py populate ==")
+write_csv(["# test schedule", "%s,21:00,25" % TODAY_WD])
+clear_state()
+calls = []
+w.run_download_calendar = lambda *a, **kw: (calls.append(a), (0, "data.csv 已更新: /x", ""))[1]
+wd = mkwarden()
+wd.reload_entries()
+check("sync 成功返回 True", wd.cmd_sync([]), True)
+check("sync 调的是 download_calendar.py populate", calls[-1][0], "populate")
+check("sync 不碰 bridge 的写接口",
+      [c for c in wd.bridge.calls if c[0] not in ("release",)], [])
+check_true("sync 给了人话反馈", any("已同步" in m[2] for m in wd.messages))
+
+calls = []
+wd = mkwarden()
+check("sync 透传参数（--days 3）", wd.cmd_sync(["--days", "3"]), True)
+check("sync 参数原样给了 populate", calls[-1], ("populate", "--days", "3"))
+
+calls = []
+w.run_download_calendar = lambda *a, **kw: (calls.append(a), (1, "", "缺少依赖 caldav"))[1]
+wd = mkwarden()
+check("sync 失败返回 False", wd.cmd_sync([]), False)
+check("sync 失败标了 had_error", wd.had_error, True)
+check_true("sync 失败把 stderr 说出来", any("缺少依赖" in m[2] for m in wd.messages))
+
+ran = []
+w.run_keep_session = lambda *a, **kw: (ran.append(a), (0, "round done", ""))[1]
+check("handle 认识 sync", wd.handle("sync") in (True, False), True)
+check("sync 走的是 download_calendar，不是 keep_session",
+      calls[-1][0], "populate")
+check("sync 不会顺手跑 keep_session check", ran, [])
+
 # ---------------------------------------------------------------- day 命令
 
 print("== day 切换 ==")
