@@ -12,6 +12,13 @@
                        cancel 1 / day 1 / sync / force-check
 4. Panic Action        —— 已按你的要求删掉。没有这个功能。
 
+视图（Tab 切换）
+----------------
+按 **Tab** 在多个视图间切换，视图显示在命令提示上面。现有「契约」（默认，就是
+上面那套）和「专注」（目标 + 可暂停次数 + 暂停倒计时 + 当前空闲秒数；只认
+`stop` = 消耗一次暂停）两个。视图可扩展：继承 `View` + `@register_view` 即可，
+`paint()` / 切换 / 命令提示都由 `VIEWS` 列表驱动。
+
 三层摩擦（这套系统真正的规则）
 ------------------------------
     草稿区  start > now+24h        → 零阻力：session 加、cancel 删，随便改 data.csv
@@ -131,6 +138,12 @@ def fmt_age(seconds):
     if seconds < 5400:
         return "%d 分钟前" % (seconds // 60)
     return "%d 小时前" % (seconds // 3600)
+
+
+def fmt_mmss(seconds):
+    """秒 → MM:SS（暂停倒计时用）。"""
+    seconds = max(0, int(seconds))
+    return "%02d:%02d" % (seconds // 60, seconds % 60)
 
 
 # ---------------------------------------------------------------- 宣言（The Walk of Shame）
@@ -374,6 +387,264 @@ class Bridge(object):
         return True, bool(r.get("browser")), ""
 
 
+# ---------------------------------------------------------------- 视图（Tab 切换）
+#
+# 可扩展：一个 View = 一块主体渲染 + 一套命令 + 一行提示。
+# 加新视图：继承 View、填 key/name/label/hint、实现 render()/handle()，
+# 然后用 @register_view 注册即可 —— paint() / 切换 / 命令提示都自动跟上。
+# 未来想加「统计」「历史」视图，照抄 FocusView 的结构就行。
+
+class View(object):
+    key = "?"
+    name = "view"
+    label = "视图"
+    hint = ""
+
+    def __init__(self, w):
+        self.w = w
+
+    def render(self):
+        """本视图的主体内容：rich renderable，或它们的列表。返回 None = 不渲染主体。"""
+        return None
+
+    def handle(self, cmd, args, line):
+        """处理一条命令。返回 True=已处理，False=退出 TUI，None=本视图不认（上层兜底）。"""
+        return None
+
+    def status_line(self):
+        """提示符上方那行「随时在变的数字」，纯文本（无 markup）。
+
+        返回 None = 这个视图没有动态内容、不需要定时刷新。
+        注意它是**单独一行**、由 paint() 打在最后，读输入时用 ANSI 原地覆盖 → 屏幕不抖。
+        """
+        return None
+
+    def wants_tick(self):
+        return self.status_line() is not None
+
+
+VIEWS = []
+
+
+def register_view(cls):
+    VIEWS.append(cls)
+    return cls
+
+
+@register_view
+class ContractView(View):
+    """契约 / 预约视图：就是原来那套表格 + 命令。"""
+
+    key = "1"
+    name = "契约"
+    label = "契约 / 预约"
+
+    @property
+    def hint(self):
+        return ("命令：mute N on|off · title N \"文本\" · session HH:MM LEN · sync · "
+                "force-check · cancel N · day -1/0/1 · refresh · start · stop · "
+                "help · quit    [dim]（Tab 切到专注视图）[/]")
+
+    def render(self):
+        out = [self.w.render_table()]
+        if self.w.rows_note:
+            out.append(Text("  " + self.w.rows_note, style="dim"))
+        out.append(self.w.render_contract())
+        return out
+
+    def handle(self, cmd, args, line):
+        w = self.w
+        if cmd in ("refresh", "r", "reload"):
+            w.refresh()
+        elif cmd in ("status", "s"):
+            pass
+        elif cmd == "day":
+            w.cmd_day(args)
+        elif cmd == "session":
+            w.cmd_session(args)
+        elif cmd in ("force-check", "forcecheck"):
+            w.cmd_force_check()
+        elif cmd == "sync":
+            w.cmd_sync(args)
+        elif cmd == "mute":
+            w.cmd_mute(args)
+        elif cmd in ("title", "t"):
+            w.cmd_title(args)
+        elif cmd == "cancel":
+            w.cmd_cancel(args)
+        elif cmd == "start":
+            w.cmd_start()
+        elif cmd == "stop":
+            w.cmd_stop()
+        elif cmd in ("help", "?", "h"):
+            w.cmd_help()
+        else:
+            return None
+        return True
+
+
+@register_view
+class FocusView(View):
+    """专注视图：当前目标 + 可暂停次数 + 暂停倒计时 + 当前空闲时间。
+
+    这个视图里只有一条命令：`stop` = 消耗一次暂停（暂停 PAUSE_MINUTES 分钟）。
+    之前那套预约命令在这里**一条都不认** —— 你要改预约就按 Tab 切回去。
+    """
+    key = "2"
+    name = "专注"
+    label = "专注 / 暂停"
+
+    @property
+    def hint(self):
+        return ("命令：[bold]stop[/] —— 消耗一次暂停次数（暂停 %d 分钟）。"
+                "    [dim]（Tab 切回契约视图）[/]" % ks.PAUSE_MINUTES)
+
+    def status_line(self):
+        """一行实时状态（提示符上面那行）。读输入时每秒原地覆盖，不重画整屏。"""
+        now = datetime.datetime.now()
+        ps = ks.pause_status(now)
+        if ps["active"]:
+            pause = "暂停 %s（剩 %d 次）" % (fmt_mmss(ps["left_sec"]), ps["remaining"])
+        else:
+            pause = "未暂停（剩 %d 次）" % ps["remaining"]
+        idle = ks.load_idle_state().get("last_idle_seconds")
+        idle_txt = "空闲 ?" if idle is None else "空闲 %ds" % int(idle)
+        return "%s   ·   %s   ·   可暂停 %d/%d" % (
+            pause, idle_txt, ps["remaining"], ks.PAUSE_MAX_PER_DAY)
+
+    def render(self):
+        w = self.w
+        now = datetime.datetime.now()        # naive 本地时间，和 schedule/daemon 同源
+        ps = ks.pause_status(now)
+        sess = ks.current_session(w.entries, now)
+
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="bold cyan", no_wrap=True)
+        t.add_column()
+
+        t.add_row("目标", Text(w.current_goal()))
+        if sess:
+            day, slot, start, end = sess
+            t.add_row("当前 session", Text(
+                "%s   %s–%s（%smin）" % (ks.key_of(day, slot), start.strftime("%H:%M"),
+                                         end.strftime("%H:%M"), slot["duration"]),
+                style="bold green"))
+        else:
+            t.add_row("当前 session", Text("（没有进行中的 session —— 看门狗也不上班）", style="dim"))
+
+        quota = Text()
+        quota.append("%d / %d" % (ps["remaining"], ks.PAUSE_MAX_PER_DAY), style="bold")
+        quota.append("   每次 %d 分钟" % ks.PAUSE_MINUTES, style="dim")
+        t.add_row("可暂停次数", quota)
+
+        # 暂停剩余 / 当前空闲是**每秒在变**的，放到下方那一行实时覆盖（见 status_line），
+        # 免得为了几个跳动的数字每秒把整屏 clear + 重画（那样会抖）。
+        t.add_row("实时", Text("暂停倒计时 / 空闲秒数在下方状态行原地刷新", style="dim"))
+
+        return Panel(t, title="[bold]Focus · 专注[/]", border_style="yellow", box=box.ROUNDED)
+
+    def handle(self, cmd, args, line):
+        if cmd == "stop":
+            self.w.cmd_pause()
+            return True
+        # 这个视图里，预约那套命令一律没用
+        self.w.say("「专注」视图只认 stop（消耗一次暂停）；按 Tab 切回契约视图再干别的。",
+                   "warn")
+        return True
+
+
+
+# ---------------------------------------------------------------- 输入（Tab 切视图 / 动态重画）
+
+
+class SwitchView(Exception):
+    """用户按了 Tab（或管道里来了一行 Tab）：切换到下一个视图。"""
+
+
+def read_command(prompt, on_tick=None, tick=1.0):
+    """读一行命令。
+
+    - **TTY**：cbreak 逐键读。按 Tab 立刻抛 SwitchView；每 tick 秒调一次 on_tick()
+      （专注视图靠它动态刷新暂停倒计时 / 空闲秒数），再把提示符和已输入内容重画出来。
+    - **非 TTY**（管道 / 测试 / --exec）：退回 input()；行首的 Tab 也算切视图。
+    """
+    if not sys.stdin.isatty():
+        line = input(prompt)
+        if "\t" in line and line.replace("\t", "").strip() == "":
+            raise SwitchView()
+        return line
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return input(prompt)
+    return _read_line_tty(prompt, on_tick=on_tick, tick=tick, termios=termios, tty=tty)
+
+
+def _read_line_tty(prompt, on_tick=None, tick=1.0, termios=None, tty=None):
+    import codecs
+    import select
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    buf = []
+    esc = False
+    dec = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def redraw():
+        sys.stdout.write("\r" + prompt + "".join(buf) + "\x1b[K")
+        sys.stdout.flush()
+
+    try:
+        tty.setcbreak(fd)          # 关 ECHO/ICANON：逐键读、自己回显
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        while True:
+            ready, _, _ = select.select([fd], [], [], tick if on_tick else None)
+            if not ready:
+                if on_tick:
+                    try:
+                        on_tick()
+                    except Exception:
+                        pass
+                redraw()
+                continue
+            data = os.read(fd, 1)
+            if not data:
+                raise EOFError()
+            for ch in dec.decode(data):
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return "".join(buf)
+                if ch == "\t":
+                    sys.stdout.write("\r\x1b[K")
+                    sys.stdout.flush()
+                    raise SwitchView()
+                if ch in ("\x7f", "\b"):
+                    if buf:
+                        buf.pop()
+                    redraw()
+                    continue
+                if ch == "\x03":
+                    raise KeyboardInterrupt()
+                if ch == "\x04":
+                    raise EOFError()
+                if ch == "\x1b":          # 转义序列（方向键等）：吃掉，不塞进输入
+                    esc = True
+                    continue
+                if esc:
+                    if ch in "[O" or ch < "@":
+                        continue
+                    esc = False
+                    continue
+                if ch.isprintable():
+                    buf.append(ch)
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 # ---------------------------------------------------------------- 看板
 
 
@@ -395,6 +666,10 @@ class Warden(object):
         self.had_error = False
         self.bridge_note = ""
         self.day_offset = int(day_offset)
+        # 视图（Tab 切换）：默认「契约」视图，第二个是「专注」视图。
+        self.views = [cls(self) for cls in VIEWS] or [ContractView(self)]
+        self.view_index = 0
+        self.view = self.views[0]
 
     # -- 选中的那一天
 
@@ -433,18 +708,62 @@ class Warden(object):
         if not self.no_clear:
             self.console.clear()
         self.console.print(self.render_header())
-        self.console.print(self.render_table())
-        if self.rows_note:
-            self.console.print("[dim]  %s[/]" % self.rows_note)
-        self.console.print(self.render_contract())
+        # 主体内容由当前视图决定（契约表 / 专注面板 / 未来的其它视图）
+        body = self.view.render()
+        if body is not None:
+            for item in (body if isinstance(body, (list, tuple)) else [body]):
+                self.console.print(item)
         if self.messages:
             self.console.print(self.render_messages())
-        self.console.print(
-            "[dim]命令：[/][bold]mute[/] N on|off · [bold]title[/] N \"文本\" · "
-            "[bold]session[/] HH:MM LEN · [bold]sync[/] · [bold]force-check[/] · "
-            "[bold]cancel[/] N · [bold]day[/] -1/0/1 · "
-            "[bold]refresh[/] · [bold]start[/] · [bold]stop[/] · [bold]help[/] · [bold]quit[/]"
-        )
+        # 视图指示 + 命令提示都放在最下面（提示符上面）
+        self.console.print(self.render_view_bar())
+        self.console.print(self.view.hint)
+
+    def render_view_bar(self):
+        """一行「当前在第几个视图」，带 Tab 提示。视图多了自动跟着排。"""
+        bar = Text()
+        bar.append("视图 ", style="dim")
+        for i, v in enumerate(self.views):
+            if i:
+                bar.append("  ", style="dim")
+            style = "bold reverse cyan" if i == self.view_index else "dim"
+            bar.append("%d %s" % (i + 1, v.name), style=style)
+        bar.append("    （Tab 切换）", style="dim")
+        return bar
+
+    def cycle_view(self, step=1):
+        """切到下一个视图。返回新视图。"""
+        if not self.views:
+            return None
+        self.view_index = (self.view_index + step) % len(self.views)
+        self.view = self.views[self.view_index]
+        self.say("切到「%s」视图" % self.view.name, "cmd")
+        return self.view
+
+    def current_goal(self):
+        """当前 session 的目标。
+
+        暂时读 temp/keep_session-goal.txt（有就用），没有就占位 —— 以后接
+        Focusmate task / 手写目标时，只要换这里的取法，专注视图不用改。
+        """
+        path = os.path.join(TEMP, "keep_session-goal.txt")
+        try:
+            with open(path, encoding="utf-8") as f:
+                txt = f.read().strip()
+            if txt:
+                return txt
+        except OSError:
+            pass
+        return "（占位）还没接目标 —— 以后从 Focusmate task / temp/keep_session-goal.txt 读"
+
+    def cmd_pause(self):
+        """专注视图的 stop：消耗一次暂停（每次 PAUSE_MINUTES 分钟，每天 3 次）。"""
+        ok, st, why = ks.start_pause()
+        if not ok:
+            self.say("暂停没生效：%s" % why, "warn")
+            return
+        self.say("暂停 %d 分钟（今天还剩 %d 次）—— 这几分钟里 daemon 不念你。"
+                 % (ks.PAUSE_MINUTES, st["remaining"]), "ok")
 
     # -- 数据
 
@@ -1234,6 +1553,7 @@ class Warden(object):
         t.add_column(style="bold", no_wrap=True, justify="right")
         t.add_column()
         for cmd, desc in [
+            ("Tab", "切换视图：契约视图 ↔ 专注视图（未来还会有别的视图）"),
             ("day -1|0|1|YYYY-MM-DD", "切换看哪一天（草稿区随便看）"),
             ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
             ("session HH:MM-HH:MM", "同上，但用起点–终点（如 11:15-12:05 → 50min）"),
@@ -1244,7 +1564,8 @@ class Warden(object):
             ("sync [--days N]", "跑 download_calendar.py populate：日历 → 覆盖 data.csv"),
             ("refresh  (r)", "重新拉选中那天的 session（会重编号）"),
             ("start", "启动 daemon（会先让 bridge 放开浏览器）"),
-            ("stop", "停用 daemon（和取消一样要敲宣言）"),
+            ("stop（契约视图）", "停用 daemon（和取消一样要敲宣言）"),
+            ("stop（专注视图）", "消耗一次暂停：暂停 5 分钟，每天最多 3 次，daemon 不念你"),
             ("status  (s)", "只重画看板"),
             ("quit  (q)", "退出（bridge 和浏览器一起收掉）"),
         ]:
@@ -1253,7 +1574,8 @@ class Warden(object):
         self.console.print(
             "[dim]ID 就是表格第一列，按时间排序、每次 refresh 重编号 —— 看着表敲，别凭记忆。\n"
             "区域标记（状态列第一格）：草=草稿区（随便改）· 锁=执行区（取消要敲宣言）"
-            "· 过=已过去。[/]"
+            "· 过=已过去。\n"
+            "专注视图：只认 stop（消耗暂停），预约那套命令在那边一律没用。[/]"
         )
         return False
 
@@ -1271,6 +1593,10 @@ class Warden(object):
 
     def handle(self, line):
         """执行一条命令；返回 False 表示该退出了。"""
+        # Tab（管道/--exec 里就是一行 "\t"）= 切换视图，任何视图、连锁死时都认
+        if "\t" in line and line.replace("\t", "").strip() == "":
+            self.cycle_view()
+            return True
         try:
             parts = shlex.split(line)
         except ValueError as e:
@@ -1305,34 +1631,24 @@ class Warden(object):
             return True
 
         try:
+            # 通用命令：所有视图都认（切换 / 重画 / 帮助 / 退出）
             if cmd in ("quit", "exit", "q"):
                 return False
+            if cmd in ("tab", "view", "switch"):
+                self.cycle_view()
+                return True
+            if cmd in ("status", "s"):
+                return True
             if cmd in ("help", "?", "h"):
                 self.cmd_help()
-            elif cmd in ("refresh", "r", "reload"):
-                self.refresh()
-            elif cmd in ("status", "s"):
-                pass
-            elif cmd == "day":
-                self.cmd_day(args)
-            elif cmd == "session":
-                self.cmd_session(args)
-            elif cmd in ("force-check", "forcecheck"):
-                self.cmd_force_check()
-            elif cmd == "sync":
-                self.cmd_sync(args)
-            elif cmd == "mute":
-                self.cmd_mute(args)
-            elif cmd in ("title", "t"):
-                self.cmd_title(args)
-            elif cmd == "cancel":
-                self.cmd_cancel(args)
-            elif cmd == "start":
-                self.cmd_start()
-            elif cmd == "stop":
-                self.cmd_stop()
-            else:
-                self.say("不认识的命令：%s（敲 help 看有哪些）" % cmd, "warn")
+                return True
+            # 其余交给当前视图；视图不认就不再受理（专注视图里那套预约命令就是这么废掉的）
+            handled = self.view.handle(cmd, args, line)
+            if handled is False:
+                return False
+            if handled is None:
+                self.say("「%s」视图不认这个命令（按 Tab 切视图；help 看当前视图的命令）。"
+                         % self.view.name, "warn")
         except BridgeError as e:
             self.had_error = True
             self.say("bridge 出错：%s" % e, "error")
@@ -1368,7 +1684,7 @@ class Warden(object):
         if exec_lines:
             self.paint()
             for line in exec_lines:
-                if line.strip():
+                if line.strip() or line.strip("\t") != line:
                     self.console.print("[bold cyan]>>>[/] %s" % line)
                     if not self.handle(line):
                         break
@@ -1378,8 +1694,12 @@ class Warden(object):
         while True:
             self.paint()
             prompt = "宣言> " if self.pending_sins() else "warden> "
+            on_tick = self.paint if self.view.wants_tick() else None
             try:
-                line = input(prompt)
+                line = read_command(prompt, on_tick=on_tick, tick=1.0)
+            except SwitchView:
+                self.cycle_view()          # Tab：换视图、立刻重画
+                continue
             except (EOFError, KeyboardInterrupt):
                 self.console.print("\n[dim]收工。[/]")
                 return 0 if not self.had_error else 1

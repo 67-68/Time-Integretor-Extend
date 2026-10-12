@@ -69,6 +69,26 @@ daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第�
 
 「提前订满」：不看「是否临近开始」，只看「还没开始且缺失」就订（现在范围是整个窗口）。
 
+## 分心看门狗（session 进行时）
+
+除了「保证订上」，daemon 还在两轮之间的睡眠里跑一个额外的检查：**session 进行中
+每个「整整一分钟」没有键盘/触控板输入 → 记一次违规 + 通知（含当前次数）；累计到
+第 3 次把系统音量拉到 10% 并播放 `data/audio/赵小六嘶吼.mp3`**。
+
+- 只在 session 进行时上班（按 `data.csv` 的契约窗口判断），不在 session 里不打扰。
+- 每整整一分钟记一次；同一分钟不重复；人回来动一下本段清零重数（累计不归零）。
+- 本场第一次观察 / 活动之后**不追溯**已经空闲掉的时间，避免瞬间连爆三次。
+- 空闲时间来自 `ioreg` 的 `HIDIdleTime`；读不到就不判（不误判）。
+- 计数落盘 `temp/keep_session-idle.json`，按 session 归零；daemon 重启不丢。
+- 配套**暂停**：warden 专注视图敲 `stop` 消耗一次（5 分钟 / 每天 3 次），
+  暂停期间 daemon 不念你。状态在 `temp/keep_session-pause.json`（`pause_status` /
+  `start_pause` 是共用实现）。
+- 出声/通知的实现拆去了 `alert.py`（音量可调）。
+- `KEEP_SESSION_IDLE_CHECK=0` 可关；改了常量/音频要 `daemon restart`。
+
+完整规则、配置、测试见 [`idle_watchdog.md`](./idle_watchdog.md)，
+出声工具见 [`alert.md`](./alert.md)，暂停的界面见 [`warden.md`](./warden.md)。
+
 ## 罪与判决（daemon 和 TUI 的接口）
 
 daemon **只记罪、只读判决，自己绝不判**。两个小文件就是全部协议：

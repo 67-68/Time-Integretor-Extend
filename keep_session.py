@@ -7,8 +7,13 @@
     │  每 LOOP_INTERVAL=300s 醒一次：                               │
     │    data.csv → 切出 (now, now+24h] 的执行区 → 一次 API 列出窗口 │
     │    内的 session → 补齐缺失的（防抖 + 指数退避）→ 写 state+日志 │
+    │                                                               │
+    │  两轮之间的睡眠里每 IDLE_POLL_SEC=5s 跑一次「分心看门狗」：     │
+    │    session 进行中每 IDLE_THRESHOLD_SEC=60s 没键盘/触控板输入    │
+    │    → 记一次违规 + 通知（含当前次数）；累计第 3 次把音量拉到     │
+    │      10% 并播放 data/audio/赵小六嘶吼.mp3。暂停期间不念。       │
     └───────────────────────────────────────────────────────────────┘
-        ▲ 读 state / verdicts / sins / 日志（warden TUI 只读文件）
+        ▲ 读 state / verdicts / sins / idle / pause / 日志（warden TUI 只读文件）
         │
         keep_session status / check    ← 前台，随时开随时关
 
@@ -42,6 +47,9 @@
 - 认罪后的判决（keep_session-verdicts.json 的 abandoned）：TUI 认罪时把这个
   slot 判成「已放弃」，daemon 从此不再重订它 —— 这才是宣言真正的牙齿。
 - 状态全部落盘（state / verdicts / sins），前台 TUI 只读文件，不依赖 daemon 生命周期。
+- 分心看门狗：session 进行中每个「整整一分钟」没输入就记一次违规 + 通知，到第 3 次
+  把音量拉到 10% 并放音频。人在动就把本段空闲清零重数（累计违规不归零）；暂停期间
+  不打扰。读不到空闲时间就不判（不误伤）。见 feature_intents/idle_watchdog.md。
 
 用法：
     python3 keep_session.py daemon start      # 后台常驻（脱离终端，关终端不影响）
@@ -62,6 +70,7 @@ import fcntl
 import json
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -90,6 +99,26 @@ LOCK_FILE = os.path.join(HERE, "temp", "keep_session.lock")  # 防 daemon 与手
 VERDICTS_FILE = os.path.join(HERE, "temp", "keep_session-verdicts.json")  # 认罪判决
 SINS_FILE = os.path.join(HERE, "temp", "warden-sins.json")        # 待认罪的罪
 SINS_ARCHIVE = os.path.join(HERE, "temp", "warden-sins.jsonl")    # 认过的罪（只增不删）
+
+# ---- 分心看门狗（daemon 在「session 进行中」额外跑的一个检查）----------------
+# 连续 IDLE_THRESHOLD_SEC 没有键盘/触控板输入 = 一次违规，通知用户当前次数；
+# 到第 IDLE_MAX_STRIKES 次时把系统音量拉到 IDLE_ALERT_VOLUME% 并播放告警音频。
+# 用 KEEP_SESSION_IDLE_CHECK=0 关掉（比如不想被念）。
+IDLE_CHECK = os.environ.get("KEEP_SESSION_IDLE_CHECK", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+IDLE_THRESHOLD_SEC = 60          # 连续无输入多久算一次违规（秒）
+IDLE_POLL_SEC = 5                # daemon 隔多久看一眼空闲时间（秒）
+IDLE_MAX_STRIKES = 3             # 第几次违规时「不好的事情」发生
+IDLE_ALERT_AUDIO = os.path.join(HERE, "data", "audio", "赵小六嘶吼.mp3")
+IDLE_ALERT_VOLUME = 10           # 「把音量拉到 10%」
+IDLE_STATE_FILE = os.path.join(HERE, "temp", "keep_session-idle.json")  # 违规计数（按 session）
+# 暂停：专注视图里用 `stop` 消耗一次，暂停 PAUSE_MINUTES 分钟、全天最多 3 次。
+# daemon 在暂停期间不念你；次数/到期时间落盘，warden 和 daemon 共用。
+PAUSE_FILE = os.path.join(HERE, "temp", "keep_session-pause.json")
+PAUSE_MAX_PER_DAY = 3
+PAUSE_MINUTES = 5
+# ioreg 在 /usr/sbin；daemon 脱离终端后 PATH 极简，写死绝对路径
+IOREG_BIN = "/usr/sbin/ioreg" if os.path.exists("/usr/sbin/ioreg") else "ioreg"
 
 NODE_BIN_DIR = "/opt/homebrew/bin"
 # daemon 子进程用的解释器：优先系统 /usr/bin/python3（稳定），否则当前解释器
@@ -159,13 +188,29 @@ def log(msg, echo=True, to_file=True):
 
 
 def notify(title, message):
-    """macOS 系统通知。非 macOS 或失败时静默降级。"""
+    """macOS 系统通知。走 alert.py（非 macOS / 失败时静默降级）。
+
+    alert.py 是「出声 / 通知」的唯一实现，这里保留一个 osascript 兜底，
+    免得 alert.py 万一不可用就连通知都没了。
+
+    注意 json.dumps 必须 ensure_ascii=False：AppleScript 不认 `\\uXXXX` 转义，
+    默认的 ensure_ascii=True 会把中文变成 `\\u4f60...`，osascript 语法错、通知弹不出来。
+    """
     if sys.platform != "darwin":
         return
     try:
+        import alert  # 同目录，纯 stdlib
+        if alert.notify(title, message) == 0:
+            return
+    except Exception:
+        pass
+    # 兜底：alert.py 不可用时自己调 osascript
+    try:
+        script = "display notification %s with title %s" % (
+            json.dumps(message, ensure_ascii=False),
+            json.dumps(title, ensure_ascii=False))
         subprocess.run(
-            ["osascript", "-e",
-             'display notification %s with title %s' % (json.dumps(message), json.dumps(title))],
+            ["osascript", "-e", script],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except Exception:
@@ -352,6 +397,229 @@ load_entries = sch.load_entries
 day_slots = sch.day_slots
 slot_datetime = sch.slot_datetime
 key_of = sch.key_of
+
+
+# ---------------------------------------------------------------- 分心看门狗
+#
+# daemon 在「session 进行中」额外跑的一个检查：每整整一分钟没键盘/触控板输入就
+# 记一次违规 + 通知（含当前次数和「到第 3 次会有不好的事情」）；到第 3 次就把
+# 系统音量拉到 10% 并播放 data/audio/赵小六嘶吼.mp3。
+#
+# 规则细节：
+# - 每一「整分钟」各记一次（连续空闲 3 分钟 = 3 次通知 → 触发）；同一分钟内不重复。
+# - 一旦有人动键鼠/触控板，本段空闲的分钟数清零、从 0 重新数（但本场累计违规不归零）。
+# - 暂停（专注视图的 `stop`）期间不打扰：把基线推到当前空闲，暂停结束后重新从 0 数。
+# - 不在 session 里时看门狗不上班；读不到空闲时间就不判（不误伤）。
+# - 每次 tick 都把「当前空闲秒数」落盘，供 warden 专注视图展示。
+# 见 feature_intents/idle_watchdog.md。
+
+_HID_IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
+
+
+def load_idle_state():
+    """看门狗落盘状态：
+
+    {session_key, strikes, episode_marks, last_idle_seconds, last_tick_at,
+     last_strike_at}
+
+    - strikes            本场累计违规次数（通知次数），封顶 IDLE_MAX_STRIKES
+    - episode_marks      当前这段连续空闲已经数过几个「整分钟」（不追溯）
+    - last_idle_seconds / last_tick_at  最近一次读到的空闲秒数（warden 展示用）
+    """
+    st = _load_json(IDLE_STATE_FILE, {})
+    if not isinstance(st.get("strikes"), int):
+        st["strikes"] = 0
+    if not isinstance(st.get("episode_marks"), int):
+        st["episode_marks"] = 0
+    return st
+
+
+def save_idle_state(st):
+    _save_json(IDLE_STATE_FILE, st)
+
+
+# ---------------------------------------------------------------- 暂停（专注视图）
+
+def load_pause_state(day=None):
+    """暂停状态：{date, used, pause_until}。跨天自动把 used 归零（每天 3 次）。"""
+    day = day or datetime.date.today()
+    st = _load_json(PAUSE_FILE, {})
+    if st.get("date") != day.isoformat():
+        return {"date": day.isoformat(), "used": 0, "pause_until": None}
+    if not isinstance(st.get("used"), int):
+        st["used"] = 0
+    return st
+
+
+def save_pause_state(st):
+    _save_json(PAUSE_FILE, st)
+
+
+def pause_status(now=None):
+    """当前暂停状态：used/remaining（今天还剩几次）、active、left_sec（还剩多少秒）。
+
+    warden 专注视图和 daemon 都读它。remaining 是「今天还能按几次 stop」。
+    """
+    now = now or datetime.datetime.now()
+    st = load_pause_state(now.date())
+    until = parse_iso(st.get("pause_until"))
+    left = int((until - now).total_seconds()) if until else 0
+    active = bool(until and left > 0)
+    used = int(st.get("used", 0))
+    return {"date": st["date"], "used": used,
+            "remaining": max(0, PAUSE_MAX_PER_DAY - used),
+            "pause_until": until, "active": active,
+            "left_sec": left if active else 0}
+
+
+def start_pause(now=None):
+    """消耗一次暂停，暂停 PAUSE_MINUTES 分钟。
+
+    返回 (ok, status, reason)。已经在暂停里 / 今天次数用完 → ok=False。
+    """
+    now = now or datetime.datetime.now()
+    st = load_pause_state(now.date())
+    st_now = pause_status(now)
+    if st_now["active"]:
+        return False, st_now, "已经在暂停中（还剩 %ds），等它走完" % st_now["left_sec"]
+    if st_now["remaining"] <= 0:
+        return False, st_now, "今天的 %d 次暂停已经用完了" % PAUSE_MAX_PER_DAY
+    st["used"] = int(st.get("used", 0)) + 1
+    st["pause_until"] = (now + datetime.timedelta(minutes=PAUSE_MINUTES)
+                         ).isoformat(timespec="seconds")
+    save_pause_state(st)
+    return True, pause_status(now), ""
+
+
+def hid_idle_seconds():
+    """最近一次键盘/鼠标/触控板输入到现在的秒数（ioreg HIDIdleTime，纳秒 / 1e9）。
+
+    非 macOS、ioreg 出错、输出里没有该字段 → None。调用方据此跳过本轮，
+    **绝不把「读不到」误判成「没输入」**。
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run([IOREG_BIN, "-c", "IOHIDSystem"],
+                             check=False, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    m = _HID_IDLE_RE.search(out or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) / 1e9
+    except ValueError:
+        return None
+
+
+def current_session(entries, now):
+    """正在进行的契约 session → (day, slot, start, end)；没有就 None。
+
+    也看昨天，覆盖 23:xx 起、跨过午夜的那点边角（duration 最长 75min）。
+    """
+    for day in (now.date(), now.date() - datetime.timedelta(days=1)):
+        for slot in day_slots(entries, day):
+            start = slot_datetime(slot, day)
+            end = start + datetime.timedelta(minutes=int(slot["duration"]))
+            if start <= now < end:
+                return (day, slot, start, end)
+    return None
+
+
+def play_alert(path=None, volume=IDLE_ALERT_VOLUME):
+    """「不好的事情」：把系统音量拉到 volume% 并播放告警音频（默认赵小六嘶吼）。
+
+    单独成函数是为了测试能把它换掉，不真的出声。返回是否成功。
+    """
+    path = path or IDLE_ALERT_AUDIO
+    if not os.path.exists(path):
+        log("  [idle] 告警音频不存在：%s" % path)
+        return False
+    log("  [idle] 把音量拉到 %d%% 并播放 %s" % (volume, os.path.basename(path)))
+    try:
+        import alert  # 同目录，纯 stdlib（osascript 设音量 + afplay 播放）
+    except Exception as e:
+        log("  [idle] 载入 alert.py 失败：%s" % e)
+        return False
+    return alert.play(path, volume=100, system_volume=volume, wait=False) == 0
+
+
+def idle_tick(dry_run=False, now=None, idle_seconds=None):
+    """session 进行中的一次分心检查（daemon 每 IDLE_POLL_SEC 调一次）。
+
+    返回本场累计违规次数；看门狗没上班（不在 session / 读不到空闲时间）返回 None，
+    暂停中返回当前累计值。idle_seconds 可注入 —— 测试不用真去问 ioreg。
+    """
+    if not IDLE_CHECK:
+        return None
+    now = now or datetime.datetime.now()
+    if idle_seconds is None:
+        idle_seconds = hid_idle_seconds()
+    if idle_seconds is None:
+        return None                      # 读不到空闲时间：不误判
+
+    st = load_idle_state()
+    prev_idle = st.get("last_idle_seconds")
+    st["last_idle_seconds"] = idle_seconds
+    st["last_tick_at"] = now.isoformat(timespec="seconds")
+
+    entries, _warnings = load_entries()
+    sess = current_session(entries, now)
+    if sess is None:
+        save_idle_state(st)              # 顺手更新「最近空闲」，看门狗不上班
+        return None
+    day, slot, _start, _end = sess
+    key = key_of(day, slot)
+    if st.get("session_key") != key:     # 换了一场：违规次数归零
+        prev_idle = None
+        st["session_key"] = key
+        st["strikes"] = 0
+        st["episode_marks"] = 0
+    strikes = int(st.get("strikes", 0))
+    marks = int(idle_seconds // IDLE_THRESHOLD_SEC)   # 已经空闲了几个「整分钟」
+
+    # 暂停中（专注视图 `stop` 换来的）：不打扰；把「已数过的分钟」推到当前，
+    # 暂停结束后从下一个整分钟接着数 —— 免得一解除就按攒下的空闲连爆三次。
+    if pause_status(now)["active"]:
+        st["episode_marks"] = marks
+        save_idle_state(st)
+        return strikes
+
+    if idle_seconds < IDLE_THRESHOLD_SEC:
+        st["episode_marks"] = 0          # 有人在动 / 还没攒够一分钟
+    elif prev_idle is None or idle_seconds < float(prev_idle):
+        # 本场第一次观察，或中间有人动过（空闲时间比上次还小）：
+        # 不追溯已经空闲掉的那几分钟，从当前这个分钟边界往后数。
+        st["episode_marks"] = marks
+
+    counted = int(st.get("episode_marks", 0))
+    while counted < marks and strikes < IDLE_MAX_STRIKES:
+        counted += 1
+        strikes += 1
+        st["strikes"] = strikes
+        st["episode_marks"] = counted
+        st["last_strike_at"] = now.isoformat(timespec="seconds")
+        save_idle_state(st)
+        log("  [idle] %s 连续 %d 分钟无键盘/触控板输入 → 违规 %d/%d"
+            % (key, counted, strikes, IDLE_MAX_STRIKES))
+        if dry_run:
+            log("  [idle][dry-run] 会通知用户；到第 %d 次会拉低音量 + 播放 %s"
+                % (IDLE_MAX_STRIKES, os.path.basename(IDLE_ALERT_AUDIO)))
+            continue
+        if strikes < IDLE_MAX_STRIKES:
+            notify("Focusmate 分心警告",
+                   "你已经 %d 分钟没碰键盘/触控板了。当前违规次数：%d/%d —— "
+                   "到第 %d 次会有不好的事情发生。"
+                   % (counted, strikes, IDLE_MAX_STRIKES, IDLE_MAX_STRIKES))
+        else:
+            notify("Focusmate 分心警告",
+                   "你已经 %d 分钟没碰键盘/触控板了。违规次数：%d/%d —— "
+                   "说好的不好的事情，现在就来。"
+                   % (counted, strikes, IDLE_MAX_STRIKES))
+            play_alert(IDLE_ALERT_AUDIO, IDLE_ALERT_VOLUME)
+    save_idle_state(st)
+    return strikes
 
 
 # ---------------------------------------------------------------- 只读 API
@@ -664,15 +932,25 @@ def cmd_run(dry_run=False):
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
     log("run 启动：每 %ds 一轮，Ctrl+C 退出" % LOOP_INTERVAL)
+    if IDLE_CHECK:
+        log("  分心看门狗已武装：session 进行中连续 %ds 无键盘/触控板输入记一次违规，"
+            "第 %d 次把音量拉到 %d%% 并播放 %s"
+            % (IDLE_THRESHOLD_SEC, IDLE_MAX_STRIKES, IDLE_ALERT_VOLUME,
+               os.path.basename(IDLE_ALERT_AUDIO)))
     while not _STOP["flag"]:
         run_once(dry_run=dry_run)
-        # 可被 STOP_FILE 或信号打断的分段睡眠
+        # 可被 STOP_FILE 或信号打断的分段睡眠；顺便每 IDLE_POLL_SEC 看一眼分心情况
         slept = 0
         while slept < LOOP_INTERVAL and not _STOP["flag"]:
             if os.path.exists(STOP_FILE):
                 log("发现 STOP_FILE，退出")
                 _STOP["flag"] = True
                 break
+            if IDLE_CHECK and slept % IDLE_POLL_SEC == 0:
+                try:
+                    idle_tick(dry_run=dry_run)
+                except Exception as e:
+                    log("  [idle] 检查出错（忽略，下轮再试）：%s" % e)
             time.sleep(min(1, LOOP_INTERVAL - slept))
             slept += 1
     log("run 已退出")
@@ -874,6 +1152,31 @@ def cmd_status():
             print("    %s  %s" % (k, ab[k].get("at", "")[:16]))
     else:
         print("  已放弃：无")
+
+    print("== 分心看门狗 ==")
+    if not IDLE_CHECK:
+        print("  已关闭（KEEP_SESSION_IDLE_CHECK=0）")
+    else:
+        sess = current_session(entries, now)
+        cur = key_of(sess[0], sess[1]) if sess else None
+        print("  当前 session：%s" % (cur + "（进行中）" if cur else "无（只在 session 进行时上班）"))
+        idle_st = load_idle_state()
+        if idle_st.get("session_key"):
+            mark = "  ← 当前这场" if idle_st.get("session_key") == cur else ""
+            print("  最近计数：%s 违规 %d/%d%s"
+                  % (idle_st.get("session_key"), idle_st.get("strikes", 0),
+                     IDLE_MAX_STRIKES, mark))
+        else:
+            print("  最近计数：无")
+        if idle_st.get("last_idle_seconds") is not None:
+            print("  最近空闲：%ds（%s）"
+                  % (int(idle_st["last_idle_seconds"]), idle_st.get("last_tick_at", "?")[11:19]))
+        ps = pause_status(now)
+        tail = ""
+        if ps["active"]:
+            tail = "，暂停中 还剩 %ds" % ps["left_sec"]
+        print("  今日暂停：已用 %d/%d（剩 %d 次，每次 %d 分钟）%s"
+              % (ps["used"], PAUSE_MAX_PER_DAY, ps["remaining"], PAUSE_MINUTES, tail))
 
     print("== 窗口内 state ==")
     st = load_state()

@@ -53,6 +53,8 @@ ks.STATE_FILE = os.path.join(TMP, "state.json")
 ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
+ks.IDLE_STATE_FILE = os.path.join(TMP, "idle-state.json")
+ks.PAUSE_FILE = os.path.join(TMP, "pause.json")
 ks.notify = lambda *a, **kw: None        # 别真弹 macOS 通知
 
 NOW = datetime.datetime.now()
@@ -636,6 +638,83 @@ wd._fallback_rows("测试")
 wd.paint()
 out = buf.getvalue()
 check("快照模式标出「快照」而不是「缺」", "快照" in out and " 缺 " not in out, True)
+
+# ---------------------------------------------------------------- 视图（Tab 切换）
+
+print("== 视图：注册 + Tab 切换 ==")
+check("注册了契约/专注两个视图", [v.name for v in w.VIEWS], ["契约", "专注"])
+wd = mkwarden()
+check("默认契约视图", (wd.view.name, wd.view_index), ("契约", 0))
+wd.handle("tab")
+check("tab 切到专注", (wd.view.name, wd.view_index), ("专注", 1))
+wd.handle("\t")
+check("字面 Tab 切回契约", (wd.view.name, wd.view_index), ("契约", 0))
+wd.cycle_view()
+check("cycle_view 切到专注", wd.view.name, "专注")
+wd.cycle_view(-1)
+check("cycle_view(-1) 切回契约", wd.view.name, "契约")
+
+print("== 专注视图：目标 / 可暂停次数 / 空闲 / 倒计时 ==")
+if os.path.exists(ks.PAUSE_FILE):
+    os.remove(ks.PAUSE_FILE)
+ks._save_json(ks.IDLE_STATE_FILE, {"session_key": "x", "strikes": 1, "episode_marks": 0,
+                                   "last_idle_seconds": 42,
+                                   "last_tick_at": NOW.isoformat(timespec="seconds")})
+inprog = (NOW - datetime.timedelta(minutes=10)).strftime("%H:%M")
+write_csv(["# view test", "%s,%s,50" % (TODAY_WD, inprog)])
+wd = mkwarden()
+wd.cycle_view()        # 专注
+buf = io.StringIO()
+wd.console = Console(file=buf, width=120, force_terminal=False)
+wd.paint()
+out = buf.getvalue()
+check("专注视图显示目标", "目标" in out, True)
+check("专注视图显示可暂停次数 3/3", "可暂停次数" in out and "3 / 3" in out, True)
+check("专注视图显示当前空闲 42s", "42s" in out, True)
+check("专注视图显示进行中的 session", "当前 session" in out, True)
+check("专注视图不画契约表", "The Contract Table" not in out, True)
+check("视图指示有 Tab 切换", "Tab 切换" in out, True)
+check("专注提示只提 stop", ("stop" in out and "session HH:MM" not in out), True)
+
+print("== 专注视图：stop = 消耗一次暂停（不是停 daemon）==")
+wd.bridge.calls = []
+check("专注视图 stop 受理", wd.handle("stop"), True)
+ps = ks.pause_status()
+check("消耗一次暂停（今天剩 2 次）", ps["remaining"], 2)
+check("暂停生效中", ps["active"], True)
+check("专注视图 stop 没碰 bridge", wd.bridge.calls, [])
+
+print("== 专注视图：预约命令没用 ==")
+before = open(CSV, encoding="utf-8").read()
+check("session 在专注视图不执行", wd.handle("session 22:00 50"), True)
+check("data.csv 没被改", open(CSV, encoding="utf-8").read(), before)
+check("提示只认 stop", any("只认 stop" in m[2] for m in wd.messages), True)
+
+print("== 切回契约视图，原来的命令还在 ==")
+wd.cycle_view()
+check("切回契约视图", wd.view.name, "契约")
+check("契约视图认 day 0", wd.handle("day 0"), True)
+check("契约视图认 mute（会走 bridge，不炸就行）", wd.handle("mute 1 on") in (True, False), True)
+
+print("== 非 TTY 下：一行 Tab 也算切视图 ==")
+_rescue_stdin = sys.stdin
+
+class _NotATTY(object):
+    def isatty(self):
+        return False
+
+sys.stdin = _NotATTY()
+try:
+    answer(["\t"])
+    try:
+        w.read_command("warden> ")
+        check("Tab 行抛 SwitchView", False, True)
+    except w.SwitchView:
+        check("Tab 行抛 SwitchView", True, True)
+    answer(["quit"])
+    check("普通行照常返回", w.read_command("warden> "), "quit")
+finally:
+    sys.stdin = _rescue_stdin
 
 shutil.rmtree(TMP, ignore_errors=True)
 

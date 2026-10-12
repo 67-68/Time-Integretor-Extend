@@ -91,6 +91,34 @@ help / quit
 拿不到 bridge 时用 state.json 快照兜底，此时**不给「缺/已订」的结论**（快照里没有 id），
 一律标 `快照`。
 
+## 视图（Tab 切换）
+
+TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切换，视图名/内容就显示在
+命令提示上面。视图是可扩展的 —— 加一个视图 = 继承 `View`、填 `key/name/label/hint`、
+实现 `render()` / `handle()`，再用 `@register_view` 注册；`paint()` / 切换 / 提示
+都会自动跟上（`VIEWS` 列表驱动，顺序即 Tab 顺序）。
+
+现有两个视图：
+
+| # | 视图 | 主体 | 命令 |
+|---|---|---|---|
+| 1 | 契约（默认） | The Contract Table + 契约摘要 | 原来那一整套（`session` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
+| 2 | 专注 | 目标 + 可暂停次数 + 暂停倒计时 + 当前空闲秒数 | **只有 `stop`**（消耗一次暂停）；预约那套命令在这个视图里**一律没用** |
+
+- 通用命令（两个视图都认）：`Tab`（切视图）/ `status` / `help` / `quit`。
+- **专注视图的 `stop` ≠ 契约视图的 `stop`**：前者是「消耗一次暂停」，
+  后者是「停 daemon（要敲宣言）」。同一个词在两个视图里语义不同，由视图分发。
+- 专注视图每秒重画一次（`View.wants_tick()` 为真），所以暂停倒计时和空闲秒数是
+  **活的**；停在提示符时也能看到数字在走。TTY 下用 cbreak 逐键读（`read_command`），
+  这样 **Tab 是即时切换**、不用回车；管道 / `--exec` 下按行处理，一行 Tab 也算。
+- 空闲秒数来自 daemon 写进 `temp/keep_session-idle.json` 的 `last_idle_seconds`
+  （daemon 每 5s 读一次 `ioreg HIDIdleTime`）。daemon 没在跑就显示「还没报过」。
+- 目标暂时是占位（读 `temp/keep_session-goal.txt`，没有就显示占位文案），
+  以后接 Focusmate task 时只改 `Warden.current_goal()`。
+
+暂停的规则（次数/时长/跨天）在 [`idle_watchdog.md`](./idle_watchdog.md)，
+实现在 `keep_session.pause_status()` / `start_pause()` —— warden 和 daemon 共用同一份。
+
 ## 宣言闸门（The Walk of Shame）
 
 密码系统已按用户要求**整个删除**（`password_problems` / PBKDF2 / `temp/warden.json` /
@@ -195,6 +223,10 @@ python3 warden.py install-deps
   （怕把正在跑的 daemon 停掉影响今天的场次）。`start` / 宣言闸 / 参数拼装都有测试。
 - 交互式 TUI 只在**管道 stdin** 下测过；没在真 TTY 上人工敲过（沙箱里没 TTY）。
   特别是 152 字宣言在真 TTY 下的粘贴/回显行为。
+- **视图的 Tab 键 / 专注视图的每秒重画只在管道下测过**：`read_command()` 的
+  cbreak 逐键读（真 Tab 即时切换、`on_tick` 每秒重画倒计时）没在真 TTY 上人工敲过；
+  管道下用「一行 Tab」走的是同一条 `SwitchView` 路径，但真 TTY 的键盘解码/
+  光标重画（尤其中文输入）没验证。不好用就先用 `tab` 命令切视图。
 - **`session` 的"立刻触发一轮 check"没在真账号上跑过**（那会真下单）。它调的是
   现成的 `keep_session.py check`，路径本身是通的，但没实地验证过。
 - **`sync` 没在真日历上端到端跑过**（那会覆盖 data.csv）。它薄封装
