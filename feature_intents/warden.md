@@ -66,6 +66,7 @@ mute 3 on|off       显式开/关
 title 2 "Math Past Paper"
 title 2 ""          清空标题
 sync [--days N]     跑 download_calendar.py populate：日历 → 覆盖 data.csv
+force-check         忽略重试上限/退避：把所有没订上的 session 各强制重订一次
 refresh / r         重新拉选中那天的 session（ID 会重编号）
 start               启动 daemon（先让 bridge 放开浏览器）
 stop                停用 daemon（**要敲宣言**）

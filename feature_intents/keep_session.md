@@ -133,7 +133,7 @@ stdout，不写共享日志——否则会和已经在跑第一轮的孙进程�
 
 - `daemon start|stop|restart|status`：后台常驻管理。
 - `run`：前台常驻循环，Ctrl+C 退出（调试）。
-- `check [--dry-run]`：只跑一轮。
+- `check [--dry-run] [--force]`：只跑一轮；`--force` 忽略重试上限/退避，把所有没订上的 session 各试一次。
 - `status`：daemon + 契约表（执行区/草稿区分开列）+ 罪与判决 + 窗口内 state + 日志尾。
 
 ## 与 download_calendar 的关系

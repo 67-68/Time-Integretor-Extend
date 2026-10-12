@@ -9,7 +9,7 @@
                        用 `day -1 / day 0 / day 1` 切换看哪天。
 3. The Interrogation   死循环 input，极简命令：
                        mute 3 / title 2 "文本" / session 09:00 50 / session 11:15-12:05
-                       cancel 1 / day 1 / sync
+                       cancel 1 / day 1 / sync / force-check
 4. Panic Action        —— 已按你的要求删掉。没有这个功能。
 
 三层摩擦（这套系统真正的规则）
@@ -441,7 +441,8 @@ class Warden(object):
             self.console.print(self.render_messages())
         self.console.print(
             "[dim]命令：[/][bold]mute[/] N on|off · [bold]title[/] N \"文本\" · "
-            "[bold]session[/] HH:MM LEN · [bold]sync[/] · [bold]cancel[/] N · [bold]day[/] -1/0/1 · "
+            "[bold]session[/] HH:MM LEN · [bold]sync[/] · [bold]force-check[/] · "
+            "[bold]cancel[/] N · [bold]day[/] -1/0/1 · "
             "[bold]refresh[/] · [bold]start[/] · [bold]stop[/] · [bold]help[/] · [bold]quit[/]"
         )
 
@@ -1127,6 +1128,28 @@ class Warden(object):
         self.refresh()
         return True
 
+    def cmd_force_check(self):
+        """force-check —— 忽略重试上限/退避，强制对执行区里所有还没订上的 session
+        各试一次重订。
+
+        普通 `check` 只补订没到上限、且不在退避中的场次；有的 slot 失败 3 次后被标成
+        failed 就再也不碰了。force-check 是手动扳轨：已经 failed、正在退避、attempts
+        已爆表的，全都再试一次。已放弃（判决 abandoned）和已订上的不碰。
+        下单逻辑不在这里重写：薄封装 `keep_session.py check --force`。
+        """
+        self.say("force-check：忽略重试上限/退避，对执行区所有没订上的 session 各试一次…", "cmd")
+        self._release_browser("daemon 下单要独占同一个 Chromium profile")
+        rc, out, err = run_keep_session("check", "--force", timeout=600)
+        for line in (out or "").splitlines()[-40:]:
+            self.say(line)
+        if rc == 0:
+            self.say("✅ force-check 跑完。", "ok")
+        else:
+            self.had_error = True
+            self.say("❌ force-check 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
+        self.refresh()
+        return True
+
     def cmd_sync(self, args):
         """sync [download_calendar 的参数] —— 调 download_calendar.py populate，把日历
         重新切成 data.csv（会覆盖 data.csv；旧文件备份到 temp/data.csv.bak）。
@@ -1217,6 +1240,7 @@ class Warden(object):
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
             ("mute N on|off", "把 #N 静音；不写 on/off 就是取反"),
             ('title N "文本"', '把 #N 的标题改成文本；title N "" 清空'),
+            ("force-check", "忽略重试上限/退避：把所有没订上的 session 各强制重订一次"),
             ("sync [--days N]", "跑 download_calendar.py populate：日历 → 覆盖 data.csv"),
             ("refresh  (r)", "重新拉选中那天的 session（会重编号）"),
             ("start", "启动 daemon（会先让 bridge 放开浏览器）"),
@@ -1293,6 +1317,8 @@ class Warden(object):
                 self.cmd_day(args)
             elif cmd == "session":
                 self.cmd_session(args)
+            elif cmd in ("force-check", "forcecheck"):
+                self.cmd_force_check()
             elif cmd == "sync":
                 self.cmd_sync(args)
             elif cmd == "mute":

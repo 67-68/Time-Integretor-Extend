@@ -51,6 +51,7 @@
     python3 keep_session.py run               # 前台常驻循环（Ctrl+C 退出，调试用）
     python3 keep_session.py check             # 只跑一轮
     python3 keep_session.py check --dry-run   # 只打印计划，不调 API 不预定
+    python3 keep_session.py check --force     # 忽略重试上限/退避，把所有没订上的都试一次
     python3 keep_session.py status            # 看 daemon 是否活着 + 今日 state + 日志尾
 
 纯 stdlib，Python 3.9 可跑。
@@ -424,22 +425,28 @@ def verify_slot_booked(start, attempts=3, wait=4):
 # ---------------------------------------------------------------- 核心一轮
 
 
-def run_once(dry_run=False):
-    """跑一轮完整检查+补订（带文件锁）。daemon 与手动 check 互斥。"""
+def run_once(dry_run=False, force=False):
+    """跑一轮完整检查+补订（带文件锁）。daemon 与手动 check 互斥。
+
+    force=True 时忽略重试上限/退避：对窗口内所有还没订上的 session 都试一次
+    （`keep_session.py check --force`，TUI 里就是 `force-check`）。
+    """
     with round_lock() as got:
         if not got:
             log("  [lock] 另一轮正在跑（daemon 或手动 check），本轮跳过")
             return 0
-        return _run_once_locked(dry_run=dry_run)
+        return _run_once_locked(dry_run=dry_run, force=force)
 
 
-def _run_once_locked(dry_run=False):
+def _run_once_locked(dry_run=False, force=False):
     """真正干活的一轮。必须在持有 round_lock 时调用。
 
     只管 (now, now+24h] 的执行区：订满它、对账已经过去的、记罪、认判决。
+    force=True 会无视 attempts 上限和退避时间，对每场没订上的都发起一次预定。
     """
     now = datetime.datetime.now()        # 本地 naive —— schedule.py 的窗口语义就用这个
-    log("=== round start (dry_run=%s) %s ===" % (dry_run, now.strftime("%Y-%m-%d %H:%M:%S")))
+    log("=== round start (dry_run=%s, force=%s) %s ==="
+        % (dry_run, force, now.strftime("%Y-%m-%d %H:%M:%S")))
 
     entries, warnings = load_entries()
     for wmsg in warnings:
@@ -555,30 +562,40 @@ def _run_once_locked(dry_run=False):
             state["slots"][key] = rec
             changed = True
         elif status == "failed":
-            log("  %s 已达重试上限，不再尝试" % key)
-            continue
+            if not force:
+                log("  %s 已达重试上限，不再尝试" % key)
+                continue
+            log("  %s 已达重试上限，force-check 忽略上限，继续尝试" % key)
 
         # 该订了吗？（退避等待）
         nra = parse_iso(rec.get("next_retry_at"))
         if nra and now < nra:
-            log("  %s 在退避中，等到 %s 再试" % (key, nra.strftime("%H:%M:%S")))
-            continue
+            if not force:
+                log("  %s 在退避中，等到 %s 再试" % (key, nra.strftime("%H:%M:%S")))
+                continue
+            log("  %s 在退避中（到 %s），force-check 忽略退避" % (key, nra.strftime("%H:%M:%S")))
 
         attempts = int(rec.get("attempts", 0))
         if attempts >= MAX_ATTEMPTS:
-            log("  %s 已尝试 %d 次仍失败，转 failed + 通知" % (key, attempts))
-            state["slots"][key] = {"status": "failed", "duration": slot["duration"],
-                                   "attempts": attempts, "last_error": rec.get("last_error")}
-            notify("Focusmate 预定失败",
-                   "%s (%smin) 尝试 %d 次仍失败，不再重试。原因：%s"
-                   % (key, slot["duration"], attempts, rec.get("last_error") or "未知"))
-            changed = True
-            continue
+            if not force:
+                log("  %s 已尝试 %d 次仍失败，转 failed + 通知" % (key, attempts))
+                state["slots"][key] = {"status": "failed", "duration": slot["duration"],
+                                       "attempts": attempts, "last_error": rec.get("last_error")}
+                notify("Focusmate 预定失败",
+                       "%s (%smin) 尝试 %d 次仍失败，不再重试。原因：%s"
+                       % (key, slot["duration"], attempts, rec.get("last_error") or "未知"))
+                changed = True
+                continue
+            log("  %s 已尝试 %d 次；force-check 忽略上限，继续尝试" % (key, attempts))
 
         # 真的去订
         attempts += 1
-        log("  %s 缺失，开始第 %d/%d 次预定...（目标时间 %s，%smin）"
-            % (key, attempts, MAX_ATTEMPTS, fmt_local_utc(start), slot["duration"]))
+        if force:
+            log("  %s 缺失，force-check 第 %d 次预定...（目标时间 %s，%smin）"
+                % (key, attempts, fmt_local_utc(start), slot["duration"]))
+        else:
+            log("  %s 缺失，开始第 %d/%d 次预定...（目标时间 %s，%smin）"
+                % (key, attempts, MAX_ATTEMPTS, fmt_local_utc(start), slot["duration"]))
         debounce()
         # 直接用算好的 start（带日期），不走 fm.resolve_target 的"过了就顺延到明天"猜谜：
         # 窗口里同时有今天和明天的场次时，那种猜法会挑错日子。
@@ -608,6 +625,9 @@ def _run_once_locked(dry_run=False):
             wait = BACKOFF_MINUTES[min(attempts - 1, len(BACKOFF_MINUTES) - 1)]
             next_retry = now + datetime.timedelta(minutes=wait)
             log("  %s 第 %d 次失败: %s（%d 分钟后重试）" % (key, attempts, reason, wait))
+        elif force:
+            log("  %s force-check 第 %d 次失败: %s（已达上限，但不发通知；下次 force-check 仍可再试）"
+                % (key, attempts, reason))
         else:
             log("  %s 第 %d 次失败: %s（已达上限，不再试）" % (key, attempts, reason))
             notify("Focusmate 预定失败",
@@ -898,6 +918,8 @@ def parse_args(argv=None):
 
     p_check = sub.add_parser("check", help="只跑一轮")
     p_check.add_argument("--dry-run", action="store_true")
+    p_check.add_argument("--force", action="store_true",
+                         help="忽略重试上限/退避：对所有还没订上的 session 都试一次")
 
     p_daemon = sub.add_parser("daemon", help="后台常驻管理")
     p_daemon.add_argument("action", choices=["start", "stop", "restart", "status"])
@@ -923,7 +945,7 @@ def main(argv=None):
     if args.cmd == "_daemon_loop":
         return cmd_run(dry_run=args.dry_run)
     if args.cmd == "check":
-        return run_once(dry_run=args.dry_run)
+        return run_once(dry_run=args.dry_run, force=args.force)
     if args.cmd == "daemon":
         return cmd_daemon(args.action, dry_run=getattr(args, "dry_run", False))
     if args.cmd == "status":
