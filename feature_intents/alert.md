@@ -29,7 +29,27 @@ python3 alert.py volume 10
 
 # 只打印要跑的命令，不出声、不弹通知、不改系统音量
 python3 alert.py play x.mp3 --system-volume 10 --dry-run
+
+# 自检 / 演练：音量设到 10% + 播放赵小六嘶吼 5 秒（只放 5 秒，不是完整 24 秒）
+python3 alert.py dry-run
+python3 alert.py dry-run --seconds 2 --volume 10      # 改时长 / 音量
+python3 alert.py dry-run --print-only                 # 真的只打印，不出声、不改音量
 ```
+
+### `dry-run` 是什么
+
+它是 daemon 第 3 次违规那条链路的**有界演练**：真的 `set volume output volume 10`
++ `afplay -v 1.0 -t 5 赵小六嘶吼.mp3`。用 `afplay -t TIME` 把播放限制在 5 秒，
+所以不会真的放完整 24 秒；`--print-only` 才是纯预览（打印命令、零副作用）。
+（名字叫 dry-run 有点误导，但它是**会出声**的试跑；默认 5 秒就是为此。）
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `--audio FILE` | `data/audio/赵小六嘶吼.mp3` | 放哪个文件 |
+| `--volume N` | 10 | 系统输出音量（%），会改动 |
+| `--seconds N` | 5 | 播放几秒（`afplay -t`） |
+| `--print-only` | 关 | 只打印命令，不出声/不改音量 |
+| `--background` | 关 | 不等待播放结束 |
 
 ## 音量语义（两个别混）
 
@@ -64,4 +84,5 @@ daemon 的「把音量拉到 10%」用的是后者（字面意思）；想安静
 ## 测试
 
 `python3 test/test_alert.py` —— 只断言「会拼出哪些命令」，不真放声音。
-覆盖：增益/系统音量换算、越界、中文不转义、`--dry-run`、非 macOS 降级。
+覆盖：增益/系统音量换算、越界、中文不转义、`--dry-run`、`dry-run` 演练命令拼装、
+非 macOS 降级。

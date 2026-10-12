@@ -15,9 +15,13 @@
 视图（Tab 切换）
 ----------------
 按 **Tab** 在多个视图间切换，视图显示在命令提示上面。现有「契约」（默认，就是
-上面那套）和「专注」（目标 + 可暂停次数 + 暂停倒计时 + 当前空闲秒数；只认
+上面那套）和「专注」（目标 + 当前 session + 可暂停次数 + 一行实时状态；只认
 `stop` = 消耗一次暂停）两个。视图可扩展：继承 `View` + `@register_view` 即可，
 `paint()` / 切换 / 命令提示都由 `VIEWS` 列表驱动。
+
+动态数字（暂停倒计时 / 空闲秒数）走 `View.status_line()`：paint() 把它打在最后一行，
+读输入时只原地覆盖那一行（`\x1b[1A` / `\x1b[K` / `\x1b[1B`），**不清屏、不重画整屏**，
+所以数字在走的时候不抖。
 
 三层摩擦（这套系统真正的规则）
 ------------------------------
@@ -554,18 +558,37 @@ class FocusView(View):
 
 
 
-# ---------------------------------------------------------------- 输入（Tab 切视图 / 动态重画）
-
+# ---------------------------------------------------------------- 输入（Tab 切视图 / 原地刷新）
 
 class SwitchView(Exception):
     """用户按了 Tab（或管道里来了一行 Tab）：切换到下一个视图。"""
 
 
-def read_command(prompt, on_tick=None, tick=1.0):
+def _term_width(default=120):
+    try:
+        import shutil
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+def status_line_escape(text, width=None):
+    """把一行状态文本包成「原地覆盖提示符上面那一行」的 ANSI 序列。
+
+    上移一行(`\\x1b[1A`) → 回行首 + 覆盖 + 清到行尾(`\\r`, `\\x1b[K`) → 下移一行(`\\x1b[1B`)。
+    纯函数，方便测试「确实没有清整屏」。
+    """
+    text = (text or "")[: max(1, (width or _term_width()) - 1)]
+    return "\x1b[1A\r" + text + "\x1b[K\x1b[1B"
+
+
+def read_command(prompt, status_fn=None, tick=1.0):
     """读一行命令。
 
-    - **TTY**：cbreak 逐键读。按 Tab 立刻抛 SwitchView；每 tick 秒调一次 on_tick()
-      （专注视图靠它动态刷新暂停倒计时 / 空闲秒数），再把提示符和已输入内容重画出来。
+    - **TTY**：cbreak 逐键读。按 Tab 立刻抛 SwitchView；每 tick 秒调一次 status_fn()
+      拿一行状态文本，**只原地覆盖提示符上面那一行**（`\\x1b[1A` / `\\x1b[K` / `\\x1b[1B`），
+      不清屏、不重画整屏 —— 所以倒计时/空闲秒数在走的时候屏幕不抖。
+      前提：`paint()` 已经把那一行打在了最后（紧贴提示符上面）。
     - **非 TTY**（管道 / 测试 / --exec）：退回 input()；行首的 Tab 也算切视图。
     """
     if not sys.stdin.isatty():
@@ -578,10 +601,10 @@ def read_command(prompt, on_tick=None, tick=1.0):
         import tty
     except ImportError:
         return input(prompt)
-    return _read_line_tty(prompt, on_tick=on_tick, tick=tick, termios=termios, tty=tty)
+    return _read_line_tty(prompt, status_fn=status_fn, tick=tick, termios=termios, tty=tty)
 
 
-def _read_line_tty(prompt, on_tick=None, tick=1.0, termios=None, tty=None):
+def _read_line_tty(prompt, status_fn=None, tick=1.0, termios=None, tty=None):
     import codecs
     import select
     fd = sys.stdin.fileno()
@@ -590,23 +613,31 @@ def _read_line_tty(prompt, on_tick=None, tick=1.0, termios=None, tty=None):
     esc = False
     dec = codecs.getincrementaldecoder("utf-8")("replace")
 
-    def redraw():
+    def redraw_prompt():
         sys.stdout.write("\r" + prompt + "".join(buf) + "\x1b[K")
         sys.stdout.flush()
+
+    def refresh_status():
+        """只把提示符上面那一行原地覆盖掉（EL 清到行尾），其余屏幕不动。"""
+        if not status_fn:
+            return
+        try:
+            st = status_fn() or ""
+        except Exception:
+            st = ""
+        # 上移一行 → 回行首覆盖 + 清到行尾 → 下移一行回提示符
+        sys.stdout.write(status_line_escape(st))
+        sys.stdout.flush()
+        redraw_prompt()
 
     try:
         tty.setcbreak(fd)          # 关 ECHO/ICANON：逐键读、自己回显
         sys.stdout.write(prompt)
         sys.stdout.flush()
         while True:
-            ready, _, _ = select.select([fd], [], [], tick if on_tick else None)
+            ready, _, _ = select.select([fd], [], [], tick if status_fn else None)
             if not ready:
-                if on_tick:
-                    try:
-                        on_tick()
-                    except Exception:
-                        pass
-                redraw()
+                refresh_status()
                 continue
             data = os.read(fd, 1)
             if not data:
@@ -623,7 +654,7 @@ def _read_line_tty(prompt, on_tick=None, tick=1.0, termios=None, tty=None):
                 if ch in ("\x7f", "\b"):
                     if buf:
                         buf.pop()
-                    redraw()
+                    redraw_prompt()
                     continue
                 if ch == "\x03":
                     raise KeyboardInterrupt()
@@ -718,6 +749,18 @@ class Warden(object):
         # 视图指示 + 命令提示都放在最下面（提示符上面）
         self.console.print(self.render_view_bar())
         self.console.print(self.view.hint)
+        # **最后一行**是动态状态行（如果有）。读输入时只原地覆盖这一行，
+        # 不 clear、不重画整屏 —— 倒计时每分钟跳动时屏幕不抖。见 _read_line_tty()。
+        st = self.live_status()
+        if st is not None:
+            self.console.print(Text(st))
+
+    def live_status(self):
+        """当前视图的动态状态行（截到控制台宽度，纯文本）；没有就 None。"""
+        st = self.view.status_line()
+        if not st:
+            return None
+        return st[: max(10, self.console.width - 1)]
 
     def render_view_bar(self):
         """一行「当前在第几个视图」，带 Tab 提示。视图多了自动跟着排。"""
@@ -1694,9 +1737,10 @@ class Warden(object):
         while True:
             self.paint()
             prompt = "宣言> " if self.pending_sins() else "warden> "
-            on_tick = self.paint if self.view.wants_tick() else None
+            # 有动态状态行时，读输入期间只原地刷新那一行（不重画整屏）
+            status_fn = self.live_status if self.view.wants_tick() else None
             try:
-                line = read_command(prompt, on_tick=on_tick, tick=1.0)
+                line = read_command(prompt, status_fn=status_fn, tick=1.0)
             except SwitchView:
                 self.cycle_view()          # Tab：换视图、立刻重画
                 continue

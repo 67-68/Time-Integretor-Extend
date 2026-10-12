@@ -87,6 +87,21 @@ check_raises("play system_volume -5 抛 ValueError",
              lambda: a.build_play_cmds("x.mp3", system_volume=-5))
 check_raises("play 空路径抛 ValueError", lambda: a.build_play_cmds(""))
 
+print("== dry-run（演练：音量 10% + 赵小六 5 秒）==")
+_reh = a.build_rehearsal_cmds()
+check("演练两条命令", len(_reh), 2)
+check("第一条把系统音量设到 10", _reh[0], ["/usr/bin/osascript", "-e", "set volume output volume 10"])
+check("第二条 afplay 播 5 秒默认音频",
+      _reh[1], ["/usr/bin/afplay", "-v", "1.0000", "-t", "5", a.DEFAULT_ALERT_AUDIO])
+check("默认音频就是赵小六", a.DEFAULT_ALERT_AUDIO.endswith("data/audio/赵小六嘶吼.mp3"), True)
+check("可换音频/音量/秒数",
+      a.build_rehearsal_cmds("y.mp3", volume=30, seconds=2),
+      [["/usr/bin/osascript", "-e", "set volume output volume 30"],
+       ["/usr/bin/afplay", "-v", "1.0000", "-t", "2", "y.mp3"]])
+check_raises("seconds=0 抛 ValueError", lambda: a.build_rehearsal_cmds(seconds=0))
+check_raises("seconds=-1 抛 ValueError", lambda: a.build_rehearsal_cmds(seconds=-1))
+check_raises("volume=200 抛 ValueError", lambda: a.build_rehearsal_cmds(volume=200))
+
 
 # ---------------------------------------------------------------- 执行（假 subprocess）
 
@@ -137,6 +152,28 @@ check("notify + system_volume 先设音量再通知", len(fake.runs), 2)
 check("第一条设系统音量", fake.runs[0][-1], "set volume output volume 10")
 check("第二条才是通知", "display notification" in fake.runs[1][-1], True)
 
+print("== dry-run 执行 ==")
+fake.runs[:] = []
+fake.popens[:] = []
+check("dry-run 返回 0", a.dry_run(), 0)
+check("dry-run 执行两条（等待播放）", (len(fake.runs), len(fake.popens)), (2, 0))
+check("第一条设音量 10", fake.runs[0][-1], "set volume output volume 10")
+check("第二条 afplay -t 5 + 赵小六",
+      ("-t" in fake.runs[1] and fake.runs[1][-1].endswith("赵小六嘶吼.mp3")), True)
+
+fake.runs[:] = []
+fake.popens[:] = []
+check("dry-run wait=False 返回 0", a.dry_run(wait=False), 0)
+check("background：osascript 同步 + afplay Popen",
+      (len(fake.runs), len(fake.popens)), (1, 1))
+
+fake.runs[:] = []
+fake.popens[:] = []
+with contextlib.redirect_stdout(io.StringIO()):
+    _rc = a.dry_run(print_only=True)
+check("dry-run print_only 返回 0", _rc, 0)
+check("print_only 不执行任何命令", (fake.runs, fake.popens), ([], []))
+
 print("== 非 macOS 降级 ==")
 a.IS_MAC = False
 fake.runs[:] = []
@@ -175,9 +212,22 @@ code, out = run_cli(["volume", "10", "--dry-run"])
 check("CLI volume dry-run 返回 0", code, 0)
 check("CLI volume 打印 set volume", "set volume output volume 10" in out, True)
 
+print("== CLI dry-run（演练）==")
+code, out = run_cli(["dry-run", "--print-only"])
+check("CLI dry-run --print-only 返回 0", code, 0)
+check("CLI 打印设音量到 10", "set volume output volume 10" in out, True)
+check("CLI 打印 afplay -t 5", ("-t 5" in out and "赵小六嘶吼.mp3" in out), True)
+
+code, out = run_cli(["dry_run", "--print-only", "--volume", "30", "--seconds", "2"])
+check("CLI 别名 dry_run 也认", code, 0)
+check("CLI 用 --volume 30", "set volume output volume 30" in out, True)
+check("CLI 用 --seconds 2", "-t 2" in out, True)
+
 print("== CLI 参数错 ==")
 code, _ = run_cli(["volume", "200"])
 check("CLI volume 200 返回 2", code, 2)
+code, _ = run_cli(["dry-run", "--seconds", "0", "--print-only"])
+check("CLI dry-run seconds=0 返回 2", code, 2)
 
 print()
 if fails:

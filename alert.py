@@ -7,13 +7,17 @@
   系统音量拉到 10% 并播放 `data/audio/赵小六嘶吼.mp3`（见 feature_intents/idle_watchdog.md）。
 - 任何 shell / agent：想响一声、想弹个通知、想把音量拧到某个数，都能直接调。
 
-三种动作
---------
+三种动作（+ 一个自检）
+----------------------
     python3 alert.py play  <file>  [--volume 0-100] [--system-volume 0-100] [--background]
     python3 alert.py notify        [--title T] [--message M] [--sound NAME] [--system-volume 0-100]
     python3 alert.py volume <0-100>
+    python3 alert.py dry-run       [--volume 10] [--seconds 5] [--audio FILE] [--print-only]
 
 `play` 用 `afplay`，`notify` / `volume` 用 `osascript`，全是 macOS 自带、纯 stdlib。
+
+`dry-run` = **一次有界的演练**：真的把系统音量设到 10%、按赵小六嘶吼播放 5 秒
+（不是完整 24 秒），用来验证 daemon 第 3 次违规那条链路。`--print-only` 才是只打印命令。
 
 音量语义（两个都能调，别混）
 ---------------------------
@@ -26,12 +30,19 @@
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 AFPLAY = "/usr/bin/afplay"
 OSASCRIPT = "/usr/bin/osascript"
 IS_MAC = sys.platform == "darwin"
+
+# 演练 / daemon 第 3 次违规默认用的音频
+DEFAULT_ALERT_AUDIO = os.path.join(HERE, "data", "audio", "赵小六嘶吼.mp3")
+DEFAULT_ALERT_VOLUME = 10
+DEFAULT_REHEARSE_SECONDS = 5
 
 
 # ---------------------------------------------------------------- 参数 / 拼命令
@@ -84,6 +95,28 @@ def build_volume_cmd(percent):
     """把系统输出音量设成 percent% 的命令。"""
     return [OSASCRIPT, "-e",
             "set volume output volume %d" % int(round(_pct(percent, "系统音量")))]
+
+
+def build_rehearsal_cmds(audio=None, volume=DEFAULT_ALERT_VOLUME,
+                         seconds=DEFAULT_REHEARSE_SECONDS):
+    """dry-run 演练要跑的命令：先把系统音量设到 volume%，再播放 audio **seconds 秒**。
+
+    `afplay -t TIME` 只播 TIME 秒，所以这是一次「有界」的演练 —— 不会放完整 24 秒。
+    纯函数，测试直接断言它。
+    """
+    audio = audio or DEFAULT_ALERT_AUDIO
+    if not audio:
+        raise ValueError("dry-run 需要一个音频文件路径")
+    try:
+        secs = float(seconds)
+    except (TypeError, ValueError):
+        raise ValueError("seconds 必须是正数，收到 %r" % (seconds,))
+    if secs <= 0:
+        raise ValueError("seconds 必须大于 0，收到 %r" % (seconds,))
+    return [
+        build_volume_cmd(volume),
+        [AFPLAY, "-v", "1.0000", "-t", "%g" % secs, audio],
+    ]
 
 
 # ---------------------------------------------------------------- 执行
@@ -145,13 +178,26 @@ def set_system_volume(percent, dry_run=False):
     return _execute([build_volume_cmd(percent)], dry_run=dry_run)
 
 
+def dry_run(audio=None, volume=DEFAULT_ALERT_VOLUME, seconds=DEFAULT_REHEARSE_SECONDS,
+            wait=True, print_only=False):
+    """演练 daemon 第 3 次违规那一套：真的把音量设到 volume%、按赵小六嘶吼放 seconds 秒。
+
+    print_only=True 时只打印命令、不出声、不改音量（那是「假装一下」的 dry run）。
+    wait=False（CLI 的 --background）时不等待播放结束。
+    """
+    cmds = build_rehearsal_cmds(audio, volume=volume, seconds=seconds)
+    if print_only:
+        return _execute(cmds, dry_run=True)
+    return _execute(cmds, background=not wait)
+
+
 # ---------------------------------------------------------------- CLI
 
 
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="alert.py", description="放音乐 / 发通知 / 调音量（macOS）")
-    sub = ap.add_subparsers(dest="cmd", metavar="{play,notify,volume}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{play,notify,volume,dry-run}")
 
     p_play = sub.add_parser("play", help="用 afplay 播放音频（音量可调）")
     p_play.add_argument("file", help="音频文件路径")
@@ -176,6 +222,18 @@ def build_parser():
     p_vol.add_argument("percent", type=float, help="0-100")
     p_vol.add_argument("--dry-run", action="store_true")
 
+    p_re = sub.add_parser("dry-run", aliases=["dry_run"],
+                          help="演练：音量设到 10%% + 播放赵小六嘶吼 5 秒（自检用）")
+    p_re.add_argument("--audio", default=None,
+                      help="音频文件（默认 data/audio/赵小六嘶吼.mp3）")
+    p_re.add_argument("--volume", type=float, default=DEFAULT_ALERT_VOLUME,
+                      help="系统音量 0-100（默认 %d）" % DEFAULT_ALERT_VOLUME)
+    p_re.add_argument("--seconds", type=float, default=DEFAULT_REHEARSE_SECONDS,
+                      help="播放几秒（默认 %d，不是完整 24 秒）" % DEFAULT_REHEARSE_SECONDS)
+    p_re.add_argument("--print-only", action="store_true",
+                      help="只打印要跑的命令（不出声、不改音量）")
+    p_re.add_argument("--background", action="store_true", help="不等待播放结束")
+
     return ap
 
 
@@ -191,6 +249,9 @@ def main(argv=None):
                           system_volume=args.system_volume, dry_run=args.dry_run)
         if args.cmd == "volume":
             return set_system_volume(args.percent, dry_run=args.dry_run)
+        if args.cmd in ("dry-run", "dry_run"):
+            return dry_run(args.audio, volume=args.volume, seconds=args.seconds,
+                           wait=not args.background, print_only=args.print_only)
     except ValueError as e:
         print("[alert] 参数错: %s" % e, file=sys.stderr)
         return 2

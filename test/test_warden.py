@@ -675,6 +675,16 @@ check("专注视图显示进行中的 session", "当前 session" in out, True)
 check("专注视图不画契约表", "The Contract Table" not in out, True)
 check("视图指示有 Tab 切换", "Tab 切换" in out, True)
 check("专注提示只提 stop", ("stop" in out and "session HH:MM" not in out), True)
+check("专注视图有动态状态行", "空闲 42s" in wd.live_status(), True)
+check("状态行被 paint() 打在最后一行（供原地刷新）",
+      out.rstrip("\n").splitlines()[-1].strip(), wd.live_status())
+check("契约视图没有动态状态行（不用定时刷新）",
+      wd.views[0].status_line(), None)
+_esc = w.status_line_escape("空闲 12s", width=80)
+check("动态行用上移/覆盖/下移，不清屏",
+      ("\x1b[1A" in _esc and "\x1b[K" in _esc and "\x1b[1B" in _esc), True)
+check("动态行不会清整屏", "\x1b[2J" not in _esc, True)
+check("超宽动态行被截断", len(w.status_line_escape("x" * 200, width=80)) < 100, True)
 
 print("== 专注视图：stop = 消耗一次暂停（不是停 daemon）==")
 wd.bridge.calls = []
