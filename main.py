@@ -15,14 +15,17 @@
 
 前置：
 1. focusmate-mcp 已装好 (./install.sh 装到 temp/，可用 FOCUSMATE_MCP_JS 覆盖路径)
-2. 已跑过一次 focusmate_auth（需要 ~/.focusmate-mcp/browser-data/ 里有登录态），
-   否则会返回 AUTH_REQUIRED。
+2. 已跑过一次 focusmate_auth（需要 browser-data/ 里有登录态），否则返回 AUTH_REQUIRED。
+   运行目录默认 `~/.focusmate-mcp`；本机沙箱禁写那里，所以 main.py 会自动切到
+   `temp/focusmate-home`（FOCUSMATE_CONFIG_DIR），首次把旧 `~/.focusmate-mcp/browser-data`
+   复制过去。Chromium profile 必须可写，否则 dashboard 会空白、所有下单失败。
 3. token 仅用于 list/verify（只读 API），book 本身走浏览器 cookies，不走 token。
 """
 import argparse
 import datetime
 import json
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -47,6 +50,91 @@ MCP_SERVER_JS = _os.environ.get(
 SCREENSHOT_DIR = _os.environ.get("FOCUSMATE_SCREENSHOT_DIR") or _os.path.join(
     _HERE, "temp", "focusmate-screenshots")
 _os.environ["FOCUSMATE_SCREENSHOT_DIR"] = SCREENSHOT_DIR
+
+# focusmate-mcp 的运行目录（browser-data / screenshots / config.json）。
+# 本机 dsh 沙箱禁止写 ~/.focusmate-mcp/：Chromium profile 写不进去时 dashboard
+# 会渲染成空白页（SPA 不挂载），这跟 slot 本身没关系，但会被当普通失败耗尽重试。
+# 这里懒解析到一个工作区可写目录，并首次把旧登录态复制过去。
+# 优先级：FOCUSMATE_CONFIG_DIR > FOCUSMATE_MCP_HOME > temp/focusmate-home。
+DEFAULT_MCP_HOME = _os.path.join(_HERE, "temp", "focusmate-home")
+LEGACY_MCP_HOME = _os.path.expanduser("~/.focusmate-mcp")
+
+
+def mcp_home():
+    """当前 MCP 运行目录：显式环境变量优先，否则用工作区可写目录。"""
+    for key in ("FOCUSMATE_CONFIG_DIR", "FOCUSMATE_MCP_HOME"):
+        val = (_os.environ.get(key) or "").strip()
+        if val:
+            return _os.path.abspath(_os.path.expanduser(val))
+    return DEFAULT_MCP_HOME
+
+
+def _ensure_writable_dir(path):
+    try:
+        _os.makedirs(path, exist_ok=True)
+        probe = _os.path.join(path, ".write-probe-%d" % _os.getpid())
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        _os.remove(probe)
+        return True
+    except OSError as e:
+        print("[mcp] 运行目录不可写：%s（%s）" % (path, e), file=sys.stderr)
+        return False
+
+
+def _seed_mcp_home(home, legacy=None):
+    """第一次使用工作区目录时，把旧 ~/.focusmate-mcp 的登录态搬过来。"""
+    legacy = legacy or LEGACY_MCP_HOME
+    if _os.path.abspath(home) == _os.path.abspath(legacy):
+        return
+    src_browser = _os.path.join(legacy, "browser-data")
+    dst_browser = _os.path.join(home, "browser-data")
+    if _os.path.isdir(src_browser) and not _os.path.exists(dst_browser):
+        tmp = dst_browser + ".tmp-%d" % _os.getpid()
+        try:
+            shutil.copytree(src_browser, tmp)
+            _os.replace(tmp, dst_browser)
+            print("[mcp] 已把登录态从 %s 迁到可写目录 %s" % (src_browser, dst_browser))
+        except Exception as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            print("[mcp] 迁移 browser-data 失败：%s" % e, file=sys.stderr)
+    for name in ("config.json", "cookies.json"):
+        src = _os.path.join(legacy, name)
+        dst = _os.path.join(home, name)
+        if _os.path.isfile(src) and not _os.path.exists(dst):
+            try:
+                shutil.copy2(src, dst)
+            except OSError as e:
+                print("[mcp] 迁移 %s 失败：%s" % (name, e), file=sys.stderr)
+
+
+def ensure_mcp_home(home=None, legacy=None):
+    """确保 MCP 运行目录可写，返回实际使用的路径。
+
+    不可写时优先退回工作区默认目录，两个都不行才抛 RuntimeError。每次
+    mcp_call 前调用，所以运行时改环境变量也生效（不缓存）。
+    """
+    env_override = any(
+        (_os.environ.get(k) or "").strip()
+        for k in ("FOCUSMATE_CONFIG_DIR", "FOCUSMATE_MCP_HOME"))
+    if home is None:
+        home = mcp_home()
+    home = _os.path.abspath(home)
+    if not _ensure_writable_dir(home):
+        fallback = _os.path.abspath(DEFAULT_MCP_HOME)
+        if fallback != home and _ensure_writable_dir(fallback):
+            home = fallback
+        else:
+            raise RuntimeError(
+                "Focusmate MCP 运行目录不可写：%s；请把 FOCUSMATE_MCP_HOME "
+                "或 FOCUSMATE_CONFIG_DIR 指到一个可写目录" % home)
+    if legacy is not None or not env_override:
+        _seed_mcp_home(home, legacy=legacy)
+    _os.environ["FOCUSMATE_CONFIG_DIR"] = home
+    _os.environ["FOCUSMATE_SCREENSHOT_DIR"] = (
+        _os.environ.get("FOCUSMATE_SCREENSHOT_DIR") or SCREENSHOT_DIR)
+    return home
+
 
 DEFAULT_START = "16:45"
 
@@ -102,6 +190,8 @@ def verify_token(target, start_iso):
 
 def mcp_call(tool: str, arguments: dict, timeout: int = 180):
     """最小 MCP stdio client：initialize -> tools/call，全用 stdlib。"""
+    home = ensure_mcp_home()   # 确保 browser-data 可写，否则 dashboard 会空白
+    print("[mcp] home=%s tool=%s" % (home, tool))
     proc = subprocess.Popen(
         ["node", MCP_SERVER_JS],
         stdin=subprocess.PIPE,

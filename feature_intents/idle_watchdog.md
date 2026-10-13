@@ -117,8 +117,10 @@ session 时违规次数归零。音频不存在 / `alert.py` 不可用时只记�
 | `KEEP_SESSION_IDLE_CHECK=0` | 开 | 关掉整个看门狗（restart daemon 生效） |
 
 > 改**模式选择**只写 `temp/keep_session-mode.json`，daemon 每 tick 重新读，**不用
-> restart**。改 `IDLE_MODES` 常量/音频还是要 `python3 keep_session.py daemon restart`
-> —— daemon 是启动时把代码读进内存的，光改文件不生效。
+> restart**。改 `IDLE_MODES` 常量/音频也不用手动 restart：daemon 会检测源码 mtime
+> 变化并自重启（`os.execv`，pid 不变），见 `keep_session.md` 的「热重载」。但**该机制
+> 上线前就已经在跑的旧 daemon 不会自己重载**，需要手动 `python3 keep_session.py
+> daemon restart` 一次。
 
 ## 测试
 

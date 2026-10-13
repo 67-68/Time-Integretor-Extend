@@ -53,6 +53,11 @@ PROFILE_DIR=/tmp/fm-profile node test/probe_xxx.mjs   # 写落到 /tmp
 > | `FOCUSMATE_MCP_HOME`（或 `FOCUSMATE_CONFIG_DIR`） | 整个运行目录（`browser-data` / `screenshots` / `config.json`），默认 `~/.focusmate-mcp` |
 > | `FOCUSMATE_SCREENSHOT_DIR` | 只挪出错截图的目录；`ti_extend` 默认指到 `temp/focusmate-screenshots` |
 >
+> `ti_extend/main.py` 的 `ensure_mcp_home()` 会在每次 `mcp_call` 前自动做这件事：
+> 显式环境变量优先；否则用可写的 `temp/focusmate-home`，并首次把旧
+> `~/.focusmate-mcp/browser-data` / `config.json` / `cookies.json` 复制过去，最后把
+> `FOCUSMATE_CONFIG_DIR` 指向它。沙箱里不要再依赖默认 `~/.focusmate-mcp`。
+>
 > 出错截图现在**只是诊断附件**：写不进去（沙箱 EPERM）只记日志，绝不再盖掉真正的报错；
 > 首选目录不可写会自动退到 `<tmp>/focusmate-mcp/screenshots`。
 

@@ -12,8 +12,10 @@ state / 日志 / data.csv 都指到临时目录。
 import datetime
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 fails = []
@@ -48,7 +50,8 @@ ks.SINS_FILE = os.path.join(TMP, "sins.json")
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
 ks.LOG_FILE = os.path.join(TMP, "log")
 sch.DATA_CSV = CSV
-ks.notify = lambda *a, **kw: None
+NOTIFIES = []
+ks.notify = lambda title=None, msg=None, **kw: NOTIFIES.append((title, msg))
 ks.debounce = lambda: None                    # 别真 sleep 5±3s
 
 LOGS = []
@@ -74,6 +77,7 @@ def clear():
     del BOOKED[:]
     del LOGS[:]
     del API[:]
+    del NOTIFIES[:]
 
 
 # 挑一个「未来 24h 内」的 slot（在窗口里，daemon 才会管它）
@@ -153,6 +157,111 @@ write_csv(["# t", "%s,%s,50" % (WD, HHMM)])
 ks.run_once()
 check("新 slot 会订", len(BOOKED), 1)
 check("订的是 50", BOOKED[-1][1], "50")
+
+# ---------------------------------------------------------------- 环境类失败
+
+print("== 环境失败分类 ==")
+blank = ("Dashboard https://app.focusmate.com/dashboard rendered a blank page "
+         "(SPA did not mount). This usually means the browser profile directory is "
+         "not writable — set FOCUSMATE_MCP_HOME to a writable directory.")
+check("空白页算环境失败", ks.is_infra_failure(blank, "AUTOMATION_FAILED"), True)
+check("EPERM 算环境失败", ks.is_infra_failure("EPERM: operation not permitted", ""), True)
+check("SLOT_UNAVAILABLE 不算环境失败",
+      ks.is_infra_failure("slot not available", "SLOT_UNAVAILABLE"), False)
+
+print("== 环境失败不占 3 次上限，也不永久 failed ==")
+clear()
+write_csv(["# t", "%s,%s,25" % (WD, HHMM)])
+orig_book = ks.fm.book_once
+ks.fm.book_once = lambda start_iso, duration: {
+    "success": False, "error": blank, "errorCode": "AUTOMATION_FAILED"}
+for _ in range(5):
+    ks.run_once(force=True)          # force 忽略退避，方便连续观察
+r = rec()
+check("环境失败后不是 failed", r.get("status"), None)
+check("环境失败不消耗 attempts", r.get("attempts"), 0)
+check("环境失败单独计数", r.get("infra_attempts"), 5)
+check("环境失败有退避时间", bool(r.get("next_retry_at")), True)
+check("环境失败日志写了环境", any("次环境失败" in m for m in LOGS), True)
+check("环境失败发了通知", any("环境问题" in str(n[0]) for n in NOTIFIES), True)
+
+print("== 旧 state 里环境类 failed 自动放回待订 ==")
+clear()
+seed("failed", "25")
+st = ks.load_state()
+st["slots"][KEY]["last_error"] = blank
+st["slots"][KEY]["last_error_code"] = "AUTOMATION_FAILED"
+ks.save_state(st)
+ks.fm.book_once = orig_book
+ks.run_once()
+check("环境类 failed 被放回并订上", rec().get("status"), "booked")
+check("环境类 failed 真的重下单", len(BOOKED), 1)
+check("日志说放回待订", any("放回待订队列" in m for m in LOGS), True)
+
+print("== slot 级失败仍走 3 次上限 ==")
+clear()
+write_csv(["# t", "%s,%s,25" % (WD, HHMM)])
+ks.fm.book_once = lambda start_iso, duration: {
+    "success": False, "error": "The requested time slot is not available.",
+    "errorCode": "SLOT_UNAVAILABLE"}
+for _ in range(3):
+    ks.run_once(force=True)
+r = rec()
+check("slot 级失败 3 次后转 failed", r.get("status"), "failed")
+check("slot 级失败 attempts 记 3", r.get("attempts"), 3)
+check("slot 级失败不发环境通知", any("环境问题" in str(n[0]) for n in NOTIFIES), False)
+ks.fm.book_once = orig_book
+
+# ---------------------------------------------------------------- MCP 运行目录迁移
+
+print("== MCP 运行目录：不可写时切到工作区，首次迁移登录态 ==")
+tmp_home = tempfile.mkdtemp(prefix="mcp-home-test-")
+legacy = os.path.join(tmp_home, "legacy")
+home = os.path.join(tmp_home, "home")
+os.makedirs(os.path.join(legacy, "browser-data", "Default"))
+with open(os.path.join(legacy, "browser-data", "Default", "cookies"), "w") as f:
+    f.write("x")
+with open(os.path.join(legacy, "config.json"), "w") as f:
+    f.write("{}")
+saved_env = {k: os.environ.get(k) for k in
+             ("FOCUSMATE_CONFIG_DIR", "FOCUSMATE_MCP_HOME")}
+for k in saved_env:
+    os.environ.pop(k, None)
+got = ks.fm.ensure_mcp_home(home=home, legacy=legacy)
+check("返回可写目录", got, os.path.abspath(home))
+check("browser-data 迁移到可写目录",
+      os.path.exists(os.path.join(home, "browser-data", "Default", "cookies")), True)
+check("config.json 也迁移", os.path.exists(os.path.join(home, "config.json")), True)
+check("环境变量指向可写目录",
+      os.environ.get("FOCUSMATE_CONFIG_DIR"), os.path.abspath(home))
+shutil.rmtree(tmp_home, ignore_errors=True)
+for k, v in saved_env.items():
+    if v is None:
+        os.environ.pop(k, None)
+    else:
+        os.environ[k] = v
+
+# ---------------------------------------------------------------- daemon 热重载
+
+print("== daemon 热重载：源码更新才重启，语法错误不重启 ==")
+reload_tmp = tempfile.mkdtemp(prefix="reload-test-")
+tmp_src = os.path.join(reload_tmp, "fake_keep_session.py")
+with open(tmp_src, "w", encoding="utf-8") as f:
+    f.write("x = 1\n")
+saved_mtimes = dict(ks._SOURCE_MTIMES)
+saved_bad = dict(ks._BAD_SOURCE_MTIMES)
+ks._SOURCE_MTIMES = {tmp_src: 0}
+ks._BAD_SOURCE_MTIMES = {}
+check("新源码 → 需要重启", ks.stale_sources(), ["fake_keep_session.py"])
+with open(tmp_src, "w", encoding="utf-8") as f:
+    f.write("def broken(:\n")
+check("语法错误的源码 → 不重启", ks.stale_sources(), [])
+ks._SOURCE_MTIMES = saved_mtimes
+ks._BAD_SOURCE_MTIMES = saved_bad
+shutil.rmtree(reload_tmp, ignore_errors=True)
+
+
+
 
 print()
 if fails:

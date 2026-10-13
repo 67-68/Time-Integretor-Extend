@@ -39,7 +39,17 @@
 - 检查走官方只读 API（GET /v1/sessions），一次调用拿到窗口内全部 session，
   所以「列一遍看谁没订」很便宜，可以每轮都做。
 - 预定必须走 focusmate-mcp 浏览器自动化（Focusmate 官方 API 只读，无下单接口）。
+  运行目录默认 `~/.focusmate-mcp`，但沙箱/只读 home 会让 Chromium profile 写不进去、
+  dashboard 空白。main.py 会切到工作区可写目录（`FOCUSMATE_CONFIG_DIR`），首次自动
+  把旧 `~/.focusmate-mcp/browser-data` 迁过去。
 - 失败退避：最多 3 次尝试，指数退避（5min → 15min），第 3 次失败转 failed + 通知。
+  但「环境/浏览器类失败」（profile 不可写、dashboard 空白、node/网络问题）跟 slot
+  本身无关，不消耗这 3 次、也不写 failed，而是用更长的退避继续试；旧 state 里被
+  误判 failed 的环境类记录会在下一轮自动放回待订。
+- 热重载：daemon 每轮/每次 idle tick 检查 keep_session.py / main.py / schedule.py /
+  alert.py 的 mtime，变了且能编译过就 `os.execv` 自重启（pid 不变）。改模式常量、
+  改计划解析、修 bug 都不用手动 `daemon restart`；只认语法能编译的文件，避免存到
+  一半的半成品把 daemon 重启死。
 - 防抖：每次真正下单前随机 sleep DEBOUNCE_BASE ± DEBOUNCE_JITTER 秒（5±3），
   避免规律性的机器行为。
 - 手动取消：自动重订（守擂），**并且记一笔 sin**——API 里没有、而 state 以为是
@@ -90,7 +100,35 @@ DEBOUNCE_BASE = 5              # 下单前基础等待（秒）
 DEBOUNCE_JITTER = 3            # 随机抖动 ±（秒）
 MAX_ATTEMPTS = 3               # 单个 slot 当天最多尝试预定次数
 BACKOFF_MINUTES = [5, 15]      # 第 1、2 次失败后的等待（分钟）；第 3 次失败即放弃
+# 环境/浏览器类失败（profile 目录不可写、dashboard 空白、node 起不来、网络抖…）
+# 跟 slot 本身无关：不消耗 3 次上限，也不写 failed；用更长的退避继续试，环境修好
+# 后自动接上。errorCode 命中 NON_INFRA_CODES 的除外——那是 slot 级事实。
+INFRA_BACKOFF_MINUTES = [10, 20, 40, 60, 120, 240]
+INFRA_NOTIFY_EVERY = 4         # 环境问题每 N 次失败最多通知一次，避免刷屏
+NON_INFRA_CODES = ("SLOT_UNAVAILABLE", "SESSION_CONFLICT")
+INFRA_CODES = ("AUTH_REQUIRED", "AUTH_EXPIRED", "AUTH_TIMEOUT", "AUTOMATION_FAILED",
+               "CONFIG_ERROR", "NETWORK_ERROR", "BROWSER_ERROR", "INTERNAL_ERROR",
+               "EXCEPTION")
+INFRA_MESSAGE_MARKERS = (
+    "FOCUSMATE_MCP_HOME", "not writable", "EPERM", "SPA did not mount",
+    "blank page", "net::ERR_", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT",
+    "ENOTFOUND", "Executable doesn't exist", "browser has been closed",
+    "Target page, context or browser has been closed", "MCP server closed stdout",
+    "tools/call", "Timeout", "timeout",
+)
 WINDOW_HOURS = sch.WINDOW_HOURS  # 执行区长度：滚动 24 小时（改这里就改了命运）
+
+
+def is_infra_failure(reason, code=None):
+    """这次失败是环境/浏览器问题，而不是「这场 slot 订不到」？"""
+    reason = str(reason or "")
+    code = str(code or "")
+    if code in NON_INFRA_CODES:
+        return False
+    if code in INFRA_CODES:
+        return True
+    return any(marker in reason for marker in INFRA_MESSAGE_MARKERS)
+
 
 STATE_FILE = os.path.join(HERE, "temp", "keep_session-state.json")
 PID_FILE = os.path.join(HERE, "temp", "keep_session.pid")
@@ -100,6 +138,64 @@ LOCK_FILE = os.path.join(HERE, "temp", "keep_session.lock")  # 防 daemon 与手
 VERDICTS_FILE = os.path.join(HERE, "temp", "keep_session-verdicts.json")  # 认罪判决
 SINS_FILE = os.path.join(HERE, "temp", "warden-sins.json")        # 待认罪的罪
 SINS_ARCHIVE = os.path.join(HERE, "temp", "warden-sins.jsonl")    # 认过的罪（只增不删）
+
+# daemon 热重载：改了这些源码就自重启（pid 不变），不用手动 daemon restart。
+# 只认语法能编译的文件，避免你存到一半的半成品把 daemon 重启死。
+RELOAD_SOURCES = [os.path.join(HERE, name) for name in
+                  ("keep_session.py", "main.py", "schedule.py", "alert.py")]
+_SOURCE_MTIMES = {p: os.path.getmtime(p) for p in RELOAD_SOURCES if os.path.exists(p)}
+_BAD_SOURCE_MTIMES = {}
+
+
+def _source_compiles(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            compile(f.read(), path, "exec")
+        return True
+    except (OSError, SyntaxError, ValueError):
+        return False
+
+
+def stale_sources():
+    """比进程启动时新的、且已经能编译的源码文件。"""
+    stale = []
+    for path, loaded_at in _SOURCE_MTIMES.items():
+        try:
+            current = os.path.getmtime(path)
+        except OSError:
+            continue
+        if current <= loaded_at:
+            continue
+        if not _source_compiles(path):
+            if _BAD_SOURCE_MTIMES.get(path) != current:
+                _BAD_SOURCE_MTIMES[path] = current
+                log("源码 %s 有更新但语法错误，暂不重启（等你保存完）"
+                    % os.path.basename(path))
+            continue
+        stale.append(os.path.basename(path))
+    return stale
+
+
+def reexec_if_stale():
+    """源码更新 → 用新代码替换当前进程（os.execv）。返回是否已重启。"""
+    stale = stale_sources()
+    if not stale:
+        return False
+    log("检测到源码更新（%s），daemon 自重启（pid 不变）..." % " / ".join(stale))
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    try:
+        os.execv(sys.executable, [sys.executable] + list(sys.argv))
+    except OSError as e:
+        log("自重启失败（继续用旧代码跑）：%s" % e)
+        for path in RELOAD_SOURCES:
+            if os.path.exists(path):
+                _SOURCE_MTIMES[path] = os.path.getmtime(path)
+    return False
+
 
 # ---- 分心看门狗（daemon 在「session 进行中」额外跑的一个检查）----------------
 # 每个模式有一条「连续无输入多久算一次违规」的阈值，以及自己的 max_strikes；
@@ -889,6 +985,28 @@ def verify_slot_booked(start, attempts=3, wait=4):
     return False, last
 
 
+def recover_env_failed_slots(state, _now=None):
+    """把历史上因环境/浏览器问题被判 failed 的 slot 放回待订队列。
+
+    旧代码把「profile 不可写 / dashboard 空白 / node 起不来」这种跟 slot 无关的
+    失败也当成 3 次耗尽 → 永久 failed。现在环境问题已经单独分类，这里做一次
+    平迁：只要 last_error 写着环境类原因，就清掉 failed。只动 failed。
+    """
+    recovered = []
+    slots = state.get("slots") or {}
+    for key, rec in list(slots.items()):
+        if rec.get("status") != "failed":
+            continue
+        if not is_infra_failure(rec.get("last_error"), rec.get("last_error_code")):
+            continue
+        rec["status"] = None
+        rec["attempts"] = 0
+        rec["infra_attempts"] = 0
+        rec["next_retry_at"] = None
+        recovered.append(key)
+    return recovered
+
+
 # ---------------------------------------------------------------- 核心一轮
 
 
@@ -931,6 +1049,15 @@ def _run_once_locked(dry_run=False, force=False):
     state = load_state()
     verdicts = load_verdicts()
     changed = False
+
+    # 环境类失败（profile 不可写 / dashboard 空白…）不是「这 slot 永远订不到」，
+    # 修好环境后应该自动接上。旧 state 里被误判 failed 的，这里平迁回待订。
+    if not dry_run:
+        recovered = recover_env_failed_slots(state, now)
+        for key in recovered:
+            log("  %s 之前是环境失败（%s），已放回待订队列"
+                % (key, (state["slots"].get(key) or {}).get("last_error") or "?"))
+            changed = True
 
     # 认过罪的：永不重订（这是宣言真正的牙齿）。daemon 自己绝不判，只读判决。
     abandoned = [(key_of(day, slot), (day, slot, start)) for day, slot, start in due
@@ -1043,11 +1170,14 @@ def _run_once_locked(dry_run=False, force=False):
             log("  %s 在退避中（到 %s），force-check 忽略退避" % (key, nra.strftime("%H:%M:%S")))
 
         attempts = int(rec.get("attempts", 0))
+        infra_attempts = int(rec.get("infra_attempts", 0))
         if attempts >= MAX_ATTEMPTS:
             if not force:
                 log("  %s 已尝试 %d 次仍失败，转 failed + 通知" % (key, attempts))
                 state["slots"][key] = {"status": "failed", "duration": slot["duration"],
-                                       "attempts": attempts, "last_error": rec.get("last_error")}
+                                       "attempts": attempts,
+                                       "last_error": rec.get("last_error"),
+                                       "last_error_code": rec.get("last_error_code")}
                 notify("Focusmate 预定失败",
                        "%s (%smin) 尝试 %d 次仍失败，不再重试。原因：%s"
                        % (key, slot["duration"], attempts, rec.get("last_error") or "未知"))
@@ -1056,13 +1186,13 @@ def _run_once_locked(dry_run=False, force=False):
             log("  %s 已尝试 %d 次；force-check 忽略上限，继续尝试" % (key, attempts))
 
         # 真的去订
-        attempts += 1
+        try_attempts = attempts + 1
         if force:
             log("  %s 缺失，force-check 第 %d 次预定...（目标时间 %s，%smin）"
-                % (key, attempts, fmt_local_utc(start), slot["duration"]))
+                % (key, try_attempts, fmt_local_utc(start), slot["duration"]))
         else:
             log("  %s 缺失，开始第 %d/%d 次预定...（目标时间 %s，%smin）"
-                % (key, attempts, MAX_ATTEMPTS, fmt_local_utc(start), slot["duration"]))
+                % (key, try_attempts, MAX_ATTEMPTS, fmt_local_utc(start), slot["duration"]))
         debounce()
         # 直接用算好的 start（带日期），不走 fm.resolve_target 的"过了就顺延到明天"猜谜：
         # 窗口里同时有今天和明天的场次时，那种猜法会挑错日子。
@@ -1079,33 +1209,64 @@ def _run_once_locked(dry_run=False, force=False):
             if ok:
                 log("  %s 复核通过：API 确认该 session 已存在" % key)
                 state["slots"][key] = {"status": "booked", "duration": slot["duration"],
-                                       "attempts": attempts}
+                                       "attempts": try_attempts, "infra_attempts": 0}
                 changed = True
                 continue
-            # 假成功：MCP 说订上了，API 查不到 → 按失败处理，走退避
+            # 假成功：MCP 说订上了、API 查不到 → 按失败处理，走退避
             reason = detail or "book_session 报成功但 API 查不到（疑似假成功）"
             log("  %s 复核失败：%s" % (key, reason))
         else:
             reason = payload.get("error") or payload.get("errorCode") or "未知错误"
-        next_retry = None
-        if attempts < MAX_ATTEMPTS:
-            wait = BACKOFF_MINUTES[min(attempts - 1, len(BACKOFF_MINUTES) - 1)]
+        code = payload.get("errorCode") or ""
+
+        # 环境/浏览器类失败：不占 3 次上限，也不写 failed；用更长退避继续试。
+        if is_infra_failure(reason, code):
+            infra_attempts += 1
+            wait = INFRA_BACKOFF_MINUTES[min(infra_attempts - 1,
+                                             len(INFRA_BACKOFF_MINUTES) - 1)]
             next_retry = now + datetime.timedelta(minutes=wait)
-            log("  %s 第 %d 次失败: %s（%d 分钟后重试）" % (key, attempts, reason, wait))
+            if infra_attempts == 1 or infra_attempts % INFRA_NOTIFY_EVERY == 0:
+                notify("Focusmate 预定遇到环境问题",
+                       "%s (%smin) 第 %d 次环境失败：%s。%d 分钟后重试，"
+                       "不消耗 3 次上限；修好运行目录（FOCUSMATE_MCP_HOME / "
+                       "FOCUSMATE_CONFIG_DIR）后会自动接上。"
+                       % (key, slot["duration"], infra_attempts, reason, wait))
+            log("  %s 第 %d 次环境失败: %s（%d 分钟后重试；不占 3 次上限）"
+                % (key, infra_attempts, reason, wait))
+            state["slots"][key] = {
+                "status": None,
+                "duration": slot["duration"],
+                "attempts": attempts,          # 环境失败不消耗 slot 尝试次数
+                "infra_attempts": infra_attempts,
+                "next_retry_at": next_retry.isoformat(),
+                "last_error": reason,
+                "last_error_code": code or None,
+            }
+            changed = True
+            continue
+
+        # 普通 slot 级失败：按 3 次上限/退避走
+        next_retry = None
+        if try_attempts < MAX_ATTEMPTS:
+            wait = BACKOFF_MINUTES[min(try_attempts - 1, len(BACKOFF_MINUTES) - 1)]
+            next_retry = now + datetime.timedelta(minutes=wait)
+            log("  %s 第 %d 次失败: %s（%d 分钟后重试）" % (key, try_attempts, reason, wait))
         elif force:
             log("  %s force-check 第 %d 次失败: %s（已达上限，但不发通知；下次 force-check 仍可再试）"
-                % (key, attempts, reason))
+                % (key, try_attempts, reason))
         else:
-            log("  %s 第 %d 次失败: %s（已达上限，不再试）" % (key, attempts, reason))
+            log("  %s 第 %d 次失败: %s（已达上限，不再试）" % (key, try_attempts, reason))
             notify("Focusmate 预定失败",
                    "%s (%smin) 尝试 %d 次仍失败：%s。不再重试。"
-                   % (key, slot["duration"], attempts, reason))
+                   % (key, slot["duration"], try_attempts, reason))
         state["slots"][key] = {
             "status": None if next_retry else "failed",
             "duration": slot["duration"],
-            "attempts": attempts,
+            "attempts": try_attempts,
+            "infra_attempts": infra_attempts,
             "next_retry_at": next_retry.isoformat() if next_retry else None,
             "last_error": reason,
+            "last_error_code": code or None,
         }
         changed = True
 
@@ -1141,6 +1302,7 @@ def cmd_run(dry_run=False):
             % (mode_txt, IDLE_ALERT_VOLUME,
                os.path.basename(IDLE_ALERT_AUDIO)))
     while not _STOP["flag"]:
+        reexec_if_stale()
         run_once(dry_run=dry_run)
         # 可被 STOP_FILE 或信号打断的分段睡眠；顺便每 IDLE_POLL_SEC 看一眼分心情况
         slept = 0
@@ -1150,6 +1312,7 @@ def cmd_run(dry_run=False):
                 _STOP["flag"] = True
                 break
             if IDLE_CHECK and slept % IDLE_POLL_SEC == 0:
+                reexec_if_stale()
                 try:
                     idle_tick(dry_run=dry_run)
                 except Exception as e:
@@ -1398,8 +1561,10 @@ def cmd_status():
         for k in sorted(st["slots"]):
             r = st["slots"][k]
             extra = ""
+            if r.get("infra_attempts"):
+                extra = " infra=%s" % r["infra_attempts"]
             if r.get("next_retry_at"):
-                extra = " retry@%s" % r["next_retry_at"][11:19]
+                extra += " retry@%s" % r["next_retry_at"][11:19]
             if r.get("last_error"):
                 extra += " err=%s" % r["last_error"]
             tag = "[已过] " if r.get("past") else ""

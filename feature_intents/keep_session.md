@@ -115,7 +115,13 @@ ground truth，MCP 的自述永远只是线索。
 
 ## 退避与防抖
 
-- 失败最多 3 次；第 1 次失败等 5min，第 2 次等 15min，第 3 次转 `failed` + 通知。
+- slot 级失败（例如 `SLOT_UNAVAILABLE`）：最多 3 次；第 1 次失败等 5min，
+  第 2 次等 15min，第 3 次转 `failed` + 通知。
+- **环境级失败**（profile 目录不可写、dashboard 空白、node 起不来、网络抖、
+  MCP pipeline 异常）：不消耗上述 3 次、也不写 `failed`，用 `infra_attempts` 单独
+  计数并走更长的退避（10/20/40/60/120/240 分钟封顶）。环境修好后会自动接上；
+  旧 state 里被误判成 `failed` 的环境类记录，会在下一轮 `recover_env_failed_slots`
+  自动放回待订队列。判定逻辑见 `is_infra_failure()`（先看 errorCode，再看文案）。
 - 每次真正下单前随机 sleep 5±3 秒，避免规律性机器行为触发风控。
 - 检查（列 session）每轮都做，便宜；下单（起浏览器）贵且敏感，才需要退避限流。
 
@@ -126,13 +132,16 @@ ground truth，MCP 的自述永远只是线索。
 {"date":"2026-10-09",
  "api_snapshot":{"at":"...","horizon":"...","sessions":["..."]},
  "slots":{"2026-10-09T09:00":{"status":"booked|failed|null|missed|abandoned",
-                              "attempts":1,"next_retry_at":"...","last_error":"...",
+                              "attempts":1,"infra_attempts":0,
+                              "next_retry_at":"...","last_error":"...",
+                              "last_error_code":"...",
                               "duration":"50","past":true}}}
 ```
 - **key 带日期**（`YYYY-MM-DDTHH:MM`）：窗口同时管今天和明天，纯 `"HH:MM"` 会串味。
 - 跨天不再「整体重置」，改成**剪枝**：只丢掉今天以前的记录。
   注意别用字符串比较（旧 key `"20:00"` 在字典序上大于 `"2026-10-08"`，会被留下来）。
 - `status=null` 待订/退避中；`booked`/`failed` 为终态（failed 不再动）。
+- `attempts` 只数 slot 级失败；`infra_attempts` 数环境级失败，不参与 3 次上限。
 - `status=missed` 只用于**已经过去**的 slot：确认今天没有这场 session，已无法补订，
   但仍显式记录，避免 status 静默不显示让人误判。
 - `status=abandoned` = warden 认罪放弃，daemon 跳过（见上「罪与判决」）。
@@ -165,7 +174,20 @@ download_calendar.py populate   ──▶ data.csv ──▶ keep_session daemon
 
 - `populate` **只生成计划、不下单**，且只能手动触发；daemon 永远不会自己去拉日历。
 - 改了日历就重跑一次 `populate`，daemon 下一轮自然读到新 csv。
-- **改了 csv 格式/解析要重启 daemon**（旧进程内存里还是旧代码）。
+- 改了 csv 格式/解析不用手动重启：daemon 会检测 `schedule.py` 等源码更新并自重启
+  （见下「热重载」）。但本机制上线前就已经在跑的旧 daemon 仍需手动重启一次。
+
+## 热重载
+
+daemon 每轮开始、以及每 `IDLE_POLL_SEC` 的 idle tick 前，会比较
+`keep_session.py` / `main.py` / `schedule.py` / `alert.py` 的 mtime 与进程启动时记录的值：
+
+- 有更新的文件、且能 `compile()` 通过 → 打印日志并 `os.execv(sys.executable, sys.argv)`
+  自重启；pid 不变，PID 文件继续有效，已有 state / lock / 子进程语义不变。
+- 文件有更新但语法错误（你还没保存完）→ 跳过并记一次日志，不会把 daemon 重启死。
+- 重载点只在两轮之间 / idle tick 之前，不会在正在下单时 exec。
+
+这样改模式常量、改计划解析、修 bug 都不需要手动 `daemon restart`。
 
 ## 环境约束
 
@@ -173,7 +195,20 @@ daemon 脱离终端后 PATH 极简，node 用 `/opt/homebrew/bin`，python 用�
 `/usr/bin/python3`，`FOCUSMATE_MCP_JS` 显式注入。预留 `temp/keep_session.stop`
 文件可作为优雅停止开关。
 
-## 已知问题：可能残留「旧版 daemon」（2026-10-08 发现）
+focusmate-mcp 的运行目录（browser-data / screenshots / config.json）由 `main.py`
+在每次 `mcp_call` 前通过 `ensure_mcp_home()` 决定：
+
+- 显式设置 `FOCUSMATE_CONFIG_DIR` 或 `FOCUSMATE_MCP_HOME` 时以你为准；
+- 否则用工作区可写的 `temp/focusmate-home`，并把它写回
+  `FOCUSMATE_CONFIG_DIR`（不写 `FOCUSMATE_MCP_HOME`，避免和 install.py 的安装目录
+  语义打架）；首次使用会把旧 `~/.focusmate-mcp/browser-data` 及 `config.json` /
+  `cookies.json` 复制过去；
+- 两个目录都不可写才抛错，错误里直接给可操作建议。
+
+本机 dsh 沙箱禁写 `~/.focusmate-mcp`，不切目录就会出现 dashboard 空白
+（SPA 不挂载）→ 所有下单失败。
+
+## 已知问题：可能残留「旧版 daemon」（2026-10-08 发现，已由热重载缓解）
 
 **现象**：日志里两种轮次交替出现，各约 5 分钟一轮、彼此错开约 2 分钟：
 
@@ -192,6 +227,9 @@ daemon 脱离终端后 PATH 极简，node 用 `/opt/homebrew/bin`，python 用�
 
 **为什么没出大事**：旧进程找不到任何 slot 就直接返回，**不会下单**，所以它只是刷噪声，
 真正的补订由新进程照常完成。（但 `daemon stop` 只会按 PID 文件杀掉其中一个。）
+
+热重载上线后，新启动的 daemon 不会再因为源码过期而行为漂移；但**该机制上线前
+就已经在跑的旧 daemon 不会自己重载**，需要手动 `daemon restart` 一次。
 
 **自查**：
 
