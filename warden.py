@@ -15,9 +15,9 @@
 视图（Tab 切换）
 ----------------
 按 **Tab** 在多个视图间切换，视图显示在命令提示上面。现有「契约」（默认，就是
-上面那套）和「专注」（目标 + 当前 session + 可暂停次数 + 一行实时状态；只认
-`stop` = 消耗一次暂停）两个。视图可扩展：继承 `View` + `@register_view` 即可，
-`paint()` / 切换 / 命令提示都由 `VIEWS` 列表驱动。
+上面那套）和「专注」（目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态；
+`stop` = 消耗一次暂停，**Shift+Tab** = 循环普通 / 做题 / 写作模式）两个。视图可扩展：
+继承 `View` + `@register_view` 即可，`paint()` / 切换 / 命令提示都由 `VIEWS` 列表驱动。
 
 动态数字（暂停倒计时 / 空闲秒数）走 `View.status_line()`：paint() 把它打在最后一行，
 读输入时只原地覆盖那一行（`\x1b[1A` / `\x1b[K` / `\x1b[1B`），**不清屏、不重画整屏**，
@@ -489,10 +489,11 @@ class ContractView(View):
 
 @register_view
 class FocusView(View):
-    """专注视图：当前目标 + 可暂停次数 + 暂停倒计时 + 当前空闲时间。
+    """专注视图：当前目标 + 当前 session + 专注模式 + 可暂停次数 + 当前空闲时间。
 
-    这个视图里只有一条命令：`stop` = 消耗一次暂停（暂停 PAUSE_MINUTES 分钟）。
-    之前那套预约命令在这里**一条都不认** —— 你要改预约就按 Tab 切回去。
+    这个视图里：`stop` = 消耗一次暂停（暂停 PAUSE_MINUTES 分钟），Shift+Tab =
+    循环切换普通 / 做题 / 写作模式。之前那套预约命令在这里**一条都不认** ——
+    你要改预约就按 Tab 切回去。
     """
     key = "2"
     name = "专注"
@@ -500,8 +501,35 @@ class FocusView(View):
 
     @property
     def hint(self):
-        return ("命令：[bold]stop[/] —— 消耗一次暂停次数（暂停 %d 分钟）。"
+        return ("命令：[bold]stop[/] —— 消耗一次暂停次数（暂停 %d 分钟）；"
+                "[bold]Shift+Tab[/] —— 循环切换普通 / 做题 / 写作模式。"
                 "    [dim]（Tab 切回契约视图）[/]" % ks.PAUSE_MINUTES)
+
+    def current_session_key(self):
+        """当前进行中的 session key；没有就 None（模式会设为下一场默认）。"""
+        sess = ks.current_session(self.w.entries, datetime.datetime.now())
+        return ks.key_of(sess[0], sess[1]) if sess else None
+
+    def mode_key(self):
+        return ks.get_idle_mode(self.current_session_key())
+
+    def mode_text(self):
+        cfg = ks.idle_mode_config(self.mode_key())
+        return "%s（%s）" % (cfg["name"], cfg["desc"])
+
+    def cycle_mode(self):
+        """Shift+Tab：在模式集合里循环。绑定到当前 session（没有就设为下一场默认）。"""
+        key = self.current_session_key()
+        cur = ks.get_idle_mode(key)
+        order = ks.IDLE_MODE_ORDER
+        idx = order.index(cur) if cur in order else 0
+        nxt = order[(idx + 1) % len(order)]
+        cfg = ks.set_idle_mode(nxt, key)
+        cur_name = ks.idle_mode_config(cur)["name"]
+        where = "已绑定本场 session" if key else "已设为下一场 session 的默认"
+        self.w.say("专注模式：%s → %s（%s；%s）"
+                   % (cur_name, cfg["name"], cfg["desc"], where), "ok")
+        return nxt
 
     def status_line(self):
         """一行实时状态（提示符上面那行）。读输入时每秒原地覆盖，不重画整屏。"""
@@ -513,8 +541,9 @@ class FocusView(View):
             pause = "未暂停（剩 %d 次）" % ps["remaining"]
         idle = ks.load_idle_state().get("last_idle_seconds")
         idle_txt = "空闲 ?" if idle is None else "空闲 %ds" % int(idle)
-        return "%s   ·   %s   ·   可暂停 %d/%d" % (
-            pause, idle_txt, ps["remaining"], ks.PAUSE_MAX_PER_DAY)
+        mode_txt = "模式 %s" % ks.idle_mode_config(self.mode_key())["name"]
+        return "%s   ·   %s   ·   %s   ·   可暂停 %d/%d" % (
+            mode_txt, pause, idle_txt, ps["remaining"], ks.PAUSE_MAX_PER_DAY)
 
     def render(self):
         w = self.w
@@ -536,6 +565,18 @@ class FocusView(View):
         else:
             t.add_row("当前 session", Text("（没有进行中的 session —— 看门狗也不上班）", style="dim"))
 
+        cfg = ks.idle_mode_config(self.mode_key())
+        mode = Text()
+        mode.append("%s" % cfg["name"], style="bold magenta")
+        mode.append("（Shift+Tab 切换）", style="dim")
+        t.add_row("专注模式", mode)
+        t.add_row("", Text("阈值：%s 无输入 = 违规；%s"
+                           % (ks.fmt_idle_seconds(cfg["threshold_sec"]),
+                              "违规前 %s 预警，预警不计次数"
+                              % ks.fmt_idle_seconds(cfg.get("warn_before_sec", 0))
+                              if cfg.get("warn") else "无预警，直接记违规"),
+                           style="dim"))
+
         quota = Text()
         quota.append("%d / %d" % (ps["remaining"], ks.PAUSE_MAX_PER_DAY), style="bold")
         quota.append("   每次 %d 分钟" % ks.PAUSE_MINUTES, style="dim")
@@ -543,7 +584,7 @@ class FocusView(View):
 
         # 暂停剩余 / 当前空闲是**每秒在变**的，放到下方那一行实时覆盖（见 status_line），
         # 免得为了几个跳动的数字每秒把整屏 clear + 重画（那样会抖）。
-        t.add_row("实时", Text("暂停倒计时 / 空闲秒数在下方状态行原地刷新", style="dim"))
+        t.add_row("实时", Text("模式 / 暂停倒计时 / 空闲秒数在下方状态行原地刷新", style="dim"))
 
         return Panel(t, title="[bold]Focus · 专注[/]", border_style="yellow", box=box.ROUNDED)
 
@@ -552,8 +593,8 @@ class FocusView(View):
             self.w.cmd_pause()
             return True
         # 这个视图里，预约那套命令一律没用
-        self.w.say("「专注」视图只认 stop（消耗一次暂停）；按 Tab 切回契约视图再干别的。",
-                   "warn")
+        self.w.say("「专注」视图只认 stop（消耗一次暂停）；Shift+Tab 切模式；"
+                   "按 Tab 切回契约视图再干别的。", "warn")
         return True
 
 
@@ -562,6 +603,10 @@ class FocusView(View):
 
 class SwitchView(Exception):
     """用户按了 Tab（或管道里来了一行 Tab）：切换到下一个视图。"""
+
+
+class SwitchFocusMode(Exception):
+    """用户按了 Shift+Tab：在专注视图里循环切换专注模式。"""
 
 
 def _term_width(default=120):
@@ -585,16 +630,21 @@ def status_line_escape(text, width=None):
 def read_command(prompt, status_fn=None, tick=1.0):
     """读一行命令。
 
-    - **TTY**：cbreak 逐键读。按 Tab 立刻抛 SwitchView；每 tick 秒调一次 status_fn()
-      拿一行状态文本，**只原地覆盖提示符上面那一行**（`\\x1b[1A` / `\\x1b[K` / `\\x1b[1B`），
-      不清屏、不重画整屏 —— 所以倒计时/空闲秒数在走的时候屏幕不抖。
-      前提：`paint()` 已经把那一行打在了最后（紧贴提示符上面）。
-    - **非 TTY**（管道 / 测试 / --exec）：退回 input()；行首的 Tab 也算切视图。
+    - **TTY**：cbreak 逐键读。按 Tab 立刻抛 SwitchView；按 Shift+Tab（`\\x1b[Z`）
+      抛 SwitchFocusMode；每 tick 秒调一次 status_fn() 拿一行状态文本，**只原地覆盖
+      提示符上面那一行**（`\\x1b[1A` / `\\x1b[K` / `\\x1b[1B`），不清屏、不重画整屏
+      —— 所以倒计时/空闲秒数在走的时候屏幕不抖。前提：`paint()` 已经把那一行打在了
+      最后（紧贴提示符上面）。
+    - **非 TTY**（管道 / 测试 / --exec）：退回 input()；行首的 Tab 也算切视图，
+      一行 `\\x1b[Z` / `shift-tab` 算切专注模式。
     """
     if not sys.stdin.isatty():
         line = input(prompt)
         if "\t" in line and line.replace("\t", "").strip() == "":
             raise SwitchView()
+        if line.strip() == "\x1b[Z" or line.strip().lower() in (
+                "shift-tab", "shift+tab", "s-tab"):
+            raise SwitchFocusMode()
         return line
     try:
         import termios
@@ -610,7 +660,7 @@ def _read_line_tty(prompt, status_fn=None, tick=1.0, termios=None, tty=None):
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     buf = []
-    esc = False
+    esc = None
     dec = codecs.getincrementaldecoder("utf-8")("replace")
 
     def redraw_prompt():
@@ -660,13 +710,23 @@ def _read_line_tty(prompt, status_fn=None, tick=1.0, termios=None, tty=None):
                     raise KeyboardInterrupt()
                 if ch == "\x04":
                     raise EOFError()
-                if ch == "\x1b":          # 转义序列（方向键等）：吃掉，不塞进输入
-                    esc = True
+                if ch == "\x1b":          # 转义序列开始（方向键 / Shift+Tab）
+                    esc = ""
                     continue
-                if esc:
-                    if ch in "[O" or ch < "@":
+                if esc is not None:
+                    if esc == "":
+                        # CSI (ESC [) 或 SS3 (ESC O) 引导；其它 ESC+x 直接吞掉
+                        esc = ch if ch in "[O" else None
                         continue
-                    esc = False
+                    if ch.isdigit() or ch == ";":
+                        esc += ch       # CSI 参数（方向键修饰键等）
+                        continue
+                    seq = esc + ch      # 收尾字符，完整序列 = ESC + seq
+                    esc = None
+                    if seq == "[Z" or (seq.startswith("[") and seq.endswith("Z")):
+                        sys.stdout.write("\r\x1b[K")   # xterm 系 Shift+Tab
+                        sys.stdout.flush()
+                        raise SwitchFocusMode()
                     continue
                 if ch.isprintable():
                     buf.append(ch)
@@ -782,6 +842,13 @@ class Warden(object):
         self.view = self.views[self.view_index]
         self.say("切到「%s」视图" % self.view.name, "cmd")
         return self.view
+
+    def cycle_focus_mode(self):
+        """Shift+Tab：只在专注视图生效，循环模式。返回新模式 key 或 None。"""
+        if not isinstance(self.view, FocusView):
+            self.say("Shift+Tab 切专注模式只在「专注」视图里有效；先按 Tab 切过去。", "warn")
+            return None
+        return self.view.cycle_mode()
 
     def current_goal(self):
         """当前 session 的目标。
@@ -1597,6 +1664,7 @@ class Warden(object):
         t.add_column()
         for cmd, desc in [
             ("Tab", "切换视图：契约视图 ↔ 专注视图（未来还会有别的视图）"),
+            ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),
             ("day -1|0|1|YYYY-MM-DD", "切换看哪一天（草稿区随便看）"),
             ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
             ("session HH:MM-HH:MM", "同上，但用起点–终点（如 11:15-12:05 → 50min）"),
@@ -1618,7 +1686,8 @@ class Warden(object):
             "[dim]ID 就是表格第一列，按时间排序、每次 refresh 重编号 —— 看着表敲，别凭记忆。\n"
             "区域标记（状态列第一格）：草=草稿区（随便改）· 锁=执行区（取消要敲宣言）"
             "· 过=已过去。\n"
-            "专注视图：只认 stop（消耗暂停），预约那套命令在那边一律没用。[/]"
+            "专注视图：只认 stop（消耗暂停）和 Shift+Tab（切模式），"
+            "预约那套命令在那边一律没用。[/]"
         )
         return False
 
@@ -1639,6 +1708,12 @@ class Warden(object):
         # Tab（管道/--exec 里就是一行 "\t"）= 切换视图，任何视图、连锁死时都认
         if "\t" in line and line.replace("\t", "").strip() == "":
             self.cycle_view()
+            return True
+        # Shift+Tab 在管道/--exec 里可写成一行 \x1b[Z 或 shift-tab（真 TTY 走
+        # read_command 的 SwitchFocusMode 分支）。
+        if line.strip() == "\x1b[Z" or line.strip().lower() in (
+                "shift-tab", "shift+tab", "s-tab"):
+            self.cycle_focus_mode()
             return True
         try:
             parts = shlex.split(line)
@@ -1743,6 +1818,9 @@ class Warden(object):
                 line = read_command(prompt, status_fn=status_fn, tick=1.0)
             except SwitchView:
                 self.cycle_view()          # Tab：换视图、立刻重画
+                continue
+            except SwitchFocusMode:
+                self.cycle_focus_mode()    # Shift+Tab：专注视图里换模式、重画
                 continue
             except (EOFError, KeyboardInterrupt):
                 self.console.print("\n[dim]收工。[/]")

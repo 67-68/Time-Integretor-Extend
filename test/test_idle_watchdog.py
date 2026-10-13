@@ -43,6 +43,7 @@ TMP = tempfile.mkdtemp(prefix="idle-watchdog-test-")
 CSV = os.path.join(TMP, "data.csv")
 sch.DATA_CSV = CSV
 ks.IDLE_STATE_FILE = os.path.join(TMP, "idle-state.json")
+ks.IDLE_MODE_FILE = os.path.join(TMP, "mode.json")
 ks.PAUSE_FILE = os.path.join(TMP, "pause.json")
 ks.LOG_FILE = os.path.join(TMP, "log")
 ks.IDLE_CHECK = True
@@ -66,7 +67,7 @@ def write_csv(lines):
 
 
 def reset():
-    for p in (ks.IDLE_STATE_FILE, ks.PAUSE_FILE):
+    for p in (ks.IDLE_STATE_FILE, ks.IDLE_MODE_FILE, ks.PAUSE_FILE):
         if os.path.exists(p):
             os.remove(p)
     del NOTIFIES[:]
@@ -164,6 +165,69 @@ check("下一次 idle=330：还是不记（没跨新的整分钟）",
       ks.idle_tick(now=NOW, idle_seconds=330), 0)
 check("跨到 361s：记第 1 次", ks.idle_tick(now=NOW, idle_seconds=361), 1)
 check("只发 1 条通知", len(NOTIFIES), 1)
+
+print("== 模式数据集：普通直记 / 做题写作先预警 ==")
+check("普通模式阈值 60s、无预警、3 次惩罚",
+      (ks.IDLE_MODES["normal"]["threshold_sec"],
+       ks.IDLE_MODES["normal"]["warn"],
+       ks.IDLE_MODES["normal"]["max_strikes"]), (60, False, 3))
+check("做题模式阈值 180s、预警 30s、1 次惩罚",
+      (ks.IDLE_MODES["study"]["threshold_sec"],
+       ks.IDLE_MODES["study"]["warn"],
+       ks.IDLE_MODES["study"]["warn_before_sec"],
+       ks.IDLE_MODES["study"]["max_strikes"]), (180, True, 30, 1))
+check("写作模式阈值 600s、预警 30s、1 次惩罚",
+      (ks.IDLE_MODES["writing"]["threshold_sec"],
+       ks.IDLE_MODES["writing"]["warn"],
+       ks.IDLE_MODES["writing"]["warn_before_sec"],
+       ks.IDLE_MODES["writing"]["max_strikes"]), (600, True, 30, 1))
+check("模式顺序覆盖三种", ks.IDLE_MODE_ORDER, ["normal", "study", "writing"])
+check("预警目标按违规周期刷新（做题 150s 预警、330s 第二个预警）",
+      (ks.idle_targets(ks.IDLE_MODES["study"], 150),
+       ks.idle_targets(ks.IDLE_MODES["study"], 330)), ((0, 1), (1, 2)))
+
+print("== 做题模式：违规前 30s 预警，第 1 次违规直接惩罚 ==")
+reset()
+write_csv(["# t", "%s,09:50,50" % WD])
+check("先建立基线", ks.idle_tick(now=NOW, idle_seconds=10, mode="study"), 0)
+check("150s 只预警，不记违规", ks.idle_tick(now=NOW, idle_seconds=150, mode="study"), 0)
+check("发的是预警", "预警" in NOTIFIES[-1][0], True)
+check("预警文案不报当前违规次数", "当前违规次数" not in NOTIFIES[-1][1], True)
+st = ks.load_idle_state()
+check("状态里预警=1 但违规=0", (st["episode_warns"], st["strikes"]), (1, 0))
+check("180s 记第 1 次违规", ks.idle_tick(now=NOW, idle_seconds=180, mode="study"), 1)
+check("第 1 次就直接惩罚", len(PLAYS), 1)
+check("违规通知是 1/1", "1/1" in NOTIFIES[-1][1], True)
+check("180s 只有 1 条预警 + 1 条违规", len(NOTIFIES), 2)
+check("300s 封顶，不再提醒/惩罚", ks.idle_tick(now=NOW, idle_seconds=300, mode="study"), 1)
+check("只惩罚一次", len(PLAYS), 1)
+check("预警不重复刷屏", len([x for x in NOTIFIES if "预警" in x[0]]), 1)
+
+print("== 写作模式：10 分钟阈值，9:30 预警，第 1 次违规直接惩罚 ==")
+reset()
+write_csv(["# t", "%s,10:00,50" % WD])
+check("先建立基线", ks.idle_tick(now=NOW, idle_seconds=10, mode="writing"), 0)
+check("570s 只预警", ks.idle_tick(now=NOW, idle_seconds=570, mode="writing"), 0)
+check("预警提前 30s", "30 秒" in NOTIFIES[-1][1], True)
+check("600s 记第 1 次违规", ks.idle_tick(now=NOW, idle_seconds=600, mode="writing"), 1)
+check("写作模式第 1 次就直接惩罚", len(PLAYS), 1)
+check("写作违规通知是 1/1", "1/1" in NOTIFIES[-1][1], True)
+check("900s 封顶，不再提醒/惩罚", ks.idle_tick(now=NOW, idle_seconds=900, mode="writing"), 1)
+check("写作只惩罚一次", len(PLAYS), 1)
+
+print("== 模式文件：未绑定=下一场默认，开始后绑到本场；绑定=只对本场 ==")
+reset()
+cfg = ks.set_idle_mode("writing")
+check("设置返回配置", cfg["key"], "writing")
+check("未绑定 session 的模式对下一场生效", ks.get_idle_mode("2026-01-01T09:00"), "writing")
+write_csv(["# t", "%s,09:50,50" % WD])
+check("新 session 第一次 tick 不误伤", ks.idle_tick(now=NOW, idle_seconds=10), 0)
+check("未绑定的下一场默认已绑到本场",
+      ks.load_mode_state()["session_key"], "%sT09:50" % TODAY)
+ks.set_idle_mode("study", "2026-01-01T09:00")
+check("绑定到本场", ks.get_idle_mode("2026-01-01T09:00"), "study")
+check("绑定后别的场回普通", ks.get_idle_mode("2026-01-02T09:00"), "normal")
+reset()
 
 print("== 暂停：期间不打扰，解除后接着数 ==")
 reset()

@@ -54,6 +54,7 @@ ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
 ks.IDLE_STATE_FILE = os.path.join(TMP, "idle-state.json")
+ks.IDLE_MODE_FILE = os.path.join(TMP, "mode.json")
 ks.PAUSE_FILE = os.path.join(TMP, "pause.json")
 ks.notify = lambda *a, **kw: None        # 别真弹 macOS 通知
 
@@ -74,6 +75,11 @@ def clear_state():
     for p in (ks.VERDICTS_FILE, ks.SINS_FILE, ks.SINS_ARCHIVE, ks.STATE_FILE):
         if os.path.exists(p):
             os.remove(p)
+
+
+def clear_mode():
+    if os.path.exists(ks.IDLE_MODE_FILE):
+        os.remove(ks.IDLE_MODE_FILE)
 
 
 write_csv(ROWS)
@@ -654,6 +660,28 @@ check("cycle_view 切到专注", wd.view.name, "专注")
 wd.cycle_view(-1)
 check("cycle_view(-1) 切回契约", wd.view.name, "契约")
 
+print("== 专注视图：Shift+Tab 循环专注模式 ==")
+clear_mode()
+mode_inprog = (NOW - datetime.timedelta(minutes=5)).strftime("%H:%M")
+write_csv(["# mode test", "%s,%s,50" % (TODAY_WD, mode_inprog)])
+wd = mkwarden()
+wd.reload_entries()
+check("契约视图里 Shift+Tab 不做事", wd.cycle_focus_mode(), None)
+wd.cycle_view()        # 专注
+mode_key = wd.view.current_session_key()
+check("默认模式是普通", ks.get_idle_mode(mode_key), "normal")
+check("Shift+Tab：普通 → 做题", wd.cycle_focus_mode(), "study")
+check("模式已绑定到当前 session", ks.load_mode_state()["session_key"], mode_key)
+check("状态行显示当前模式", "模式 做题" in wd.live_status(), True)
+buf = io.StringIO()
+wd.console = Console(file=buf, width=120, force_terminal=False)
+wd.paint()
+check("专注面板显示模式与阈值", "专注模式" in buf.getvalue() and "3 分钟" in buf.getvalue(), True)
+check("Shift+Tab：做题 → 写作", wd.cycle_focus_mode(), "writing")
+check("Shift+Tab：写作 → 普通", wd.cycle_focus_mode(), "normal")
+check("循环回普通", ks.get_idle_mode(mode_key), "normal")
+clear_mode()
+
 print("== 专注视图：目标 / 可暂停次数 / 空闲 / 倒计时 ==")
 if os.path.exists(ks.PAUSE_FILE):
     os.remove(ks.PAUSE_FILE)
@@ -721,6 +749,18 @@ try:
         check("Tab 行抛 SwitchView", False, True)
     except w.SwitchView:
         check("Tab 行抛 SwitchView", True, True)
+    answer(["\x1b[Z"])
+    try:
+        w.read_command("warden> ")
+        check("Shift+Tab 行抛 SwitchFocusMode", False, True)
+    except w.SwitchFocusMode:
+        check("Shift+Tab 行抛 SwitchFocusMode", True, True)
+    answer(["\t"])
+    try:
+        w.read_command("warden> ")
+        check("Tab 行照旧抛 SwitchView", False, True)
+    except w.SwitchView:
+        check("Tab 行照旧抛 SwitchView", True, True)
     answer(["quit"])
     check("普通行照常返回", w.read_command("warden> "), "quit")
 finally:

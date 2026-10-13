@@ -103,19 +103,25 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
 | 1 | 契约（默认） | The Contract Table + 契约摘要 | 原来那一整套（`session` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
-| 2 | 专注 | 目标 + 当前 session + 可暂停次数 + 一行实时状态 | **只有 `stop`**（消耗一次暂停）；预约那套命令在这个视图里**一律没用** |
+| 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 
 - 通用命令（两个视图都认）：`Tab`（切视图）/ `status` / `help` / `quit`。
 - **专注视图的 `stop` ≠ 契约视图的 `stop`**：前者是「消耗一次暂停」，
   后者是「停 daemon（要敲宣言）」。同一个词在两个视图里语义不同，由视图分发。
+- **Shift+Tab 切专注模式**：普通=1 分钟无输入直接记违规、3 次惩罚；做题=3 分钟、
+  写作=10 分钟，做题/写作在违规前 30s 先预警，且第 1 次违规就直接惩罚。
+  选择写进 `temp/keep_session-mode.json`：有进行中的 session 就绑定本场，没有就设为
+  下一场默认；daemon 在新 session 第一次 tick 时把「下一场默认」绑到本场，之后下一场
+  自然回到普通。daemon 每 tick 重读，改完不用 restart。
 - **动态数字不重画整屏**。`View.status_line()` 给出一行纯文本（专注视图 =
-  「暂停 04:32 · 空闲 12s · 可暂停 2/3」），`paint()` 把它打在**最后一行**（紧贴提示符
-  上面）；读输入时 `_read_line_tty()` 每秒只做
+  「模式 做题 · 暂停 04:32 · 空闲 12s · 可暂停 2/3」），`paint()` 把它打在**最后一行**
+  （紧贴提示符上面）；读输入时 `_read_line_tty()` 每秒只做
   `\x1b[1A` 上移 → `\r` + 新内容 + `\x1b[K`（清到行尾）→ `\x1b[1B` 下移，再重画提示符行。
   所以倒计时/空闲秒数在走的时候屏幕**不抖**，也不会每秒 clear 一次、更不会每秒 ping
   bridge。契约视图 `status_line()` 返回 None → 完全不 tick。
-- TTY 下用 cbreak 逐键读（`read_command`），**Tab 是即时切换**、不用回车；管道 / `--exec`
-  下按行处理，一行 Tab 也算。
+- TTY 下用 cbreak 逐键读（`read_command`），**Tab 是即时切换**、不用回车；
+  **Shift+Tab（`\x1b[Z`）** 是即时切模式；管道 / `--exec` 下按行处理，一行 Tab /
+  `shift-tab` 也算。
 - 空闲秒数来自 daemon 写进 `temp/keep_session-idle.json` 的 `last_idle_seconds`
   （daemon 每 5s 读一次 `ioreg HIDIdleTime`）。daemon 没在跑就显示「空闲 ?」。
 - 目标暂时是占位（读 `temp/keep_session-goal.txt`，没有就显示占位文案），

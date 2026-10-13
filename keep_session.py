@@ -9,9 +9,10 @@
     │    内的 session → 补齐缺失的（防抖 + 指数退避）→ 写 state+日志 │
     │                                                               │
     │  两轮之间的睡眠里每 IDLE_POLL_SEC=5s 跑一次「分心看门狗」：     │
-    │    session 进行中每 IDLE_THRESHOLD_SEC=60s 没键盘/触控板输入    │
-    │    → 记一次违规 + 通知（含当前次数）；累计第 3 次把音量拉到     │
-    │      10% 并播放 data/audio/赵小六嘶吼.mp3。暂停期间不念。       │
+    │    session 进行中按当前模式（普通 60s / 做题 180s / 写作 600s）  │
+    │    没输入 → 记一次违规 + 通知；做题/写作在违规前 30s 先预警。   │
+    │    普通第 3 次、做题/写作第 1 次：音量拉到 10% 播放告警音频。    │
+    │    暂停期间不念；模式由 warden 专注视图的 Shift+Tab 切换。       │
     └───────────────────────────────────────────────────────────────┘
         ▲ 读 state / verdicts / sins / idle / pause / 日志（warden TUI 只读文件）
         │
@@ -101,17 +102,60 @@ SINS_FILE = os.path.join(HERE, "temp", "warden-sins.json")        # 待认罪的
 SINS_ARCHIVE = os.path.join(HERE, "temp", "warden-sins.jsonl")    # 认过的罪（只增不删）
 
 # ---- 分心看门狗（daemon 在「session 进行中」额外跑的一个检查）----------------
-# 连续 IDLE_THRESHOLD_SEC 没有键盘/触控板输入 = 一次违规，通知用户当前次数；
-# 到第 IDLE_MAX_STRIKES 次时把系统音量拉到 IDLE_ALERT_VOLUME% 并播放告警音频。
-# 用 KEEP_SESSION_IDLE_CHECK=0 关掉（比如不想被念）。
+# 每个模式有一条「连续无输入多久算一次违规」的阈值，以及自己的 max_strikes；
+# 到 max_strikes 次时把系统音量拉到 IDLE_ALERT_VOLUME% 并播放告警音频。做题/写作
+# 模式在违规之前还有一次不计入违规次数的预警。用 KEEP_SESSION_IDLE_CHECK=0 关掉。
 IDLE_CHECK = os.environ.get("KEEP_SESSION_IDLE_CHECK", "1").strip().lower() not in (
     "0", "false", "no", "off", "")
-IDLE_THRESHOLD_SEC = 60          # 连续无输入多久算一次违规（秒）
 IDLE_POLL_SEC = 5                # daemon 隔多久看一眼空闲时间（秒）
-IDLE_MAX_STRIKES = 3             # 第几次违规时「不好的事情」发生
+IDLE_MAX_STRIKES = 3             # 兜底值；真正惩罚次数用模式里的 max_strikes
 IDLE_ALERT_AUDIO = os.path.join(HERE, "data", "audio", "赵小六嘶吼.mp3")
 IDLE_ALERT_VOLUME = 10           # 「把音量拉到 10%」
+
+# 专注模式的数据集。字段说明：
+#   threshold_sec   连续无输入多少秒 = 一次违规
+#   warn            违规前是否先发一次预警通知（预警不算违规次数）
+#   warn_before_sec 若有预警，在违规前多少秒发；每个违规周期都可以刷新一次
+#   max_strikes     累计到第几次违规触发惩罚（普通 3 次；做题/写作 1 次）
+#   desc            给 TUI / status 用的人话说明
+# 新增模式只需在这里加一条，并把它挂进 IDLE_MODE_ORDER；daemon 每 tick 都会
+# 从文件里重新解析当前模式，所以改完不用 restart daemon。
+IDLE_MODES = {
+    "normal": {
+        "key": "normal",
+        "name": "普通",
+        "threshold_sec": 60,
+        "warn": False,
+        "warn_before_sec": 0,
+        "max_strikes": 3,
+        "desc": "1 分钟没输入 = 违规；3 次后惩罚",
+    },
+    "study": {
+        "key": "study",
+        "name": "做题",
+        "threshold_sec": 180,
+        "warn": True,
+        "warn_before_sec": 30,
+        "max_strikes": 1,
+        "desc": "3 分钟没输入 = 违规；违规前 30s 预警；1 次就直接惩罚",
+    },
+    "writing": {
+        "key": "writing",
+        "name": "写作",
+        "threshold_sec": 600,
+        "warn": True,
+        "warn_before_sec": 30,
+        "max_strikes": 1,
+        "desc": "10 分钟没输入 = 违规；违规前 30s 预警；1 次就直接惩罚",
+    },
+}
+IDLE_MODE_ORDER = ["normal", "study", "writing"]
+DEFAULT_IDLE_MODE = "normal"
+# 旧常量保留为普通模式阈值，外部/测试还在引用；真正判定用模式里的 threshold_sec。
+IDLE_THRESHOLD_SEC = IDLE_MODES["normal"]["threshold_sec"]
+
 IDLE_STATE_FILE = os.path.join(HERE, "temp", "keep_session-idle.json")  # 违规计数（按 session）
+IDLE_MODE_FILE = os.path.join(HERE, "temp", "keep_session-mode.json")    # 当前专注模式（TUI/daemon 共用）
 # 暂停：专注视图里用 `stop` 消耗一次，暂停 PAUSE_MINUTES 分钟、全天最多 3 次。
 # daemon 在暂停期间不念你；次数/到期时间落盘，warden 和 daemon 共用。
 PAUSE_FILE = os.path.join(HERE, "temp", "keep_session-pause.json")
@@ -419,11 +463,13 @@ _HID_IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
 def load_idle_state():
     """看门狗落盘状态：
 
-    {session_key, strikes, episode_marks, last_idle_seconds, last_tick_at,
-     last_strike_at}
+    {session_key, mode, strikes, episode_marks, episode_warns,
+     last_idle_seconds, last_tick_at, last_strike_at}
 
-    - strikes            本场累计违规次数（通知次数），封顶 IDLE_MAX_STRIKES
-    - episode_marks      当前这段连续空闲已经数过几个「整分钟」（不追溯）
+    - strikes            本场累计违规次数（通知次数），封顶当前模式的 max_strikes
+    - episode_marks      当前这段连续空闲已经数过几个违规阈值（不追溯）
+    - episode_warns      当前这段连续空闲已经发过几次预警（不追溯）
+    - mode               这段状态是用哪个模式算的（切模式时本段重新开始）
     - last_idle_seconds / last_tick_at  最近一次读到的空闲秒数（warden 展示用）
     """
     st = _load_json(IDLE_STATE_FILE, {})
@@ -431,11 +477,106 @@ def load_idle_state():
         st["strikes"] = 0
     if not isinstance(st.get("episode_marks"), int):
         st["episode_marks"] = 0
+    if not isinstance(st.get("episode_warns"), int):
+        st["episode_warns"] = 0
+    if st.get("mode") not in IDLE_MODES:
+        st["mode"] = DEFAULT_IDLE_MODE
     return st
 
 
 def save_idle_state(st):
     _save_json(IDLE_STATE_FILE, st)
+
+
+# ---------------------------------------------------------------- 专注模式
+
+def load_mode_state():
+    """当前专注模式落盘：{session_key, mode, set_at}。
+
+    session_key 为空 / None 时表示这是「下一个 session 的默认模式」；绑定到具体
+    session_key 后只对该场生效。TUI 的 Shift+Tab 写这里，daemon 每 tick 读这里。
+    """
+    st = _load_json(IDLE_MODE_FILE, {})
+    mode = st.get("mode")
+    if mode not in IDLE_MODES:
+        mode = DEFAULT_IDLE_MODE
+    key = st.get("session_key")
+    if key is not None and not isinstance(key, str):
+        key = None
+    return {"session_key": key or None, "mode": mode, "set_at": st.get("set_at")}
+
+
+def save_mode_state(st):
+    _save_json(IDLE_MODE_FILE, st)
+
+
+def idle_mode_config(mode=None):
+    """取某个模式配置；不认识就落回普通模式。"""
+    if isinstance(mode, dict):
+        return mode
+    return IDLE_MODES.get(mode) or IDLE_MODES[DEFAULT_IDLE_MODE]
+
+
+def get_idle_mode(session_key=None):
+    """当前生效模式 key。
+
+    规则：
+    - 模式绑定在正在进行的 session 上 → 用它；
+    - 模式是「下一个 session 默认」（session_key 为空）→ 所有还没绑定的场都用它；
+    - 绑定的是别的（已结束的）session → 回普通模式，下一场重新选。
+    """
+    st = load_mode_state()
+    if not st["session_key"]:
+        return st["mode"]
+    if session_key and st["session_key"] == session_key:
+        return st["mode"]
+    return DEFAULT_IDLE_MODE
+
+
+def set_idle_mode(mode, session_key=None, now=None):
+    """设置专注模式；返回配置。mode 不认识时抛 ValueError。
+
+    session_key 传当前 session 的 key = 只对这场改；传 None = 设为下一场默认。
+    """
+    if mode not in IDLE_MODES:
+        raise ValueError("未知专注模式：%s（可选：%s）"
+                         % (mode, " / ".join(IDLE_MODE_ORDER)))
+    now = now or datetime.datetime.now()
+    st = {"session_key": session_key or None, "mode": mode,
+          "set_at": now.isoformat(timespec="seconds")}
+    save_mode_state(st)
+    return idle_mode_config(mode)
+
+
+def fmt_idle_seconds(sec):
+    """把秒数写成人话：30 秒 / 1 分钟 / 2 分 30 秒。"""
+    try:
+        sec = int(round(float(sec)))
+    except (TypeError, ValueError):
+        return "?"
+    if sec < 60:
+        return "%d 秒" % sec
+    m, s = divmod(sec, 60)
+    if s:
+        return "%d 分 %d 秒" % (m, s)
+    return "%d 分钟" % m
+
+
+def idle_targets(cfg, idle_seconds):
+    """当前连续空闲已跨过几个「违规阈值」和几个「预警阈值」。
+
+    marks = floor(idle / T)；warn_before=T 之前 W 秒，所以第 n 个预警发生在
+    n*T-W。warns 也取 floor((idle+W)/T)，并且每个违规周期最多一个预警（预警本身
+    不增加违规次数，只是在下一次违规前刷新一次提醒）。
+    """
+    threshold = max(1, int(cfg.get("threshold_sec") or IDLE_THRESHOLD_SEC))
+    marks = int(idle_seconds // threshold)
+    warns = 0
+    if cfg.get("warn"):
+        lead = int(cfg.get("warn_before_sec") or 0)
+        lead = max(0, min(lead, threshold - 1))
+        warns = int((idle_seconds + lead) // threshold)
+    return marks, warns
 
 
 # ---------------------------------------------------------------- 暂停（专注视图）
@@ -545,11 +686,12 @@ def play_alert(path=None, volume=IDLE_ALERT_VOLUME):
     return alert.play(path, volume=100, system_volume=volume, wait=False) == 0
 
 
-def idle_tick(dry_run=False, now=None, idle_seconds=None):
+def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
     """session 进行中的一次分心检查（daemon 每 IDLE_POLL_SEC 调一次）。
 
     返回本场累计违规次数；看门狗没上班（不在 session / 读不到空闲时间）返回 None，
-    暂停中返回当前累计值。idle_seconds 可注入 —— 测试不用真去问 ioreg。
+    暂停中返回当前累计值。idle_seconds / mode 可注入 —— 测试不用真去问 ioreg 或
+    改文件。
     """
     if not IDLE_CHECK:
         return None
@@ -576,47 +718,104 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None):
         st["session_key"] = key
         st["strikes"] = 0
         st["episode_marks"] = 0
-    strikes = int(st.get("strikes", 0))
-    marks = int(idle_seconds // IDLE_THRESHOLD_SEC)   # 已经空闲了几个「整分钟」
+        st["episode_warns"] = 0
 
-    # 暂停中（专注视图 `stop` 换来的）：不打扰；把「已数过的分钟」推到当前，
-    # 暂停结束后从下一个整分钟接着数 —— 免得一解除就按攒下的空闲连爆三次。
+    # 模式每次 tick 都从文件/参数重新解析：TUI 中途改了立刻生效，不用重启 daemon。
+    # 同一场 session 里切模式时，旧阈值下攒的整分钟数作废，从当前空闲重新对齐。
+    chosen = mode if mode in IDLE_MODES else get_idle_mode(key)
+    if chosen not in IDLE_MODES:
+        chosen = DEFAULT_IDLE_MODE
+    # TUI 在没有 session 时设的模式是「下一场默认」；新 session 一开始就让 daemon
+    # 把它绑到本场，这样这场结束后的下一场会回到普通模式，不会一直粘着。
+    if mode is None:
+        mst = load_mode_state()
+        if not mst["session_key"] and mst["mode"] != DEFAULT_IDLE_MODE:
+            set_idle_mode(chosen, key, now)
+    if st.get("mode") != chosen:
+        prev_idle = None
+        st["episode_marks"] = 0
+        st["episode_warns"] = 0
+    st["mode"] = chosen
+    cfg = idle_mode_config(chosen)
+    threshold = max(1, int(cfg["threshold_sec"]))
+    max_strikes = max(1, int(cfg.get("max_strikes") or IDLE_MAX_STRIKES))
+    marks, warns = idle_targets(cfg, idle_seconds)
+    strikes = int(st.get("strikes", 0))
+
+    # 暂停中（专注视图 `stop` 换来的）：不打扰；把「已数过的阈值」推到当前，
+    # 暂停结束后从下一个阈值接着数 —— 免得一解除就按攒下的空闲连爆三次。
     if pause_status(now)["active"]:
         st["episode_marks"] = marks
+        st["episode_warns"] = warns
         save_idle_state(st)
         return strikes
 
-    if idle_seconds < IDLE_THRESHOLD_SEC:
-        st["episode_marks"] = 0          # 有人在动 / 还没攒够一分钟
+    if idle_seconds < threshold:
+        st["episode_marks"] = 0          # 有人在动 / 还没攒够阈值
+        st["episode_warns"] = 0
     elif prev_idle is None or idle_seconds < float(prev_idle):
         # 本场第一次观察，或中间有人动过（空闲时间比上次还小）：
-        # 不追溯已经空闲掉的那几分钟，从当前这个分钟边界往后数。
+        # 不追溯已经空闲掉的那几个阈值，从当前阈值边界往后数。
         st["episode_marks"] = marks
+        st["episode_warns"] = warns
 
     counted = int(st.get("episode_marks", 0))
-    while counted < marks and strikes < IDLE_MAX_STRIKES:
+    warned = int(st.get("episode_warns", 0))
+
+    # 预警：每个违规周期都可以刷新一次，但不算违规次数。只有在对应违规还没
+    # 记上时才补发；已经数过的旧预警不追溯。
+    if warned < counted:
+        warned = counted
+        st["episode_warns"] = warned
+    while cfg.get("warn") and warned < warns and strikes < max_strikes:
+        nxt = warned + 1
+        if nxt > counted + 1:
+            break                         # 一次 tick 最多补一个预警，避免追债式轰炸
+        if nxt > max_strikes:
+            break
+        warned = nxt
+        st["episode_warns"] = warned
+        st["last_warn_at"] = now.isoformat(timespec="seconds")
+        save_idle_state(st)
+        lead = fmt_idle_seconds(cfg.get("warn_before_sec", 0))
+        next_no = min(strikes + 1, max_strikes)
+        log("  [idle] %s（%s模式）连续 %s 无输入 → 预警：再 %s 就记第 %d/%d 次违规"
+            % (key, cfg["name"], fmt_idle_seconds(idle_seconds), lead,
+               next_no, max_strikes))
+        if dry_run:
+            log("  [idle][dry-run] 会发预警，但不记违规")
+        else:
+            notify("Focusmate 分心预警",
+                   "（%s模式）你已经连续 %s 没碰键盘/触控板了；再 %s 就会记"
+                   "一次违规。预警不算违规次数，到下一个违规周期前会再提醒。"
+                   % (cfg["name"], fmt_idle_seconds(idle_seconds), lead))
+
+    while counted < marks and strikes < max_strikes:
         counted += 1
         strikes += 1
         st["strikes"] = strikes
         st["episode_marks"] = counted
         st["last_strike_at"] = now.isoformat(timespec="seconds")
         save_idle_state(st)
-        log("  [idle] %s 连续 %d 分钟无键盘/触控板输入 → 违规 %d/%d"
-            % (key, counted, strikes, IDLE_MAX_STRIKES))
+        log("  [idle] %s（%s模式）连续 %s 无键盘/触控板输入 → 违规 %d/%d"
+            % (key, cfg["name"], fmt_idle_seconds(idle_seconds), strikes,
+               max_strikes))
         if dry_run:
             log("  [idle][dry-run] 会通知用户；到第 %d 次会拉低音量 + 播放 %s"
-                % (IDLE_MAX_STRIKES, os.path.basename(IDLE_ALERT_AUDIO)))
+                % (max_strikes, os.path.basename(IDLE_ALERT_AUDIO)))
             continue
-        if strikes < IDLE_MAX_STRIKES:
+        if strikes < max_strikes:
             notify("Focusmate 分心警告",
-                   "你已经 %d 分钟没碰键盘/触控板了。当前违规次数：%d/%d —— "
+                   "（%s模式）连续 %s 没碰键盘/触控板 = 违规。当前违规次数：%d/%d —— "
                    "到第 %d 次会有不好的事情发生。"
-                   % (counted, strikes, IDLE_MAX_STRIKES, IDLE_MAX_STRIKES))
+                   % (cfg["name"], fmt_idle_seconds(idle_seconds), strikes,
+                      max_strikes, max_strikes))
         else:
             notify("Focusmate 分心警告",
-                   "你已经 %d 分钟没碰键盘/触控板了。违规次数：%d/%d —— "
+                   "（%s模式）连续 %s 没碰键盘/触控板。违规次数：%d/%d —— "
                    "说好的不好的事情，现在就来。"
-                   % (counted, strikes, IDLE_MAX_STRIKES))
+                   % (cfg["name"], fmt_idle_seconds(idle_seconds), strikes,
+                      max_strikes))
             play_alert(IDLE_ALERT_AUDIO, IDLE_ALERT_VOLUME)
     save_idle_state(st)
     return strikes
@@ -933,9 +1132,13 @@ def cmd_run(dry_run=False):
     signal.signal(signal.SIGTERM, _handle_stop)
     log("run 启动：每 %ds 一轮，Ctrl+C 退出" % LOOP_INTERVAL)
     if IDLE_CHECK:
-        log("  分心看门狗已武装：session 进行中连续 %ds 无键盘/触控板输入记一次违规，"
-            "第 %d 次把音量拉到 %d%% 并播放 %s"
-            % (IDLE_THRESHOLD_SEC, IDLE_MAX_STRIKES, IDLE_ALERT_VOLUME,
+        mode_txt = " / ".join(
+            "%s %s·第%d次罚" % (IDLE_MODES[m]["name"],
+                                fmt_idle_seconds(IDLE_MODES[m]["threshold_sec"]),
+                                IDLE_MODES[m]["max_strikes"])
+            for m in IDLE_MODE_ORDER)
+        log("  分心看门狗已武装：模式 %s；惩罚时把音量拉到 %d%% 并播放 %s"
+            % (mode_txt, IDLE_ALERT_VOLUME,
                os.path.basename(IDLE_ALERT_AUDIO)))
     while not _STOP["flag"]:
         run_once(dry_run=dry_run)
@@ -1159,13 +1362,19 @@ def cmd_status():
     else:
         sess = current_session(entries, now)
         cur = key_of(sess[0], sess[1]) if sess else None
+        cur_mode = get_idle_mode(cur)
+        cur_cfg = idle_mode_config(cur_mode)
         print("  当前 session：%s" % (cur + "（进行中）" if cur else "无（只在 session 进行时上班）"))
+        print("  当前模式：%s（%s）" % (cur_cfg["name"], cur_cfg["desc"]))
         idle_st = load_idle_state()
         if idle_st.get("session_key"):
             mark = "  ← 当前这场" if idle_st.get("session_key") == cur else ""
-            print("  最近计数：%s 违规 %d/%d%s"
-                  % (idle_st.get("session_key"), idle_st.get("strikes", 0),
-                     IDLE_MAX_STRIKES, mark))
+            st_cfg = idle_mode_config(idle_st.get("mode"))
+            st_max = int(st_cfg.get("max_strikes") or IDLE_MAX_STRIKES)
+            print("  最近计数：%s 模式=%s 违规 %d/%d 预警 %d%s"
+                  % (idle_st.get("session_key"), idle_st.get("mode", DEFAULT_IDLE_MODE),
+                     idle_st.get("strikes", 0), st_max,
+                     idle_st.get("episode_warns", 0), mark))
         else:
             print("  最近计数：无")
         if idle_st.get("last_idle_seconds") is not None:
