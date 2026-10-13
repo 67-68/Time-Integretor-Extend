@@ -1,3 +1,289 @@
+diff --git a/src/automation/browser.ts b/src/automation/browser.ts
+index 8f35699..6cd9184 100644
+--- a/src/automation/browser.ts
++++ b/src/automation/browser.ts
+@@ -1,8 +1,9 @@
+ import { chromium, BrowserContext, Page } from 'playwright';
+ import * as path from 'path';
+ import * as fs from 'fs';
++import * as os from 'os';
+ import { getConfigDir } from './config.js';
+-import { AuthExpiredError, AutomationFailedError } from '../utils/errors.js';
++import { AuthExpiredError, AutomationFailedError, FocusmateError } from '../utils/errors.js';
+ 
+ const FOCUSMATE_BASE_URL = 'https://www.focusmate.com';
+ const FOCUSMATE_APP_URL = 'https://app.focusmate.com';
+@@ -11,37 +12,53 @@ const DASHBOARD_URL = `${FOCUSMATE_APP_URL}/dashboard`;
+ 
+ // Persistent browser state using user data directory
+ // This preserves IndexedDB, localStorage, cookies - everything Firebase needs
+-const USER_DATA_DIR = path.join(getConfigDir(), 'browser-data');
++//
++// 懒解析（不在模块顶层求值）：顶层 mkdir 在只读/沙箱环境会 EPERM，
++// 而且 import 一个模块不该有磁盘副作用。
++function getUserDataDir(): string {
++  return path.join(getConfigDir(), 'browser-data');
++}
+ 
+ export interface BrowserOptions {
+   headless?: boolean;
+   slowMo?: number;
+ }
+ 
+-function ensureUserDataDir(): void {
+-  if (!fs.existsSync(USER_DATA_DIR)) {
+-    fs.mkdirSync(USER_DATA_DIR, { recursive: true, mode: 0o700 });
++function ensureUserDataDir(): string {
++  const userDataDir = getUserDataDir();
++  if (!fs.existsSync(userDataDir)) {
++    try {
++      fs.mkdirSync(userDataDir, { recursive: true, mode: 0o700 });
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      throw new Error(
++        `Cannot create browser data directory ${userDataDir}: ${message}. ` +
++        `Set FOCUSMATE_MCP_HOME to a writable directory if home is read-only.`
++      );
++    }
+   }
++  return userDataDir;
+ }
+ 
+ export function hasAuthData(): boolean {
+   // Check if user data directory has been used (contains Default folder from Chromium)
+-  const defaultDir = path.join(USER_DATA_DIR, 'Default');
++  const defaultDir = path.join(getUserDataDir(), 'Default');
+   return fs.existsSync(defaultDir);
+ }
+ 
+ export function clearAuthData(): void {
+-  if (fs.existsSync(USER_DATA_DIR)) {
+-    fs.rmSync(USER_DATA_DIR, { recursive: true, force: true });
++  const userDataDir = getUserDataDir();
++  if (fs.existsSync(userDataDir)) {
++    fs.rmSync(userDataDir, { recursive: true, force: true });
+   }
+ }
+ 
+ export async function launchPersistentContext(options: BrowserOptions = {}): Promise<BrowserContext> {
+   const { headless = true, slowMo = 0 } = options;
+-  ensureUserDataDir();
++  const userDataDir = ensureUserDataDir();
+ 
+   // Launch with persistent context - this preserves ALL browser state including IndexedDB
+-  const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
++  const context = await chromium.launchPersistentContext(userDataDir, {
+     headless,
+     slowMo
+   });
+@@ -68,6 +85,33 @@ export async function isLoggedIn(page: Page): Promise<boolean> {
+   }
+ }
+ 
++/**
++ * 页面是不是「空白页」（SPA 没挂载）。
++ *
++ * 实测：Chromium 的 profile 目录不可写时，Angular 能 bootstrap 但 router-outlet 是空的
++ * （见 docs/focusmate-ui-api-notes.md §1.1）。这时页面截图只有几 KB，后面每个 locator
++ * 都会 timeout —— 早点识别出来 reload 一次，再不行给一个说人话的报错。
++ */
++export async function isBlankPage(page: Page): Promise<boolean> {
++  try {
++    return await page.evaluate(
++      () => ((document.body && document.body.innerText) || '').trim().length === 0
++    );
++  } catch {
++    // 页面/上下文已经死了：交给调用方按原错误处理
++    return false;
++  }
++}
++
++async function waitForPageContent(page: Page, timeoutMs: number): Promise<boolean> {
++  const deadline = Date.now() + timeoutMs;
++  while (Date.now() < deadline) {
++    if (!(await isBlankPage(page))) return true;
++    await page.waitForTimeout(500).catch(() => {});
++  }
++  return !(await isBlankPage(page));
++}
++
+ async function checkAuthAndNavigate(page: Page, targetUrl: string): Promise<void> {
+   await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+ 
+@@ -91,35 +135,89 @@ async function checkAuthAndNavigate(page: Page, targetUrl: string): Promise<void
+ 
+   // Firebase 有长连接，networkidle 永远等不到；等 SPA 渲染一会即可
+   await page.waitForTimeout(2000);
++
++  // 首屏空白 → reload 一次（给渲染第二次机会）；仍空白则明确报错，别让下游
++  // locator 等 10s 后冒出一句莫名其妙的 "waiting for button '50 min'"。
++  if (await isBlankPage(page)) {
++    await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
++    await page.waitForTimeout(2000);
++
++    if (page.url().includes('/login')) {
++      throw new AuthExpiredError('Session expired. Please run focusmate_auth to log in again.');
++    }
++
++    if (!(await waitForPageContent(page, 15000))) {
++      throw new AutomationFailedError(
++        `Dashboard ${targetUrl} rendered a blank page (SPA did not mount). ` +
++        `This usually means the browser profile directory is not writable — ` +
++        `set FOCUSMATE_MCP_HOME to a writable directory.`
++      );
++    }
++  }
+ }
+ 
+ export async function navigateToDashboard(page: Page): Promise<void> {
+   await checkAuthAndNavigate(page, DASHBOARD_URL);
+ }
+ 
+-function getScreenshotDir(): string {
+-  const screenshotDir = path.join(getConfigDir(), 'screenshots');
+-  if (!fs.existsSync(screenshotDir)) {
+-    fs.mkdirSync(screenshotDir, { recursive: true });
++/**
++ * 出错截图的候选目录（按优先级）：
++ *   1. FOCUSMATE_SCREENSHOT_DIR        —— 显式指定
++ *   2. <config dir>/screenshots        —— 默认（~/.focusmate-mcp/screenshots）
++ *   3. <tmp>/focusmate-mcp/screenshots —— 兜底（home 只读 / 沙箱禁写时用）
++ * 每次调用重新读环境变量，不缓存。
++ */
++export function getScreenshotDirCandidates(): string[] {
++  const configured = process.env.FOCUSMATE_SCREENSHOT_DIR;
++  const candidates = [
++    configured,
++    path.join(getConfigDir(), 'screenshots'),
++    path.join(os.tmpdir(), 'focusmate-mcp', 'screenshots')
++  ];
++  const seen = new Set<string>();
++  const out: string[] = [];
++  for (const candidate of candidates) {
++    if (!candidate || !candidate.trim()) continue;
++    const resolved = path.resolve(candidate);
++    if (seen.has(resolved)) continue;
++    seen.add(resolved);
++    out.push(resolved);
+   }
+-  return screenshotDir;
++  return out;
+ }
+ 
++/**
++ * 把出错截图写盘，返回真正落盘的路径；一个都写不了就返回 undefined。
++ *
++ * 截图只是**诊断附件**：任何失败（目录不可写、页面已关、Playwright 报错）
++ * 都只记日志、绝不向上抛。否则就会出现「EPERM 截图错误盖掉真正的预定报错」。
++ */
+ async function captureScreenshotOnError(
+   page: Page,
+   operationName: string
+-): Promise<string> {
+-  const screenshotDir = getScreenshotDir();
++): Promise<string | undefined> {
+   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+   const filename = `${operationName}-error-${timestamp}.png`;
+-  const screenshotPath = path.join(screenshotDir, filename);
+ 
+-  await page.screenshot({
+-    path: screenshotPath,
+-    fullPage: true
+-  });
++  for (const dir of getScreenshotDirCandidates()) {
++    const screenshotPath = path.join(dir, filename);
++    try {
++      fs.mkdirSync(dir, { recursive: true });
++      await page.screenshot({
++        path: screenshotPath,
++        fullPage: true,
++        timeout: 15000
++      });
++      return screenshotPath;
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      // 目录不可写（EPERM/EACCES）→ 换下一个候选目录；页面已死之类的也照样往下试。
++      console.error(`[focusmate-mcp] screenshot to ${dir} failed: ${message}`);
++    }
++  }
+ 
+-  return screenshotPath;
++  console.error('[focusmate-mcp] no writable screenshot directory, skipping screenshot');
++  return undefined;
+ }
+ 
+ export async function withErrorScreenshot<T>(
+@@ -130,15 +228,23 @@ export async function withErrorScreenshot<T>(
+   try {
+     return await operation();
+   } catch (error) {
++    // 截图失败绝不能覆盖原始报错 —— 这正是 EPERM 伪装成预定失败的原因。
+     const screenshotPath = await captureScreenshotOnError(page, operationName);
++    if (screenshotPath) {
++      console.error(`[focusmate-mcp] ${operationName} failed; screenshot: ${screenshotPath}`);
++    }
+ 
+-    if (error instanceof AuthExpiredError) {
++    // 已知的业务错误（AuthExpired / SlotUnavailable / SessionConflict / NotFound…）
++    // 必须原样抛出：调用方要靠 instanceof 判断该不该重试，包成 AutomationFailedError
++    // 会让这些判断全部失效、白白重试。
++    if (error instanceof FocusmateError) {
+       throw error;
+     }
+ 
+     const message = error instanceof Error ? error.message : 'Unknown error';
+     throw new AutomationFailedError(
+-      `${operationName} failed: ${message}. Screenshot saved to ${screenshotPath}`,
++      `${operationName} failed: ${message}` +
++        (screenshotPath ? ` (screenshot: ${screenshotPath})` : ''),
+       screenshotPath
+     );
+   }
+diff --git a/src/automation/config.ts b/src/automation/config.ts
+index 06efb52..0394908 100644
+--- a/src/automation/config.ts
++++ b/src/automation/config.ts
+@@ -2,11 +2,36 @@ import * as fs from 'fs';
+ import * as path from 'path';
+ import * as os from 'os';
+ 
+-const CONFIG_DIR = path.join(os.homedir(), '.focusmate-mcp');
++const DEFAULT_CONFIG_DIR = path.join(os.homedir(), '.focusmate-mcp');
++
++/**
++ * 运行目录解析（默认 `~/.focusmate-mcp`）。
++ *
++ * 受管环境（沙箱 / CI / 只读 home）常常禁止写 home 下的隐藏目录，本机 dsh 沙箱
++ * 就是如此：`touch ~/.focusmate-mcp/x` → EPERM。这时把运行目录整体搬到可写位置即可：
++ *
++ *   FOCUSMATE_MCP_HOME=/path/to/writable
++ *   FOCUSMATE_CONFIG_DIR=/path/to/writable   # 同上，优先级更高
++ *
++ * 每次调用都重新读环境变量（不缓存），方便单测与运行时切换。
++ */
++export function resolveConfigDir(): string {
++  const override = process.env.FOCUSMATE_CONFIG_DIR || process.env.FOCUSMATE_MCP_HOME;
++  if (override && override.trim()) {
++    return path.resolve(override.trim());
++  }
++  return DEFAULT_CONFIG_DIR;
++}
+ 
+ export function getConfigDir(): string {
+-  if (!fs.existsSync(CONFIG_DIR)) {
+-    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
++  const dir = resolveConfigDir();
++  if (!fs.existsSync(dir)) {
++    try {
++      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
++    } catch {
++      // 建不出来（EPERM/EROFS…）不要在这里抛：每个调用方各自有降级路径
++      // （截图会换 fallback 目录、浏览器启动会给出更清楚的错误）。
++    }
+   }
+-  return CONFIG_DIR;
++  return dir;
+ }
 diff --git a/src/automation/pages/booking.ts b/src/automation/pages/booking.ts
 index fef249e..511b15e 100644
 --- a/src/automation/pages/booking.ts
@@ -242,3 +528,194 @@ index eddd2ce..f97dd0d 100644
            return {
              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }]
            };
+diff --git a/tests/error-screenshot.test.ts b/tests/error-screenshot.test.ts
+new file mode 100644
+index 0000000..f7afc7e
+--- /dev/null
++++ b/tests/error-screenshot.test.ts
+@@ -0,0 +1,185 @@
++import { describe, it, expect, afterEach, vi } from 'vitest';
++import * as fs from 'fs';
++import * as os from 'os';
++import * as path from 'path';
++import type { Page } from 'playwright';
++import { isBlankPage, withErrorScreenshot } from '../src/automation/browser.js';
++import { resolveConfigDir } from '../src/automation/config.js';
++import { AutomationFailedError, SlotUnavailableError } from '../src/utils/errors.js';
++
++/**
++ * 回归测试：focusmate-mcp 的出错截图曾经把真正的报错吞掉。
++ *
++ * 现场（ti_extend/temp/keep_session.log.daemon.out）：
++ *   Booking attempt 1 failed, retrying: EPERM: operation not permitted,
++ *     open '/Users/a67_68/.focusmate-mcp/screenshots/book-session-attempt-0-error-….png'
++ *   Booking attempt 3 failed … book-session-attempt-2-error-….png   ← 最终报给用户的
++ * 也就是说：真正让预定失败的错误（网络/页面）被「写截图失败」顶掉了，
++ * 而且错误类型被换成 AutomationFailedError，连「不可重试」的判断都失效了。
++ */
++
++const createdDirs: string[] = [];
++const envKeys = ['FOCUSMATE_SCREENSHOT_DIR', 'FOCUSMATE_MCP_HOME', 'FOCUSMATE_CONFIG_DIR'];
++const savedEnv: Record<string, string | undefined> = {};
++
++for (const key of envKeys) savedEnv[key] = process.env[key];
++
++function tempDir(name: string): string {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `fm-${name}-`));
++  createdDirs.push(dir);
++  return dir;
++}
++
++/** 假装是 Page：只实现 withErrorScreenshot 会用到的 screenshot()。 */
++function fakePage(screenshot: (options: { path?: string }) => Promise<unknown>): Page {
++  return { screenshot } as unknown as Page;
++}
++
++/** 假装是 Page：只实现判断空白页会用到的 evaluate()。 */
++function pageWithText(text: string | (() => never)): Page {
++  return {
++    evaluate: async (fn: () => unknown) => {
++      if (typeof text === 'function') return text();
++      return text.trim().length === 0;
++    }
++  } as unknown as Page;
++}
++
++afterEach(() => {
++  for (const dir of createdDirs.splice(0)) {
++    fs.rmSync(dir, { recursive: true, force: true });
++  }
++  for (const key of envKeys) {
++    if (savedEnv[key] === undefined) delete process.env[key];
++    else process.env[key] = savedEnv[key];
++  }
++  vi.restoreAllMocks();
++});
++
++describe('withErrorScreenshot', () => {
++  it('returns the operation result untouched when nothing throws', async () => {
++    const page = fakePage(async () => {});
++    const result = await withErrorScreenshot(page, 'op', async () => 42);
++    expect(result).toBe(42);
++  });
++
++  it('does not let a failing screenshot (EPERM) mask the real error', async () => {
++    // 模拟沙箱禁写 ~/.focusmate-mcp/screenshots：写截图必然 EPERM。
++    const page = fakePage(async () => {
++      throw new Error(
++        "EPERM: operation not permitted, open '/Users/x/.focusmate-mcp/screenshots/op-error.png'"
++      );
++    });
++    vi.spyOn(console, 'error').mockImplementation(() => {});
++
++    const realError = new Error('page.goto: net::ERR_TUNNEL_CONNECTION_FAILED');
++    const thrown = await withErrorScreenshot(page, 'book-session-attempt-0', async () => {
++      throw realError;
++    }).catch((error: unknown) => error as Error);
++
++    expect(thrown.message).toContain('ERR_TUNNEL_CONNECTION_FAILED');
++    expect(thrown.message).not.toContain('EPERM');
++    expect(thrown).toBeInstanceOf(AutomationFailedError);
++    expect((thrown as AutomationFailedError).screenshotPath).toBeUndefined();
++  });
++
++  it('rethrows known business errors as-is so retry/errorCode logic still works', async () => {
++    const page = fakePage(async () => {
++      throw new Error('EPERM: operation not permitted');
++    });
++    vi.spyOn(console, 'error').mockImplementation(() => {});
++
++    const conflict = new SlotUnavailableError();
++    const thrown = await withErrorScreenshot(page, 'op', async () => {
++      throw conflict;
++    }).catch((error: unknown) => error);
++
++    // 必须是同一个实例：book-session.ts 靠 instanceof 决定「不重试」。
++    expect(thrown).toBe(conflict);
++    expect(thrown).not.toBeInstanceOf(AutomationFailedError);
++  });
++
++  it('saves the screenshot to FOCUSMATE_SCREENSHOT_DIR and reports the path', async () => {
++    const dir = tempDir('shots');
++    process.env.FOCUSMATE_SCREENSHOT_DIR = dir;
++
++    // Playwright 的 path 选项 = 直接写文件，这里如法炮制。
++    const page = fakePage(async (options) => {
++      if (options.path) fs.writeFileSync(options.path, 'PNG');
++      return Buffer.from('PNG');
++    });
++
++    const thrown = (await withErrorScreenshot(page, 'book-session-attempt-2', async () => {
++      throw new Error('boom');
++    }).catch((error: unknown) => error)) as AutomationFailedError;
++
++    expect(thrown).toBeInstanceOf(AutomationFailedError);
++    expect(thrown.screenshotPath).toBeDefined();
++    expect(fs.realpathSync(path.dirname(thrown.screenshotPath as string))).toBe(fs.realpathSync(dir));
++    expect(thrown.screenshotPath).toContain('book-session-attempt-2-error-');
++    expect(fs.existsSync(thrown.screenshotPath as string)).toBe(true);
++    expect(thrown.message).toContain('boom');
++  });
++
++  it('falls back to another writable directory when the preferred one is unusable', async () => {
++    // 首选目录是个不可能建出来的路径（父级是文件）。
++    const blocker = path.join(tempDir('blocker'), 'not-a-dir');
++    fs.writeFileSync(blocker, '');
++    process.env.FOCUSMATE_SCREENSHOT_DIR = path.join(blocker, 'screenshots');
++
++    const dir = tempDir('fallback');
++    process.env.FOCUSMATE_MCP_HOME = dir;
++    vi.spyOn(console, 'error').mockImplementation(() => {});
++
++    const page = fakePage(async (options) => {
++      if (options.path) fs.writeFileSync(options.path, 'PNG');
++      return Buffer.from('PNG');
++    });
++
++    const thrown = (await withErrorScreenshot(page, 'op', async () => {
++      throw new Error('boom');
++    }).catch((error: unknown) => error)) as AutomationFailedError;
++
++    expect(thrown.screenshotPath).toBeDefined();
++    // 首选目录写不了 → 落到 <FOCUSMATE_MCP_HOME>/screenshots。
++    expect(thrown.screenshotPath).toBe(path.join(dir, 'screenshots', path.basename(thrown.screenshotPath as string)));
++    expect(fs.existsSync(thrown.screenshotPath as string)).toBe(true);
++  });
++});
++
++describe('resolveConfigDir', () => {
++  it('defaults to ~/.focusmate-mcp', () => {
++    delete process.env.FOCUSMATE_MCP_HOME;
++    delete process.env.FOCUSMATE_CONFIG_DIR;
++    expect(resolveConfigDir()).toBe(path.join(os.homedir(), '.focusmate-mcp'));
++  });
++
++  it('honours FOCUSMATE_MCP_HOME and FOCUSMATE_CONFIG_DIR', () => {
++    process.env.FOCUSMATE_MCP_HOME = '/tmp/fm-home';
++    delete process.env.FOCUSMATE_CONFIG_DIR;
++    expect(resolveConfigDir()).toBe('/tmp/fm-home');
++
++    process.env.FOCUSMATE_CONFIG_DIR = '/tmp/fm-config';
++    expect(resolveConfigDir()).toBe('/tmp/fm-config');
++  });
++});
++
++
++describe('isBlankPage', () => {
++  it('detects an unmounted SPA (empty body text)', async () => {
++    await expect(isBlankPage(pageWithText('   '))).resolves.toBe(true);
++  });
++
++  it('treats a rendered page as not blank', async () => {
++    await expect(isBlankPage(pageWithText('Session Settings 25 min 50 min'))).resolves.toBe(false);
++  });
++
++  it('does not blow up on a dead page/context', async () => {
++    const dead = {
++      evaluate: async () => {
++        throw new Error('Target page, context or browser has been closed');
++      }
++    } as unknown as Page;
++    await expect(isBlankPage(dead)).resolves.toBe(false);
++  });
++});

@@ -40,6 +40,14 @@ MCP_SERVER_JS = _os.environ.get(
     _os.path.join(_HERE, "temp", "focusmate-mcp", "build", "index.js"),
 )
 
+# 出错截图目录。focusmate-mcp 默认写到 ~/.focusmate-mcp/screenshots，但本机的
+# dsh 沙箱禁止写该目录 —— 截图失败本身还会把真正的预定报错盖成 EPERM。指到
+# 工作区内的 temp/（可写、且 temp/ 已在 .gitignore 里，截图含账号信息不外泄）。
+# 显式设了 FOCUSMATE_SCREENSHOT_DIR 就以你的为准。
+SCREENSHOT_DIR = _os.environ.get("FOCUSMATE_SCREENSHOT_DIR") or _os.path.join(
+    _HERE, "temp", "focusmate-screenshots")
+_os.environ["FOCUSMATE_SCREENSHOT_DIR"] = SCREENSHOT_DIR
+
 DEFAULT_START = "16:45"
 
 

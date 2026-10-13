@@ -46,6 +46,16 @@ PROFILE_DIR=/tmp/fm-profile node test/probe_xxx.mjs   # 写落到 /tmp
 
 这样 dashboard 正常渲染。**注意**：`/tmp/fm-profile` 里有你的登录凭据，用完请删除。
 
+> **2026-10-13 更新**：`temp/focusmate-mcp` 现在支持用环境变量指定运行目录，不必再改代码：
+>
+> | 变量 | 作用 |
+> |---|---|
+> | `FOCUSMATE_MCP_HOME`（或 `FOCUSMATE_CONFIG_DIR`） | 整个运行目录（`browser-data` / `screenshots` / `config.json`），默认 `~/.focusmate-mcp` |
+> | `FOCUSMATE_SCREENSHOT_DIR` | 只挪出错截图的目录；`ti_extend` 默认指到 `temp/focusmate-screenshots` |
+>
+> 出错截图现在**只是诊断附件**：写不进去（沙箱 EPERM）只记日志，绝不再盖掉真正的报错；
+> 首选目录不可写会自动退到 `<tmp>/focusmate-mcp/screenshots`。
+
 ### 1.3 静/动态两条腿
 
 - **动态**：Playwright 驱动真实页面（`test/probe_*.mjs`）。
