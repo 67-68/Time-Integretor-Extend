@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""ti_extend 依赖安装器（幂等）：focusmate-mcp 装到 ti_extend/temp，装过就跳过。
+"""ti_extend 一键安装器（幂等）：依赖装到 ti_extend/temp，另把 Warden.app 装进应用程序目录。
+
+分两半，各自幂等：
+  依赖半 —— focusmate-mcp + Chromium，装到 ti_extend/temp，装过就跳过。
+  app 半 —— 构建 Warden.app（可前台唤起的 macOS 应用）并装到 /Applications。
+            构建/安装逻辑在 app/install-app.sh 与 app/build-app.sh，这里只负责调用，
+            不重复实现 —— 「怎么构建 bundle」只有那一份真相。
 
 设计：
 - 安装位置：ti_extend/temp/focusmate-mcp（工作区内，可用 FOCUSMATE_MCP_HOME 覆盖）。
@@ -17,6 +23,11 @@
     python3 install.py --force        # 全量重装（删 temp 重来）
     python3 install.py --skip-browser # 跳过 Chromium 下载
     python3 install.py --force-browser# 重下 Chromium
+    python3 install.py --skip-app     # 只装依赖，不碰 Warden.app（老行为）
+    python3 install.py --app-dest DIR # Warden.app 装到哪（默认 /Applications，
+                                      #   不可写则退到 ~/Applications）
+    python3 install.py --no-launch    # 装完不自动唤起
+    python3 install.py --force-app    # 强制重建 Warden.app
     ./install.sh ...                  # 薄封装，转调本脚本，参数透传
 """
 
@@ -34,6 +45,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEMP = os.path.join(HERE, "temp")
 DEFAULT_DEST = os.path.join(TEMP, "focusmate-mcp")
 STATE_FILE = os.path.join(TEMP, ".install-state.json")
+APP_INSTALL_SH = os.path.join(HERE, "app", "install-app.sh")
 REPO = "https://github.com/67-68/focusmate-mcp.git"
 BRANCH = "main"
 
@@ -42,8 +54,21 @@ def dest_dir():
     return os.environ.get("FOCUSMATE_MCP_HOME", DEFAULT_DEST)
 
 
+def flush():
+    """把 python 这层的 stdout 刷出去。
+
+    不然会跟子进程的输出乱序：python 写管道时是块缓冲的，子进程直接写 fd，
+    于是 `Warden.app：` 这种标题会跑到子进程输出后面去。
+    """
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def sh(cmd, cwd=None):
     print("  $ " + " ".join(cmd))
+    flush()
     r = subprocess.run(cmd, cwd=cwd)
     if r.returncode != 0:
         raise RuntimeError("命令失败(%d)：%s" % (r.returncode, " ".join(cmd)))
@@ -255,12 +280,40 @@ def print_status(s):
     print("  总体          : %s" % ("已安装齐" if s["installed"] else "缺东西，需安装"))
 
 
+def install_app(args, check=False):
+    """跑 app/install-app.sh：构建 Warden.app 并装进应用程序目录。
+
+    这里刻意不实现任何细节 —— 「怎么构建 bundle」（swiftc / Info.plist / codesign）
+    是 app/build-app.sh 的事，「装到哪、怎么替换、要不要唤起」是 app/install-app.sh 的事。
+    """
+    if not os.path.isfile(APP_INSTALL_SH):
+        print("  Warden.app：跳过（找不到 %s）" % APP_INSTALL_SH, file=sys.stderr)
+        return 1
+    cmd = [APP_INSTALL_SH]
+    if check:
+        cmd.append("--check")
+    else:
+        # 刻意不加 --quiet：首次安装要让你看见「第一次唤起会弹授权框」那段提示。
+        if args.force_app:
+            cmd.append("--force")
+        if args.no_launch:
+            cmd.append("--no-launch")
+    if args.app_dest:
+        cmd += ["--app-dest", args.app_dest]
+    print("  $ " + " ".join(cmd))
+    flush()
+    return subprocess.run(cmd).returncode
+
+
 def cmd_check(args):
     s = status(dest_dir())
     print_status(s)
-    if args.verbose_chromium is False:
-        pass
-    return 0 if s["installed"] else 1
+    rc = 0 if s["installed"] else 1
+    if not args.skip_app:
+        print("")
+        if install_app(args, check=True) != 0:
+            rc = 1
+    return rc
 
 
 def ensure_source(dest, force):
@@ -495,12 +548,19 @@ def ensure_browser(dest, skip, force_browser):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="ti_extend 依赖安装器（幂等，装到 temp/）")
+    ap = argparse.ArgumentParser(
+        description="ti_extend 一键安装器（幂等）：依赖装到 temp/，另把 Warden.app 装进应用程序目录")
     ap.add_argument("--check", action="store_true", help="只检测不安装")
     ap.add_argument("--force", action="store_true", help="全量重装（清空 temp 重来）")
     ap.add_argument("--skip-browser", action="store_true", help="跳过 Chromium 下载")
     ap.add_argument("--force-browser", action="store_true", help="重下 Chromium")
     ap.add_argument("--verbose-chromium", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--skip-app", action="store_true",
+                    help="不碰 Warden.app，只装依赖（老行为）")
+    ap.add_argument("--app-dest", default=None, metavar="DIR",
+                    help="Warden.app 装到哪个目录（默认 /Applications，不可写则 ~/Applications）")
+    ap.add_argument("--no-launch", action="store_true", help="装完 Warden.app 不自动唤起")
+    ap.add_argument("--force-app", action="store_true", help="强制重建 Warden.app")
     args = ap.parse_args(argv)
 
     if shutil.which("node") is None:
@@ -535,10 +595,22 @@ def main(argv=None):
 
     print("")
     print("完成。server 入口：%s" % os.path.join(dest, "build", "index.js"))
+
+    app_rc = 0
+    print("")
+    if args.skip_app:
+        print("（--skip-app：没碰 Warden.app）")
+    else:
+        print("Warden.app：")
+        app_rc = install_app(args)
+
+    print("")
     print("下一步：")
+    if not args.skip_app and app_rc == 0:
+        print("  open -a Warden          # 唤起看板（已开着就聚焦 + refresh）")
     print("  python3 \"%s\" --auth    # 首次登录（会弹浏览器）" % os.path.join(HERE, "main.py"))
     print("  python3 \"%s\"           # 订 16:45 / 50min 测试" % os.path.join(HERE, "main.py"))
-    return 0
+    return app_rc
 
 
 if __name__ == "__main__":
