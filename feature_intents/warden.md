@@ -61,6 +61,8 @@ session HH:MM LEN   创建一场：先写 data.csv，再立刻触发一轮 check
 session HH:MM-HH:MM 同上，但用起点–终点：11:15-12:05 → 写入 11:15 + 50min
                     （11:15 12:05 / 11:15 - 12:05 / "11:15 - 12:05" 都认）
 cancel N            取消：草稿区直接删契约行；执行区敲宣言；过去直接拒
+relocate N -15      临时把 #N 提前 15 分钟（只改选中这一天的计划，不写 data.csv）
+relocate N +15      临时把 #N 推后 15 分钟；同一天只能推一次，且不能跨天
 mute 3              把 #3 静音（不写 on/off 就是取反）
 mute 3 on|off       显式开/关
 title 2 "Math Past Paper"
@@ -78,6 +80,13 @@ help / quit
 写完重读 data.csv。它**会覆盖 data.csv**（download_calendar 自己备份到 `temp/data.csv.bak`，
 且一个 session 都没切出来时会拒绝覆盖）。和 cancel/stop 不同，sync 不需要敲宣言 ——
 它是「重新拉目标」，不是「放弃目标」。
+
+`relocate` 和 `sync` 相反：它**不写 data.csv**，只把「某一天 + 原 HH:MM」映射到新时间
+写进 `temp/keep_session-relocations.json`。`schedule.day_slots()` 是唯一入口，所以 warden
+和 daemon 会同时看到「原 slot 消失、新 slot 出现」；过了这一天，记录不再命中任何日期，
+未来同星期几完全不受影响。提前不设次数；推后是拖延诱惑，所以**每个 session 日期只准一次**，
+且原时间和目标时间必须在同一天（23:45 +15 会被拒）。执行区里挪动会先取消原 API session，
+再让 daemon 走一轮 `check` 订新时间；原时间对应的 state/判决不会被写成「罪」。
 
 **ID 是「当前这张表里的行号」**，按时间排序，每次 refresh 重新编号。所以
 命令里的 N 只对「你现在看到的这张表」有效 —— 表在屏幕上是显式的，看完再敲。

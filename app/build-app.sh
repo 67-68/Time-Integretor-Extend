@@ -135,31 +135,77 @@ touch "$OUT"
 # 不写 Custom Command —— 跑什么命令由 warden-summon.applescript 决定，写两处会跑两遍。
 if [ ! -f "$PROFILE" ]; then
     cat > "$PROFILE" <<'JSON'
-[
-  {
-    "Name": "Warden",
-    "Guid": "warden-tui-profile-1",
-    "Dynamic Profile Parent Name": "Default",
-    "Use Custom Window Title": true,
-    "Custom Window Title": "Warden",
-    "Scrollback Lines": 2000,
-    "Terminal Type": "xterm-256color",
-    "Background Color": { "Red Component": 0.043, "Green Component": 0.055, "Blue Component": 0.078, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Foreground Color": { "Red Component": 0.847, "Green Component": 0.871, "Blue Component": 0.914, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Bold Color": { "Red Component": 0.949, "Green Component": 0.961, "Blue Component": 0.980, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Cursor Color": { "Red Component": 0.310, "Green Component": 0.612, "Blue Component": 0.976, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Cursor Text Color": { "Red Component": 0.043, "Green Component": 0.055, "Blue Component": 0.078, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Selection Color": { "Red Component": 0.169, "Green Component": 0.227, "Blue Component": 0.333, "Alpha Component": 1, "Color Space": "sRGB" }
-  }
-]
+{
+  "Profiles": [
+    {
+      "Name": "Warden",
+      "Guid": "warden-tui-profile-1",
+      "Dynamic Profile Parent Name": "Default",
+      "Use Custom Window Title": true,
+      "Custom Window Title": "Warden",
+      "Scrollback Lines": 2000,
+      "Terminal Type": "xterm-256color",
+      "Background Color": {
+        "Red Component": 0.043,
+        "Green Component": 0.055,
+        "Blue Component": 0.078,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Foreground Color": {
+        "Red Component": 0.847,
+        "Green Component": 0.871,
+        "Blue Component": 0.914,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Bold Color": {
+        "Red Component": 0.949,
+        "Green Component": 0.961,
+        "Blue Component": 0.98,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Cursor Color": {
+        "Red Component": 0.31,
+        "Green Component": 0.612,
+        "Blue Component": 0.976,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Cursor Text Color": {
+        "Red Component": 0.043,
+        "Green Component": 0.055,
+        "Blue Component": 0.078,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Selection Color": {
+        "Red Component": 0.169,
+        "Green Component": 0.227,
+        "Blue Component": 0.333,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      }
+    }
+  ]
+}
 JSON
     echo "→ 生成了 iTerm2 外观草稿：$PROFILE"
 fi
 
 if [ "$ACTION_INSTALL_PROFILE" = 1 ]; then
-    mkdir -p "$(dirname "$PROFILE_DEST")"
-    cp "$PROFILE" "$PROFILE_DEST"
-    echo "✓ 已装 iTerm2 外观：${PROFILE_DEST}（iTerm2 热加载，不用重启）"
+    mkdir -p "$(dirname "$PROFILE_DEST")" 2>/dev/null || true
+    if cp "$PROFILE" "$PROFILE_DEST" 2>/dev/null; then
+        echo "✓ 已装 iTerm2 外观：${PROFILE_DEST}（iTerm2 热加载，不用重启）"
+    else
+        # 沙箱 / 权限挡住了。别只丢一句 cp 的报错，把该跑什么写清楚。
+        echo "✗ 拷不进 ${PROFILE_DEST}" >&2
+        echo "  手动来：" >&2
+        echo "    mkdir -p \"$(dirname "$PROFILE_DEST")\"" >&2
+        echo "    cp \"$PROFILE\" \"$PROFILE_DEST\"" >&2
+        exit 2
+    fi
 else
     echo "→ iTerm2 外观没装（不想没验证过就动你的 iTerm 配置）。想装：./app/build-app.sh --install-profile"
 fi

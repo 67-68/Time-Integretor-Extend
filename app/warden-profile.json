@@ -1,17 +1,55 @@
-[
-  {
-    "Name": "Warden",
-    "Guid": "warden-tui-profile-1",
-    "Dynamic Profile Parent Name": "Default",
-    "Use Custom Window Title": true,
-    "Custom Window Title": "Warden",
-    "Scrollback Lines": 2000,
-    "Terminal Type": "xterm-256color",
-    "Background Color": { "Red Component": 0.043, "Green Component": 0.055, "Blue Component": 0.078, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Foreground Color": { "Red Component": 0.847, "Green Component": 0.871, "Blue Component": 0.914, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Bold Color": { "Red Component": 0.949, "Green Component": 0.961, "Blue Component": 0.980, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Cursor Color": { "Red Component": 0.310, "Green Component": 0.612, "Blue Component": 0.976, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Cursor Text Color": { "Red Component": 0.043, "Green Component": 0.055, "Blue Component": 0.078, "Alpha Component": 1, "Color Space": "sRGB" },
-    "Selection Color": { "Red Component": 0.169, "Green Component": 0.227, "Blue Component": 0.333, "Alpha Component": 1, "Color Space": "sRGB" }
-  }
-]
+{
+  "Profiles": [
+    {
+      "Name": "Warden",
+      "Guid": "warden-tui-profile-1",
+      "Dynamic Profile Parent Name": "Default",
+      "Use Custom Window Title": true,
+      "Custom Window Title": "Warden",
+      "Scrollback Lines": 2000,
+      "Terminal Type": "xterm-256color",
+      "Background Color": {
+        "Red Component": 0.043,
+        "Green Component": 0.055,
+        "Blue Component": 0.078,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Foreground Color": {
+        "Red Component": 0.847,
+        "Green Component": 0.871,
+        "Blue Component": 0.914,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Bold Color": {
+        "Red Component": 0.949,
+        "Green Component": 0.961,
+        "Blue Component": 0.98,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Cursor Color": {
+        "Red Component": 0.31,
+        "Green Component": 0.612,
+        "Blue Component": 0.976,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Cursor Text Color": {
+        "Red Component": 0.043,
+        "Green Component": 0.055,
+        "Blue Component": 0.078,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      },
+      "Selection Color": {
+        "Red Component": 0.169,
+        "Green Component": 0.227,
+        "Blue Component": 0.333,
+        "Alpha Component": 1,
+        "Color Space": "sRGB"
+      }
+    }
+  ]
+}

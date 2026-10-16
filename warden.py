@@ -9,7 +9,7 @@
                        用 `day -1 / day 0 / day 1` 切换看哪天。
 3. The Interrogation   死循环 input，极简命令：
                        mute 3 / title 2 "文本" / session 09:00 50 / session 11:15-12:05
-                       cancel 1 / day 1 / sync / force-check
+                       cancel 1 / relocate 1 -15 / day 1 / sync / force-check
 4. Panic Action        —— 已按你的要求删掉。没有这个功能。
 
 视图（Tab 切换）
@@ -71,6 +71,7 @@
 退出码：0 正常 / 1 出过错 / 2 用法或依赖问题
 """
 import argparse
+import copy
 import datetime
 import json
 import os
@@ -446,8 +447,8 @@ class ContractView(View):
     @property
     def hint(self):
         return ("命令：mute N on|off · title N \"文本\" · session HH:MM LEN · sync · "
-                "force-check · cancel N · day -1/0/1 · refresh · start · stop · "
-                "help · quit    [dim]（Tab 切到专注视图）[/]")
+                "force-check · cancel N · relocate N ±15 · day -1/0/1 · refresh · "
+                "start · stop · help · quit    [dim]（Tab 切到专注视图）[/]")
 
     def render(self):
         out = [self.w.render_table()]
@@ -466,6 +467,8 @@ class ContractView(View):
             w.cmd_day(args)
         elif cmd == "session":
             w.cmd_session(args)
+        elif cmd == "relocate":
+            w.cmd_relocate(args)
         elif cmd in ("force-check", "forcecheck"):
             w.cmd_force_check()
         elif cmd == "sync":
@@ -972,7 +975,14 @@ class Warden(object):
             row["planned"] = True
             row["lineno"] = slot["lineno"]
             row["raw"] = slot["raw"]
-            row["contract"] = "%s,%s,%s" % (slot["weekday"], slot["start"], slot["duration"])
+            relocation = slot.get("relocation")
+            if relocation:
+                row["relocation"] = dict(relocation)
+                row["relocated_from"] = slot.get("relocated_from")
+                row["contract"] = "临时 %s→%s" % (slot.get("relocated_from") or "?",
+                                                   slot["start"])
+            else:
+                row["contract"] = "%s,%s,%s" % (slot["weekday"], slot["start"], slot["duration"])
             row["zone"] = sch.zone_name(start, now)
             rows.append(row)
 
@@ -1266,6 +1276,11 @@ class Warden(object):
         if ab:
             txt.append("\n已放弃（daemon 永不重订）：", style="bold")
             txt.append("、".join(sorted(ab)[:6]) + ("…" if len(ab) > 6 else ""), style="red")
+        relocated = [r for r in self.rows if r.get("planned") and r.get("relocation")]
+        if relocated:
+            txt.append("\n临时挪动（只影响这一天，不改 data.csv）：", style="bold")
+            txt.append("、".join("%s→%s" % (r.get("relocated_from") or "?", r["startLabel"])
+                                 for r in relocated), style="magenta")
         txt.append("   [%s]" % sch.data_csv_path(), style="dim")
         return txt
 
@@ -1476,8 +1491,151 @@ class Warden(object):
         self.refresh(quiet=True)
         return True
 
+    def cmd_relocate(self, args):
+        """relocate N ±MM —— 把当前表里 #N 临时提前/推后 MM 分钟。
+
+        提前：直接改临时计划并取消原 API session，不需要宣言（这是在往前赶）。
+        推后：同一天只能推一次，且不能跨天；防止把拖延变成日常操作。
+        **不写 data.csv**：只影响所选这一天的这一场，未来同星期几照旧。
+        """
+        if not args:
+            raise ValueError("用法：relocate N ±MM（MM 是 15 的倍数，如 relocate 3 -15）")
+        idx_token, delta = parse_relocate_spec(args)
+        if idx_token is None:
+            raise ValueError("用法：relocate N ±MM（MM 是 15 的倍数，如 relocate 3 -15）")
+        idx, row = self.pick(idx_token)
+
+        if row.get("zone") == "past" or row.get("phase") == "已结束":
+            raise ValueError("#%d 已经开始（%s）—— 过去的场次不能挪。" % (idx, row["startLabel"]))
+        if not row.get("planned"):
+            raise ValueError("#%d 是计划外 session（data.csv 里没有对应契约），relocate 改不了它。"
+                             % idx)
+
+        day = self.sel_date
+        rec = row.get("relocation") or {}
+        from_hhmm = rec.get("from") or row.get("relocated_from") or row["startLabel"]
+        cur_hhmm = row["startLabel"]
+        dur = row.get("durationMin") or rec.get("duration")
+        if not dur:
+            raise ValueError("#%d 看不出时长（快照？），先 refresh 成功一次再挪。" % idx)
+        dur = str(int(dur))
+
+        got = sch.parse_hhmm(cur_hhmm)
+        if got is None:
+            raise ValueError("当前行时间 %r 不是合法 HH:MM" % cur_hhmm)
+        cur_start = datetime.datetime(day.year, day.month, day.day, got[0], got[1])
+        target = cur_start + datetime.timedelta(minutes=delta)
+        if target.date() != day:
+            raise ValueError("不能跨天移动：%s %s 挪 %+d 分钟会跑到 %s。"
+                             % (day.isoformat(), cur_hhmm, delta, target.date().isoformat()))
+        target_hhmm = target.strftime("%H:%M")
+
+        if delta > 0 and sch.get_later_move(day):
+            raise ValueError("%s 已经往后挪过一次了；一天只能往后挪一次。"
+                             % day.isoformat())
+
+        # 目标时间撞车：契约里不能撞，API 里也不能撞（原 session 自己不算）。
+        for slot in sch.day_slots(self.entries, day):
+            if slot["start"] == cur_hhmm:
+                continue
+            if slot["start"] == target_hhmm:
+                raise ValueError("目标时间 %s 已经有一场契约；不能撞车。" % target_hhmm)
+        for r in getattr(self, "api_rows", []):
+            if r.get("startLabel") == target_hhmm and r.get("id") != row.get("id"):
+                raise ValueError("目标时间 %s API 里已经有一场 session；不能撞车。" % target_hhmm)
+
+        old_offset = int(rec.get("offset") or 0)
+        new_offset = old_offset + delta
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        key = sch.key_of(day, from_hhmm)
+
+        # 先落临时挪动记录；原 session 取消失败就回滚，保证「取消+挪动」不会只做一半。
+        before = sch.load_relocations()
+        after = copy.deepcopy(before)
+        after.setdefault("relocations", {})[key] = {
+            "kind": "temporary",
+            "date": day.isoformat(),
+            "from": from_hhmm,
+            "to": target_hhmm,
+            "duration": dur,
+            "offset": new_offset,
+            "at": stamp,
+        }
+        if delta > 0:
+            after.setdefault("later_moves", {})[day.isoformat()] = {
+                "key": key,
+                "from": from_hhmm,
+                "to": target_hhmm,
+                "at": stamp,
+            }
+        sch.save_relocations(after)
+
+        if row.get("id") is not None:
+            self.say("#%d 取消原 session %s…" % (idx, cur_hhmm), "cmd")
+            try:
+                with self.console.status("[red]取消原 session…[/]", spinner="dots"):
+                    res = self.bridge.call("cancel", startMs=row["startMs"], meetingId=row["id"])
+            except BridgeError:
+                sch.save_relocations(before)
+                raise
+            if not res.get("verified"):
+                sch.save_relocations(before)
+                self.had_error = True
+                self.say("❌ #%d 原 session 取消后复核还在；临时挪动已回滚。" % idx, "error")
+                return False
+            # 本地表也把旧 session 拿掉，离线/测试环境不用等下一次 refresh 才看不到它。
+            self.api_rows = [r for r in self.api_rows
+                             if not (r.get("id") == row.get("id")
+                                     and r.get("startMs") == row.get("startMs"))]
+
+        moved = "提前" if delta < 0 else "推后"
+        self.say("✅ #%d %s %d 分钟：%s → %s（临时，不改 data.csv；原时间 %s）。"
+                 % (idx, moved, abs(delta), cur_hhmm, target_hhmm, from_hhmm), "ok")
+
+        # 执行区里的场次立刻走一轮 check：data.csv 原 slot 已被临时记录替换，
+        # check 会去订新时间；草稿区还没进窗口，等 daemon 到点再说。
+        if row.get("zone") != "draft":
+            self._release_browser("daemon 下单要独占同一个 Chromium profile")
+            self.say("立刻触发一轮 check（keep_session.py check）…", "cmd")
+            rc, out, err = run_keep_session("check", timeout=600)
+            for line in (out or "").splitlines()[-20:]:
+                self.say(line)
+            if rc == 0:
+                self.say("✅ check 跑完。", "ok")
+            else:
+                self.had_error = True
+                self.say("❌ check 退出码 %d%s（临时计划已落盘，daemon 后续还会补）"
+                         % (rc, ("：" + err) if err else ""), "error")
+
+        self.reload_entries()
+        self.rebuild_rows()
+        if not self.offline:
+            self.refresh(quiet=True)
+        return True
+
     def _drop_contract_row(self, idx, row):
-        """草稿区：把 data.csv 里那行删掉。零阻力、不问任何问题 —— 这就是「自由」。"""
+        """草稿区：把 data.csv 里那行删掉。零阻力、不问任何问题 —— 这就是「自由」。
+
+        如果这一行是临时挪动出来的：撤销挪动（恢复 data.csv 原时间），
+        **不删** data.csv 的按星期几规则；已订上的目标 session 顺手取消。
+        """
+        if row.get("relocation"):
+            rec = row.get("relocation") or {}
+            from_hhmm = rec.get("from") or row.get("relocated_from") or row["startLabel"]
+            if row.get("id") is not None:
+                self.say("#%d 取消临时挪动目标 %s…" % (idx, row["startLabel"]), "cmd")
+                with self.console.status("[red]取消中…[/]", spinner="dots"):
+                    res = self.bridge.call("cancel", startMs=row["startMs"], meetingId=row["id"])
+                if not res.get("verified"):
+                    self.had_error = True
+                    self.say("❌ #%d 取消后复核：临时目标还在；挪动没撤销。" % idx, "error")
+                    return False
+            sch.remove_relocation(self.sel_date, from_hhmm)
+            self.say("✅ 已撤销 #%d 的临时挪动：恢复 data.csv 原时间 %s。"
+                     % (idx, from_hhmm), "ok")
+            self.refresh(quiet=True)
+            return True
+
         if not row.get("lineno"):
             raise ValueError("#%d 在 data.csv 里没有对应行（计划外的场次），删不了" % idx)
         if sch.fingerprint() != self.csv_fp:
@@ -1669,6 +1827,7 @@ class Warden(object):
             ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
             ("session HH:MM-HH:MM", "同上，但用起点–终点（如 11:15-12:05 → 50min）"),
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
+            ("relocate N ±MM", "临时把 #N 提前/推后：不写 data.csv；推后一天一次，且不能跨天"),
             ("mute N on|off", "把 #N 静音；不写 on/off 就是取反"),
             ('title N "文本"', '把 #N 的标题改成文本；title N "" 清空'),
             ("force-check", "忽略重试上限/退避：把所有没订上的 session 各强制重订一次"),
@@ -1907,6 +2066,39 @@ def parse_session_spec(args):
 
 
 # ---------------------------------------------------------------- CLI
+
+
+def parse_relocate_offset(token):
+    """解析 relocate 的第二个参数：±MM，必须是 15 的倍数、不能是 0。"""
+    s = str(token).strip()
+    if not re.match(r"^[+-]?\d+$", s or ""):
+        raise ValueError("挪动分钟数要像 -15 / +15；你给的是 %r" % token)
+    minutes = int(s)
+    if minutes == 0:
+        raise ValueError("挪 0 分钟等于没挪；-15 是提前，+15 是推后。")
+    if minutes % 15 != 0:
+        raise ValueError("Focusmate 只认 15 分钟整点；挪动分钟数要是 15 的倍数，你给的是 %r"
+                         % token)
+    return minutes
+
+
+def parse_relocate_spec(args):
+    """把 relocate 参数解析成 (ID token, 偏移分钟)。
+
+    兼容 `["1", "-15"]`、连写 `["1-15"]`，也兼容只传偏移量 `["-15"]`
+    （这种调用方自己已经有 ID）。
+    """
+    toks = [str(a).strip() for a in args if str(a).strip()]
+    usage = "用法：relocate N ±MM（MM 是 15 的倍数，如 relocate 3 -15）"
+    if len(toks) == 2:
+        return toks[0], parse_relocate_offset(toks[1])
+    if len(toks) == 1:
+        # 有人会连写成 relocate 1-15 / relocate 1+15。
+        m = re.match(r"^(\d+)([+-]\d+)$", toks[0])
+        if m:
+            return m.group(1), parse_relocate_offset(m.group(2))
+        return None, parse_relocate_offset(toks[0])
+    raise ValueError(usage)
 
 
 def cmd_install_deps():

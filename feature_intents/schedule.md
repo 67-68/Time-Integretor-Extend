@@ -71,12 +71,18 @@ HH:MM-HH:MM                 —— 每天，如 11:15-12:05
 | `parse_text(text, weekday=None)` | 解析内容 → `(slots, warnings)`，永不抛异常 |
 | `load_entries(path=None, weekday=None)` | 读文件 → `(slots, warnings)`；文件不存在 = `([], [])` |
 | `load_slots(path=None, weekday=None)` | 只要 slots 的老接口（`test_download_calendar.py` 还在用） |
-| `day_slots(entries, day)` | 某一天实际生效的契约（该星期几 + 每天），按时间去重排序 |
+| `day_slots(entries, day)` | 某一天实际生效的契约（该星期几 + 每天 + 临时挪动覆盖），按时间去重排序 |
 | `window(entries, now, hours=24)` | 切出 `{horizon, due, past}` —— daemon 每轮就吃这个 |
 | `zone_name(start, now, hours=24)` | `past` / `locked` / `draft` —— 三层摩擦的判据 |
 | `key_of(day, slot)` | 状态机 key：`2026-10-09T19:00`（带日期，跨天不串味） |
 | `add_row(...)` / `remove_row(...)` | TUI 的增删（合法性校验 + 排序插入 + 先备份） |
+| `add_relocation(...)` / `remove_relocation(...)` | 临时挪动：只覆盖具体日期，不写 data.csv |
 | `fingerprint()` | 内容 sha1：改文件前比对，防「改错行」 |
+
+临时挪动（`relocate`）不写 data.csv，只写 `temp/keep_session-relocations.json`：
+key 是「具体日期 + 原 HH:MM」，`day_slots()` 在对应日期把它替换成新时间；
+过了那一天记录不再命中，未来同星期几不受影响。推后额度也存在同一文件里，
+按 session 日期记一次。
 
 `python3 schedule.py show [YYYY-MM-DD]` / `show --week` 是给人看的只读视图。
 

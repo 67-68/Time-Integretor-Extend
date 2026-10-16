@@ -61,7 +61,9 @@ ks.notify = lambda *a, **kw: None        # 别真弹 macOS 通知
 NOW = datetime.datetime.now()
 TODAY = NOW.date()
 TODAY_WD = sch.weekday_of_day(TODAY)
-FRI = TODAY + datetime.timedelta(days=(4 - TODAY.weekday()) % 7 or 7)
+# “另一个有契约的星期几”。如果下一个周五就是今天（今天周五），+7 仍是同一个
+# weekday，测试里两行会撞车；所以退到明天，保证 FRI_WD != TODAY_WD。
+FRI = TODAY + datetime.timedelta(days=(4 - TODAY.weekday()) % 7 or 1)
 FRI_WD = sch.weekday_of_day(FRI)
 ROWS = ["# test schedule", "%s,21:00,25" % TODAY_WD, "%s,09:00,50" % FRI_WD]
 

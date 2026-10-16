@@ -123,6 +123,7 @@ cat temp/warden-summon.log     # AppleScript 侧：命中哪个窗口、每一�
 | **`$VAR` 后面紧跟中文标点** | bash 报 `APP_DIR\uFFFD: unbound variable` | 变量名的字节判断会把全角标点的首字节吃进变量名。写 `${VAR}。` 而不是 `$VAR。` |
 | **拿完整路径去 `grep` 二进制判仓库搬家** | 永远匹配不上，每次重装都重建 | Swift 里烤的是「仓库根」一个字符串，`app/warden-summon.applescript` 是运行时拼的。要 grep 仓库根 |
 | **`[ -w /Applications ]`** | 说可写、装到一半才炸 | 只读权限位。要真去写一个探针文件 |
+| **Dynamic Profiles 的 JSON 根元素** | iTerm2 每次启动弹「does not have an Object (i.e., a dictionary) as its root element」 | 根必须是**字典**：`{\"Profiles\": [ {...} ]}`，裸数组不行。profile 里的键（Name/Guid/Dynamic Profile Parent Name/颜色那几个）都是对的，错的只有最外层 |
 
 ---
 

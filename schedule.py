@@ -53,6 +53,7 @@
 纯 stdlib，Python 3.9 可跑。
 """
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -61,6 +62,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEMP = os.path.join(HERE, "temp")
 DATA_CSV = os.path.join(HERE, "data.csv")
 BACKUP_CSV = os.path.join(TEMP, "data.csv.bak")
+RELOCATIONS_FILENAME = "keep_session-relocations.json"
 
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 CN_WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -266,16 +268,141 @@ def load_slots(path=None, weekday=None):
     return load_entries(path, weekday=weekday)[0]
 
 
-def day_slots(entries, day):
-    """某一天实际生效的契约：该星期几 + 每天的行，按时间排序、同时间只留一条。
+def relocations_path(path=None):
+    """临时挪动记录文件：只影响具体某一天，不写回 data.csv。"""
+    return path or os.path.join(TEMP, RELOCATIONS_FILENAME)
 
-    同时间撞车时按文件行号取第一条（先写的赢），后面的忽略。
+
+def load_relocations(path=None):
+    """读临时挪动记录。
+
+    返回 {"version": 1, "relocations": {...}, "later_moves": {...}}。
+    文件不存在 / 坏掉时返回空结构（和 data.csv 一样：坏文件不能让 TUI 炸）。
     """
+    default = {"version": 1, "relocations": {}, "later_moves": {}}
+    try:
+        with open(relocations_path(path), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return default
+    if not isinstance(data, dict):
+        return default
+    data.setdefault("version", 1)
+    if not isinstance(data.get("relocations"), dict):
+        data["relocations"] = {}
+    if not isinstance(data.get("later_moves"), dict):
+        data["later_moves"] = {}
+    return data
+
+
+def save_relocations(data, path=None):
+    """原子写回临时挪动记录。"""
+    p = relocations_path(path)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, p)
+    return p
+
+
+def get_later_move(day, relocations=None):
+    """这一天有没有已经用掉「往后挪一次」的额度？返回记录或 None。"""
+    data = relocations if relocations is not None else load_relocations()
+    return (data.get("later_moves") or {}).get(day.isoformat())
+
+
+def add_relocation(day, from_hhmm, to_hhmm, duration, offset=0, later=False, path=None):
+    """记下「某一天、原 start → 临时 start」的挪动。
+
+    只写 temp/ 下的记录文件，不碰 data.csv；day_slots() 会在选中这一天时用记录覆盖。
+    offset 是从 data.csv 原时间算起的累计分钟数（方便连续挪动后还原）。
+    later=True 时同时占用这一天的「往后挪一次」额度。
+    """
+    data = load_relocations(path)
+    key = key_of(day, from_hhmm)
+    rec = {
+        "kind": "temporary",
+        "date": day.isoformat(),
+        "from": from_hhmm,
+        "to": to_hhmm,
+        "duration": str(duration),
+        "offset": int(offset),
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    data.setdefault("relocations", {})[key] = rec
+    if later:
+        data.setdefault("later_moves", {})[day.isoformat()] = {
+            "key": key,
+            "from": from_hhmm,
+            "to": to_hhmm,
+            "at": rec["at"],
+        }
+    save_relocations(data, path)
+    return rec
+
+
+def remove_relocation(day, from_hhmm, path=None):
+    """撤销某一天的临时挪动，并把同一天占用的「往后挪」额度一起还回去。"""
+    data = load_relocations(path)
+    key = key_of(day, from_hhmm)
+    rec = (data.get("relocations") or {}).pop(key, None)
+    later = (data.get("later_moves") or {}).get(day.isoformat())
+    if later and later.get("key") == key:
+        data["later_moves"].pop(day.isoformat(), None)
+    if rec is not None or later:
+        save_relocations(data, path)
+    return rec
+
+
+def _day_slots_raw(entries, day):
+    """某一天**没有临时挪动时**的契约：星期几匹配 + 每天，按时间排序、同时刻只留一条。"""
     wd = weekday_of_day(day)
     out, used = [], set()
     for slot in entries:
         if slot["weekday"] not in ("*", wd):
             continue
+        if slot["start"] in used:
+            continue
+        used.add(slot["start"])
+        out.append(slot)
+    out.sort(key=lambda s: (s["hour"], s["minute"]))
+    return out
+
+
+def day_slots(entries, day, relocations=None):
+    """某一天实际生效的契约：data.csv 规则 + 这一天的临时挪动。
+
+    临时挪动只按「具体日期 + 原 HH:MM」覆盖，所以不会改到以后每个星期。
+    同一目标时间撞车时按原表顺序先到先得（正常命令会先拒绝撞车）。
+    """
+    base = _day_slots_raw(entries, day)
+    if relocations is None:
+        relocations = load_relocations()
+    recs = (relocations or {}).get("relocations") or {}
+    if not recs:
+        return base
+
+    shifted = []
+    for slot in base:
+        rec = recs.get(key_of(day, slot["start"]))
+        if not isinstance(rec, dict):
+            shifted.append(slot)
+            continue
+        target = rec.get("to")
+        got = parse_hhmm(target) if target else None
+        if got is None:
+            shifted.append(slot)
+            continue
+        new = dict(slot)
+        new["start"] = fmt_hhmm(*got)
+        new["hour"], new["minute"] = got
+        new["relocated_from"] = slot["start"]
+        new["relocation"] = dict(rec)
+        shifted.append(new)
+
+    out, used = [], set()
+    for slot in shifted:
         if slot["start"] in used:
             continue
         used.add(slot["start"])
