@@ -7,7 +7,8 @@
 
 定位是**看板 + 审讯台**，不是自动化中枢：它不替代 daemon，也不做定时，**也不重写业务逻辑**
 —— 下单和启停走 `keep_session.py` 子进程（薄封装），CSV 解析/编辑走 `schedule.py`。
-daemon 负责「保证订上」，warden 负责「随时看得见、随时能改、想取消得付出代价」。
+daemon 负责「保证订上」，warden 负责「随时看得见、随时能改、想取消得付出代价」，
+另外还负责「回头看这几个月到底干成什么样」（统计视图，取数在 `stats.py`）。
 
 ## 架构
 
@@ -26,9 +27,14 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
      │            python3 download_calendar.py populate      ← sync：日历 → data.csv
      │    → 下单/启停/拉日历都走现成 CLI，不在自己进程里 fork、也不重写
      │
-     └──4) JSON 行（stdin/stdout）──> scripts/bridge.mjs
-                                        └── Playwright ──> 常驻 Chromium
-                                            └── 内部 API（PUT/DELETE，裸 Firebase token）
+     ├──4) JSON 行（stdin/stdout）──> scripts/bridge.mjs
+     │                                  └── Playwright ──> 常驻 Chromium
+     │                                      └── 内部 API（PUT/DELETE，裸 Firebase token）
+     │
+     └──5) stats.py（只读，给统计视图供数）
+            ├── GET /v1/me                → memberSince / totalSessionCount
+            ├── GET /v1/sessions 按 ≤365 天分块 → 全量历史
+            └── temp/stat-history.json    → 1 小时缓存（唯一写的东西）
 ```
 
 为什么要有 bridge：`scripts/*.mjs` 那四个 CLI 每次调用都要冷启动一个 Chromium。
@@ -72,6 +78,8 @@ force-check         忽略重试上限/退避：把所有没订上的 session �
 refresh / r         重新拉选中那天的 session（ID 会重编号）
 start               启动 daemon（先让 bridge 放开浏览器）
 stop                停用 daemon（**要敲宣言**）
+stat [refresh]      切到「统计」视图：生涯累计 / 每天分布 / 按月 / 永不重订名单
+                    （走 1 小时缓存；加 refresh 强制重拉；数据来自只读 API）
 status / s          重画看板
 help / quit
 ```
@@ -107,14 +115,25 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 实现 `render()` / `handle()`，再用 `@register_view` 注册；`paint()` / 切换 / 提示
 都会自动跟上（`VIEWS` 列表驱动，顺序即 Tab 顺序）。
 
-现有两个视图：
+现有三个视图：
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
 | 1 | 契约（默认） | The Contract Table + 契约摘要 | 原来那一整套（`session` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
+| 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（拉一次，走 1 小时缓存）/ `stat refresh`（强制重拉）/ `refresh` / `r` |
 
-- 通用命令（两个视图都认）：`Tab`（切视图）/ `status` / `help` / `quit`。
+- **统计视图的数据链在 `stats.py`**（只读公开 API，按 ≤365 天分块拉全量历史，
+  口径与缓存见 [`stat.md`](./stat.md)）。它不写任何东西：不改 `data.csv`、
+  不碰内部写接口、也不动 daemon 的状态文件。
+- **进统计视图会懒加载一次**（Tab 进去或敲 `stat` 都算），之后走内存/磁盘缓存。
+  首次要拉几秒，TUI 会卡那一下 —— 这是刻意接受的代价，换来「切过去就有数」。
+- **「永不重订」名单（verdicts 的 `abandoned`）只在统计视图底部逐行列**（一条一行）。
+  契约视图的契约摘要里只留一句「永不重订名单（N 条）：stat 命令 / 统计视图」指路，
+  平常视图不铺开这些记录。
+- 通用命令（三个视图都认）：`Tab`（切视图）/ `stat` / `status` / `help` / `quit`。
+  注意：**罪案区锁死时 `stat` 也进不去**（和别的命令一样，除了敲宣言什么都不受理）——
+  这是既有的锁语义，不是统计视图的特例。
 - **专注视图的 `stop` ≠ 契约视图的 `stop`**：前者是「消耗一次暂停」，
   后者是「停 daemon（要敲宣言）」。同一个词在两个视图里语义不同，由视图分发。
 - **Shift+Tab 切专注模式**：普通=1 分钟无输入直接记违规、3 次惩罚；做题=3 分钟、
@@ -131,6 +150,25 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 - TTY 下用 cbreak 逐键读（`read_command`），**Tab 是即时切换**、不用回车；
   **Shift+Tab（`\x1b[Z`）** 是即时切模式；管道 / `--exec` 下按行处理，一行 Tab /
   `shift-tab` 也算。
+### 整帧重画（删掉上一帧，而不是 clear 整屏）
+
+屏幕**永远只有一帧**：`paint()` 先把上一帧从终端上删掉，再画新的。
+
+- 记账：`_frame_rows` = 上一帧占了几行，`_tail_rows` = 帧之后又打了几行
+  （提示符那一行、帮助面板、宣言闸门、`>>>` 回显…）。删的时候是
+  `\x1b[<n>A` 上移 + `\r\x1b[J` 清到屏幕末尾，**不是** `Console.clear()`。
+  为什么不用 `clear()`：它只把屏幕推到滚动历史里，翻上去是一摞残帧。
+- **帧外的输出必须走 `emit()`**（它渲染到 `capture` 里数行数再写回 `console.file`）。
+  直接 `console.print` 的后果不是「少删一行」而是**光标落进旧内容中间**：
+  下一次上移的 n 算少了，屏幕上留半张旧面板。
+- 上移行数**钳在 `console.height - 1`**：帧比屏幕高时（比如统计视图很长），
+  顶上去的部分在滚动历史里，终端本来也擦不到；不钳的话光标会乱跳。
+- 帧比屏幕高是终端的极限，不是 bug：内容多就多滚几行，`--no-clear` 那种"残留"
+  才会真正消失。想彻底不管屏幕、只留滚动历史就用 `WARDEN_CLEAR=0`（等于 `--no-clear`）。
+- 非 TTY（管道 / 测试的 `Console(file=StringIO)`）一个 ANSI 都不写，退化成纯文本追加
+  —— 老测试和 `--exec` 的输出格式没变。
+- 消息区（Recent）：**屏幕上只显示最近 `MESSAGE_SHOW`=3 条**（帧越高顶部越容易被顶掉），
+  内部留 `MESSAGE_KEEP`=12 条好让「敲错被记账」这类过程还能被测试和排查看到。
 - 空闲秒数来自 daemon 写进 `temp/keep_session-idle.json` 的 `last_idle_seconds`
   （daemon 每 5s 读一次 `ioreg HIDIdleTime`）。daemon 没在跑就显示「空闲 ?」。
 - 目标暂时是占位（读 `temp/keep_session-goal.txt`，没有就显示占位文案），
@@ -226,6 +264,12 @@ stdout  每行： {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 9. **state 的 key 剪枝不能用字符串比较**。旧格式的 key 是 `"20:00"`，而
    `"20:00" > "2026-10-08"` 在字典序上**成立**（`:` 排在数字后面），会把旧记录留下来。
    现在按 `date.fromisoformat(k[:10])` 判。
+10. **帧外打印不记账 = 屏幕留残影**。整帧重画靠「上一帧占几行」来决定上移多少，
+   帧外的 `console.print`（帮助面板 / 宣言闸门 / `>>>`）不经过 `emit()` 就没记进
+   `_tail_rows` → 少上移几行 → 光标落在旧面板中间重画。全部改走 `emit()`。
+11. **上移行数要用 `console.height`，不是 `_term_height()`**。测试里造的是
+   `Console(file=StringIO, height=40)` 这种"矮终端"，用 `shutil.get_terminal_size()`
+   会拿到 fallback（24 行）→ 钳位钳错，断言就对不上。真 TTY 上两者一致。
 
 ## 依赖
 
@@ -255,7 +299,14 @@ python3 warden.py install-deps
   `populate` 本身另有 `test_download_calendar.py`。
 - 表格默认不自动刷新。如果发现「数字看漂」，考虑加一个只读的轻量刷新
   （不走浏览器），但会拉长占锁时间。
-- 真 TTY 下 `Console.clear()` 的表现没验证；不好用就 `--no-clear`。
+- **整帧重画的真 TTY 手感没人工验证过**（沙箱里没 TTY）：转义序列
+  （`\x1b[<n>A\r\x1b[J`）、Tab 切视图时"提示符那一行"的行数差、中文输入折行，
+  都只在假终端（`force_terminal=True` 的 StringIO）上断言过。不好用就
+  `WARDEN_CLEAR=0` 退回旧的追加行为（逃生通道一直留着）。
+- **统计视图第一次进会卡几秒**（拉全量历史，按年分块）。缓存命中和 `stat refresh`
+  之后的第二次都快；没做后台线程 —— 真嫌卡就把 `stats.CACHE_TTL` 调大。
+- **统计视图的高度**：内容比屏幕高时顶部会滚进滚动历史（终端的极限）。面板里
+  「最近 14 天」+「按月」+「永不重订」都想要，所以行数不少；嫌高就先砍按月。
 
 ## 已删除的历史设计（别再抄回来）
 

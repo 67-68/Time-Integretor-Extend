@@ -58,6 +58,43 @@ ks.IDLE_MODE_FILE = os.path.join(TMP, "mode.json")
 ks.PAUSE_FILE = os.path.join(TMP, "pause.json")
 ks.notify = lambda *a, **kw: None        # 别真弹 macOS 通知
 
+
+def fake_stat_history():
+    """手搭一份 stats.py 口径下的 history：累计 6 场完成、8 场订，区间 10 天。
+
+    为什么在 warden 的测试里也塞这个：统计视图**一进就懒加载**（Tab 也会进去），
+    不把 st.load 换掉的话，只要测试里切到统计视图就会真去连 api.focusmate.com。
+    """
+    plan = {"2026-01-01": [("09:00", True), ("10:00", True)],
+            "2026-01-02": [("09:00", False)],
+            "2026-01-03": [],
+            "2026-01-04": [("09:00", True), ("10:00", False)],
+            "2026-01-05": [("09:00", True), ("10:00", True), ("11:00", True)]}
+    sessions = []
+    for day, items in sorted(plan.items()):
+        for hhmm, done in items:
+            sessions.append({"sessionId": "%s-%s" % (day, hhmm),
+                             "start": "%sT%s:00" % (day, hhmm), "durationMin": 50,
+                             "completed": done, "joined": True, "title": "",
+                             "activityType": "", "mine": True})
+    return {"fetched_at": "2026-01-11T09:00:00", "since": "2026-01-01",
+            "until": "2026-01-10", "source": "api",
+            "me": {"userId": "me", "name": "测试", "memberSince": "2026-01-01T00:00:00",
+                   "totalSessionCount": 6, "timeZone": "Asia/Hong_Kong"},
+            "sessions": sessions}
+
+
+FAKE_STAT = fake_stat_history()
+STAT_PULLS = []
+
+
+def fake_stat_load(force=False, **kw):
+    STAT_PULLS.append(bool(force))
+    return FAKE_STAT, "测试缓存"
+
+
+w.st.load = fake_stat_load          # 全程离线；真正走网络的分支在 test/test_stat.py 测
+
 NOW = datetime.datetime.now()
 TODAY = NOW.date()
 TODAY_WD = sch.weekday_of_day(TODAY)
@@ -650,13 +687,15 @@ check("快照模式标出「快照」而不是「缺」", "快照" in out and " 
 # ---------------------------------------------------------------- 视图（Tab 切换）
 
 print("== 视图：注册 + Tab 切换 ==")
-check("注册了契约/专注两个视图", [v.name for v in w.VIEWS], ["契约", "专注"])
+check("注册了契约/专注/统计三个视图", [v.name for v in w.VIEWS], ["契约", "专注", "统计"])
 wd = mkwarden()
 check("默认契约视图", (wd.view.name, wd.view_index), ("契约", 0))
 wd.handle("tab")
 check("tab 切到专注", (wd.view.name, wd.view_index), ("专注", 1))
 wd.handle("\t")
-check("字面 Tab 切回契约", (wd.view.name, wd.view_index), ("契约", 0))
+check("再一个 Tab 切到统计（Tab 是循环）", (wd.view.name, wd.view_index), ("统计", 2))
+wd.handle("\t")
+check("第三个 Tab 转回契约", (wd.view.name, wd.view_index), ("契约", 0))
 wd.cycle_view()
 check("cycle_view 切到专注", wd.view.name, "专注")
 wd.cycle_view(-1)
@@ -731,10 +770,143 @@ check("data.csv 没被改", open(CSV, encoding="utf-8").read(), before)
 check("提示只认 stop", any("只认 stop" in m[2] for m in wd.messages), True)
 
 print("== 切回契约视图，原来的命令还在 ==")
-wd.cycle_view()
+wd.go_to_view(w.ContractView)
 check("切回契约视图", wd.view.name, "契约")
 check("契约视图认 day 0", wd.handle("day 0"), True)
 check("契约视图认 mute（会走 bridge，不炸就行）", wd.handle("mute 1 on") in (True, False), True)
+
+# ---------------------------------------------------------------- 帧式重画
+
+print("== 帧式重画：删掉上一帧，而不是 clear 整屏 ==")
+check("frame_rows 数换行", w.frame_rows("a\nb\n"), 2)
+check("frame_rows 空字符串", w.frame_rows(""), 0)
+check("erase_escape(0) 什么都不发", w.erase_escape(0), "")
+check("erase_escape 上移 + 清到屏尾", w.erase_escape(5, height=10), "\x1b[5A\r\x1b[J")
+check("erase_escape 钳在 屏高-1（顶上去的部分在滚动历史里擦不到）",
+      w.erase_escape(50, height=24), "\x1b[23A\r\x1b[J")
+check("erase_escape 不清整屏（没有 2J/H）",
+      ("\x1b[2J" in w.erase_escape(5, height=10)) or ("\x1b[H" in w.erase_escape(5, height=10)),
+      False)
+
+buf = io.StringIO()
+console = Console(file=buf, width=100, force_terminal=True, height=40)
+wd = w.Warden(console, FakeBridge(), no_clear=False, offline=True)
+wd.paint()
+check("第一帧不删任何东西（没有 ANSI 上移）", buf.getvalue().startswith("\x1b["), False)
+check("第一帧记了占几行", wd._frame_rows, buf.getvalue().count("\n"))
+f1 = wd._frame_rows
+buf.seek(0)
+buf.truncate()
+wd.paint()
+out = buf.getvalue()
+check("第二帧开头就是删上一帧", out.startswith("\x1b[%dA\r\x1b[J" % (f1 + 1)), True)
+check("删帧不用 clear 整屏", "\x1b[2J" not in out, True)
+check("记账和实际占行一致", wd._frame_rows, out.split("\x1b[J", 1)[1].count("\n"))
+check("提示符那一行也记账（交互模式）", wd._tail_rows, 1)
+
+wd.emit("[bold cyan]>>>[/] help")
+check("emit 帧外的行会记账", wd._tail_rows, 2)
+wd.emit(w.Panel("x" * 300, title="P"))
+check_true("emit 一个高面板会按行数记账", wd._tail_rows > 3)
+f2 = wd._frame_rows
+tail = wd._tail_rows
+buf.seek(0)
+buf.truncate()
+wd.paint()
+n = int(buf.getvalue().split("\x1b[")[1].split("A")[0])
+check("重画时把「上一帧 + 帧外那些行」一起删", n, f2 + tail)
+
+buf2 = io.StringIO()
+console2 = Console(file=buf2, width=100, force_terminal=True, height=40)
+wd2 = w.Warden(console2, FakeBridge(), no_clear=True, offline=True)
+wd2.paint()
+wd2.paint()
+check("--no-clear 一个转义都不发（留着滚动历史）",
+      ("\x1b[1A" in buf2.getvalue()) or ("\x1b[J" in buf2.getvalue()), False)
+check("--no-clear 两次重画 = 两份内容（追加）",
+      buf2.getvalue().count("The Contract Table"), 2)
+
+buf3 = io.StringIO()
+console3 = Console(file=buf3, width=100, force_terminal=False)
+wd3 = w.Warden(console3, FakeBridge(), no_clear=False, offline=True)
+wd3.paint()
+wd3.paint()
+check("非 TTY（管道/测试）不写任何 ANSI", "\x1b[" in buf3.getvalue(), False)
+
+print("== 消息区：屏幕只显示最近 3 条，内部多留一点 ==")
+check("屏幕显示条数常量", w.MESSAGE_SHOW, 3)
+wd = mkwarden()
+for i in range(15):
+    wd.say("msg%d" % i)
+check("内部只留 MESSAGE_KEEP 条", len(wd.messages), w.MESSAGE_KEEP)
+buf = io.StringIO()
+wd.console = Console(file=buf, width=120, force_terminal=False)
+wd.paint()
+out = buf.getvalue()
+check("屏幕上只剩最近 3 条", [("msg%d" % i) in out for i in (14, 13, 12)], [True, True, True])
+check("第 4 条旧的没上屏", "msg11" in out, False)
+
+# ---------------------------------------------------------------- 统计视图 / stat 命令
+
+print("== 统计视图 + stat 命令 ==")
+write_csv(ROWS)
+clear_state()
+ks._save_json(ks.VERDICTS_FILE, {"abandoned": {
+    "2026-01-09T09:00": {"at": "2026-01-09T10:30:00", "why": "walk-of-shame", "note": "测试用"}}})
+STAT_PULLS[:] = []
+wd = mkwarden()
+check("统计视图没有动态状态行（不用每秒刷）", wd.views[2].status_line(), None)
+check("一进来不是统计视图", wd.view.name, "契约")
+
+check("任意视图敲 stat 都受理", wd.handle("stat"), True)
+check("stat 切到了统计视图", wd.view.name, "统计")
+check("stat 拉到了数字（完成 6 场 / 10 天）",
+      (wd.stat["total_completed"], wd.stat["days"]), (6, 10))
+
+buf = io.StringIO()
+wd.console = Console(file=buf, width=120, force_terminal=False)
+wd.paint()
+out = buf.getvalue()
+for label in ("Stat · 统计", "每天平均", "空 天", "峰 值", "中位数", "p25", "最近 10 天",
+              "按月", "永不重订", "完成 6"):
+    check("统计面板有 %s" % label, label in out, True)
+check("永不重订逐行列（一条一行）", "2026-01-09 09:00" in out, True)
+check("永不重订带认罪时间", "2026-01-09 10:30" in out, True)
+check("统计视图不画契约表", "The Contract Table" not in out, True)
+
+wd.go_to_view(w.ContractView)
+check("切回契约视图", wd.view.name, "契约")
+buf = io.StringIO()
+wd.console = Console(file=buf, width=120, force_terminal=False)
+wd.paint()
+out = buf.getvalue()
+check("平常视图不逐行列永不重订名单", "2026-01-09 09:00" not in out, True)
+check("平常视图只留一句指路", "永不重订名单（1 条）" in out, True)
+
+# 缓存语义：内存里已有就别再拉；stat refresh 强制重拉
+STAT_PULLS[:] = []
+wd.handle("stat")
+check("第二次 stat 不重拉（内存里已有）", STAT_PULLS, [])
+wd.handle("stat refresh")
+check("stat refresh 强制重拉", STAT_PULLS, [True])
+wd.go_to_view(w.StatsView)
+check("Tab 进统计视图不重拉", STAT_PULLS, [True])
+
+# 拉取失败：不掀 TUI，视图给一行说明
+def boom(force=False, **kw):
+    raise OSError("网络炸了")
+
+
+w.st.load = boom
+wd = mkwarden()
+check("拉取失败 stat 返回 False（不炸）", wd.handle("stat"), True)
+check("失败时 had_error 置位", wd.had_error, True)
+check("失败时没有数字", wd.stat, None)
+buf = io.StringIO()
+wd.console = Console(file=buf, width=120, force_terminal=False)
+wd.paint()
+check("失败也把说明打在统计视图上", "拉取失败" in buf.getvalue(), True)
+w.st.load = fake_stat_load        # 复原：后面的用例还要离线拉假的
 
 print("== 非 TTY 下：一行 Tab 也算切视图 ==")
 _rescue_stdin = sys.stdin

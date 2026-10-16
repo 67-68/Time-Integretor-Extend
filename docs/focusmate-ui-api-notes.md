@@ -157,6 +157,19 @@ Prefer Favorites
 - 认证：`X-API-Key: <key>`（在 Focusmate 设置页生成，存 `~/.focusmate-mcp/config.json`）
 - 能力：`GET /me`、`GET /sessions` —— **只读**，不能 book / 改 / 删。
 
+**实测补充（2026-10-17，给 `stats.py` 的生涯统计用）：**
+
+- `GET /v1/sessions?start=&end=` 的边界是 **UTC ISO**，返回区间内**全部** session
+  （含早已过去的）。
+- **单次查询上限 365 天**：365 天 → 200（拿到 2251 条），366 天 → `400 Bad Request`。
+  所以拉全量历史要按 ≤365 天**分块**，不是翻页 —— 没发现 `page`/`cursor` 参数。
+- `GET /v1/me` 给 `userId` / `name` / `memberSince` / `totalSessionCount` / `timeZone`。
+  `totalSessionCount`（本账号 1933）＝ 该用户 `completed=true` 的场次数，
+  比「订过多少场」（同一区间 2261 条记录）少。
+- 每条 session 的形状：`sessionId / sessionType / duration(ms) / startTime / title /
+  users[]`；`users[]` 里 `userId` 对得上自己的那条才有
+  `joinedAt / completed / activityType / preferences`（另一位 partner 只有 `userId`）。
+
 ### 3.2 App 内部 API（未文档化，可写）
 
 同一个 base `https://api.focusmate.com/v1/`，认证换成 **Firebase ID token**：

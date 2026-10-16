@@ -9,18 +9,32 @@
                        用 `day -1 / day 0 / day 1` 切换看哪天。
 3. The Interrogation   死循环 input，极简命令：
                        mute 3 / title 2 "文本" / session 09:00 50 / session 11:15-12:05
-                       cancel 1 / relocate 1 -15 / day 1 / sync / force-check
+                       cancel 1 / relocate 1 -15 / day 1 / sync / force-check / stat
 4. Panic Action        —— 已按你的要求删掉。没有这个功能。
 
 视图（Tab 切换）
 ----------------
-按 **Tab** 在多个视图间切换，视图显示在命令提示上面。现有「契约」（默认，就是
-上面那套）和「专注」（目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态；
-`stop` = 消耗一次暂停，**Shift+Tab** = 循环普通 / 做题 / 写作模式）两个。视图可扩展：
-继承 `View` + `@register_view` 即可，`paint()` / 切换 / 命令提示都由 `VIEWS` 列表驱动。
+按 **Tab** 在多个视图间循环切换，视图显示在命令提示上面。现有三个：
+
+1. **契约**（默认）：上面那套表格 + 命令。
+2. **专注**：目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态；
+   `stop` = 消耗一次暂停，**Shift+Tab** = 循环普通 / 做题 / 写作模式。
+3. **统计**：生涯累计（总场次 / 每天平均 / 空天 / 峰值 / 中位数与 p25）/ 按月 /
+   最近 14 天，**底部逐行列「永不重订」名单**（verdicts 的 `abandoned`，
+   平常视图不铺开）。取数与口径在 `stats.py`（只读公开 API，1 小时缓存）；
+   任意视图敲 `stat` 都能切过去，`stat refresh` 强制重拉。
+
+视图可扩展：继承 `View` + `@register_view` 即可，`paint()` / 切换 / 命令提示都由
+`VIEWS` 列表驱动。
+
+屏幕永远只有**一帧**：`paint()` 先把上一帧删掉（`\x1b[<n>A` 上移 + `\r\x1b[J` 清到屏尾，
+行数靠 `_frame_rows`/`_tail_rows` 记账），**不是** `Console.clear()` —— clear 只把旧帧
+推进滚动历史，翻上去是一摞残帧。帧外的输出（帮助面板 / 宣言闸门 / `>>>` 回显）一律走
+`emit()`，否则不记账、光标会落进旧内容中间。消息区屏幕上只显示最近 3 条。
+`--no-clear`（`WARDEN_CLEAR=0`）保留旧的追加行为，留着滚动历史。
 
 动态数字（暂停倒计时 / 空闲秒数）走 `View.status_line()`：paint() 把它打在最后一行，
-读输入时只原地覆盖那一行（`\x1b[1A` / `\x1b[K` / `\x1b[1B`），**不清屏、不重画整屏**，
+读输入时只原地覆盖那一行（`\x1b[1A` / `\x1b[K` / `\x1b[1B`），**不重画整帧**，
 所以数字在走的时候不抖。
 
 三层摩擦（这套系统真正的规则）
@@ -39,7 +53,8 @@
        │  ▲
        │  └── 只读文件 ──> temp/keep_session-state.json / warden-sins.json / pid / log
        ├── 读写 data.csv ──> schedule.py（解析/编辑的**唯一**实现，daemon 也用它）
-       └── 子进程 ──> keep_session.py check | daemon start | stop（薄封装，不重写业务）
+       ├── 子进程 ──> keep_session.py check | daemon start | stop（薄封装，不重写业务）
+       └── stats.py ──> 只读公开 API（/v1/me + /v1/sessions 分块拉全量历史）→ 统计视图
 
 - 写操作（mute / title / cancel）全部走 bridge（内部 API，见 docs/…-notes.md）。
 - daemon 的启停、`session` 之后的立刻下单，都走 keep_session.py 子进程
@@ -56,7 +71,8 @@
 用法
 ----
     python3 warden.py                          # 交互 TUI
-    python3 warden.py --no-clear               # 别清屏（留滚动历史）
+    python3 warden.py --no-clear               # 退化成追加（不删帧、留滚动历史）
+    python3 warden.py --exec "stat"            # 拉一次生涯统计（切到统计视图）
     python3 warden.py --exec "day 1; session 09:00 50"   # 跑完命令就退（`;` 分隔）
     python3 warden.py --exec "sync"            # 拉日历重生成 data.csv 后退出
     python3 warden.py --day 1                  # 一进来就看明天
@@ -107,12 +123,23 @@ except ImportError:
 sys.path.insert(0, HERE)
 import keep_session as ks  # noqa: E402  只用来读 daemon 状态 / 起停 daemon / 罪与判决
 import schedule as sch  # noqa: E402  data.csv 的解析与编辑（唯一实现）
+import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + 算数字 + 缓存
 
 BRIDGE_JS = os.path.join(HERE, "scripts", "bridge.mjs")
 
 # 罪案区的全局锁：有未认罪的 sin 时，除了宣言什么都不受理。
 # 上限只影响一轮循环里反复敲错的次数（敲错就继续鸣笛、继续锁）。
 SIN_BEEP_LIMIT = 3
+
+# 消息区（Recent）：屏幕上只显示最近 MESSAGE_SHOW 条 —— 屏幕永远只有「一帧」，
+# 留一长串历史只会让帧越来越高、钳到屏高之后顶部残帧反而删不干净。
+# 内部再多留几条（MESSAGE_KEEP），好让「敲错被记账」这类过程还能被测试和排查看到。
+MESSAGE_SHOW = 3
+MESSAGE_KEEP = 12
+
+# 帧式重画：把上一帧从终端上抹掉，而不是 Console.clear() 整屏清。
+# 上移 n 行（`\x1b[<n>A`）+ 回行首 + 清到屏幕末尾（`\r\x1b[J`）。
+ERASE_FRAME = "\x1b[%dA\r\x1b[J"
 
 # ---------------------------------------------------------------- 小工具
 
@@ -601,6 +628,160 @@ class FocusView(View):
         return True
 
 
+@register_view
+class StatsView(View):
+    """统计视图：生涯累计 + 每天分布 + 永不重订名单。
+
+    数据链在 `stats.py`（只读公开 API，按 365 天分块拉全量历史，缓存 1 小时）；
+    这个视图只管渲染。口径见 stats.py 的 docstring（完成 = completed=true，
+    区间 = memberSince → 昨天，分母含空天）。
+
+    「永不重订」（daemon 永不重订的场次 = 你敲完宣言认过罪的地方）**只在这里**出现，
+    一条一行列在最底下 —— 平常视图一个字都不提。
+    """
+
+    key = "3"
+    name = "统计"
+    label = "统计 / 历史"
+
+    @property
+    def hint(self):
+        return ("命令：[bold]stat[/] 拉一次 · [bold]stat refresh[/] 无视缓存重拉 · "
+                "[bold]r[/] 刷新    [dim]（Tab 切视图；数据：Focusmate 只读 API）[/]")
+
+    def status_line(self):
+        return None                     # 静态面板，不需要每秒刷新
+
+    def handle(self, cmd, args, line):
+        w = self.w
+        if cmd in ("stat", "stats"):
+            w.cmd_stat(force=any(a in ("refresh", "force", "--force") for a in args))
+        elif cmd in ("refresh", "r", "reload"):
+            w.cmd_stat()
+        else:
+            w.say("「统计」视图只认 stat / stat refresh / refresh；"
+                  "按 Tab 切回去再敲别的。", "warn")
+        return True
+
+    # -- 渲染
+
+    @staticmethod
+    def _bar(value, vmax, width=8):
+        """把一天的量画成一小段条（0 就留空）。"""
+        if value <= 0:
+            return ""
+        if vmax <= 0:
+            return "▇"
+        return "▇" * max(1, int(round(value * width / float(vmax))))
+
+    def _recent_panel(self, s):
+        vmax = max([r["completed"] for r in s["recent"]] or [0])
+        cells = []
+        for r in s["recent"]:
+            n = r["completed"]
+            bar = self._bar(n, vmax, width=8)
+            txt = Text()
+            txt.append(r["date"][5:] + " ", style="dim")
+            txt.append((bar or "·").ljust(8), style="green" if n else "dim")
+            txt.append(" %2d" % n, style="bold" if n else "dim")
+            cells.append(txt)
+        cols = 7
+        t = Table.grid(padding=(0, 1))
+        for _ in range(cols):
+            t.add_column(no_wrap=True)
+        for i in range(0, len(cells), cols):
+            row = cells[i:i + cols]
+            while len(row) < cols:
+                row.append(Text(""))
+            t.add_row(*row)
+        return Panel(t, title="[bold]最近 %d 天[/]" % len(cells), border_style="dim",
+                     box=box.ROUNDED)
+
+    def _month_panel(self, s):
+        t = Table.grid(padding=(0, 1))
+        for _ in range(4):
+            t.add_column(no_wrap=True)
+        cells = []
+        for m in s["by_month"]:
+            txt = Text()
+            txt.append(m["month"][2:] + " ", style="dim")
+            txt.append("%d" % m["completed"], style="bold green")
+            txt.append("/%d" % m["booked"], style="dim")
+            cells.append(txt)
+        for i in range(0, len(cells), 4):
+            row = cells[i:i + 4]
+            while len(row) < 4:
+                row.append(Text(""))
+            t.add_row(*row)
+        return Panel(t, title="[bold]按月（完成 / 订了）[/]", border_style="dim",
+                     box=box.ROUNDED)
+
+    def _never_panel(self):
+        """永不重订名单：一行一条，像无序列表。平常视图里不出现。"""
+        abandoned = ks.load_verdicts()["abandoned"]
+        t = Table.grid(padding=(0, 1))
+        t.add_column(style="red", no_wrap=True)
+        t.add_column(no_wrap=True)
+        t.add_column(style="dim")
+        if not abandoned:
+            t.add_row("", Text("（还没有认过罪的场次 —— daemon 会一直重订）", style="dim"))
+        for key in sorted(abandoned):
+            rec = abandoned[key] or {}
+            when = (rec.get("at") or "").replace("T", " ")
+            t.add_row("·  " + key.replace("T", " "),
+                      "认罪于 " + (when or "?"),
+                      (rec.get("note") or rec.get("why") or "")[:48])
+        return Panel(t, title="[bold red]永不重订 · 你认过罪的地方[/]",
+                     border_style="red", box=box.ROUNDED)
+
+    def render(self):
+        w = self.w
+        if not w.stat:
+            return Panel(
+                Text(w.stat_note or "还没拉过。敲 stat 拉一次（Focusmate 只读 API）。",
+                     style="dim"),
+                title="[bold]📊 Stat · 统计[/]", border_style="green", box=box.ROUNDED)
+        s = w.stat
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style="bold cyan", no_wrap=True)
+        t.add_column()
+
+        t.add_row("生涯", Text("%s → %s · %d 天" % (s["since"], s["until"], s["days"])))
+        total = Text()
+        total.append("完成 %d" % s["total_completed"], style="bold green")
+        total.append("  ·  订了 %d  ·  完成率 %.1f%%" % (s["total_booked"],
+                                                        s["completion_rate"]), style="dim")
+        t.add_row("总场次", total)
+        mean = Text("%.2f 场/天" % s["mean_per_day"], style="bold")
+        mean.append("（含空天） · %.2f 场/天（只算做过的 %d 天）"
+                    % (s["mean_active_day"], s["active_days"]), style="dim")
+        t.add_row("每天平均", mean)
+        zero = Text()
+        zero.append("%d 天" % s["zero_days"], style="bold red" if s["zero_days"] else "bold green")
+        zero.append(" 一个 session 都没做（%.1f%%）" % s["zero_rate"], style="dim")
+        t.add_row("空 天", zero)
+        t.add_row("峰 值", Text("%s · %d 场" % (s["max_day"]["date"], s["max_day"]["completed"]),
+                              style="bold yellow"))
+        t.add_row("分 布", Text("p25 %g · 中位数 %g · p75 %g · 最大 %d"
+                              % (s["p25"], s["median"], s["p75"], s["max_per_day"])))
+        t.add_row("累 计", Text("%.0f 小时 · 每场均值 %.1f 分钟"
+                              % (s["total_hours"], s["avg_minutes"])))
+        t.add_row("连 续", Text("当前 %d 天 · 最长 %d 天"
+                              % (s["streak_current"], s["streak_best"])))
+        src = Text((s.get("fetched_at") or "?").replace("T", " "), style="dim")
+        src.append(" · %s" % (w.stat_note or "?"), style="dim")
+        t.add_row("数 据", src)
+
+        out = [Panel(t, title="[bold]📊 Stat · 统计（Focusmate 只读 API）[/]",
+                     border_style="green", box=box.ROUNDED)]
+        if s["recent"]:
+            out.append(self._recent_panel(s))
+        if s["by_month"]:
+            out.append(self._month_panel(s))
+        out.append(self._never_panel())
+        return out
+
+
 
 # ---------------------------------------------------------------- 输入（Tab 切视图 / 原地刷新）
 
@@ -618,6 +799,36 @@ def _term_width(default=120):
         return shutil.get_terminal_size((default, 24)).columns
     except Exception:
         return default
+
+
+def _term_height(default=24):
+    """终端有几行。帧式重画用它把上移行数钳住 —— 帧比屏幕高时不能去啃滚动历史。"""
+    try:
+        import shutil
+        return shutil.get_terminal_size((default, 24)).lines
+    except Exception:
+        return default
+
+
+def frame_rows(text):
+    """一帧占几行 = 里面有几个换行。rich 每渲染一行就写一个 `\\n`，所以这就够了。
+
+    纯函数，方便测试「记账和实际占行一致」。
+    """
+    return (text or "").count("\n")
+
+
+def erase_escape(rows, height=None):
+    """把「上一帧」从终端上删掉的转义序列。
+
+    上移 rows 行（钳在 height-1 以内，多出来的行在滚动历史里、终端也擦不到），
+    然后回行首、清到屏幕末尾。纯函数：测试断言它不清整屏（没有 `\\x1b[2J`）。
+    """
+    rows = int(rows or 0)
+    if rows <= 0:
+        return ""
+    limit = max(1, (height or _term_height()) - 1)
+    return ERASE_FRAME % min(rows, limit)
 
 
 def status_line_escape(text, width=None):
@@ -764,6 +975,16 @@ class Warden(object):
         self.views = [cls(self) for cls in VIEWS] or [ContractView(self)]
         self.view_index = 0
         self.view = self.views[0]
+        # 生涯统计（统计视图 / stat 命令）：self.stat 是 stats.compute_stats 的结果，
+        # stat_note 是「实时拉取 / 走缓存 / 拉取失败」那行说明。
+        self.stat = None
+        self.stat_note = ""
+        # 帧式重画的记账（见 paint / erase_frame / emit）：
+        #   _frame_rows = 上一帧占了终端几行；_tail_rows = 帧之后又打了几行
+        #   （提示符那一行 / 帮助面板 / 宣言闸门 / `>>>` 回显…）。
+        # 下一次 paint() 要把这两部分一起删掉，不然屏幕会越长越高、还会留残影。
+        self._frame_rows = 0
+        self._tail_rows = 0
 
     # -- 选中的那一天
 
@@ -794,29 +1015,81 @@ class Warden(object):
     def say(self, text, kind="info"):
         stamp = now_local().strftime("%H:%M:%S")
         self.messages.append((stamp, kind, text))
-        del self.messages[:-12]
+        del self.messages[:-MESSAGE_KEEP]
 
-    def paint(self):
+    def emit(self, renderable=None):
+        """帧外打印（帮助面板 / 宣言闸门 / `>>>` 回显…），同时记账。
+
+        为什么必须走这里：这些内容打在**当前帧外面**，下一次 paint() 要把它们
+        连同上一帧一起删掉。不经过 emit 的 print 不会被记账 → paint() 上移的
+        行数算少 → 光标落进旧内容中间，屏幕上留一摊垃圾。
+        """
+        with self.console.capture() as cap:
+            if renderable is None:
+                self.console.print()
+            else:
+                self.console.print(renderable)
+        text = cap.get()
+        self._write(text)
+        self._tail_rows += max(1, frame_rows(text))
+
+    def _write(self, text):
+        """把渲染好的字符串写进 console 的落点（真 TTY = stdout，测试 = StringIO）。"""
+        self.console.file.write(text)
+        try:
+            self.console.file.flush()
+        except Exception:
+            pass
+
+    def erase_frame(self):
+        """把上一帧（+ 帧外那些行）从终端上删掉。非 TTY / --no-clear 时不动。
+
+        `--no-clear`（WARDEN_CLEAR=0）= 旧的追加行为：不清、不删，留着滚动历史。
+        """
+        rows = self._frame_rows + self._tail_rows
+        self._frame_rows = 0
+        self._tail_rows = 0
+        if self.no_clear or not self.console.is_terminal:
+            return
+        # 钳位用 console 自己的高度（真 TTY = 终端实际行数；测试里可以造一个矮终端）
+        esc = erase_escape(rows, height=self.console.height or None)
+        if esc:
+            # 写 console.file（真 TTY 就是 stdout）：和帧内容走同一个落点，
+            # 顺序才不会错 —— 测试里也能断言这段转义真的发出去了。
+            self._write(esc)
+
+    def paint(self, prompt_row=True):
+        """重画整屏：先删上一帧，再整帧渲染、记账。
+
+        整帧渲染到一个 capture 里再写回 `console.file`，为的是数出「这一帧占几行」
+        —— 这只是记账手段，输出内容和以前逐步 console.print 完全一致（测试用
+        `Console(file=StringIO)` 读到的还是同样的文本）。
+        """
         # 每次画之前重读 data.csv：契约可能在别处被人手改了（这就是控制面）
         self.reload_entries()
-        if not self.no_clear:
-            self.console.clear()
-        self.console.print(self.render_header())
-        # 主体内容由当前视图决定（契约表 / 专注面板 / 未来的其它视图）
-        body = self.view.render()
-        if body is not None:
-            for item in (body if isinstance(body, (list, tuple)) else [body]):
-                self.console.print(item)
-        if self.messages:
-            self.console.print(self.render_messages())
-        # 视图指示 + 命令提示都放在最下面（提示符上面）
-        self.console.print(self.render_view_bar())
-        self.console.print(self.view.hint)
-        # **最后一行**是动态状态行（如果有）。读输入时只原地覆盖这一行，
-        # 不 clear、不重画整屏 —— 倒计时每分钟跳动时屏幕不抖。见 _read_line_tty()。
-        st = self.live_status()
-        if st is not None:
-            self.console.print(Text(st))
+        self.erase_frame()
+        with self.console.capture() as cap:
+            self.console.print(self.render_header())
+            # 主体内容由当前视图决定（契约表 / 专注面板 / 统计面板…）
+            body = self.view.render()
+            if body is not None:
+                for item in (body if isinstance(body, (list, tuple)) else [body]):
+                    self.console.print(item)
+            if self.messages:
+                self.console.print(self.render_messages())
+            # 视图指示 + 命令提示都放在最下面（提示符上面）
+            self.console.print(self.render_view_bar())
+            self.console.print(self.view.hint)
+            # **最后一行**是动态状态行（如果有）。读输入时只原地覆盖这一行，
+            # 不重画整帧 —— 倒计时跳动时屏幕不抖。见 _read_line_tty()。
+            st = self.live_status()
+            if st is not None:
+                self.console.print(Text(st))
+        frame = cap.get()
+        self._write(frame)
+        self._frame_rows = frame_rows(frame)
+        # 交互模式下，提示符那一行紧接着就打在帧下面；下次重画时要把它一起删掉。
+        self._tail_rows = 1 if prompt_row else 0
 
     def live_status(self):
         """当前视图的动态状态行（截到控制台宽度，纯文本）；没有就 None。"""
@@ -844,7 +1117,45 @@ class Warden(object):
         self.view_index = (self.view_index + step) % len(self.views)
         self.view = self.views[self.view_index]
         self.say("切到「%s」视图" % self.view.name, "cmd")
+        self.enter_view()
         return self.view
+
+    def go_to_view(self, cls):
+        """直接跳到某个视图（stat 命令用）。已经是它就原地不动。返回该视图。"""
+        for i, v in enumerate(self.views):
+            if isinstance(v, cls):
+                self.view_index = i
+                self.view = v
+                self.enter_view()
+                return v
+        return None
+
+    def enter_view(self):
+        """进视图时的懒加载：第一次进统计视图就把数据拉上（之后走内存/磁盘缓存）。"""
+        if isinstance(self.view, StatsView) and self.stat is None:
+            self.cmd_stat()
+
+    def cmd_stat(self, force=False):
+        """拉生涯统计：stats.load 走 1 小时缓存 + 按 365 天分块；失败不掀 TUI。"""
+        try:
+            history, note = st.load(force=force)
+        except Exception as e:
+            self.had_error = True
+            self.stat_note = "拉取失败：%s: %s" % (type(e).__name__, e)
+            self.say("生涯统计拉取失败：%s" % e, "error")
+            return False
+        try:
+            self.stat = st.compute_stats(history)
+        except Exception as e:                      # 数据变形的兜底
+            self.had_error = True
+            self.stat_note = "数据没法算：%s" % e
+            self.say("生涯统计算不动：%s" % e, "error")
+            return False
+        self.stat_note = note
+        self.say("生涯统计：%s（完成 %d 场 / %d 天）"
+                 % (note, self.stat["total_completed"], self.stat["days"]),
+                 "ok" if history else "warn")
+        return True
 
     def cycle_focus_mode(self):
         """Shift+Tab：只在专注视图生效，循环模式。返回新模式 key 或 None。"""
@@ -1274,8 +1585,10 @@ class Warden(object):
                     txt.append("   —— daemon 会在下一轮补", style="dim")
         ab = ks.load_verdicts()["abandoned"]
         if ab:
-            txt.append("\n已放弃（daemon 永不重订）：", style="bold")
-            txt.append("、".join(sorted(ab)[:6]) + ("…" if len(ab) > 6 else ""), style="red")
+            # 名单本体只在「统计」视图里逐行列（用户要求：平常视图不展示他们）。
+            # 这里只留一句指路，免得不知道去哪儿看。
+            txt.append("\n永不重订名单（%d 条）：stat 命令 / 「统计」视图" % len(ab),
+                       style="dim red")
         relocated = [r for r in self.rows if r.get("planned") and r.get("relocation")]
         if relocated:
             txt.append("\n临时挪动（只影响这一天，不改 data.csv）：", style="bold")
@@ -1290,7 +1603,7 @@ class Warden(object):
         t.add_column(no_wrap=False)
         colors = {"info": "white", "ok": "green", "warn": "yellow", "error": "bold red",
                   "cmd": "bold cyan"}
-        for stamp, kind, text in self.messages:
+        for stamp, kind, text in self.messages[-MESSAGE_SHOW:]:
             t.add_row(stamp, Text(text, style=colors.get(kind, "white")))
         return Panel(t, title="[bold]Recent[/]", border_style="dim", box=box.ROUNDED)
 
@@ -1318,14 +1631,14 @@ class Warden(object):
         body.append("共 %d 字符（含标点）。少一个标点、错一个引号，都继续锁死并鸣笛。\n"
                     "Ctrl+C 可以放弃 —— 那就什么都不做。"
                     % len(DECLARATION), style="dim")
-        self.console.print(Panel(body, title="[bold red]⛓  The Walk of Shame[/]",
+        self.emit(Panel(body, title="[bold red]⛓  The Walk of Shame[/]",
                                  border_style="bold red", box=box.HEAVY))
         tries = 0
         while True:
             try:
                 typed = input("  宣言> ")
             except (EOFError, KeyboardInterrupt):
-                self.console.print("\n  [dim]放弃了。[/]")
+                self.emit("\n  [dim]放弃了。[/]")
                 return False
             ok, why = check_declaration(typed)
             if ok:
@@ -1333,7 +1646,7 @@ class Warden(object):
                 return True
             tries += 1
             beep()
-            self.console.print("[bold red]✗ 不通过：%s[/]" % why)
+            self.emit("[bold red]✗ 不通过：%s[/]" % why)
             self.say("宣言不通过（第 %d 次）：%s" % (tries, why), "error")
 
     def confess(self, sins):
@@ -1462,7 +1775,7 @@ class Warden(object):
         info.add_row("标题", row.get("title") or "[dim]（无）[/]")
         info.add_row("伙伴", "[cyan]已匹配 —— 对方会被放鸽子[/]" if matched else "[dim]还没匹配[/]")
         info.add_row("session", (row.get("id") or "—")[:8] + ("…" if row.get("id") else ""))
-        self.console.print(Panel(info, title="[bold red]⚠  执行区：取消要过宣言闸门[/]",
+        self.emit(Panel(info, title="[bold red]⚠  执行区：取消要过宣言闸门[/]",
                                  border_style="bold red", box=box.HEAVY))
 
         if not self.require_declaration("取消 #%d（%s %s）"
@@ -1796,7 +2109,7 @@ class Warden(object):
         daemon 是你今天 session 的保命绳：停掉之后，执行区里没人补订、
         罪也没人记。所以停用要付一样的代价。
         """
-        self.console.print(Panel(
+        self.emit(Panel(
             "停掉 daemon = 执行区里剩下的场次没人补订、也没人记账。\n"
             "要停就得和取消 session 一样，过 The Walk of Shame。",
             title="[bold yellow]停用 daemon[/]",
@@ -1821,7 +2134,8 @@ class Warden(object):
         t.add_column(style="bold", no_wrap=True, justify="right")
         t.add_column()
         for cmd, desc in [
-            ("Tab", "切换视图：契约视图 ↔ 专注视图（未来还会有别的视图）"),
+            ("Tab", "切换视图：契约 → 专注 → 统计 → 契约（循环）"),
+            ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
             ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),
             ("day -1|0|1|YYYY-MM-DD", "切换看哪一天（草稿区随便看）"),
             ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
@@ -1840,13 +2154,14 @@ class Warden(object):
             ("quit  (q)", "退出（bridge 和浏览器一起收掉）"),
         ]:
             t.add_row(cmd, desc)
-        self.console.print(Panel(t, title="[bold]命令[/]", border_style="cyan", box=box.ROUNDED))
-        self.console.print(
+        self.emit(Panel(t, title="[bold]命令[/]", border_style="cyan", box=box.ROUNDED))
+        self.emit(
             "[dim]ID 就是表格第一列，按时间排序、每次 refresh 重编号 —— 看着表敲，别凭记忆。\n"
             "区域标记（状态列第一格）：草=草稿区（随便改）· 锁=执行区（取消要敲宣言）"
             "· 过=已过去。\n"
             "专注视图：只认 stop（消耗暂停）和 Shift+Tab（切模式），"
-            "预约那套命令在那边一律没用。[/]"
+            "预约那套命令在那边一律没用。\n"
+            "统计视图：只读，stat / stat refresh 重拉；它不改 data.csv、不碰 API 写接口。[/]"
         )
         return False
 
@@ -1897,7 +2212,7 @@ class Warden(object):
             beep()
             self.had_error = True
             self.say("锁死中：%s" % (why or "把宣言一字不差地敲完才能做别的事。"), "error")
-            self.console.print(Panel(
+            self.emit(Panel(
                 Text.assemble((self.lockdown_reason() + "\n\n", "bold red"),
                               ("把下面这段一字不差地敲一遍（少一个标点就继续锁死 + 鸣笛）：\n\n",
                                "bold red"),
@@ -1915,6 +2230,14 @@ class Warden(object):
                 self.cycle_view()
                 return True
             if cmd in ("status", "s"):
+                return True
+            if cmd in ("stat", "stats"):
+                # 任意视图都能敲：切到统计视图 + 拉数据（`stat refresh` 无视缓存）。
+                # go_to_view 里的 enter_view() 第一次进视图已经会拉，这里别拉第二遍。
+                force = any(a in ("refresh", "force", "--force") for a in args)
+                self.go_to_view(StatsView)
+                if self.stat is None or force:
+                    self.cmd_stat(force=force)
                 return True
             if cmd in ("help", "?", "h"):
                 self.cmd_help()
@@ -1937,7 +2260,7 @@ class Warden(object):
         return True
 
     def run(self, exec_lines=None):
-        self.console.print("[dim]起 bridge、拉 session…[/]")
+        self.emit("[dim]起 bridge、拉 session…[/]")
         try:
             self.refresh()
         except Exception as e:
@@ -1947,7 +2270,7 @@ class Warden(object):
         # 一进来就有未认罪的罪 → 先把话说明白
         reason = self.lockdown_reason()
         if reason:
-            self.console.print(Panel(
+            self.emit(Panel(
                 Text.assemble(("⛔  这个 TUI 现在是锁死的。\n\n", "bold red"),
                               (reason + "\n\n", "red"),
                               ("唯一能做的事：把下面这段一字不差地敲一遍"
@@ -1959,13 +2282,14 @@ class Warden(object):
             ))
 
         if exec_lines:
-            self.paint()
+            # --exec 没有提示符行，帧外只有 `>>>` 回显（emit 会记账）
+            self.paint(prompt_row=False)
             for line in exec_lines:
                 if line.strip() or line.strip("\t") != line:
-                    self.console.print("[bold cyan]>>>[/] %s" % line)
+                    self.emit("[bold cyan]>>>[/] %s" % line)
                     if not self.handle(line):
                         break
-                    self.paint()
+                    self.paint(prompt_row=False)
             return 0 if not self.had_error else 1
 
         while True:
@@ -1982,7 +2306,7 @@ class Warden(object):
                 self.cycle_focus_mode()    # Shift+Tab：专注视图里换模式、重画
                 continue
             except (EOFError, KeyboardInterrupt):
-                self.console.print("\n[dim]收工。[/]")
+                self.emit("\n[dim]收工。[/]")
                 return 0 if not self.had_error else 1
             if not self.handle(line):
                 return 0 if not self.had_error else 1
@@ -2134,7 +2458,8 @@ def parse_args(argv=None):
     ap.add_argument("--day", dest="day", type=parse_day_offset, default=0,
                     help="一进来就看哪一天：-1=昨天 0=今天 1=明天（也可给 YYYY-MM-DD）")
     ap.add_argument("--status", action="store_true", help="只画一次看板然后退出（不拉浏览器列表）")
-    ap.add_argument("--no-clear", action="store_true", help="别清屏（留滚动历史）")
+    ap.add_argument("--no-clear", action="store_true",
+                    help="退化成追加：不删上一帧、留滚动历史（默认是整帧原地替换）")
     ap.add_argument("--offline", action="store_true", help="不碰浏览器，只用 state.json 里的快照")
     ap.add_argument("--headed", action="store_true", help="浏览器有头模式（看它怎么操作）")
     ap.add_argument("--idle-ms", type=int, default=None,
@@ -2161,7 +2486,7 @@ def main(argv=None):
         # 只画一次：不连浏览器，用 state.json 的快照/本地文件
         warden.offline = True
         warden._fallback_rows("--status 不连浏览器")
-        warden.paint()
+        warden.paint(prompt_row=False)
         return 0
 
     exec_lines = None
