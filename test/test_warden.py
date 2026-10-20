@@ -484,8 +484,10 @@ check("day 1 → 明天",
       (wd.cmd_day(["1"]), wd.day_offset, wd.sel_date), (True, 1, TODAY + datetime.timedelta(days=1)))
 check("day -1 → 昨天", (wd.cmd_day(["-1"]), wd.day_offset), (True, -1))
 check("day 0 → 今天", (wd.cmd_day(["0"]), wd.sel_date), (True, TODAY))
-check("day 2026-10-11 → 绝对日期", (wd.cmd_day(["2026-10-11"]), wd.day_offset),
-      (True, (datetime.date(2026, 10, 11) - TODAY).days))
+# 用相对日期：写死具体某天的话，过几天就会自己掉出 -7..+60 的窗口
+_recent = TODAY - datetime.timedelta(days=3)
+check("day <3 天前> → 绝对日期", (wd.cmd_day([_recent.isoformat()]), wd.day_offset),
+      (True, -3))
 check("day 不带参数只是报告（不退出）", wd.cmd_day([]), False)
 for bad in ("明天", "2026-13-99", "abc"):
     try:
@@ -511,9 +513,16 @@ wd = mkwarden()
 wd.reload_entries()
 wd.bridge.calls = []
 check("有罪时 lockdown_reason 有话说", bool(wd.lockdown_reason()), True)
+# 罪案区现在是「视图上的两个钩子」：prompt_text 交出「宣言> 」，intercept 拦住派发
+check("有罪时提示符变成「宣言> 」", wd.prompt_text(), "宣言> ")
+check("有罪时 shell 用的就是那个提示符", wd.shell.prompt, "宣言> ")
 out, rang = beeped(lambda: wd.handle("mute 1 on"))
 check("有罪时 mute 被拦（没碰 API）", [c for c in wd.bridge.calls if c[0] == "mute"], [])
 check("有罪时 mute 会鸣笛", rang, True)
+_buf = io.StringIO()
+wd.console = Console(file=_buf, width=120, force_terminal=False)
+beeped(lambda: wd.handle("mute 1 on"))
+check("拦住时把宣言面板打出来", "认罪之前" in _buf.getvalue(), True)
 check("有罪时 handle 不退出", out, True)
 beeped(lambda: wd.handle("session 22:00 50"))
 check("有罪时 session 也被拦（连契约表都不给写）",
@@ -743,17 +752,24 @@ check("专注视图显示当前空闲 42s", "42s" in out, True)
 check("专注视图显示进行中的 session", "当前 session" in out, True)
 check("专注视图不画契约表", "The Contract Table" not in out, True)
 check("视图指示有 Tab 切换", "Tab 切换" in out, True)
-check("专注提示只提 stop", ("stop" in out and "session HH:MM" not in out), True)
+_hint = wd.view.hint_line("", [])
+check("专注提示只提 stop", ("stop" in _hint and "session HH:MM" not in _hint), True)
 check("专注视图有动态状态行", "空闲 42s" in wd.live_status(), True)
 check("状态行被 paint() 打在最后一行（供原地刷新）",
       out.rstrip("\n").splitlines()[-1].strip(), wd.live_status())
 check("契约视图没有动态状态行（不用定时刷新）",
       wd.views[0].status_line(), None)
-_esc = w.status_line_escape("空闲 12s", width=80)
-check("动态行用上移/覆盖/下移，不清屏",
-      ("\x1b[1A" in _esc and "\x1b[K" in _esc and "\x1b[1B" in _esc), True)
-check("动态行不会清整屏", "\x1b[2J" not in _esc, True)
-check("超宽动态行被截断", len(w.status_line_escape("x" * 200, width=80)) < 100, True)
+# 现在提示行 / 状态行 / 提示符都由 repl_kit 的 chrome 拼，顺序是固定的：
+#   <看板> <提示行> <状态行> <提示符>
+_chrome = wd.shell.chrome("")
+check("chrome 最后一段是提示符", _chrome[-1][1], wd.shell.prompt)
+check("状态行紧贴提示符上面", "空闲 42s" in _chrome[-2][1], True)
+check("提示行在状态行上面", _chrome[-3][1].startswith("命令"), True)
+check("状态行用独立样式类（不跟提示行混在一起）",
+      _chrome[-2][0] != _chrome[-3][0], True)
+wd.console = Console(file=io.StringIO(), width=40, force_terminal=False)
+check("超宽状态行在交给框架前就被截到控制台宽度",
+      len(wd.live_status()) < 40, True)
 
 print("== 专注视图：stop = 消耗一次暂停（不是停 daemon）==")
 wd.bridge.calls = []
@@ -777,61 +793,57 @@ check("契约视图认 mute（会走 bridge，不炸就行）", wd.handle("mute 
 
 # ---------------------------------------------------------------- 帧式重画
 
-print("== 帧式重画：删掉上一帧，而不是 clear 整屏 ==")
-check("frame_rows 数换行", w.frame_rows("a\nb\n"), 2)
-check("frame_rows 空字符串", w.frame_rows(""), 0)
-check("erase_escape(0) 什么都不发", w.erase_escape(0), "")
-check("erase_escape 上移 + 清到屏尾", w.erase_escape(5, height=10), "\x1b[5A\r\x1b[J")
-check("erase_escape 钳在 屏高-1（顶上去的部分在滚动历史里擦不到）",
-      w.erase_escape(50, height=24), "\x1b[23A\r\x1b[J")
-check("erase_escape 不清整屏（没有 2J/H）",
-      ("\x1b[2J" in w.erase_escape(5, height=10)) or ("\x1b[H" in w.erase_escape(5, height=10)),
-      False)
+print("== 重画：擦除交给 prompt_toolkit，warden 只负责交出看板 ==")
 
+# warden 不再手算「上一帧占几行」。它只提供一个 frame() —— 一个 rich
+# renderable —— 由 repl_kit/prompt_toolkit 按单元格 diff 上屏。
 buf = io.StringIO()
 console = Console(file=buf, width=100, force_terminal=True, height=40)
 wd = w.Warden(console, FakeBridge(), no_clear=False, offline=True)
 wd.paint()
-check("第一帧不删任何东西（没有 ANSI 上移）", buf.getvalue().startswith("\x1b["), False)
-check("第一帧记了占几行", wd._frame_rows, buf.getvalue().count("\n"))
-f1 = wd._frame_rows
+first = buf.getvalue()
+check("画一帧 = 把看板打出来", "The Contract Table" in first, True)
+check("画帧本身不发任何擦除转义",
+      ("\x1b[J" in first) or ("\x1b[2J" in first) or ("\x1b[1A" in first), False)
 buf.seek(0)
 buf.truncate()
 wd.paint()
-out = buf.getvalue()
-check("第二帧开头就是删上一帧", out.startswith("\x1b[%dA\r\x1b[J" % (f1 + 1)), True)
-check("删帧不用 clear 整屏", "\x1b[2J" not in out, True)
-check("记账和实际占行一致", wd._frame_rows, out.split("\x1b[J", 1)[1].count("\n"))
-check("提示符那一行也记账（交互模式）", wd._tail_rows, 1)
+check("两次 paint = 两份追加内容（擦除不是 warden 的事了）",
+      buf.getvalue().count("The Contract Table"), 1)
 
-wd.emit("[bold cyan]>>>[/] help")
-check("emit 帧外的行会记账", wd._tail_rows, 2)
-wd.emit(w.Panel("x" * 300, title="P"))
-check_true("emit 一个高面板会按行数记账", wd._tail_rows > 3)
-f2 = wd._frame_rows
-tail = wd._tail_rows
-buf.seek(0)
-buf.truncate()
-wd.paint()
-n = int(buf.getvalue().split("\x1b[")[1].split("A")[0])
-check("重画时把「上一帧 + 帧外那些行」一起删", n, f2 + tail)
+# frame() 必须是可复用的 renderable：框架每帧都会调它
+frame = wd.frame()
+check("frame() 交出 renderable 而不是字符串", isinstance(frame, w.Group), True)
 
-buf2 = io.StringIO()
-console2 = Console(file=buf2, width=100, force_terminal=True, height=40)
-wd2 = w.Warden(console2, FakeBridge(), no_clear=True, offline=True)
-wd2.paint()
-wd2.paint()
-check("--no-clear 一个转义都不发（留着滚动历史）",
-      ("\x1b[1A" in buf2.getvalue()) or ("\x1b[J" in buf2.getvalue()), False)
-check("--no-clear 两次重画 = 两份内容（追加）",
-      buf2.getvalue().count("The Contract Table"), 2)
+# chrome 的头一段就是那块看板
+shell = wd.shell
+chrome = shell.chrome("")
+# 看板是 rich 渲染出来的 ANSI，prompt_toolkit 会把它拆成很多片段，所以拼起来看
+chrome_text = "".join(fragment[1] for fragment in chrome)
+check("chrome 里有看板", "The Contract Table" in chrome_text, True)
+check("看板只出现一次（不会和提示行重复）",
+      chrome_text.count("The Contract Table"), 1)
+check("chrome 里看板在前、提示符在后",
+      chrome_text.index("The Contract Table") < chrome_text.index(shell.prompt), True)
 
+# 空表 / 窄终端仍然不炸
+for width in (40, 80, 160):
+    buf2 = io.StringIO()
+    console2 = Console(file=buf2, width=width, force_terminal=False)
+    wd2 = w.Warden(console2, FakeBridge(), no_clear=True, offline=True)
+    wd2.paint()
+    check("width=%d frame() 不炸" % width, "Traceback" in buf2.getvalue(), False)
+
+# 非 TTY（管道/测试）不该出现任何 ANSI
 buf3 = io.StringIO()
 console3 = Console(file=buf3, width=100, force_terminal=False)
 wd3 = w.Warden(console3, FakeBridge(), no_clear=False, offline=True)
 wd3.paint()
-wd3.paint()
 check("非 TTY（管道/测试）不写任何 ANSI", "\x1b[" in buf3.getvalue(), False)
+
+# 提示符：欠着罪时换成「宣言> 」
+check("没欠账时用默认提示符", wd3.prompt_text(), None)
+check("欠着罪时提示符变成「宣言> 」", wd3.shell.prompt, "warden> ")
 
 print("== 消息区：屏幕只显示最近 3 条，内部多留一点 ==")
 check("屏幕显示条数常量", w.MESSAGE_SHOW, 3)
@@ -913,37 +925,17 @@ wd.paint()
 check("失败也把说明打在统计视图上", "拉取失败" in buf.getvalue(), True)
 w.st.load = fake_stat_load        # 复原：后面的用例还要离线拉假的
 
-print("== 非 TTY 下：一行 Tab 也算切视图 ==")
-_rescue_stdin = sys.stdin
+print("== 非 TTY 下：一行 Tab / Shift+Tab 也算切换 ==")
 
-class _NotATTY(object):
-    def isatty(self):
-        return False
-
-sys.stdin = _NotATTY()
-try:
-    answer(["\t"])
-    try:
-        w.read_command("warden> ")
-        check("Tab 行抛 SwitchView", False, True)
-    except w.SwitchView:
-        check("Tab 行抛 SwitchView", True, True)
-    answer(["\x1b[Z"])
-    try:
-        w.read_command("warden> ")
-        check("Shift+Tab 行抛 SwitchFocusMode", False, True)
-    except w.SwitchFocusMode:
-        check("Shift+Tab 行抛 SwitchFocusMode", True, True)
-    answer(["\t"])
-    try:
-        w.read_command("warden> ")
-        check("Tab 行照旧抛 SwitchView", False, True)
-    except w.SwitchView:
-        check("Tab 行照旧抛 SwitchView", True, True)
-    answer(["quit"])
-    check("普通行照常返回", w.read_command("warden> "), "quit")
-finally:
-    sys.stdin = _rescue_stdin
+# 以前这是 read_command 的活儿（逐键读，遇到 Tab 就抛异常）。
+# 现在输入归 repl_kit，warden 只在 handle() 里认这两种「命令行的切换写法」。
+wd = mkwarden()
+check("默认在契约视图", wd.view.name, "契约")
+check("一行 Tab 切到专注视图", (wd.handle("\t"), wd.view.name), (True, "专注"))
+check("一行 \\x1b[Z 认作 Shift+Tab（切专注模式）", wd.handle("\x1b[Z"), True)
+check("shift-tab 文字写法也认", wd.handle("shift-tab"), True)
+check("普通一行照常执行（不返回 False）", wd.handle("day 0"), True)
+check("quit 仍然返回 False", wd.handle("quit"), False)
 
 shutil.rmtree(TMP, ignore_errors=True)
 

@@ -25,18 +25,20 @@
    任意视图敲 `stat` 都能切过去；`stat refresh` 立刻增量刷新（只拉缺口 + 最近几天，
    不是把两千多条重拉一遍），`stat refresh full` 才是全量重拉；缓存新鲜时一次网络都不打。
 
-视图可扩展：继承 `View` + `@register_view` 即可，`paint()` / 切换 / 命令提示都由
-`VIEWS` 列表驱动。
+视图可扩展：继承 `View` + `@register_view` 即可；每个视图用 `commands()` 声明自己
+认哪些命令，`to_view()` 把它交给 `repl_kit`。
 
-屏幕永远只有**一帧**：`paint()` 先把上一帧删掉（`\x1b[<n>A` 上移 + `\r\x1b[J` 清到屏尾，
-行数靠 `_frame_rows`/`_tail_rows` 记账），**不是** `Console.clear()` —— clear 只把旧帧
-推进滚动历史，翻上去是一摞残帧。帧外的输出（帮助面板 / 宣言闸门 / `>>>` 回显）一律走
-`emit()`，否则不记账、光标会落进旧内容中间。消息区屏幕上只显示最近 3 条。
-`--no-clear`（`WARDEN_CLEAR=0`）保留旧的追加行为，留着滚动历史。
+界面那一层**不在这个文件里**。提示行、Tab 补全、Shift+Tab 切视图、Ctrl+O 切专注模式、
+状态行的每秒刷新、看板的擦除与重画，全部由 `repl_kit`（prompt_toolkit）负责 ——
+它按单元格 diff，只把变化的那几格写出去，不整屏重画，所以倒计时跳动时屏幕不抖。
+这里只提供三样东西：`frame()`（当前视图的看板）、`View.status_line()`（那行数字）、
+`intercept()`（派发前的一道闸，罪案区就挂在这儿）。消息区屏幕上只显示最近 3 条。
 
-动态数字（暂停倒计时 / 空闲秒数）走 `View.status_line()`：paint() 把它打在最后一行，
-读输入时只原地覆盖那一行（`\x1b[1A` / `\x1b[K` / `\x1b[1B`），**不重画整帧**，
-所以数字在走的时候不抖。
+命令输出（帮助面板 / 宣言闸门 / `>>>` 回显）直接 print 就行：它们发生在两次提示符
+之间，擦除和重画归 prompt_toolkit。
+
+`--no-clear` / `WARDEN_CLEAR=0` 现在没有效果了（追加/擦除不再由 warden 决定），
+仍然接受，只为不打断已有的命令行习惯。
 
 三层摩擦（这套系统真正的规则）
 ------------------------------
@@ -89,6 +91,7 @@
 """
 import argparse
 import copy
+import dataclasses
 import datetime
 import json
 import os
@@ -110,7 +113,7 @@ if os.path.isdir(PYLIBS) and PYLIBS not in sys.path:
 
 try:
     from rich import box
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
@@ -122,6 +125,19 @@ except ImportError:
     sys.exit(2)
 
 sys.path.insert(0, HERE)
+
+# TUI 的「提示行 / 补全 / 视图切换 / 状态行 / 帮助表」全在 repl_kit 里，
+# 这里只写业务命令。装法：pip install -e /path/to/paper_researcher
+try:
+    import repl_kit
+except ImportError:
+    sys.stderr.write(
+        "缺少 repl_kit（TUI 框架）。装一下：\n"
+        "    pip install -e /path/to/paper_researcher\n"
+        "或者临时：PYTHONPATH=/path/to/paper_researcher python3 warden.py\n"
+    )
+    raise SystemExit(2)
+
 import keep_session as ks  # noqa: E402  只用来读 daemon 状态 / 起停 daemon / 罪与判决
 import schedule as sch  # noqa: E402  data.csv 的解析与编辑（唯一实现）
 import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + 算数字 + 缓存
@@ -427,7 +443,20 @@ class Bridge(object):
 # 然后用 @register_view 注册即可 —— paint() / 切换 / 命令提示都自动跟上。
 # 未来想加「统计」「历史」视图，照抄 FocusView 的结构就行。
 
+def _cmd(name, handler, summary, aliases=(), section="命令"):
+    """一条 repl_kit 命令：只描述「叫什么 / 干什么 / 还有什么别名」。"""
+    return repl_kit.Command(name=name, handler=handler, summary=summary,
+                            aliases=tuple(aliases), section=section)
+
+
 class View(object):
+    """一个视图 = 一套命令 + 一块看板 + 一行状态。
+
+    业务留在子类里（render / status_line / cmd_*），
+    对外统一经过 to_view() 变成 repl_kit 的 View：命令表、提示行、
+    看板、状态行、进视图时的钩子、提示符，全由框架接管。
+    """
+
     key = "?"
     name = "view"
     label = "视图"
@@ -440,20 +469,56 @@ class View(object):
         """本视图的主体内容：rich renderable，或它们的列表。返回 None = 不渲染主体。"""
         return None
 
-    def handle(self, cmd, args, line):
-        """处理一条命令。返回 True=已处理，False=退出 TUI，None=本视图不认（上层兜底）。"""
-        return None
-
     def status_line(self):
-        """提示符上方那行「随时在变的数字」，纯文本（无 markup）。
-
-        返回 None = 这个视图没有动态内容、不需要定时刷新。
-        注意它是**单独一行**、由 paint() 打在最后，读输入时用 ANSI 原地覆盖 → 屏幕不抖。
-        """
+        """提示符上方那行「随时在变的数字」，纯文本（无 markup）。None = 不需要定时刷新。"""
         return None
 
-    def wants_tick(self):
-        return self.status_line() is not None
+    def commands(self):
+        """本视图认识的命令：[(repl_kit.Command, ...)]。"""
+        return []
+
+    def unknown_hint(self):
+        return "「%s」视图不认这个命令（Shift+Tab 切视图；help 看当前视图的命令）。" % self.name
+
+    # -- 所有视图都认的命令 --------------------------------------------
+
+    def common_commands(self):
+        w = self.w
+        return [
+            _cmd("quit", lambda a: w.exit_tui(),
+                 "退出（bridge 和浏览器一起收掉）", ("exit", "q"), "通用"),
+            _cmd("help", lambda a: w.cmd_help(), "命令列表", ("?", "h"), "通用"),
+            _cmd("view", lambda a: w.cycle_view(),
+                 "下一个视图", ("tab", "switch"), "通用"),
+            _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
+                 ("stats",), "通用"),
+            _cmd("status", lambda a: None, "只重画看板", ("s",), "通用"),
+        ]
+
+    def build_registry(self):
+        w = self.w
+        guarded = [
+            dataclasses.replace(command, handler=w.guard(command.handler))
+            for command in self.commands() + self.common_commands()
+        ]
+        return repl_kit.Registry(guarded)
+
+    def hint_line(self, text, parts):
+        """repl_kit 的提示行回调：把 rich markup 剥掉，PT 的提示行是单一样式。"""
+        return repl_kit.strip_markup(self.hint or "")
+
+    def to_view(self):
+        """变成框架认识的那个 View。"""
+        w = self.w
+        return repl_kit.View(
+            name=self.name,
+            registry=self.build_registry(),
+            hint=self.hint_line,
+            status=self.status_line,
+            render=w.frame,
+            on_enter=w.enter_view,
+            prompt=w.prompt_text,
+        )
 
 
 VIEWS = []
@@ -485,37 +550,26 @@ class ContractView(View):
         out.append(self.w.render_contract())
         return out
 
-    def handle(self, cmd, args, line):
+    def unknown_hint(self):
+        return "「契约」视图不认这个命令（Shift+Tab 切视图；help 看当前视图的命令）。"
+
+    def commands(self):
         w = self.w
-        if cmd in ("refresh", "r", "reload"):
-            w.refresh()
-        elif cmd in ("status", "s"):
-            pass
-        elif cmd == "day":
-            w.cmd_day(args)
-        elif cmd == "session":
-            w.cmd_session(args)
-        elif cmd == "relocate":
-            w.cmd_relocate(args)
-        elif cmd in ("force-check", "forcecheck"):
-            w.cmd_force_check()
-        elif cmd == "sync":
-            w.cmd_sync(args)
-        elif cmd == "mute":
-            w.cmd_mute(args)
-        elif cmd in ("title", "t"):
-            w.cmd_title(args)
-        elif cmd == "cancel":
-            w.cmd_cancel(args)
-        elif cmd == "start":
-            w.cmd_start()
-        elif cmd == "stop":
-            w.cmd_stop()
-        elif cmd in ("help", "?", "h"):
-            w.cmd_help()
-        else:
-            return None
-        return True
+        return [
+            _cmd("refresh", lambda a: w.refresh(),
+                 "重新拉选中那天的 session（会重编号）", ("r", "reload")),
+            _cmd("day", w.cmd_day, "切换看哪一天（-1/0/1 或 YYYY-MM-DD）"),
+            _cmd("session", w.cmd_session, "创建一场：HH:MM LEN 或 HH:MM-HH:MM"),
+            _cmd("relocate", w.cmd_relocate, "临时把 #N 提前/推后：relocate N ±MM"),
+            _cmd("force-check", lambda a: w.cmd_force_check(),
+                 "忽略重试上限，把所有没订上的各强制重订一次", ("forcecheck",)),
+            _cmd("sync", w.cmd_sync, "跑 download_calendar.py populate：日历 → data.csv"),
+            _cmd("mute", w.cmd_mute, "把 #N 静音：mute N on|off"),
+            _cmd("title", w.cmd_title, '把 #N 的标题改成文本：title N "文本"', ("t",)),
+            _cmd("cancel", w.cmd_cancel, "取消 #N（执行区要敲宣言）"),
+            _cmd("start", lambda a: w.cmd_start(), "启动 daemon"),
+            _cmd("stop", lambda a: w.cmd_stop(), "停用 daemon（要敲宣言）"),
+        ]
 
 
 @register_view
@@ -619,14 +673,16 @@ class FocusView(View):
 
         return Panel(t, title="[bold]Focus · 专注[/]", border_style="yellow", box=box.ROUNDED)
 
-    def handle(self, cmd, args, line):
-        if cmd == "stop":
-            self.w.cmd_pause()
-            return True
-        # 这个视图里，预约那套命令一律没用
-        self.w.say("「专注」视图只认 stop（消耗一次暂停）；Shift+Tab 切模式；"
-                   "按 Tab 切回契约视图再干别的。", "warn")
-        return True
+    def commands(self):
+        # 预约那套命令在这个视图里一条都不注册 —— 框架层面就不存在
+        return [
+            _cmd("stop", lambda a: self.w.cmd_pause(),
+                 "消耗一次暂停（暂停 %d 分钟）" % ks.PAUSE_MINUTES),
+        ]
+
+    def unknown_hint(self):
+        return ("「专注」视图只认 stop（消耗一次暂停）；Ctrl+O 切模式；"
+                "Shift+Tab 切回契约视图再干别的。")
 
 
 @register_view
@@ -654,17 +710,16 @@ class StatsView(View):
     def status_line(self):
         return None                     # 静态面板，不需要每秒刷新
 
-    def handle(self, cmd, args, line):
+    def unknown_hint(self):
+        return "「统计」视图只认 stat / stat refresh [/full] / refresh；Shift+Tab 切回去再敲别的。"
+
+    def commands(self):
         w = self.w
-        if cmd in ("stat", "stats"):
-            w.cmd_stat(force=any(a in ("refresh", "force", "--force") for a in args),
-                       full=any(a in ("full", "all", "--full") for a in args))
-        elif cmd in ("refresh", "r", "reload"):
-            w.cmd_stat()
-        else:
-            w.say("「统计」视图只认 stat / stat refresh [/full] / refresh；"
-                  "按 Tab 切回去再敲别的。", "warn")
-        return True
+        # `stat` 由通用命令集提供（任何视图都能敲），这里只补这个视图的 refresh
+        return [
+            _cmd("refresh", lambda a: w.cmd_stat(),
+                 "重新拉一次统计", ("r", "reload")),
+        ]
 
     # -- 渲染
 
@@ -788,176 +843,9 @@ class StatsView(View):
 
 # ---------------------------------------------------------------- 输入（Tab 切视图 / 原地刷新）
 
-class SwitchView(Exception):
-    """用户按了 Tab（或管道里来了一行 Tab）：切换到下一个视图。"""
-
-
-class SwitchFocusMode(Exception):
-    """用户按了 Shift+Tab：在专注视图里循环切换专注模式。"""
-
-
-def _term_width(default=120):
-    try:
-        import shutil
-        return shutil.get_terminal_size((default, 24)).columns
-    except Exception:
-        return default
-
-
-def _term_height(default=24):
-    """终端有几行。帧式重画用它把上移行数钳住 —— 帧比屏幕高时不能去啃滚动历史。"""
-    try:
-        import shutil
-        return shutil.get_terminal_size((default, 24)).lines
-    except Exception:
-        return default
-
-
-def frame_rows(text):
-    """一帧占几行 = 里面有几个换行。rich 每渲染一行就写一个 `\\n`，所以这就够了。
-
-    纯函数，方便测试「记账和实际占行一致」。
-    """
-    return (text or "").count("\n")
-
-
-def erase_escape(rows, height=None):
-    """把「上一帧」从终端上删掉的转义序列。
-
-    上移 rows 行（钳在 height-1 以内，多出来的行在滚动历史里、终端也擦不到），
-    然后回行首、清到屏幕末尾。纯函数：测试断言它不清整屏（没有 `\\x1b[2J`）。
-    """
-    rows = int(rows or 0)
-    if rows <= 0:
-        return ""
-    limit = max(1, (height or _term_height()) - 1)
-    return ERASE_FRAME % min(rows, limit)
-
-
-def status_line_escape(text, width=None):
-    """把一行状态文本包成「原地覆盖提示符上面那一行」的 ANSI 序列。
-
-    上移一行(`\\x1b[1A`) → 回行首 + 覆盖 + 清到行尾(`\\r`, `\\x1b[K`) → 下移一行(`\\x1b[1B`)。
-    纯函数，方便测试「确实没有清整屏」。
-    """
-    text = (text or "")[: max(1, (width or _term_width()) - 1)]
-    return "\x1b[1A\r" + text + "\x1b[K\x1b[1B"
-
-
-def read_command(prompt, status_fn=None, tick=1.0):
-    """读一行命令。
-
-    - **TTY**：cbreak 逐键读。按 Tab 立刻抛 SwitchView；按 Shift+Tab（`\\x1b[Z`）
-      抛 SwitchFocusMode；每 tick 秒调一次 status_fn() 拿一行状态文本，**只原地覆盖
-      提示符上面那一行**（`\\x1b[1A` / `\\x1b[K` / `\\x1b[1B`），不清屏、不重画整屏
-      —— 所以倒计时/空闲秒数在走的时候屏幕不抖。前提：`paint()` 已经把那一行打在了
-      最后（紧贴提示符上面）。
-    - **非 TTY**（管道 / 测试 / --exec）：退回 input()；行首的 Tab 也算切视图，
-      一行 `\\x1b[Z` / `shift-tab` 算切专注模式。
-    """
-    if not sys.stdin.isatty():
-        line = input(prompt)
-        if "\t" in line and line.replace("\t", "").strip() == "":
-            raise SwitchView()
-        if line.strip() == "\x1b[Z" or line.strip().lower() in (
-                "shift-tab", "shift+tab", "s-tab"):
-            raise SwitchFocusMode()
-        return line
-    try:
-        import termios
-        import tty
-    except ImportError:
-        return input(prompt)
-    return _read_line_tty(prompt, status_fn=status_fn, tick=tick, termios=termios, tty=tty)
-
-
-def _read_line_tty(prompt, status_fn=None, tick=1.0, termios=None, tty=None):
-    import codecs
-    import select
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    buf = []
-    esc = None
-    dec = codecs.getincrementaldecoder("utf-8")("replace")
-
-    def redraw_prompt():
-        sys.stdout.write("\r" + prompt + "".join(buf) + "\x1b[K")
-        sys.stdout.flush()
-
-    def refresh_status():
-        """只把提示符上面那一行原地覆盖掉（EL 清到行尾），其余屏幕不动。"""
-        if not status_fn:
-            return
-        try:
-            st = status_fn() or ""
-        except Exception:
-            st = ""
-        # 上移一行 → 回行首覆盖 + 清到行尾 → 下移一行回提示符
-        sys.stdout.write(status_line_escape(st))
-        sys.stdout.flush()
-        redraw_prompt()
-
-    try:
-        tty.setcbreak(fd)          # 关 ECHO/ICANON：逐键读、自己回显
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
-        while True:
-            ready, _, _ = select.select([fd], [], [], tick if status_fn else None)
-            if not ready:
-                refresh_status()
-                continue
-            data = os.read(fd, 1)
-            if not data:
-                raise EOFError()
-            for ch in dec.decode(data):
-                if ch in ("\r", "\n"):
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    return "".join(buf)
-                if ch == "\t":
-                    sys.stdout.write("\r\x1b[K")
-                    sys.stdout.flush()
-                    raise SwitchView()
-                if ch in ("\x7f", "\b"):
-                    if buf:
-                        buf.pop()
-                    redraw_prompt()
-                    continue
-                if ch == "\x03":
-                    raise KeyboardInterrupt()
-                if ch == "\x04":
-                    raise EOFError()
-                if ch == "\x1b":          # 转义序列开始（方向键 / Shift+Tab）
-                    esc = ""
-                    continue
-                if esc is not None:
-                    if esc == "":
-                        # CSI (ESC [) 或 SS3 (ESC O) 引导；其它 ESC+x 直接吞掉
-                        esc = ch if ch in "[O" else None
-                        continue
-                    if ch.isdigit() or ch == ";":
-                        esc += ch       # CSI 参数（方向键修饰键等）
-                        continue
-                    seq = esc + ch      # 收尾字符，完整序列 = ESC + seq
-                    esc = None
-                    if seq == "[Z" or (seq.startswith("[") and seq.endswith("Z")):
-                        sys.stdout.write("\r\x1b[K")   # xterm 系 Shift+Tab
-                        sys.stdout.flush()
-                        raise SwitchFocusMode()
-                    continue
-                if ch.isprintable():
-                    buf.append(ch)
-                    sys.stdout.write(ch)
-                    sys.stdout.flush()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-# ---------------------------------------------------------------- 看板
-
-
 class Warden(object):
     def __init__(self, console, bridge, no_clear=False, offline=False, day_offset=0):
+        # no_clear 只是个历史参数：擦除/重画已经归 repl_kit，这里不再使用。
         self.console = console
         self.bridge = bridge
         self.no_clear = no_clear
@@ -974,21 +862,25 @@ class Warden(object):
         self.had_error = False
         self.bridge_note = ""
         self.day_offset = int(day_offset)
-        # 视图（Tab 切换）：默认「契约」视图，第二个是「专注」视图。
-        self.views = [cls(self) for cls in VIEWS] or [ContractView(self)]
-        self.view_index = 0
-        self.view = self.views[0]
+        # 视图（Shift+Tab 切换）：默认「契约」视图，第二个是「专注」视图。
+        self.view_impls = [cls(self) for cls in VIEWS] or [ContractView(self)]
         # 生涯统计（统计视图 / stat 命令）：self.stat 是 stats.compute_stats 的结果，
         # stat_note 是「实时拉取 / 走缓存 / 拉取失败」那行说明。
         self.stat = None
         self.stat_note = ""
         self.stat_at = None         # 内存里这份统计是什么时候拿的（超 TTL 就重拉）
-        # 帧式重画的记账（见 paint / erase_frame / emit）：
-        #   _frame_rows = 上一帧占了终端几行；_tail_rows = 帧之后又打了几行
-        #   （提示符那一行 / 帮助面板 / 宣言闸门 / `>>>` 回显…）。
-        # 下一次 paint() 要把这两部分一起删掉，不然屏幕会越长越高、还会留残影。
-        self._frame_rows = 0
-        self._tail_rows = 0
+        # 提示行 / 补全 / 视图切换 / 状态行的定时刷新 / 帧的擦除重画，
+        # 全部交给 repl_kit（prompt_toolkit 按单元格 diff，只写变化的那几格）。
+        self.shell = repl_kit.ReplShell(
+            name="warden",
+            views=[impl.to_view() for impl in self.view_impls],
+            console=lambda: self.console,
+            tick=1.0,
+            view_key="s-tab",          # Shift+Tab：切视图
+            focus_key="c-o",           # Ctrl+O：循环专注模式
+            on_focus=self.cycle_focus_mode,
+            intercept=self.intercept,
+        )
 
     # -- 选中的那一天
 
@@ -1022,78 +914,40 @@ class Warden(object):
         del self.messages[:-MESSAGE_KEEP]
 
     def emit(self, renderable=None):
-        """帧外打印（帮助面板 / 宣言闸门 / `>>>` 回显…），同时记账。
+        """帧外打印：帮助面板 / 宣言闸门 / `>>>` 回显。
 
-        为什么必须走这里：这些内容打在**当前帧外面**，下一次 paint() 要把它们
-        连同上一帧一起删掉。不经过 emit 的 print 不会被记账 → paint() 上移的
-        行数算少 → 光标落进旧内容中间，屏幕上留一摊垃圾。
+        命令输出发生在两次提示符之间，所以直接 print 就行 —— 擦除和重画
+        归 prompt_toolkit 管，不用再手算「这一帧占几行」。
         """
-        with self.console.capture() as cap:
-            if renderable is None:
-                self.console.print()
-            else:
-                self.console.print(renderable)
-        text = cap.get()
-        self._write(text)
-        self._tail_rows += max(1, frame_rows(text))
+        if renderable is None:
+            self.console.print()
+        else:
+            self.console.print(renderable)
 
-    def _write(self, text):
-        """把渲染好的字符串写进 console 的落点（真 TTY = stdout，测试 = StringIO）。"""
-        self.console.file.write(text)
-        try:
-            self.console.file.flush()
-        except Exception:
-            pass
+    # -- 看板（框架把它画在提示行上方）---------------------------------
 
-    def erase_frame(self):
-        """把上一帧（+ 帧外那些行）从终端上删掉。非 TTY / --no-clear 时不动。
-
-        `--no-clear`（WARDEN_CLEAR=0）= 旧的追加行为：不清、不删，留着滚动历史。
-        """
-        rows = self._frame_rows + self._tail_rows
-        self._frame_rows = 0
-        self._tail_rows = 0
-        if self.no_clear or not self.console.is_terminal:
-            return
-        # 钳位用 console 自己的高度（真 TTY = 终端实际行数；测试里可以造一个矮终端）
-        esc = erase_escape(rows, height=self.console.height or None)
-        if esc:
-            # 写 console.file（真 TTY 就是 stdout）：和帧内容走同一个落点，
-            # 顺序才不会错 —— 测试里也能断言这段转义真的发出去了。
-            self._write(esc)
-
-    def paint(self, prompt_row=True):
-        """重画整屏：先删上一帧，再整帧渲染、记账。
-
-        整帧渲染到一个 capture 里再写回 `console.file`，为的是数出「这一帧占几行」
-        —— 这只是记账手段，输出内容和以前逐步 console.print 完全一致（测试用
-        `Console(file=StringIO)` 读到的还是同样的文本）。
-        """
+    def frame(self):
+        """当前视图的整块看板。repl_kit 每帧调它一次，按单元格 diff 上屏。"""
         # 每次画之前重读 data.csv：契约可能在别处被人手改了（这就是控制面）
         self.reload_entries()
-        self.erase_frame()
-        with self.console.capture() as cap:
-            self.console.print(self.render_header())
-            # 主体内容由当前视图决定（契约表 / 专注面板 / 统计面板…）
-            body = self.view.render()
-            if body is not None:
-                for item in (body if isinstance(body, (list, tuple)) else [body]):
-                    self.console.print(item)
-            if self.messages:
-                self.console.print(self.render_messages())
-            # 视图指示 + 命令提示都放在最下面（提示符上面）
-            self.console.print(self.render_view_bar())
-            self.console.print(self.view.hint)
-            # **最后一行**是动态状态行（如果有）。读输入时只原地覆盖这一行，
-            # 不重画整帧 —— 倒计时跳动时屏幕不抖。见 _read_line_tty()。
-            st = self.live_status()
-            if st is not None:
-                self.console.print(Text(st))
-        frame = cap.get()
-        self._write(frame)
-        self._frame_rows = frame_rows(frame)
-        # 交互模式下，提示符那一行紧接着就打在帧下面；下次重画时要把它一起删掉。
-        self._tail_rows = 1 if prompt_row else 0
+        parts = [self.render_header()]
+        body = self.view.render()
+        if body is not None:
+            parts.extend(body if isinstance(body, (list, tuple)) else [body])
+        if self.messages:
+            parts.append(self.render_messages())
+        parts.append(self.render_view_bar())
+        return Group(*parts)
+
+    def paint(self, prompt_row=True):
+        """画一整帧到 console：--status / --exec / 测试用。
+
+        交互模式下不走这里，走 repl_kit 的 chrome。
+        """
+        self.console.print(self.frame())
+        st = self.live_status()
+        if st is not None:
+            self.console.print(Text(st))
 
     def live_status(self):
         """当前视图的动态状态行（截到控制台宽度，纯文本）；没有就 None。"""
@@ -1102,34 +956,50 @@ class Warden(object):
             return None
         return st[: max(10, self.console.width - 1)]
 
+    def prompt_text(self):
+        """欠着罪的时候提示符换成「宣言> 」—— 那时候只受理宣言。"""
+        return "宣言> " if self.pending_sins() else None
+
     def render_view_bar(self):
-        """一行「当前在第几个视图」，带 Tab 提示。视图多了自动跟着排。"""
+        """一行「当前在第几个视图」，带切换键提示。视图多了自动跟着排。"""
         bar = Text()
         bar.append("视图 ", style="dim")
-        for i, v in enumerate(self.views):
+        for i, v in enumerate(self.view_impls):
             if i:
                 bar.append("  ", style="dim")
-            style = "bold reverse cyan" if i == self.view_index else "dim"
+            style = "bold reverse cyan" if i == self.shell.view_index else "dim"
             bar.append("%d %s" % (i + 1, v.name), style=style)
-        bar.append("    （Tab 切换）", style="dim")
+        bar.append("    （Shift+Tab 切换）", style="dim")
         return bar
+
+    # -- 视图（业务侧的对象；框架侧在 self.shell.views）------------------
+
+    @property
+    def views(self):
+        return self.view_impls
+
+    @property
+    def view(self):
+        return self.view_impls[self.shell.view_index]
+
+    @property
+    def view_index(self):
+        return self.shell.view_index
 
     def cycle_view(self, step=1):
         """切到下一个视图。返回新视图。"""
-        if not self.views:
+        if not self.view_impls:
             return None
-        self.view_index = (self.view_index + step) % len(self.views)
-        self.view = self.views[self.view_index]
+        self.shell.switch_view(step)
         self.say("切到「%s」视图" % self.view.name, "cmd")
         self.enter_view()
         return self.view
 
     def go_to_view(self, cls):
         """直接跳到某个视图（stat 命令用）。已经是它就原地不动。返回该视图。"""
-        for i, v in enumerate(self.views):
+        for i, v in enumerate(self.view_impls):
             if isinstance(v, cls):
-                self.view_index = i
-                self.view = v
+                self.shell.set_view(i)
                 self.enter_view()
                 return v
         return None
@@ -2189,33 +2059,58 @@ class Warden(object):
                 "但 API 里查不到 —— 也就是你手动取消了。" %
                 (len(sins), head, "…" if len(sins) > 3 else ""))
 
-    def handle(self, line):
-        """执行一条命令；返回 False 表示该退出了。"""
-        # Tab（管道/--exec 里就是一行 "\t"）= 切换视图，任何视图、连锁死时都认
-        if "\t" in line and line.replace("\t", "").strip() == "":
-            self.cycle_view()
-            return True
-        # Shift+Tab 在管道/--exec 里可写成一行 \x1b[Z 或 shift-tab（真 TTY 走
-        # read_command 的 SwitchFocusMode 分支）。
-        if line.strip() == "\x1b[Z" or line.strip().lower() in (
-                "shift-tab", "shift+tab", "s-tab"):
-            self.cycle_focus_mode()
-            return True
+    # -- 派发（框架的 intercept 钩子 + 一个给测试/--exec 用的瘦包装）------
+
+    def guard(self, fn):
+        """把一条命令的异常翻译成人话 —— 交互路径和测试路径用的是同一套。"""
+        def run(args):
+            try:
+                fn(args)
+            except SystemExit:
+                raise
+            except BridgeError as e:
+                self.had_error = True
+                self.say("bridge 出错：%s" % e, "error")
+            except ValueError as e:
+                self.say(str(e), "warn")
+            except Exception as e:  # 兜底：别让一条命令把 TUI 掀了
+                self.had_error = True
+                self.say("意外错误：%s: %s" % (type(e).__name__, e), "error")
+        return run
+
+    def exit_tui(self):
+        raise SystemExit(0)
+
+    def cmd_stat_from_args(self, args):
+        """`stat` 在任何视图都能敲：先切到统计视图，再按 TTL 决定要不要重拉。"""
+        force = any(a in ("refresh", "force", "--force") for a in args)
+        full = any(a in ("full", "all", "--full") for a in args)
+        # 先切视图：第一次进统计视图时 enter_view() 自己会拉一次，别拉两遍。
+        self.go_to_view(StatsView)
+        # 内存里那份放超过 TTL 也算过期：TUI 开着过夜再敲 stat 不该看到旧数字。
+        stale = (self.stat is None or self.stat_at is None
+                 or (datetime.datetime.now() - self.stat_at).total_seconds()
+                 >= st.CACHE_TTL)
+        if stale or force or full:
+            self.cmd_stat(force=force, full=full)
+
+    def _split(self, line):
+        """shlex 拆一行；引号不配对就说一句、返回 None。"""
         try:
-            parts = shlex.split(line)
+            return shlex.split(line)
         except ValueError as e:
             self.say("引号没配对：%s" % e, "error")
-            return True
-        if not parts:
-            return True
-        cmd, args = parts[0].lower(), parts[1:]
+            return None
 
+    def intercept(self, line):
+        """repl_kit 在派发前问一句：返回 True=我处理了，None=照常派发。"""
         # 罪案区的全局锁：除了敲宣言，什么都不受理。
+        # （Shift+Tab / Ctrl+O 是框架的键绑定，不经过这里 —— 和以前一样能按。）
         sins = self.pending_sins()
         if sins:
-            if cmd in ("quit", "exit", "q"):
+            if line.strip().lower() in ("quit", "exit", "q"):
                 self.say("你要走可以，但罪挂在那儿、锁不会解 —— 下次开 TUI 还得敲。", "warn")
-                return False
+                raise SystemExit(0)
             ok, why = check_declaration(line)
             if ok:
                 self.confess(sins)
@@ -2224,59 +2119,55 @@ class Warden(object):
             beep()
             self.had_error = True
             self.say("锁死中：%s" % (why or "把宣言一字不差地敲完才能做别的事。"), "error")
-            self.emit(Panel(
-                Text.assemble((self.lockdown_reason() + "\n\n", "bold red"),
-                              ("把下面这段一字不差地敲一遍（少一个标点就继续锁死 + 鸣笛）：\n\n",
-                               "bold red"),
-                              (DECLARATION, "bold")),
-                title="[bold red]⛔  认罪之前，什么都不许做[/]",
-                border_style="bold red", box=box.HEAVY,
-            ))
+            self.emit(self.render_lockdown_panel())
             return True
 
+        parts = self._split(line)
+        if parts is None:
+            return True
+        if not parts:
+            return True
+        if self.shell.registry.get(parts[0].lower()) is None:
+            self.say(self.view.unknown_hint(), "warn")
+            return True
+        return None
+
+    def handle(self, line):
+        """执行一条命令；返回 False 表示该退出了（--exec 和测试走这条路）。"""
+        if "\t" in line and line.replace("\t", "").strip() == "":
+            self.cycle_view()
+            return True
+        if line.strip() == "\x1b[Z" or line.strip().lower() in (
+                "shift-tab", "shift+tab", "s-tab"):
+            self.cycle_focus_mode()
+            return True
         try:
-            # 通用命令：所有视图都认（切换 / 重画 / 帮助 / 退出）
-            if cmd in ("quit", "exit", "q"):
-                return False
-            if cmd in ("tab", "view", "switch"):
-                self.cycle_view()
+            if self.intercept(line) is True:
                 return True
-            if cmd in ("status", "s"):
-                return True
-            if cmd in ("stat", "stats"):
-                # 任意视图都能敲：切到统计视图 + 拉数据（`stat refresh` 无视缓存）。
-                # go_to_view 里的 enter_view() 第一次进视图已经会拉，这里别拉第二遍。
-                force = any(a in ("refresh", "force", "--force") for a in args)
-                full = any(a in ("full", "all", "--full") for a in args)
-                # 先切视图：第一次进统计视图时 enter_view() 自己会拉一次，别拉两遍。
-                self.go_to_view(StatsView)
-                # 内存里那份放超过 TTL 也算过期：TUI 开着过夜再敲 stat 不该看到旧数字。
-                # （st.load 内部还有磁盘缓存的 TTL，所以这里最多退化成"读一次缓存文件"。）
-                stale = (self.stat is None or self.stat_at is None
-                         or (datetime.datetime.now() - self.stat_at).total_seconds()
-                         >= st.CACHE_TTL)
-                if stale or force or full:
-                    self.cmd_stat(force=force, full=full)
-                return True
-            if cmd in ("help", "?", "h"):
-                self.cmd_help()
-                return True
-            # 其余交给当前视图；视图不认就不再受理（专注视图里那套预约命令就是这么废掉的）
-            handled = self.view.handle(cmd, args, line)
-            if handled is False:
-                return False
-            if handled is None:
-                self.say("「%s」视图不认这个命令（按 Tab 切视图；help 看当前视图的命令）。"
-                         % self.view.name, "warn")
-        except BridgeError as e:
-            self.had_error = True
-            self.say("bridge 出错：%s" % e, "error")
-        except ValueError as e:
-            self.say(str(e), "warn")
-        except Exception as e:  # 兜底：别让一条命令把 TUI 掀了
-            self.had_error = True
-            self.say("意外错误：%s: %s" % (type(e).__name__, e), "error")
+        except SystemExit:
+            return False
+        parts = self._split(line)
+        if not parts:
+            return True
+        command = self.shell.registry.get(parts[0].lower())
+        if command is None:
+            self.say(self.view.unknown_hint(), "warn")
+            return True
+        try:
+            command.handler(parts[1:])
+        except SystemExit:
+            return False
         return True
+
+    def render_lockdown_panel(self):
+        return Panel(
+            Text.assemble((self.lockdown_reason() + "\n\n", "bold red"),
+                          ("把下面这段一字不差地敲一遍（少一个标点就继续锁死 + 鸣笛）：\n\n",
+                           "bold red"),
+                          (DECLARATION, "bold")),
+            title="[bold red]⛔  认罪之前，什么都不许做[/]",
+            border_style="bold red", box=box.HEAVY,
+        )
 
     def run(self, exec_lines=None):
         self.emit("[dim]起 bridge、拉 session…[/]")
@@ -2287,11 +2178,10 @@ class Warden(object):
             self.had_error = True
 
         # 一进来就有未认罪的罪 → 先把话说明白
-        reason = self.lockdown_reason()
-        if reason:
+        if self.lockdown_reason():
             self.emit(Panel(
                 Text.assemble(("⛔  这个 TUI 现在是锁死的。\n\n", "bold red"),
-                              (reason + "\n\n", "red"),
+                              (self.lockdown_reason() + "\n\n", "red"),
                               ("唯一能做的事：把下面这段一字不差地敲一遍"
                                "（%d 字符，少一个标点就继续锁死 + 鸣笛）。\n\n"
                                % len(DECLARATION), "bold red"),
@@ -2301,7 +2191,7 @@ class Warden(object):
             ))
 
         if exec_lines:
-            # --exec 没有提示符行，帧外只有 `>>>` 回显（emit 会记账）
+            # --exec 没有提示符行，帧外只有 `>>>` 回显
             self.paint(prompt_row=False)
             for line in exec_lines:
                 if line.strip() or line.strip("\t") != line:
@@ -2311,24 +2201,14 @@ class Warden(object):
                     self.paint(prompt_row=False)
             return 0 if not self.had_error else 1
 
-        while True:
-            self.paint()
-            prompt = "宣言> " if self.pending_sins() else "warden> "
-            # 有动态状态行时，读输入期间只原地刷新那一行（不重画整屏）
-            status_fn = self.live_status if self.view.wants_tick() else None
-            try:
-                line = read_command(prompt, status_fn=status_fn, tick=1.0)
-            except SwitchView:
-                self.cycle_view()          # Tab：换视图、立刻重画
-                continue
-            except SwitchFocusMode:
-                self.cycle_focus_mode()    # Shift+Tab：专注视图里换模式、重画
-                continue
-            except (EOFError, KeyboardInterrupt):
-                self.emit("\n[dim]收工。[/]")
-                return 0 if not self.had_error else 1
-            if not self.handle(line):
-                return 0 if not self.had_error else 1
+        # 交互模式：提示行、补全、Shift+Tab 切视图、Ctrl+O 切模式、
+        # 状态行每秒原地刷新、帧的擦除重画 —— 全在 repl_kit 里。
+        # 提示符（宣言> / warden>）和罪案区闸门由 prompt_text / intercept 提供。
+        try:
+            self.shell.run()
+        finally:
+            self.emit("[dim]收工。[/]")
+        return 0 if not self.had_error else 1
 
 
 # ---------------------------------------------------------------- daemon 子进程
@@ -2478,7 +2358,7 @@ def parse_args(argv=None):
                     help="一进来就看哪一天：-1=昨天 0=今天 1=明天（也可给 YYYY-MM-DD）")
     ap.add_argument("--status", action="store_true", help="只画一次看板然后退出（不拉浏览器列表）")
     ap.add_argument("--no-clear", action="store_true",
-                    help="退化成追加：不删上一帧、留滚动历史（默认是整帧原地替换）")
+                    help="【已废弃，无效果】以前是退化成追加；现在擦除重画由 repl_kit 管")
     ap.add_argument("--offline", action="store_true", help="不碰浏览器，只用 state.json 里的快照")
     ap.add_argument("--headed", action="store_true", help="浏览器有头模式（看它怎么操作）")
     ap.add_argument("--idle-ms", type=int, default=None,
@@ -2494,6 +2374,9 @@ def main(argv=None):
         return cmd_install_deps()
 
     no_clear = args.no_clear or os.environ.get("WARDEN_CLEAR") == "0"
+    if no_clear:
+        sys.stderr.write("注意：--no-clear / WARDEN_CLEAR=0 已经不起作用了"
+                         "（擦除重画交给 repl_kit / prompt_toolkit）。\n")
     console = Console()
 
     bridge = Bridge(console, headed=args.headed, idle_ms=args.idle_ms,
