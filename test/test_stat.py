@@ -180,20 +180,31 @@ check("新鲜缓存 → 不重拉", len(pulls), 0)
 check("新鲜缓存的 note", note, "缓存")
 h2, note = st.load(ttl=3600, path=CACHE, fetch=fake_fetch, today=TODAY,
                    now=datetime.datetime(2026, 1, 11, 12, 0))
-check("过期缓存 → 重拉", len(pulls), 1)
-check("重拉的 note", note, "实时")
+check("过期缓存 → 刷新", len(pulls), 1)
+check("过期缓存只回看尾巴（不是把 10 天重拉一遍）", pulls[0].get("since"),
+      UNTIL - datetime.timedelta(days=st.TAIL_REFRESH_DAYS - 1))
+check("增量刷新的 note", note, "增量（回看最近 %d 天）" % st.TAIL_REFRESH_DAYS)
 
 pulls[:] = []
-st.save_cache(dict(hist, until="2026-01-09"), CACHE)      # until 对不上（昨天变了）
+st.save_cache(dict(hist, until="2026-01-09"), CACHE)      # 缓存缺了 1/10 那天
 st.load(ttl=3600, path=CACHE, fetch=fake_fetch, today=TODAY,
         now=datetime.datetime(2026, 1, 11, 9, 30))
-check("缓存里的 until 和这次要算的不一致 → 重拉（否则今天会被算成空天）", len(pulls), 1)
+check("缓存 until 对不上 → 只从缺口那次接着拉（不重头来）", len(pulls), 1)
+check("缺一天时从「缺口/回看窗口」里更早的那个起点拉",
+      pulls[0].get("since"), UNTIL - datetime.timedelta(days=st.TAIL_REFRESH_DAYS - 1))
 
 pulls[:] = []
 st.save_cache(hist, CACHE)
 st.load(force=True, path=CACHE, fetch=fake_fetch, today=TODAY,
         now=datetime.datetime(2026, 1, 11, 9, 30))
-check("force=True 无视新鲜缓存", len(pulls), 1)
+check("force=True 无视新鲜度、但仍然是增量", (len(pulls), pulls[0].get("since") is not None),
+      (1, True))
+
+pulls[:] = []
+st.save_cache(hist, CACHE)
+st.load(full=True, path=CACHE, fetch=fake_fetch, today=TODAY)
+check("full=True 才是全量重拉", len(pulls), 1)
+check("全量重拉不带 since（从 memberSince 起）", pulls[0].get("since"), None)
 
 
 def boom(**kw):
@@ -212,6 +223,83 @@ except OSError:
 
 
 # ---------------------------------------------------------------- 口径（compute_stats）
+
+print("== 增量刷新：窗口 / 合并 / 不再问 /me ==")
+cache_10 = dict(hist, until="2026-01-10")
+check("没缓存 → 只能全量",
+      st.refresh_window(None, datetime.date(2026, 1, 10)), (None, "实时（全量）"))
+check("缓存到昨天 → 只回看尾巴（缺口比回看窗口小）",
+      st.refresh_window(cache_10, datetime.date(2026, 1, 10)),
+      (datetime.date(2026, 1, 8), "增量（回看最近 3 天）"))
+check("缓存缺 1 天 → 回看窗口比缺口长，起点是回看窗口",
+      st.refresh_window(cache_10, datetime.date(2026, 1, 11)),
+      (datetime.date(2026, 1, 9), "增量（回看最近 3 天）"))
+check("缓存缺 30 天 → 从缺口起点拉（不是只拉最近 3 天）",
+      st.refresh_window(cache_10, datetime.date(2026, 2, 9)),
+      (datetime.date(2026, 1, 11), "增量（补 30 天缺口：2026-01-11 → 2026-02-09）"))
+check("缓存比目标还新（时钟往回跳）→ 还是只回看尾巴",
+      st.refresh_window(dict(hist, until="2026-01-20"), datetime.date(2026, 1, 10)),
+      (datetime.date(2026, 1, 8), "增量（回看最近 3 天）"))
+
+
+def mk(day, hhmm="09:00", sid=None, done=True):
+    return {"sessionId": sid or ("%s-%s" % (day, hhmm)), "start": "%sT%s:00" % (day, hhmm),
+            "durationMin": 50, "completed": done, "joined": True, "title": "",
+            "activityType": "", "mine": True}
+
+
+cached = [mk("2026-01-05", "09:00", "a"), mk("2026-01-06", "09:00", "b"),
+          mk("2026-01-08", "09:00", "c", done=False), mk("2026-01-09", "09:00", "d")]
+fresh = [mk("2026-01-08", "09:00", "c", done=True),      # 同一场：后补成 completed
+         mk("2026-01-09", "09:00", "e")]                 # 1/9 那场换了 id（旧的该被删）
+merged = st.merge_sessions(cached, fresh, datetime.date(2026, 1, 8))
+check("窗口之前的旧记录留着", [x["sessionId"] for x in merged][:2], ["a", "b"])
+check("窗口内的旧记录被丢掉（1/9 的 d 没了）",
+      [x["sessionId"] for x in merged], ["a", "b", "c", "e"])
+check("同 id 用新记录覆盖（completed False → True）",
+      [x["completed"] for x in merged if x["sessionId"] == "c"], [True])
+check("合并后按时间排序", [x["start"] for x in merged], sorted(x["start"] for x in merged))
+check("fetch_from=None（全量）→ 旧记录一条都不留",
+      [x["sessionId"] for x in st.merge_sessions(cached, fresh, None)], ["c", "e"])
+check("没有 sessionId 的记录也不静默丢",
+      len(st.merge_sessions([{"sessionId": "", "start": "2026-01-01T09:00:00",
+                              "completed": True}], [], datetime.date(2026, 1, 5))), 1)
+
+me_calls = []
+
+
+def raw_api(day, hhmm="09:00", sid=None, done=True):
+    """API 真正的形状（startTime/duration/users）—— slim 是 stats 自己做的。"""
+    return {"sessionId": sid or ("%s-%s" % (day, hhmm)),
+            "startTime": "%sT%s:00Z" % (day, hhmm), "duration": 3000000,
+            "users": [{"userId": "me", "completed": done, "joinedAt": "x"}]}
+
+
+def counting_json(url, token, timeout=None):
+    if "/me" in url:
+        me_calls.append(url)
+        return {"user": {"userId": "me", "memberSince": "2026-01-01T00:00:00Z",
+                         "totalSessionCount": 3}}
+    return {"sessions": [raw_api("2026-01-10")]}
+
+
+calls_made = []
+
+
+def counting_fetch(**kw):
+    calls_made.append(kw)
+    return st.fetch_history(get_json=counting_json,
+                            **{k: v for k, v in kw.items() if k != "get_json"})
+
+
+st.save_cache(dict(hist, sessions=[mk("2026-01-01")]), CACHE)
+st.load(force=True, path=CACHE, fetch=counting_fetch, get_json=counting_json, today=TODAY)
+check("增量刷新只打 1 个请求", len(calls_made), 1)
+check("增量路径不再问 /me（用缓存里的 memberSince）", me_calls, [])
+check("合并后旧记录还在（1/1）+ 新拉的（1/10）",
+      sorted(x["sessionId"] for x in st.load_cache(CACHE)["sessions"]),
+      ["2026-01-01-09:00", "2026-01-10-09:00"])
+check("缓存里的 me 被保留", st.load_cache(CACHE)["me"]["userId"], "me")
 
 print("== compute_stats 口径 ==")
 PLAN = {

@@ -23,11 +23,21 @@
   `memberSince` 就退到「第一条 session 的本地日期」。
 - **分母 = 区间里的每一天**，包含一场都没做的空天 —— 所以「零 session 天数」才有意义。
 
-缓存
-----
-`temp/stat-history.json`（只存瘦身后的字段），TTL `CACHE_TTL` 秒。缓存的
-`until` 必须和这次要算的 `until` 一致才复用（否则昨天的缓存会把今天算成空天）。
-`force=True`（TUI 里 `stat refresh`）无视缓存重拉；拉失败时回落到旧缓存并标注。
+缓存（增量刷新，不是每次重拉）
+------------------------------
+`temp/stat-history.json`（只存瘦身后的字段），TTL `CACHE_TTL` 秒。
+
+- **新鲜缓存（TTL 内且 `until` 对得上）→ 一次网络都不打。**
+- 过期 / 过了午夜 → **只拉「缓存缺口 + 最近 `TAIL_REFRESH_DAYS` 天」**，
+  拼在旧缓存后面（`merge_sessions`），通常 1 个请求、几十条。
+  全量重拉只在**第一次**或者显式 `full=True` 时发生。
+- 缓存的 `until` 和这次要算的 `until` 不一致时**不能直接复用**，但也**不需要全量重来**
+  —— 从 `cached_until + 1` 接着拉就行（`refresh_window` 保证缺口连得上）。
+- 为什么尾部要回看几天：`completed` 是事后才落定的，迟到的取消/重订也只影响最近几天。
+- `/v1/me` 只在没有缓存时问一次：`memberSince` 不会变。
+- `force=True`（TUI 里 `stat refresh`）跳过新鲜度判断，但**仍然增量**；
+  `full=True` 才是真的把两千多条重拉一遍。
+- 拉失败时回落到旧缓存并标注；连缓存都没有才抛出去。
 
 本模块**不 import rich**：拉取 / 计算 / 缓存都是纯 stdlib，渲染在 warden.py 的
 `StatsView` 里。这样 `test/test_stat.py` 能完全离线（注入 `get_json` 假实现）跑。
@@ -53,6 +63,7 @@ API_BASE = "https://api.focusmate.com/v1"
 CHUNK_DAYS = 365               # API 单次查询上限（实测 366 天 = 400）
 CACHE_FILE = os.path.join(TEMP, "stat-history.json")
 CACHE_TTL = 3600               # 缓存多久算新鲜（秒）
+TAIL_REFRESH_DAYS = 3          # 增量刷新时，尾部回看几天（completed 是事后才落定的）
 TIMEOUT = 30
 
 # 渲染用的一些窗口
@@ -219,7 +230,7 @@ def fetch_history(token=None, since=None, until=None, get_json=_get_json, me=Non
     }
 
 
-# ---------------------------------------------------------------- 缓存
+# ---------------------------------------------------------------- 缓存（增量刷新）
 
 
 def load_cache(path=None):
@@ -261,26 +272,130 @@ def desired_until(today=None):
     return (today or datetime.date.today()) - datetime.timedelta(days=1)
 
 
-def load(force=False, ttl=CACHE_TTL, token=None, today=None, path=None,
-         fetch=fetch_history, get_json=_get_json, now=None):
-    """拿一份可用的 history：新鲜缓存 / 重拉 / 旧缓存兜底。
+def cache_since(cache):
+    """缓存是从哪天开始攒的（本地 date）。读不出来就 None。"""
+    if not cache:
+        return None
+    since = local_date_of((cache.get("me") or {}).get("memberSince"))
+    return since or local_date_of(cache.get("since"))
 
-    返回 (history, note)：note 是给人看的一行说明（实时 / 缓存 / 网络失败兜底）。
+
+def cache_until(cache):
+    return local_date_of(cache.get("until")) if cache else None
+
+
+def refresh_window(cache, until, tail_days=TAIL_REFRESH_DAYS):
+    """增量刷新要从哪天开始重拉。纯函数，单测直接喂。
+
+    两条原则：
+
+    1. **缺口必须连上**：缓存只攒到 `cached_until`，那 `cached_until + 1` 之后
+       那几天一条都不能少 —— 从缺口起点拉，不能只拉最近几天。
+    2. **尾部回看 `tail_days` 天**：`completed` 是事后才落定的（还可能有迟到的
+       取消/重订），所以尾部那个小窗口每次重拉一遍、覆盖旧记录。
+       窗口大小固定，与缺口多长无关 —— 这就是"增量"的全部含义。
+
+    返回 (fetch_from, note)。`fetch_from=None` = 没有可用缓存，只能全量。
+    """
+    tail_start = until - datetime.timedelta(days=max(1, int(tail_days)) - 1)
+    cached_until = cache_until(cache)
+    if cached_until is None:
+        return None, "实时（全量）"
+    gap_start = cached_until + datetime.timedelta(days=1)
+    fetch_from = min(gap_start, tail_start)
+    if fetch_from == gap_start and cached_until < until:
+        return fetch_from, "增量（补 %d 天缺口：%s → %s）" % (
+            (until - fetch_from).days + 1, fetch_from.isoformat(), until.isoformat())
+    return fetch_from, "增量（回看最近 %d 天）" % tail_days
+
+
+def merge_sessions(cached, fresh, fetch_from):
+    """把「重拉窗口之前的旧记录」和「刚拉回来的新记录」拼起来。
+
+    窗口内的旧记录一律丢掉（那正是要刷新/删掉的），按 sessionId 去重、按时间排序。
+    `fetch_from=None` = 不留旧记录（全量）。
+    """
+    kept = []
+    if fetch_from is not None:
+        for s in cached or []:
+            day = local_date_of(s.get("start"))
+            if day is not None and day < fetch_from:
+                kept.append(s)
+    by_id = {}
+    extra = []
+    for s in kept + list(fresh or []):
+        sid = s.get("sessionId")
+        if sid:
+            by_id[sid] = s            # fresh 在后 → 同 id 时覆盖成新记录
+        else:
+            extra.append(s)
+    return sorted(list(by_id.values()) + extra, key=lambda s: s.get("start") or "")
+
+
+def _trim_range(history, since, until):
+    """兜底：缓存里只留 [since, until] 区间内的记录（别把未来/太早的带出去）。"""
+    def in_range(s):
+        day = local_date_of(s.get("start"))
+        return day is not None and since <= day <= until
+    history["sessions"] = [s for s in (history.get("sessions") or []) if in_range(s)]
+    history["since"] = since.isoformat()
+    history["until"] = until.isoformat()
+    return history
+
+
+def _stamp(now=None):
+    return (now or datetime.datetime.now()).replace(microsecond=0).isoformat()
+
+
+def load(force=False, ttl=CACHE_TTL, token=None, today=None, path=None,
+         fetch=fetch_history, get_json=_get_json, now=None, full=False,
+         tail_days=TAIL_REFRESH_DAYS):
+    """拿一份可用的 history：新鲜缓存 → 增量刷新 → 全量重拉 → 旧缓存兜底。
+
+    - 缓存新鲜（TTL 内且 `until` 对得上）→ **一次网络都不打**。
+    - 缓存过期或过了午夜 → **只拉缺口 + 最近 `tail_days` 天**（通常 1 个请求、
+      几十条），拼在旧缓存后面，而不是把两千多条重拉一遍。
+    - `force=True`（TUI 的 `stat refresh`）→ 跳过新鲜度判断，但仍然走增量。
+    - `full=True`（`stat refresh full`）→ 丢掉缓存全量重拉。
+
+    返回 (history, note)：note 是给人看的一行（缓存 / 增量… / 实时（全量）/ 兜底）。
     """
     today = today or datetime.date.today()
     until = desired_until(today)
     cache = load_cache(path)
-    fresh = (cache is not None
-             and cache_age(cache, now=now) < ttl
-             and cache.get("until") == until.isoformat())
-    if fresh and not force:
+
+    # 1) 新鲜缓存：直接用，不打网络
+    if (cache is not None and not force and not full
+            and cache.get("until") == until.isoformat()
+            and cache_age(cache, now=now) < ttl):
         return cache, "缓存"
 
+    base = None if (full or cache is None) else cache
     try:
-        history = fetch(token=token, until=until, today=today, get_json=get_json)
-        history["source"] = "api"
+        if base is None:
+            # 全量：/me + 按 ≤365 天分块把 memberSince → 昨天 全拉回来
+            history = fetch(token=token, until=until, today=today, get_json=get_json)
+            note = "实时（全量）"
+            since = cache_since(history) or until
+        else:
+            since = cache_since(base) or until
+            fetch_from, note = refresh_window(base, until, tail_days)
+            me = base.get("me") or None          # memberSince 不会变，别每次都问 /me
+            fresh = fetch(token=token, since=fetch_from, until=until, me=me,
+                          today=today, get_json=get_json)
+            history = {
+                "fetched_at": _stamp(now),
+                "since": since.isoformat(),
+                "until": until.isoformat(),
+                "me": fresh.get("me") or me or {},
+                "sessions": merge_sessions(base.get("sessions"), fresh.get("sessions"),
+                                           fetch_from),
+                "source": "incremental",
+            }
+        _trim_range(history, since, until)
+        history["source"] = history.get("source") or "api"
         save_cache(history, path)
-        return history, "实时"
+        return history, note
     except Exception as e:
         if cache is not None:
             stale = dict(cache)
@@ -430,11 +545,12 @@ def format_text(stats):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Focusmate 生涯统计（只读）")
-    ap.add_argument("--force", action="store_true", help="无视缓存重拉")
+    ap.add_argument("--force", action="store_true", help="无视新鲜度，立刻增量刷新一次")
+    ap.add_argument("--full", action="store_true", help="丢掉缓存，全量重拉（慢，很少需要）")
     ap.add_argument("--save-only", action="store_true", help="只刷缓存，不打印")
     ap.add_argument("--cache", default=CACHE_FILE, help="缓存文件路径")
     args = ap.parse_args(argv)
-    history, note = load(force=args.force, path=args.cache)
+    history, note = load(force=args.force, full=args.full, path=args.cache)
     print("[stats] %s" % note)
     if args.save_only:
         return 0

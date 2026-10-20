@@ -89,7 +89,7 @@ STAT_PULLS = []
 
 
 def fake_stat_load(force=False, **kw):
-    STAT_PULLS.append(bool(force))
+    STAT_PULLS.append((bool(force), bool(kw.get("full"))))
     return FAKE_STAT, "测试缓存"
 
 
@@ -888,9 +888,14 @@ STAT_PULLS[:] = []
 wd.handle("stat")
 check("第二次 stat 不重拉（内存里已有）", STAT_PULLS, [])
 wd.handle("stat refresh")
-check("stat refresh 强制重拉", STAT_PULLS, [True])
+check("stat refresh → 立刻增量刷新（force，但不是 full）", STAT_PULLS, [(True, False)])
+wd.handle("stat refresh full")
+check("stat refresh full → 全量重拉", STAT_PULLS, [(True, False), (True, True)])
+wd.stat_at = datetime.datetime.now() - datetime.timedelta(seconds=w.st.CACHE_TTL + 10)
+wd.handle("stat")
+check("内存里那份放超过 TTL → 再敲 stat 会重拉", len(STAT_PULLS), 3)
 wd.go_to_view(w.StatsView)
-check("Tab 进统计视图不重拉", STAT_PULLS, [True])
+check("Tab 进统计视图不重拉", len(STAT_PULLS), 3)
 
 # 拉取失败：不掀 TUI，视图给一行说明
 def boom(force=False, **kw):

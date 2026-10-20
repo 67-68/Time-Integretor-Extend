@@ -22,7 +22,8 @@
 3. **统计**：生涯累计（总场次 / 每天平均 / 空天 / 峰值 / 中位数与 p25）/ 按月 /
    最近 14 天，**底部逐行列「永不重订」名单**（verdicts 的 `abandoned`，
    平常视图不铺开）。取数与口径在 `stats.py`（只读公开 API，1 小时缓存）；
-   任意视图敲 `stat` 都能切过去，`stat refresh` 强制重拉。
+   任意视图敲 `stat` 都能切过去；`stat refresh` 立刻增量刷新（只拉缺口 + 最近几天，
+   不是把两千多条重拉一遍），`stat refresh full` 才是全量重拉；缓存新鲜时一次网络都不打。
 
 视图可扩展：继承 `View` + `@register_view` 即可，`paint()` / 切换 / 命令提示都由
 `VIEWS` 列表驱动。
@@ -646,8 +647,9 @@ class StatsView(View):
 
     @property
     def hint(self):
-        return ("命令：[bold]stat[/] 拉一次 · [bold]stat refresh[/] 无视缓存重拉 · "
-                "[bold]r[/] 刷新    [dim]（Tab 切视图；数据：Focusmate 只读 API）[/]")
+        return ("命令：[bold]stat[/] 拉一次（走缓存）· [bold]stat refresh[/] 立刻增量刷新（只拉缺口"
+                "+最近几天）· [bold]stat refresh full[/] 丢掉缓存全量重拉 · [bold]r[/] 刷新"
+                "    [dim]（Tab 切视图；数据：Focusmate 只读 API）[/]")
 
     def status_line(self):
         return None                     # 静态面板，不需要每秒刷新
@@ -655,11 +657,12 @@ class StatsView(View):
     def handle(self, cmd, args, line):
         w = self.w
         if cmd in ("stat", "stats"):
-            w.cmd_stat(force=any(a in ("refresh", "force", "--force") for a in args))
+            w.cmd_stat(force=any(a in ("refresh", "force", "--force") for a in args),
+                       full=any(a in ("full", "all", "--full") for a in args))
         elif cmd in ("refresh", "r", "reload"):
             w.cmd_stat()
         else:
-            w.say("「统计」视图只认 stat / stat refresh / refresh；"
+            w.say("「统计」视图只认 stat / stat refresh [/full] / refresh；"
                   "按 Tab 切回去再敲别的。", "warn")
         return True
 
@@ -979,6 +982,7 @@ class Warden(object):
         # stat_note 是「实时拉取 / 走缓存 / 拉取失败」那行说明。
         self.stat = None
         self.stat_note = ""
+        self.stat_at = None         # 内存里这份统计是什么时候拿的（超 TTL 就重拉）
         # 帧式重画的记账（见 paint / erase_frame / emit）：
         #   _frame_rows = 上一帧占了终端几行；_tail_rows = 帧之后又打了几行
         #   （提示符那一行 / 帮助面板 / 宣言闸门 / `>>>` 回显…）。
@@ -1135,10 +1139,15 @@ class Warden(object):
         if isinstance(self.view, StatsView) and self.stat is None:
             self.cmd_stat()
 
-    def cmd_stat(self, force=False):
-        """拉生涯统计：stats.load 走 1 小时缓存 + 按 365 天分块；失败不掀 TUI。"""
+    def cmd_stat(self, force=False, full=False):
+        """拉生涯统计：stats.load 走缓存 + 增量刷新；失败不掀 TUI。
+
+        - 默认：TTL 内直接用缓存，不打网络；过期只拉缺口 + 最近几天。
+        - force：立刻增量刷新（`stat refresh`）。
+        - full：丢掉缓存全量重拉（`stat refresh full`，很少需要）。
+        """
         try:
-            history, note = st.load(force=force)
+            history, note = st.load(force=force, full=full)
         except Exception as e:
             self.had_error = True
             self.stat_note = "拉取失败：%s: %s" % (type(e).__name__, e)
@@ -1152,6 +1161,7 @@ class Warden(object):
             self.say("生涯统计算不动：%s" % e, "error")
             return False
         self.stat_note = note
+        self.stat_at = datetime.datetime.now()
         self.say("生涯统计：%s（完成 %d 场 / %d 天）"
                  % (note, self.stat["total_completed"], self.stat["days"]),
                  "ok" if history else "warn")
@@ -2136,6 +2146,7 @@ class Warden(object):
         for cmd, desc in [
             ("Tab", "切换视图：契约 → 专注 → 统计 → 契约（循环）"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
+            ("stat refresh full", "统计：丢掉缓存、全量重拉（默认只增量拉缺口 + 最近几天）"),
             ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),
             ("day -1|0|1|YYYY-MM-DD", "切换看哪一天（草稿区随便看）"),
             ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
@@ -2161,7 +2172,8 @@ class Warden(object):
             "· 过=已过去。\n"
             "专注视图：只认 stop（消耗暂停）和 Shift+Tab（切模式），"
             "预约那套命令在那边一律没用。\n"
-            "统计视图：只读，stat / stat refresh 重拉；它不改 data.csv、不碰 API 写接口。[/]"
+            "统计视图：只读，stat 走缓存、stat refresh 只增量拉缺口 + 最近几天；"
+            "它不改 data.csv、不碰 API 写接口。[/]"
         )
         return False
 
@@ -2235,9 +2247,16 @@ class Warden(object):
                 # 任意视图都能敲：切到统计视图 + 拉数据（`stat refresh` 无视缓存）。
                 # go_to_view 里的 enter_view() 第一次进视图已经会拉，这里别拉第二遍。
                 force = any(a in ("refresh", "force", "--force") for a in args)
+                full = any(a in ("full", "all", "--full") for a in args)
+                # 先切视图：第一次进统计视图时 enter_view() 自己会拉一次，别拉两遍。
                 self.go_to_view(StatsView)
-                if self.stat is None or force:
-                    self.cmd_stat(force=force)
+                # 内存里那份放超过 TTL 也算过期：TUI 开着过夜再敲 stat 不该看到旧数字。
+                # （st.load 内部还有磁盘缓存的 TTL，所以这里最多退化成"读一次缓存文件"。）
+                stale = (self.stat is None or self.stat_at is None
+                         or (datetime.datetime.now() - self.stat_at).total_seconds()
+                         >= st.CACHE_TTL)
+                if stale or force or full:
+                    self.cmd_stat(force=force, full=full)
                 return True
             if cmd in ("help", "?", "h"):
                 self.cmd_help()

@@ -51,14 +51,30 @@ PUT/DELETE 那套在 `scripts/` 里，和这里无关），不改 `data.csv`，�
 - 分位数用 inclusive 线性插值（和 `statistics.quantiles(method="inclusive")` 同义），
   自己实现是为了 `n<2` 时不抛异常。
 
-## 缓存
+## 缓存：增量刷新，不是每次重拉
 
 `temp/stat-history.json`（`temp/` 在 .gitignore 里），只存瘦身后的字段。
 
-- TTL `CACHE_TTL`（1 小时）。
-- **缓存的 `until` 必须和这次要算的 `until` 一致**才复用：昨天到今天过了午夜，
-  缓存里缺今天那天的数据，直接复用会把昨天算成空天。
-- `force=True`（TUI 里 `stat refresh`）无视缓存重拉。
+**一次全量，之后只拉缺口。** 两千多条记录只在第一次（或显式 `full`）拉：
+
+| 情况 | 网络 | 拉回多少 |
+|---|---|---|
+| 缓存新鲜（TTL 1 小时内，且 `until` 对得上） | **0 个请求** | 0 |
+| 过了午夜 / TTL 过期（缺 1 天） | 1 个请求 | 回看窗口那几天（几十条） |
+| 缓存停在很久以前（缺 N 天） | 1 个请求 | 缺口 + 回看窗口（不是全历史） |
+| 第一次 / `full=True` | `/me` + 每 ≤365 天一块 | 全部（2261 条） |
+
+- **缺口必须连上**：从 `cached_until + 1` 接着拉，不能只拉最近几天，否则中间那些天
+  会被算成空天（`refresh_window` 取「缺口起点」和「回看窗口起点」里更早的那个）。
+- **尾部回看 `TAIL_REFRESH_DAYS`=3 天**：`completed` 是事后才落定的，迟到的取消/重订
+  也只影响最近几天。所以即使缓存"只缺今天"，也会把前 2 天一起重拉、覆盖旧记录
+  （`merge_sessions`：窗口内旧记录丢掉、窗口外保留、按 `sessionId` 去重、按时间排序）。
+- **`/v1/me` 只在没有缓存时问一次**：`memberSince` 不会变，增量路径用缓存里那份。
+- 缓存的 `until` 和这次要算的 `until` 不一致**不等于要全量重来**，只按缺口处理。
+- `force=True`（TUI 里 `stat refresh`）跳过新鲜度判断，但**仍然增量**；
+  `full=True`（`stat refresh full` / `stats.py --full`）才是真的重拉全部。
+- TUI 自己还记了一份「内存里这份是什么时候拿的」：放超过 TTL 再敲 `stat` 会重走
+  `load()`（TUI 开着过夜不该看到旧数字），但绝大多数情况只是读一次缓存文件就返回。
 - 拉失败时**回落到旧缓存**并标注「拉取失败（…）→ 退回缓存」；连缓存都没有才抛出去
   由 TUI 兜（TUI 只记一条 error 消息，不掀屏）。
 
@@ -81,7 +97,8 @@ PUT/DELETE 那套在 `scripts/` 里，和这里无关），不改 `data.csv`，�
 
 ## 和 TUI 的接口
 
-- `stats.load(...)` → `(history, note)`；`note` 是给人看的一行（"实时" / "缓存" /
+- `stats.load(force=False, full=False)` → `(history, note)`；`note` 是给人看的一行
+  （"缓存" / "增量（回看最近 3 天）" / "增量（补 N 天缺口：…）" / "实时（全量）" /
   "拉取失败（…）→ 退回缓存"）。
 - `stats.compute_stats(history)` → 上面那张表。
 - `stats.format_text(stats)` → 纯文本（`python3 stats.py` 用，排查时不开 TUI）。
@@ -94,4 +111,5 @@ TUI 侧：`warden.py` 的 `StatsView`（Tab 第 3 个视图）渲染面板，**�
 
 - 不写 Focusmate（不 book / 不 cancel / 不改 title）。统计是照镜子，不是动手。
 - 不替 daemon 做决策：`abandoned` 仍然是 `keep_session.py` 读了才生效的判决。
-- 不做高频轮询：TTL 缓存 + 手动 `stat refresh`，别把只读接口当监控探针用。
+- 不做高频轮询：TTL 缓存 + 增量刷新 + 手动 `stat refresh`，别把只读接口当监控探针用。
+- 不做后台线程/定时：`load()` 是同步的，进视图那一下要等（增量通常 1 个请求、几百 ms）。
