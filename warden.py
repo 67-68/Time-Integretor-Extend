@@ -26,13 +26,21 @@
    不是把两千多条重拉一遍），`stat refresh full` 才是全量重拉；缓存新鲜时一次网络都不打。
 
 视图可扩展：继承 `View` + `@register_view` 即可；每个视图用 `commands()` 声明自己
-认哪些命令，`to_view()` 把它交给 `repl_kit`。
+认哪些命令、用 `idle_hint()` 声明空闲提示，`to_view()` 把它交给 `repl_kit`。
+
+提示行和 paper_tui 是同一套：空闲时由 `repl_kit.Hint` 排成
+`命令: session  cancel  mute   (Tab 切专注视图)`；输入命令后自动换成
+`Command.hint` 给的参数 / 取值 / 选项提示（`mute 3 ` → `取值: on  off`）。
 
 界面那一层**不在这个文件里**。提示行、Tab 补全、Shift+Tab 切视图、Ctrl+O 切专注模式、
 状态行的每秒刷新、看板的擦除与重画，全部由 `repl_kit`（prompt_toolkit）负责 ——
 它按单元格 diff，只把变化的那几格写出去，不整屏重画，所以倒计时跳动时屏幕不抖。
 这里只提供三样东西：`frame()`（当前视图的看板）、`View.status_line()`（那行数字）、
 `intercept()`（派发前的一道闸，罪案区就挂在这儿）。消息区屏幕上只显示最近 3 条。
+
+看板比终端高时，`WardenShell` 会从**顶部**裁，保证最下面的消息 / 视图栏 / 提示行 /
+状态行 / 输入行永远在屏幕上（矮终端里顶部本来就装不下）。补全菜单浮在看板上，
+不再在输入行下面预留 8 行空白。
 
 命令输出（帮助面板 / 宣言闸门 / `>>>` 回显）直接 print 就行：它们发生在两次提示符
 之间，擦除和重画归 prompt_toolkit。
@@ -71,6 +79,11 @@
     python3 warden.py install-deps     # 把 rich 装到 temp/pylibs（不污染系统）
     python3 warden.py                  # 起 TUI
 
+    TUI 框架 repl_kit 在隔壁仓库 paper_researcher 里，按顺序找：已装好的 →
+    REPL_KIT_PATH → 同级的 ../paper_researcher。所以两个仓库并排放着时，
+    不装也能跑（.app 就走这条路：Finder 起的进程没有你的 PYTHONPATH）。
+    想正经装：pip install -e ../paper_researcher
+
 用法
 ----
     python3 warden.py                          # 交互 TUI
@@ -93,11 +106,13 @@ import argparse
 import copy
 import dataclasses
 import datetime
+import inspect
 import json
 import os
 import queue
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -127,16 +142,40 @@ except ImportError:
 sys.path.insert(0, HERE)
 
 # TUI 的「提示行 / 补全 / 视图切换 / 状态行 / 帮助表」全在 repl_kit 里，
-# 这里只写业务命令。装法：pip install -e /path/to/paper_researcher
+# 这里只写业务命令。
+#
+# repl_kit 是隔壁仓库里的独立包，按三种方式找，前面的赢：
+#   1. 已经装好的（pip install -e /path/to/paper_researcher）—— 正常情况
+#   2. REPL_KIT_PATH 指到 paper_researcher —— 换机器/换解释器又不想动环境
+#   3. 同级的 ../paper_researcher —— 两个仓库一起 checkout 时的默认位置
+#
+# 第 3 条主要是给 .app 用的：Finder 双击起的进程拿不到你 shell 里的
+# PYTHONPATH，"少跑过一次 pip" 不该表现成『点什么都没反应』。
+REPL_KIT_CANDIDATES = [
+    os.environ.get("REPL_KIT_PATH") or "",
+    os.path.join(os.path.dirname(HERE), "paper_researcher"),
+]
 try:
-    import repl_kit
+    import repl_kit  # noqa: F401
 except ImportError:
-    sys.stderr.write(
-        "缺少 repl_kit（TUI 框架）。装一下：\n"
-        "    pip install -e /path/to/paper_researcher\n"
-        "或者临时：PYTHONPATH=/path/to/paper_researcher python3 warden.py\n"
-    )
-    raise SystemExit(2)
+    for _cand in REPL_KIT_CANDIDATES:
+        if not _cand or not os.path.isdir(os.path.join(_cand, "repl_kit")):
+            continue
+        sys.path.insert(0, _cand)
+        try:
+            import repl_kit  # noqa: F401
+            break
+        except ImportError:
+            sys.path.remove(_cand)
+    else:
+        sys.stderr.write(
+            "缺少 repl_kit（TUI 框架）。三种解法选一个：\n"
+            "  1. pip install -e %s\n"
+            "  2. REPL_KIT_PATH=/path/to/paper_researcher python3 warden.py\n"
+            "  3. 把 ti_extend 和 paper_researcher 放在同一个目录下\n"
+            % REPL_KIT_CANDIDATES[1]
+        )
+        raise SystemExit(2)
 
 import keep_session as ks  # noqa: E402  只用来读 daemon 状态 / 起停 daemon / 罪与判决
 import schedule as sch  # noqa: E402  data.csv 的解析与编辑（唯一实现）
@@ -439,20 +478,97 @@ class Bridge(object):
 # ---------------------------------------------------------------- 视图（Tab 切换）
 #
 # 可扩展：一个 View = 一块主体渲染 + 一套命令 + 一行提示。
-# 加新视图：继承 View、填 key/name/label/hint、实现 render()/handle()，
+# 加新视图：继承 View、填 key/name/label、实现 idle_hint()/render()/commands()，
 # 然后用 @register_view 注册即可 —— paint() / 切换 / 命令提示都自动跟上。
 # 未来想加「统计」「历史」视图，照抄 FocusView 的结构就行。
 
-def _cmd(name, handler, summary, aliases=(), section="命令"):
-    """一条 repl_kit 命令：只描述「叫什么 / 干什么 / 还有什么别名」。"""
-    return repl_kit.Command(name=name, handler=handler, summary=summary,
-                            aliases=tuple(aliases), section=section)
+def _cmd(name, handler, summary, aliases=(), section="命令", usage="",
+         options=(), hint=None):
+    """一条 repl_kit 命令。
+
+    命令的「叫什么 / 干什么 / 怎么用 / 补全什么 / 提示什么」都放在这一条记录里，
+    由 repl_kit 统一排版成 help 表和提示行 —— 和 paper_tui 用的是同一套。
+    """
+    return repl_kit.Command(
+        name=name, handler=handler, summary=summary, aliases=tuple(aliases),
+        section=section, usage=usage, options=tuple(options), hint=hint,
+    )
+
+
+# -- 提示行（repl_kit.Hint）-------------------------------------------------
+#
+# paper_tui 的提示行长这样：
+#
+#     命令: session  cancel  mute   (Tab 切专注视图)
+#           ^ items 之间两个空格   ^ note 三个空格 + 括号
+#
+# 这里不手写字符串，统一交给 repl_kit.Hint 排版；命令自己的参数提示用
+# Command.hint（框架会在输入了命令名之后自动换上去）。
+
+def _hint(prefix, *items, note=""):
+    """静态提示：`<prefix>: item  item   (note)`。"""
+    def hook(_parts):
+        return repl_kit.Hint(prefix, items, note=note)
+    return hook
+
+
+def _hint_actions(*items, note=""):
+    return _hint("动作", *items, note=note)
+
+
+def _hint_day(parts):
+    return repl_kit.Hint("取值", ("-1", "0", "1", "YYYY-MM-DD"))
+
+
+def _hint_session(parts):
+    if len(parts) >= 3:
+        return repl_kit.Hint("取值", ("25", "50", "75"))
+    if len(parts) >= 2:
+        return repl_kit.Hint("取值", ("25", "50", "75"),
+                             note="也可以写 11:15-12:05")
+    return repl_kit.Hint("参数", ("HH:MM", "25|50|75"),
+                         note="或 HH:MM-HH:MM")
+
+
+def _hint_relocate(parts):
+    if len(parts) >= 3:
+        return repl_kit.Hint("取值", ("-30", "-15", "+15", "+30"))
+    return repl_kit.Hint("参数", ("<n>", "±MM"),
+                         note="15 的倍数，不能跨天")
+
+
+def _hint_mute(parts):
+    if len(parts) >= 3:
+        return repl_kit.Hint("取值", ("on", "off"))
+    return repl_kit.Hint("参数", ("<n>", "on|off"),
+                         note="不写 on/off 就是取反")
+
+
+def _hint_title(parts):
+    if len(parts) >= 2:
+        return repl_kit.Hint("参数", ('"文本"',), note='"" = 清空')
+    return repl_kit.Hint("参数", ("<n>", '"文本"'))
+
+
+def _hint_cancel(parts):
+    return repl_kit.Hint("参数", ("<n>",), note="执行区要敲宣言")
+
+
+def _hint_sync(parts):
+    return repl_kit.Hint("选项", ("--days",), note="日历 → data.csv")
+
+
+def _hint_stat(parts):
+    if len(parts) >= 2 and parts[1] == "refresh":
+        return repl_kit.Hint("动作", ("full",), note="不加 full = 增量刷新")
+    return repl_kit.Hint("动作", ("refresh", "refresh full"),
+                         note="默认走 1 小时缓存")
 
 
 class View(object):
     """一个视图 = 一套命令 + 一块看板 + 一行状态。
 
-    业务留在子类里（render / status_line / cmd_*），
+    业务留在子类里（render / status_line / cmd_* / idle_hint），
     对外统一经过 to_view() 变成 repl_kit 的 View：命令表、提示行、
     看板、状态行、进视图时的钩子、提示符，全由框架接管。
     """
@@ -460,7 +576,6 @@ class View(object):
     key = "?"
     name = "view"
     label = "视图"
-    hint = ""
 
     def __init__(self, w):
         self.w = w
@@ -471,6 +586,10 @@ class View(object):
 
     def status_line(self):
         """提示符上方那行「随时在变的数字」，纯文本（无 markup）。None = 不需要定时刷新。"""
+        return None
+
+    def idle_hint(self):
+        """没在输入命令时的那行提示：返回 repl_kit.Hint（或 None = 用框架默认）。"""
         return None
 
     def commands(self):
@@ -486,13 +605,18 @@ class View(object):
         w = self.w
         return [
             _cmd("quit", lambda a: w.exit_tui(),
-                 "退出（bridge 和浏览器一起收掉）", ("exit", "q"), "通用"),
-            _cmd("help", lambda a: w.cmd_help(), "命令列表", ("?", "h"), "通用"),
+                 "退出（bridge 和浏览器一起收掉）", ("exit", "q"), "通用",
+                 usage="quit", hint=_hint_actions("quit", note="bridge 和浏览器一起收掉")),
+            _cmd("help", lambda a: w.cmd_help(), "命令列表", ("?", "h"), "通用",
+                 usage="help", hint=_hint_actions("help", note="当前视图的全部命令")),
             _cmd("view", lambda a: w.cycle_view(),
-                 "下一个视图", ("tab", "switch"), "通用"),
+                 "下一个视图", ("tab", "switch"), "通用",
+                 usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
             _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
-                 ("stats",), "通用"),
-            _cmd("status", lambda a: None, "只重画看板", ("s",), "通用"),
+                 ("stats",), "通用", usage="stat [refresh [full]]",
+                 options=("refresh", "full"), hint=_hint_stat),
+            _cmd("status", lambda a: None, "只重画看板", ("s",), "通用",
+                 usage="status", hint=_hint_actions("status", note="只重画看板")),
         ]
 
     def build_registry(self):
@@ -504,8 +628,15 @@ class View(object):
         return repl_kit.Registry(guarded)
 
     def hint_line(self, text, parts):
-        """repl_kit 的提示行回调：把 rich markup 剥掉，PT 的提示行是单一样式。"""
-        return repl_kit.strip_markup(self.hint or "")
+        """repl_kit 的提示行回调。
+
+        空行（没在输入）→ 本视图的 idle_hint；已经开始输入 → None，
+        让框架去问 `Command.hint`（参数 / 取值 / 选项），没有就回落到
+        框架自动生成的 `命令: ...`。这和 paper_tui 的钩子完全同构。
+        """
+        if parts:
+            return None
+        return self.idle_hint()
 
     def to_view(self):
         """变成框架认识的那个 View。"""
@@ -537,11 +668,12 @@ class ContractView(View):
     name = "契约"
     label = "契约 / 预约"
 
-    @property
-    def hint(self):
-        return ("命令：mute N on|off · title N \"文本\" · session HH:MM LEN · sync · "
-                "force-check · cancel N · relocate N ±15 · day -1/0/1 · refresh · "
-                "start · stop · help · quit    [dim]（Tab 切到专注视图）[/]")
+    def idle_hint(self):
+        return repl_kit.Hint(
+            "命令",
+            ("session", "cancel", "mute", "title", "day", "sync", "help", "quit"),
+            note="Tab 切专注视图",
+        )
 
     def render(self):
         out = [self.w.render_table()]
@@ -557,18 +689,39 @@ class ContractView(View):
         w = self.w
         return [
             _cmd("refresh", lambda a: w.refresh(),
-                 "重新拉选中那天的 session（会重编号）", ("r", "reload")),
-            _cmd("day", w.cmd_day, "切换看哪一天（-1/0/1 或 YYYY-MM-DD）"),
-            _cmd("session", w.cmd_session, "创建一场：HH:MM LEN 或 HH:MM-HH:MM"),
-            _cmd("relocate", w.cmd_relocate, "临时把 #N 提前/推后：relocate N ±MM"),
+                 "重新拉选中那天的 session（会重编号）", ("r", "reload"),
+                 usage="refresh",
+                 hint=_hint_actions("refresh", note="重拉选中那天的 session（会重编号）")),
+            _cmd("day", w.cmd_day, "切换看哪一天（-1/0/1 或 YYYY-MM-DD）",
+                 usage="day <-1|0|1|YYYY-MM-DD>",
+                 options=("-1", "0", "1"),
+                 hint=_hint_day),
+            _cmd("session", w.cmd_session, "创建一场：HH:MM LEN 或 HH:MM-HH:MM",
+                 usage="session <HH:MM> <25|50|75>",
+                 options=("25", "50", "75"),
+                 hint=_hint_session),
+            _cmd("relocate", w.cmd_relocate, "临时把 #N 提前/推后：relocate N ±MM",
+                 usage="relocate <n> ±MM",
+                 options=("-30", "-15", "+15", "+30"),
+                 hint=_hint_relocate),
             _cmd("force-check", lambda a: w.cmd_force_check(),
-                 "忽略重试上限，把所有没订上的各强制重订一次", ("forcecheck",)),
-            _cmd("sync", w.cmd_sync, "跑 download_calendar.py populate：日历 → data.csv"),
-            _cmd("mute", w.cmd_mute, "把 #N 静音：mute N on|off"),
-            _cmd("title", w.cmd_title, '把 #N 的标题改成文本：title N "文本"', ("t",)),
-            _cmd("cancel", w.cmd_cancel, "取消 #N（执行区要敲宣言）"),
-            _cmd("start", lambda a: w.cmd_start(), "启动 daemon"),
-            _cmd("stop", lambda a: w.cmd_stop(), "停用 daemon（要敲宣言）"),
+                 "忽略重试上限，把所有没订上的各强制重订一次", ("forcecheck",),
+                 usage="force-check",
+                 hint=_hint_actions("force-check", note="忽略重试上限，全部重订一次")),
+            _cmd("sync", w.cmd_sync, "跑 download_calendar.py populate：日历 → data.csv",
+                 usage="sync [--days N]", options=("--days",),
+                 hint=_hint_sync),
+            _cmd("mute", w.cmd_mute, "把 #N 静音：mute N on|off",
+                 usage="mute <n> on|off", options=("on", "off"),
+                 hint=_hint_mute),
+            _cmd("title", w.cmd_title, '把 #N 的标题改成文本：title N "文本"', ("t",),
+                 usage='title <n> "文本"', hint=_hint_title),
+            _cmd("cancel", w.cmd_cancel, "取消 #N（执行区要敲宣言）",
+                 usage="cancel <n>", hint=_hint_cancel),
+            _cmd("start", lambda a: w.cmd_start(), "启动 daemon",
+                 usage="start", hint=_hint_actions("start", note="启动 daemon")),
+            _cmd("stop", lambda a: w.cmd_stop(), "停用 daemon（要敲宣言）",
+                 usage="stop", hint=_hint_actions("stop", note="停用 daemon（要敲宣言）")),
         ]
 
 
@@ -584,11 +737,11 @@ class FocusView(View):
     name = "专注"
     label = "专注 / 暂停"
 
-    @property
-    def hint(self):
-        return ("命令：[bold]stop[/] —— 消耗一次暂停次数（暂停 %d 分钟）；"
-                "[bold]Shift+Tab[/] —— 循环切换普通 / 做题 / 写作模式。"
-                "    [dim]（Tab 切回契约视图）[/]" % ks.PAUSE_MINUTES)
+    def idle_hint(self):
+        return repl_kit.Hint(
+            "命令", ("stop",),
+            note="消耗一次暂停 · Shift+Tab 切模式 · Tab 切回契约",
+        )
 
     def current_session_key(self):
         """当前进行中的 session key；没有就 None（模式会设为下一场默认）。"""
@@ -677,7 +830,10 @@ class FocusView(View):
         # 预约那套命令在这个视图里一条都不注册 —— 框架层面就不存在
         return [
             _cmd("stop", lambda a: self.w.cmd_pause(),
-                 "消耗一次暂停（暂停 %d 分钟）" % ks.PAUSE_MINUTES),
+                 "消耗一次暂停（暂停 %d 分钟）" % ks.PAUSE_MINUTES,
+                 usage="stop",
+                 hint=_hint_actions("stop", note="消耗一次暂停（%d 分钟）"
+                                    % ks.PAUSE_MINUTES)),
         ]
 
     def unknown_hint(self):
@@ -701,11 +857,11 @@ class StatsView(View):
     name = "统计"
     label = "统计 / 历史"
 
-    @property
-    def hint(self):
-        return ("命令：[bold]stat[/] 拉一次（走缓存）· [bold]stat refresh[/] 立刻增量刷新（只拉缺口"
-                "+最近几天）· [bold]stat refresh full[/] 丢掉缓存全量重拉 · [bold]r[/] 刷新"
-                "    [dim]（Tab 切视图；数据：Focusmate 只读 API）[/]")
+    def idle_hint(self):
+        return repl_kit.Hint(
+            "命令", ("stat", "stat refresh", "refresh"),
+            note="Tab 切视图 · 数据：Focusmate 只读 API",
+        )
 
     def status_line(self):
         return None                     # 静态面板，不需要每秒刷新
@@ -718,7 +874,9 @@ class StatsView(View):
         # `stat` 由通用命令集提供（任何视图都能敲），这里只补这个视图的 refresh
         return [
             _cmd("refresh", lambda a: w.cmd_stat(),
-                 "重新拉一次统计", ("r", "reload")),
+                 "重新拉一次统计", ("r", "reload"),
+                 usage="refresh",
+                 hint=_hint_actions("refresh", note="重新拉一次统计（走缓存）")),
         ]
 
     # -- 渲染
@@ -843,6 +1001,58 @@ class StatsView(View):
 
 # ---------------------------------------------------------------- 输入（Tab 切视图 / 原地刷新）
 
+
+class WardenShell(repl_kit.ReplShell):
+    """repl_kit 的 shell，加一条只属于看板型 TUI 的让步。
+
+    prompt_toolkit 把 `frame()` 当成**多行 prompt**：内容比终端高时，它先
+    保住最下面的输入行，然后从看板**底部**裁掉几行。被裁的恰好是 Recent、
+    视图栏和命令提示 —— 这就是「warden 最下面几行被吞掉」的原因。
+
+    这里在交给 prompt_toolkit 之前，先按终端高度把看板裁到「底部预算」内：
+    要裁就从**顶部**裁，把最下面的东西（消息 / 视图栏 / 提示行 / 状态行 /
+    输入行）永远留在屏幕上。矮终端里看板顶部本来就装不下 —— 与其让它把底部
+    挤掉，不如让顶部让位。
+
+    补全菜单的空间由 repl_kit 的 reserve_space_for_menu 决定；warden 把它
+    设成 0（菜单改成浮在看板上面），所以这里只需要给它留 0 行。
+    """
+
+    def frame_text(self):
+        raw = super().frame_text()
+        if not raw:
+            return raw
+        reserved = 1                                  # 提示行
+        # 老版本 repl_kit 没有这个属性时，PromptSession 仍会预留 8 行。
+        reserved += max(0, getattr(self, "reserve_space_for_menu", 8))
+        try:
+            has_status = bool(self.status_line())
+        except Exception:                             # 状态行坏了也不该撑破布局
+            has_status = False
+        if has_status:
+            reserved += 1                             # 状态行（专注视图）
+        reserved += 1                                 # 提示符
+        budget = max(1, self._terminal_rows() - reserved)
+        lines = raw.splitlines()
+        if len(lines) > budget:
+            # 只保留最后 budget 行：顶部滚走，底部（含提示）留下。
+            raw = "\n".join(lines[-budget:]) + "\n"
+        return raw
+
+    @staticmethod
+    def _terminal_rows():
+        """这次渲染实际可用的行数。
+
+        优先问 prompt_toolkit 的 output（离屏渲染/测试时它才是真的）；
+        拿不到再退回终端尺寸。两者在真 TTY 下是同一个数。
+        """
+        try:
+            from prompt_toolkit.application.current import get_app
+            return get_app().output.get_size().rows
+        except Exception:
+            return shutil.get_terminal_size((80, 24)).lines
+
+
 class Warden(object):
     def __init__(self, console, bridge, no_clear=False, offline=False, day_offset=0):
         # no_clear 只是个历史参数：擦除/重画已经归 repl_kit，这里不再使用。
@@ -871,7 +1081,7 @@ class Warden(object):
         self.stat_at = None         # 内存里这份统计是什么时候拿的（超 TTL 就重拉）
         # 提示行 / 补全 / 视图切换 / 状态行的定时刷新 / 帧的擦除重画，
         # 全部交给 repl_kit（prompt_toolkit 按单元格 diff，只写变化的那几格）。
-        self.shell = repl_kit.ReplShell(
+        shell_kwargs = dict(
             name="warden",
             views=[impl.to_view() for impl in self.view_impls],
             console=lambda: self.console,
@@ -881,6 +1091,12 @@ class Warden(object):
             on_focus=self.cycle_focus_mode,
             intercept=self.intercept,
         )
+        # 看板自己就是最下面那块内容；补全菜单浮在它上面，不再在输入行
+        # 下面留 8 行空白（留了就会把看板/提示挤出屏幕）。
+        # 老版本 repl_kit 没有这个参数就退回默认值（WardenShell 会按 8 行算）。
+        if "reserve_space_for_menu" in inspect.signature(WardenShell).parameters:
+            shell_kwargs["reserve_space_for_menu"] = 0
+        self.shell = WardenShell(**shell_kwargs)
 
     # -- 选中的那一天
 

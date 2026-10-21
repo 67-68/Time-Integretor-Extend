@@ -4,7 +4,7 @@
 分两半，各自幂等：
   依赖半 —— focusmate-mcp + Chromium，装到 ti_extend/temp，装过就跳过。
   app 半 —— 构建 Warden.app（可前台唤起的 macOS 应用）并装到 /Applications。
-            构建/安装逻辑在 app/install-app.sh 与 app/build-app.sh，这里只负责调用，
+            构建/安装逻辑在 app/install-app.sh 与 app/build.sh，这里只负责调用，
             不重复实现 —— 「怎么构建 bundle」只有那一份真相。
 
 设计：
@@ -284,7 +284,7 @@ def install_app(args, check=False):
     """跑 app/install-app.sh：构建 Warden.app 并装进应用程序目录。
 
     这里刻意不实现任何细节 —— 「怎么构建 bundle」（swiftc / Info.plist / codesign）
-    是 app/build-app.sh 的事，「装到哪、怎么替换、要不要唤起」是 app/install-app.sh 的事。
+    是 app/build.sh 的事，「装到哪、怎么替换、要不要唤起」是 app/install-app.sh 的事。
     """
     if not os.path.isfile(APP_INSTALL_SH):
         print("  Warden.app：跳过（找不到 %s）" % APP_INSTALL_SH, file=sys.stderr)

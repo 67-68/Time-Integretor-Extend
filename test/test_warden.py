@@ -11,6 +11,7 @@ import datetime
 import importlib.util
 import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -35,6 +36,14 @@ def check(label, got, want):
 
 def check_true(label, got):
     check(label, bool(got), True)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def plain(text):
+    """去掉 rich 写出的 ANSI，方便断言屏幕上真正看到的字。"""
+    return ANSI_RE.sub("", text)
 
 
 w = load("warden", "warden.py")
@@ -753,7 +762,9 @@ check("专注视图显示进行中的 session", "当前 session" in out, True)
 check("专注视图不画契约表", "The Contract Table" not in out, True)
 check("视图指示有 Tab 切换", "Tab 切换" in out, True)
 _hint = wd.view.hint_line("", [])
-check("专注提示只提 stop", ("stop" in _hint and "session HH:MM" not in _hint), True)
+check("专注提示是 repl_kit.Hint（交给框架排版）",
+      isinstance(_hint, w.repl_kit.Hint), True)
+check("专注提示只提 stop", ("stop" in str(_hint) and "session HH:MM" not in str(_hint)), True)
 check("专注视图有动态状态行", "空闲 42s" in wd.live_status(), True)
 check("状态行被 paint() 打在最后一行（供原地刷新）",
       out.rstrip("\n").splitlines()[-1].strip(), wd.live_status())
@@ -770,6 +781,42 @@ check("状态行用独立样式类（不跟提示行混在一起）",
 wd.console = Console(file=io.StringIO(), width=40, force_terminal=False)
 check("超宽状态行在交给框架前就被截到控制台宽度",
       len(wd.live_status()) < 40, True)
+
+print("== 提示行：用 repl_kit.Hint 排版，空闲 + 命令参数两层 ==")
+wd_hint = mkwarden()
+check("空闲提示是 repl_kit.Hint",
+      isinstance(wd_hint.view.hint_line("", []), w.repl_kit.Hint), True)
+idle_text = wd_hint.shell.hint_line("")
+check("空闲提示是框架格式（命令: a  b   (note)）",
+      idle_text.startswith("命令: ") and "  " in idle_text and "(" in idle_text, True)
+check("空闲提示里不再堆一长串手写命令",
+      "mute N on|off" not in idle_text, True)
+check("day 后提示取值", wd_hint.shell.hint_line("day ").startswith("取值: "), True)
+check("day 提示含日期格式", "YYYY-MM-DD" in wd_hint.shell.hint_line("day "), True)
+check("mute 第二个参数提示 on/off",
+      "on" in wd_hint.shell.hint_line("mute 3 ")
+      and "off" in wd_hint.shell.hint_line("mute 3 "), True)
+check("session 第二个参数提示时长",
+      "25" in wd_hint.shell.hint_line("session 11:15 "), True)
+help_labels = [label for _, rows in wd_hint.shell.sections() for label, _ in rows]
+check("help 表显示 usage（带参数）", "mute <n> on|off" in help_labels, True)
+
+print("== 看板比屏幕高：裁顶部，不裁底部（提示/状态/视图栏/输入行） ==")
+wd_frame = mkwarden()
+shell = wd_frame.shell
+check("补全菜单浮在看板上（不占输入行下面 8 行）",
+      shell.reserve_space_for_menu, 0)
+shell._terminal_rows = lambda: 80
+full = shell.frame_text()
+check("默认看板确实比矮终端高", len(full.splitlines()) > 12, True)
+shell._terminal_rows = lambda: 14
+trimmed = shell.frame_text()
+lines = trimmed.splitlines()
+check("裁到终端预算内（14 行 - 提示 - 输入）", len(lines) <= 12, True)
+check("从顶部裁：The Warden 标题滚走", "The Warden" not in plain(trimmed), True)
+check("底部视图栏留下", "视图 1 契约" in plain(trimmed), True)
+shell._terminal_rows = lambda: 80
+check("终端够高时不裁", len(shell.frame_text().splitlines()), len(full.splitlines()))
 
 print("== 专注视图：stop = 消耗一次暂停（不是停 daemon）==")
 wd.bridge.calls = []

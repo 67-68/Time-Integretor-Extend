@@ -16,6 +16,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 dc = ks = None
 fails = []
 
+# 日期不能写死：plan_week() 会把「今天之前」的时段裁到 now，fixture 里写死的
+# 2026-10-07 落到过去之后，切出来的表就整片空了（测试看起来像功能坏了）。
+# 这里把基准日挪到「下一个和原来同weekday的未来日期」，星期几的期望值保持不变。
+_ANCHOR = datetime.date(2026, 10, 7)      # 原始 fixture 的基准日（周三）
+_TODAY = datetime.date.today()
+_SHIFT = (_ANCHOR.weekday() - _TODAY.weekday()) % 7 or 7
+BASE = _TODAY + datetime.timedelta(days=_SHIFT)
+
+
+def ics_date(offset):
+    """基准日往后 offset 天的 ICS 日期写法（YYYYMMDD）。"""
+    return (BASE + datetime.timedelta(days=offset)).strftime("%Y%m%d")
+
 
 def load(name, filename):
     spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, filename))
@@ -31,60 +44,60 @@ def check(label, got, want):
     print("%s %s" % ("ok  " if ok else "FAIL", label))
 
 
-SELFSTUDY = """BEGIN:VCALENDAR
+SELFSTUDY = f"""BEGIN:VCALENDAR
 VERSION:2.0
 X-WR-CALNAME:自习
 BEGIN:VEVENT
 UID:s1
-DTSTART;TZID=Asia/Shanghai:20261007T141000
-DTEND;TZID=Asia/Shanghai:20261007T153000
+DTSTART;TZID=Asia/Shanghai:{ics_date(0)}T141000
+DTEND;TZID=Asia/Shanghai:{ics_date(0)}T153000
 SUMMARY:复习数学
 END:VEVENT
 BEGIN:VEVENT
 UID:s2
-DTSTART;TZID=Asia/Shanghai:20261007T160000
-DTEND;TZID=Asia/Shanghai:20261007T162000
+DTSTART;TZID=Asia/Shanghai:{ics_date(0)}T160000
+DTEND;TZID=Asia/Shanghai:{ics_date(0)}T162000
 SUMMARY:只有20分钟
 END:VEVENT
 BEGIN:VEVENT
 UID:s3
-DTSTART;TZID=Asia/Shanghai:20261011T090000
-DTEND;TZID=Asia/Shanghai:20261011T120000
+DTSTART;TZID=Asia/Shanghai:{ics_date(4)}T090000
+DTEND;TZID=Asia/Shanghai:{ics_date(4)}T120000
 SUMMARY:周日上午自习
 END:VEVENT
 BEGIN:VEVENT
 UID:s4
-DTSTART;VALUE=DATE:20261010
-DTEND;VALUE=DATE:20261011
+DTSTART;VALUE=DATE:{ics_date(3)}
+DTEND;VALUE=DATE:{ics_date(4)}
 SUMMARY:全天事件
 END:VEVENT
 BEGIN:VEVENT
 UID:s5
-DTSTART;TZID=Asia/Shanghai:20261009T200000
-DTEND;TZID=Asia/Shanghai:20261009T210000
+DTSTART;TZID=Asia/Shanghai:{ics_date(2)}T200000
+DTEND;TZID=Asia/Shanghai:{ics_date(2)}T210000
 RRULE:FREQ=WEEKLY;BYDAY=FR
 SUMMARY:周五晚自习
 END:VEVENT
 END:VCALENDAR
 """
-CLASS = """BEGIN:VCALENDAR
+CLASS = f"""BEGIN:VCALENDAR
 VERSION:2.0
 X-WR-CALNAME:上课
 BEGIN:VEVENT
 UID:c1
-DTSTART;TZID=Asia/Shanghai:20261007T090000
-DTEND;TZID=Asia/Shanghai:20261007T120000
+DTSTART;TZID=Asia/Shanghai:{ics_date(0)}T090000
+DTEND;TZID=Asia/Shanghai:{ics_date(0)}T120000
 SUMMARY:高等数学
 END:VEVENT
 END:VCALENDAR
 """
-REST = """BEGIN:VCALENDAR
+REST = f"""BEGIN:VCALENDAR
 VERSION:2.0
 X-WR-CALNAME:休息
 BEGIN:VEVENT
 UID:r1
-DTSTART;TZID=Asia/Shanghai:20261007T120000
-DTEND;TZID=Asia/Shanghai:20261007T130000
+DTSTART;TZID=Asia/Shanghai:{ics_date(0)}T120000
+DTEND;TZID=Asia/Shanghai:{ics_date(0)}T130000
 SUMMARY:午休
 END:VEVENT
 END:VCALENDAR
@@ -188,7 +201,7 @@ def test_plan_week():
 
 
 def test_cli(ics_args):
-    r = run("populate", *ics_args, "--start", "2026-10-07", "--days", "5", "--dry-run")
+    r = run("populate", *ics_args, "--start", BASE.isoformat(), "--days", "5", "--dry-run")
     check("populate --dry-run 退出码 0", r.returncode, 0)
     marker = "---- data.csv（预览，不写）----"
     body = [l for l in r.stdout[r.stdout.index(marker) + len(marker):].splitlines()
@@ -196,7 +209,7 @@ def test_cli(ics_args):
     check("生成的 csv 正文", body,
           ["wed,14:15,50", "fri,20:00,50", "sun,09:00,50", "sun,10:00,50", "sun,11:00,50"])
 
-    md = run("fetch", *ics_args, "--start", "2026-10-07", "--days", "1", "--dry-run").stdout
+    md = run("fetch", *ics_args, "--start", BASE.isoformat(), "--days", "1", "--dry-run").stdout
     check("md 里有需求例的时间段", "| 14:10–15:30 | 80 min |" in md, True)
     check("md 切出 14:15–15:05", "| 14:15–15:05 | 50 min |" in md, True)
     check("md 把 <25min 的段单独列进 details", "太短被丢掉的时间段（1" in md, True)

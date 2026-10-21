@@ -7,7 +7,7 @@
     python3 app/make-icon.py            # 默认画深色版
     python3 app/make-icon.py --accent ff5f56   # 换个强调色（十六进制）
 
-改设计直接改下面的 draw()，再跑一次 build-app.sh 就行。
+改设计直接改下面的 draw()，再跑一次 app/build.sh 就行。
 """
 import argparse
 import os

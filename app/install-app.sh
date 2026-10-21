@@ -8,7 +8,7 @@
 #   ./app/install-app.sh --app-dest DIR   # 换安装位置（默认 /Applications，不可写则 ~/Applications）
 #   ./app/install-app.sh --quiet          # 只说结论
 #
-# 这一层只管「装到哪、怎么替换、要不要唤起」；「怎么构建」是 app/build-app.sh 的事，
+# 这一层只管「装到哪、怎么替换、要不要唤起」；「怎么构建」是 app/build.sh 的事，
 # 「先装哪些依赖」是 install.py 的事。通常不用直接跑它 —— 跑 install.py 或 install.sh 就行。
 set -euo pipefail
 
@@ -72,7 +72,7 @@ pick_app_dir() {
 # 源文件里比已装二进制新的（空 = 不需要重建）。Warden.icns 是生成物，可能还不存在。
 sources_newer_than() {
     local target="$1" f
-    local srcs=("$HERE/WardenMain.swift" "$SUMMON" "$HERE/build-app.sh" "$HERE/Warden.icns")
+    local srcs=("$HERE/TuiMain.swift" "$SUMMON" "$HERE/build.sh" "$HERE/Warden.icns")
     for f in "${srcs[@]}"; do
         [ -f "$f" ] || continue
         [ "$f" -nt "$target" ] && printf '%s\n' "$f" && return 0
@@ -131,9 +131,9 @@ fi
 if [ "$need_build" != 1 ]; then
     say "→ Warden.app 已是最新，跳过构建（--force 可强制重建）"
 elif [ "$QUIET" = 1 ]; then
-    "$HERE/build-app.sh" >/dev/null
+    "$HERE/build.sh" >/dev/null
 else
-    "$HERE/build-app.sh"
+    "$HERE/build.sh"
 fi
 
 # ---------------------------------------------------------------- 装

@@ -1,11 +1,19 @@
 # app/ —— 把 warden TUI 封装成「可前台唤起的 macOS 应用」
 
+> `Warden.command` / `TuiMain.swift` / `warden-summon.applescript` / `build.sh`
+> 由 `repl-kit app init` 生成，**别手改**（重烤会覆盖）。重烤时带上原来的 bundle id：
+> ```bash
+> repl-kit app init --root . --name Warden --entry warden.py \
+>     --bundle-id com.ti-extend.warden --module rich --module prompt_toolkit \
+>     --needs-cmd node --refresh-text refresh --force
+> ```
+
 同一份 `warden.py`，三种「应用感」。三者都只是**包装**，不碰 `warden.py` 的业务逻辑；
 删掉 `app/` 目录对主程序没有任何影响。
 
 | 方式 | 长什么样 | 前台唤起 | 入口 |
 |---|---|---|---|
-| **`Warden.app`** | Dock / ⌘-Tab / Spotlight 里的 `Warden` | ✅ 找到就聚焦 + refresh，找不到就新建 | `WardenMain.swift` |
+| **`Warden.app`** | Dock / ⌘-Tab / Spotlight 里的 `Warden` | ✅ 找到就聚焦 + refresh，找不到就新建 | `TuiMain.swift` |
 | `Warden.command` | 开一个终端窗口跑 TUI | ❌ 每次都是新窗口（它没有 app 身份） | 双击 |
 | `warden-web.sh` | 浏览器里的网页终端 | ⚠️ 借 Chrome 的窗口，且要 ttyd 常驻 | `brew install ttyd` |
 
@@ -16,7 +24,7 @@
 ## 架构：两层，各管一件事
 
 ```
-Warden.app (WardenMain.swift, 真 app, 常驻)
+Warden.app (TuiMain.swift, 真 app, 常驻)
    │  只管「什么时候该唤起」：
    │    applicationDidFinishLaunching / applicationDidBecomeActive / applicationShouldHandleReopen
    │
@@ -64,14 +72,15 @@ osascript app/warden-summon.applescript --log        # 直接看日志
 ## 构建
 
 ```bash
-./app/build-app.sh                    # 生成 app/Warden.app
-./app/build-app.sh --out ~/Applications/Warden.app
-./app/build-app.sh --install-profile  # 顺带把 iTerm2 的「Warden」外观装进 DynamicProfiles
+./app/build.sh                        # 生成 app/Warden.app
+./app/build.sh --out ~/Applications/Warden.app
+./app/build.sh --icon app/Warden.icns # 缺省就是 app/warden.icns（大小写不敏感卷上等价）
 ```
 
 依赖：`swiftc`（Xcode Command Line Tools 自带）+ macOS 自带的
 `osascript` / `codesign` / `lsregister` / `iconutil`。
-图标由 `make-icon.py` 用 PIL 画（深色渐变 + `W` + 状态绿点）。
+图标由 `make-icon.py` 用 PIL 画（深色渐变 + `W` + 状态绿点）；改了设计要手动跑一次：
+`python3 app/make-icon.py` —— `build.sh` 只负责把 `app/*.icns` 塞进 bundle。
 
 仓库路径在 build 时烤进 Swift 和 AppleScript 两处，**所以仓库搬家后要重跑一次**；
 `Warden.app` 本身可以放在任何地方（比如 `~/Applications`）。
@@ -115,7 +124,7 @@ cat temp/warden-summon.log     # AppleScript 侧：命中哪个窗口、每一�
 | **`application "iTerm" is running` 不可信** | GUI 没起却返回 `true` | iTerm 的 XPC 守护进程（`iTermServer` / `pidinfo`）活着就算数。改查 `pgrep -x iTerm2` |
 | **`set current window to window N`** | `-10000 AppleEvent处理程序失败` | iTerm 3.6.11 不认。要用 `select window/tab/session` 逐层选 |
 | **iTerm 半启动时查窗口** | `-1708 "count"不能继续` | 刚被拉起的 iTerm 查 `count of windows` 会抛 errAENoSuchObject；那段整体包 `try`，降级成「没命中 → 新建」 |
-| **改完 Info.plist 没重签** | 授权弹框**根本不弹**，直接 `-1743`；设置的「自动化」里也找不到它 | Info.plist 是签名封印的一部分，一改签名就坏；签名一坏 TCC 拒绝记录任何决策。所有改动之后必须 `codesign` 重签（`build-app.sh` 会自动做并校验） |
+| **改完 Info.plist 没重签** | 授权弹框**根本不弹**，直接 `-1743`；设置的「自动化」里也找不到它 | Info.plist 是签名封印的一部分，一改签名就坏；签名一坏 TCC 拒绝记录任何决策。所有改动之后必须 `codesign` 重签（`build.sh` 会自动做并校验） |
 | **即席签名的身份** | 每次重 build 都算「另一个 app」，授权作废 | designated requirement 显式写 `=designated => identifier "com.ti-extend.warden"` |
 | **后台 `open` 不激活 app** | 起来了但什么都没发生 | 不能只挂 `applicationDidBecomeActive`，`applicationDidFinishLaunching` 也得挂 |
 | **新窗口 `create` 完立刻 `write text`** | 命令偶尔丢 | 窗口的 shell 还没接上 pty，先 `delay 0.5` |
@@ -131,4 +140,5 @@ cat temp/warden-summon.log     # AppleScript 侧：命中哪个窗口、每一�
 
 - `Warden.app/`、`Warden.iconset/`、`app/.warden-window` —— 构建 / 运行产物，已进 `app/.gitignore`。
 - `Warden.icns` —— 跟着走（图标是资产，不是产物）。
-- `warden-profile.json` —— iTerm2 外观草稿，`build-app.sh` 只在它不存在时生成，所以你可以直接改它。
+- `warden-profile.json` —— **现在没人用了**：summon 走的是 `create window with default profile`，
+  这个文件从来没被应用过。留着只当草稿，想改 iTerm 外观直接改 iTerm 自己的 profile。
