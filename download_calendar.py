@@ -906,9 +906,11 @@ def _populate_from_download(args):
     layouts = sp.load_layouts(getattr(args, "layouts", None))
     sessions = sp.all_sessions(download, layouts)
     csv = sp.render_data_csv(download, layouts, date_specific=True)
+    counts = sp.plan_counts(download, layouts)
     _print_download_summary(download)
     info("")
-    info("按 layout 生成 %d 场 session" % len(sessions))
+    info("按 layout 生成 %d 场 session（另：一次性 %d 场，长期规则 %d 条）"
+         % (len(sessions), counts.get("extra", 0), counts.get("rule", 0)))
 
     if args.dry_run:
         info("")
@@ -916,7 +918,8 @@ def _populate_from_download(args):
         info(csv)
         return 0
 
-    if not sessions and not args.force:
+    if not sessions and not counts.get("extra") and not counts.get("rule") \
+            and not args.force:
         die("下载层里没有生成任何 session —— 检查时段/layout。现有 data.csv 没动。")
 
     if os.path.exists(DATA_CSV):
@@ -959,10 +962,12 @@ def cmd_populate(args):
         info(csv)
         return 0
 
-    has_sessions = (bool(sp.all_sessions(download,
-                                         sp.load_layouts(getattr(args, "layouts", None))))
-                    if download is not None and meta.get("download_mode") == "profiles"
-                    else any(p.sessions for p in plans))
+    if download is not None and meta.get("download_mode") == "profiles":
+        counts = sp.plan_counts(download, sp.load_layouts(getattr(args, "layouts", None)))
+        has_sessions = bool(counts.get("period") or counts.get("extra")
+                            or counts.get("rule"))
+    else:
+        has_sessions = any(p.sessions for p in plans)
     if not has_sessions and not args.force:
         die("这一周没切出任何 session——多半是过滤/模型不对。\n"
             "  确认一下日历内容，或加 --force 强行写空 data.csv，"
@@ -1021,7 +1026,10 @@ def cmd_layout(args):
         os.makedirs(TEMP, exist_ok=True)
         shutil.copy2(DATA_CSV, BACKUP_CSV)
     write_text(DATA_CSV, csv)
-    info("data.csv 已重算：%s" % DATA_CSV)
+    counts = sp.plan_counts(download, layouts)
+    info("data.csv 已重算：%s（时段 %d / 一次性 %d / 长期规则 %d）"
+         % (DATA_CSV, counts.get("period", 0), counts.get("extra", 0),
+            counts.get("rule", 0)))
     return 0
 
 

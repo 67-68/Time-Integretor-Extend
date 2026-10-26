@@ -51,6 +51,7 @@ from rich.console import Console  # noqa: E402  (warden 已经把 temp/pylibs �
 
 ks = w.ks
 sch = w.sch
+sp = w.sp
 
 TMP = tempfile.mkdtemp(prefix="warden-test-")
 # 所有落盘的东西都关进临时目录：绝不碰仓库里的真 data.csv / 状态文件
@@ -58,6 +59,9 @@ CSV = os.path.join(TMP, "data.csv")
 sch.DATA_CSV = CSV
 sch.BACKUP_CSV = os.path.join(TMP, "data.csv.bak")
 sch.TEMP = TMP
+os.environ["TI_SESSION_EXTRAS"] = os.path.join(TMP, "session-extras.json")
+os.environ["TI_SESSION_RULES"] = os.path.join(TMP, "session-rules.json")
+os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
 ks.STATE_FILE = os.path.join(TMP, "state.json")
 ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
@@ -391,7 +395,7 @@ except ValueError as e:
 
 # ---------------------------------------------------------------- session 命令
 
-print("== session：先写契约表，再立刻跑一轮 check ==")
+print("== session：默认只加这一天（一次性），--permanent 才写进日历 ==")
 write_csv(["# test schedule", "%s,21:00,25" % TODAY_WD])
 clear_state()
 ran = []
@@ -399,19 +403,33 @@ w.run_keep_session = lambda *a, **kw: (ran.append(a), (0, "round done", ""))[1]
 wd = mkwarden()
 wd.reload_entries()
 wd.bridge.calls = []
+for pth in (sp.extras_path(), sp.rules_path()):
+    if os.path.exists(pth):
+        os.remove(pth)
 check("session 写进去了", wd.cmd_session(["21:30", "50"]), True)
-check("契约表多了这一行", "%s,21:30,50" % TODAY_WD in sch.read_text(), True)
+check("一次性 session 记在 extras 里",
+      [r["start"] for r in sp.extras_for_date(sp.load_extras(), TODAY)], ["21:30"])
+check("一次性 session 不进长期规则", sp.load_rules()["rules"], [])
 ents, _ = sch.load_entries()
-check_true("新行被解析成按星期几的规则",
-           any(e["weekday"] == TODAY_WD and e["start"] == "21:30" and e["duration"] == "50"
-               for e in ents))
+check("data.csv 里是**精确日期**行（不是每周重复的 weekday 行）",
+      "%s,21:30,50" % TODAY.isoformat() in sch.read_text(), True)
+check_true("解析成日期行",
+           any(e.get("date") == TODAY.isoformat() and e["start"] == "21:30"
+               and e["duration"] == "50" for e in ents))
+check("没有写成按星期几的规则",
+      [e for e in ents if e["start"] == "21:30" and not e.get("date")], [])
 check("session 之后立刻跑了一轮 check", ran[-1], ("check",))
 check("session 不自己碰 cancel/title 那类写接口",
       [c for c in wd.bridge.calls if c[0] not in ("release",)], [])
 
 ran = []
-wd.handle("session 21:30 50")
-check("重复的 slot → 被拒（没再跑 check）", ran, [])
+wd.handle("session --permanent 21:30 50")
+check("--permanent 写长期规则", [r["start"] for r in sp.load_rules()["rules"]], ["21:30"])
+check_true("长期规则按星期几",
+           sp.load_rules()["rules"][0]["weekday"] == TODAY_WD)
+ran = []
+wd.handle("session --permanent 21:30 50")
+check("重复的永久 slot → 被拒（没再跑 check）", ran, [])
 check_true("重复时给了人话提示", any("已经有" in m[2] for m in wd.messages))
 for bad, note in [("session 22:00 40", "25/50/75"),
                   ("session 22:10 50", "15 分钟整点"),
@@ -445,11 +463,11 @@ wd = mkwarden()
 wd.reload_entries()
 check("session 11:15-12:05 写进去了", wd.cmd_session(["11:15-12:05"]), True)
 check("契约表里是规范的 HH:MM,duration（不是区间）",
-      "%s,11:15,50" % TODAY_WD in sch.read_text(), True)
+      "%s,11:15,50" % TODAY.isoformat() in sch.read_text(), True)
 ents, _ = sch.load_entries()
 check_true("区间推出 50 分钟",
-           any(e["weekday"] == TODAY_WD and e["start"] == "11:15" and e["duration"] == "50"
-               for e in ents))
+           any(e.get("date") == TODAY.isoformat() and e["start"] == "11:15"
+               and e["duration"] == "50" for e in ents))
 
 # ---------------------------------------------------------------- sync 命令
 
@@ -706,8 +724,8 @@ check("快照模式标出「快照」而不是「缺」", "快照" in out and " 
 # ---------------------------------------------------------------- 视图（Tab 切换）
 
 print("== 视图：注册 + Tab 切换 ==")
-check("注册了契约/专注/统计/任务四个视图", [v.name for v in w.VIEWS],
-      ["契约", "专注", "统计", "任务"])
+check("注册了契约/专注/统计/任务/设置五个视图", [v.name for v in w.VIEWS],
+      ["契约", "专注", "统计", "任务", "设置"])
 wd = mkwarden()
 check("默认契约视图", (wd.view.name, wd.view_index), ("契约", 0))
 wd.handle("tab")
@@ -717,7 +735,9 @@ check("再一个 Tab 切到统计（Tab 是循环）", (wd.view.name, wd.view_in
 wd.handle("\t")
 check("第三个 Tab 切到任务", (wd.view.name, wd.view_index), ("任务", 3))
 wd.handle("\t")
-check("第四个 Tab 转回契约", (wd.view.name, wd.view_index), ("契约", 0))
+check("第四个 Tab 切到设置", (wd.view.name, wd.view_index), ("设置", 4))
+wd.handle("\t")
+check("第五个 Tab 转回契约", (wd.view.name, wd.view_index), ("契约", 0))
 wd.cycle_view()
 check("cycle_view 切到专注", wd.view.name, "专注")
 wd.cycle_view(-1)
@@ -944,7 +964,11 @@ wd.console = Console(file=buf, width=120, force_terminal=False)
 wd.paint()
 out = buf.getvalue()
 check("平常视图不逐行列永不重订名单", "2026-01-09 09:00" not in out, True)
-check("平常视图只留一句指路", "永不重订名单（1 条）" in out, True)
+check("那一行已经换成警告（状态框里不再提永不重订名单）",
+      "永不重订名单" not in out, True)
+check("契约视图最上面是 ASCII「状态」框", "+-- 状态" in out, True)
+check("状态框里有契约执行情况", "契约" in out and "data.csv" in out, True)
+check("状态框里有警告", "→" in out, True)
 
 # 缓存语义：内存里已有就别再拉；stat refresh 强制重拉
 STAT_PULLS[:] = []

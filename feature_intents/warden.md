@@ -116,13 +116,15 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 实现 `render()` / `handle()`，再用 `@register_view` 注册；`paint()` / 切换 / 提示
 都会自动跟上（`VIEWS` 列表驱动，顺序即 Tab 顺序）。
 
-现有三个视图：
+现有五个视图：
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
-| 1 | 契约（默认） | The Contract Table + 契约摘要 | 原来那一整套（`session` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
+| 1 | 契约（默认） | **状态框（ASCII）+ The Contract Table** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
+| 4 | 任务 | 任务表（含 `重复` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/sync` |
+| 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 
 - **统计视图的数据链在 `stats.py`**（只读公开 API，按 ≤365 天分块拉全量历史，
   口径与缓存见 [`stat.md`](./stat.md)）。它不写任何东西：不改 `data.csv`、
@@ -131,8 +133,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
   只有**第一次**要拉全量（几秒，TUI 会卡那一下），之后是增量：只拉缺口 + 最近 3 天，
   通常 1 个请求、几百 ms；TTL 内的第二次连请求都不发（见 [`stat.md`](./stat.md)）。
 - **「永不重订」名单（verdicts 的 `abandoned`）只在统计视图底部逐行列**（一条一行）。
-  契约视图的契约摘要里只留一句「永不重订名单（N 条）：stat 命令 / 统计视图」指路，
-  平常视图不铺开这些记录。
+  契约视图里原来那句指路已经**换成警告**（见下面的「状态框」），平常视图不铺开这些记录。
 - 通用命令（三个视图都认）：`Tab`（切视图）/ `stat` / `status` / `help` / `quit`。
   注意：**罪案区锁死时 `stat` 也进不去**（和别的命令一样，除了敲宣言什么都不受理）——
   这是既有的锁语义，不是统计视图的特例。
@@ -319,6 +320,46 @@ python3 warden.py install-deps
   现在按区分层：草稿区零阻力、执行区敲宣言。`CANCEL_COOLDOWN` 常量已删。
 
 
+## 状态框（警告） + 设置视图
+
+### 状态框
+
+契约视图最上面那块是**状态框**：一个只用 `+ - |` 画的 ASCII 框，标题「状态」：
+
+```
++-- 状态 ----------------------------------------------------------+
+| 契约（data.csv 周一）：计划 3 场 · 已落地 3 场 ✅ 一场不缺        |
+| 来源：时段排布 8 · 一次性 1 · 长期规则 2   （session = …）        |
+| /Users/.../data.csv                                             |
+| ! 今天的 session 里没有「明日时间安排」这类每周重复任务            |
+|     → task create title=明日时间安排 --repeat mon@22:15           |
++------------------------------------------------------------------+
+```
+
+- 上半是 `ContractView.status_box()` 给的行（契约执行情况 / 来源 / 临时挪动 / 文件路径）；
+- 下半是**警告**：`repl_kit.WarningBoard` 里当前的条目。warden 只负责"有什么问题"
+  （`collect_warnings()`），画框、限宽、CJK 对齐、按视图显示都由框架做。
+- 警告来源：`data.csv` 解析问题、时段 layout 坏了、重算 `data.csv` 冲掉的旧行、
+  今天没有任何「每周重复任务」落点（附 `--repeat` 的写法）。
+- 默认显示、默认只在**契约**视图显示（`show_warnings=True` + `warnings_view=("契约",)`）；
+  `warn on|off` 可以随时开关（只藏警告，契约那几行还在）。
+- 每帧画框之前会 `refresh_warnings()` 重算（5 秒节流，纯本地、不联网、不写盘）；
+  每条命令跑完也会强制重算一次 —— 框里永远是"现在"的事实。
+
+### 设置视图
+
+设置是**数据**（`settings_store.SETTINGS`），不是散落在 warden 里的 if：
+
+| id | 默认 | 作用 |
+|---|---|---|
+| `edit-tomorrow` | `on` | 今天可以先安排明天：选中「明天」时按**草稿区**处理（晚上 11 点想排明天早上 10 点不用敲宣言）。过了凌晨明天变今天，自动回到 24 小时窗口那套规则。行上仍保留原始判据 `zone_raw`，方便追溯 |
+| `tomorrow-plan` | 空 | 「明日时间安排」：一个每周重复任务的规格（`mon@22:15`）。填了会提示用 `task create ... --repeat` 建出来 |
+
+- 界面列出**全部**设置项（哪怕从没改过）连同解释、当前值和默认值；改过的标 `*`。
+- `set <id> <value>` 改；`set <id>`（不写 value）= 恢复默认。任何视图都能敲。
+- 只把**改过的**值写进 `data/settings.json`：改回默认值 = 从文件里删掉，
+  以后默认值变了能跟着走。
+
 ## 2026-10 追加：时段列 + 任务视图
 
 - 契约表增加 `时段 ID | 时段 | 类型 | 名称` 四列；同一时段只有第一行显示，
@@ -329,3 +370,13 @@ python3 warden.py install-deps
   `completedAt`，归档到 `data/task-archive.json`。
 - `session T1 50 50` / `period T1 50 50` / 裸 `T1 50 50` 改时段排布；
   任何一场超出时段终点 → 报错，layout 和 data.csv 都不动。
+- 改排布时若该时段已有 API session 且起点/时长不再匹配，先取消旧场（执行区
+  仍要敲宣言），再写新 layout + data.csv，最后立刻 `check` 补订新场次。
+- 第五个视图 `设置 / 规则` + `set <id> <value>`；`edit-tomorrow` 让「明天」临时按
+  草稿区处理（`Warden.effective_zone`），`tomorrow-plan` 是「明日时间安排」的规格。
+- `session` 默认**只加这一天**（`temp/session-extras.json`），`session --permanent`
+  才写成按星期几重复的长期规则（`temp/session-rules.json`）；两者都在重算
+  `data.csv` 时并进去，sync 不会冲掉。
+- `task create ... --repeat 周几@HH:MM` / `task repeat <id> ...`：每周重复任务，
+  只落在「同一星期几 + 同一时刻 + 同一时长」的那场 session 上（拆分后那一周不落，
+  设置不变）；`task sync` 负责真的挂到 Focusmate。

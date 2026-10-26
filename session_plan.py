@@ -34,12 +34,17 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMP = os.path.join(HERE, "temp")
 DOWNLOAD_FILE = os.path.join(TEMP, "calendar-download.json")
 LAYOUTS_FILE = os.path.join(TEMP, "session-layouts.json")
+#: 一次性 session（只属于某一天；session 命令默认写这里）
+EXTRAS_FILE = os.path.join(TEMP, "session-extras.json")
+#: 长期规则（按星期几重复；session --permanent 写这里）
+RULES_FILE = os.path.join(TEMP, "session-rules.json")
 DATA_CSV = os.path.join(HERE, "data.csv")
 DURATIONS = (25, 50, 75)
 
@@ -50,6 +55,14 @@ def download_path(path=None):
 
 def layouts_path(path=None):
     return path or os.environ.get("TI_SESSION_LAYOUTS") or LAYOUTS_FILE
+
+
+def extras_path(path=None):
+    return path or os.environ.get("TI_SESSION_EXTRAS") or EXTRAS_FILE
+
+
+def rules_path(path=None):
+    return path or os.environ.get("TI_SESSION_RULES") or RULES_FILE
 
 
 def _now():
@@ -415,6 +428,213 @@ def sessions_for_period(period, layouts):
     return plan_period(period, ds)
 
 
+# ---------------------------------------------------------------- 一次性 session
+#
+# 数据流里 data.csv 是**生成物**（下载层 + layout → 精确日期行）。所以「今天临时加
+# 一场」不能直接手写 data.csv —— 下一次 populate 会把它冲掉。一次性 session 单独
+# 存一份，渲染 data.csv 时并进去；长期规则（按星期几重复）同理。
+
+
+def empty_extras():
+    return {"version": 1, "dates": {}}
+
+
+def load_extras(path=None):
+    try:
+        with open(extras_path(path), encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return empty_extras()
+    if not isinstance(raw, dict):
+        return empty_extras()
+    raw.setdefault("version", 1)
+    dates = raw.get("dates")
+    if not isinstance(dates, dict):
+        dates = {}
+    clean = {}
+    for day, items in dates.items():
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(day)):
+            continue
+        rows = []
+        for item in (items if isinstance(items, list) else []):
+            try:
+                start = "%02d:%02d" % parse_hhmm(item.get("start"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                duration = int(item.get("duration"))
+            except (TypeError, ValueError):
+                continue
+            if duration not in DURATIONS:
+                continue
+            rec = {"start": start, "duration": duration}
+            if item.get("note"):
+                rec["note"] = str(item["note"])
+            if item.get("created_at"):
+                rec["created_at"] = str(item["created_at"])
+            rows.append(rec)
+        if rows:
+            clean[str(day)] = rows
+    raw["dates"] = clean
+    return raw
+
+
+def save_extras(data, path=None):
+    _atomic_json(extras_path(path), data)
+    return extras_path(path)
+
+
+def _drop_old_extras(data, today=None):
+    """一次性 session 过期就忘掉：只保留今天及以后。"""
+    today = (today or datetime.date.today()).isoformat()
+    dates = data.get("dates") or {}
+    data["dates"] = {d: v for d, v in dates.items() if d >= today}
+    return data
+
+
+def add_extra(day, hhmm, duration, note=None, path=None):
+    """往某一天加一场一次性 session（重复就报错）。返回 (dates_key, rec)。"""
+    iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+    got = parse_hhmm(hhmm)
+    if got is None:
+        raise ValueError("时间格式不对：%r（要 HH:MM）" % (hhmm,))
+    start = fmt_hhmm(*got)
+    try:
+        duration = int(str(duration).strip())
+    except (TypeError, ValueError):
+        raise ValueError("时长只能是 %s 分钟；你给的是 %r"
+                         % ("/".join(str(x) for x in DURATIONS), duration))
+    if duration not in DURATIONS:
+        raise ValueError("时长只能是 %s 分钟；你给的是 %r"
+                         % ("/".join(str(x) for x in DURATIONS), duration))
+    if got[1] % 15:
+        raise ValueError("Focusmate 只认 15 分钟整点（:00/:15/:30/:45），%s 不行" % start)
+    data = load_extras(path)
+    rows = data["dates"].setdefault(iso, [])
+    if any(r.get("start") == start for r in rows):
+        raise ValueError("%s 已经有一场一次性 session 在 %s 了" % (iso, start))
+    rec = {"start": start, "duration": duration, "created_at": _now()}
+    if note:
+        rec["note"] = str(note)
+    rows.append(rec)
+    rows.sort(key=lambda r: r["start"])
+    save_extras(data, path)
+    return iso, rec
+
+
+def remove_extra(day, hhmm, path=None):
+    iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+    got = parse_hhmm(hhmm)
+    start = fmt_hhmm(*got) if got else str(hhmm)
+    data = load_extras(path)
+    rows = data["dates"].get(iso) or []
+    kept = [r for r in rows if r.get("start") != start]
+    removed = [r for r in rows if r.get("start") == start]
+    if removed:
+        if kept:
+            data["dates"][iso] = kept
+        else:
+            data["dates"].pop(iso, None)
+        save_extras(data, path)
+    return removed[0] if removed else None
+
+
+def extras_for_date(data, day):
+    iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+    return list((data.get("dates") or {}).get(iso) or [])
+
+
+# ---------------------------------------------------------------- 长期规则
+
+
+def empty_rules():
+    return {"version": 1, "rules": []}
+
+
+def load_rules(path=None):
+    try:
+        with open(rules_path(path), encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return empty_rules()
+    if isinstance(raw, list):
+        raw = {"version": 1, "rules": raw}
+    if not isinstance(raw, dict):
+        return empty_rules()
+    raw.setdefault("version", 1)
+    out = []
+    for item in (raw.get("rules") if isinstance(raw.get("rules"), list) else []):
+        if not isinstance(item, dict):
+            continue
+        wd = item.get("weekday")
+        if isinstance(wd, int) and 0 <= wd <= 6:
+            label = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][wd]
+        else:
+            label = str(wd or "").strip().lower()[:3]
+            if label not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
+                continue
+        got = parse_hhmm(item.get("start"))
+        try:
+            duration = int(item.get("duration"))
+        except (TypeError, ValueError):
+            duration = None
+        if got is None or duration not in DURATIONS:
+            continue
+        rec = {"weekday": label, "start": fmt_hhmm(*got), "duration": duration}
+        if item.get("created_at"):
+            rec["created_at"] = str(item["created_at"])
+        out.append(rec)
+    raw["rules"] = out
+    return raw
+
+
+def save_rules(data, path=None):
+    _atomic_json(rules_path(path), data)
+    return rules_path(path)
+
+
+def add_rule(weekday, hhmm, duration, path=None):
+    """加一条长期规则（按星期几重复）。重复就报错。"""
+    label = str(weekday or "").strip().lower()[:3]
+    if label not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
+        raise ValueError("星期几认不出来：%r（mon..sun / 周一..周日）" % (weekday,))
+    got = parse_hhmm(hhmm)
+    if got is None:
+        raise ValueError("时间格式不对：%r（要 HH:MM）" % (hhmm,))
+    start = fmt_hhmm(*got)
+    try:
+        duration = int(str(duration).strip())
+    except (TypeError, ValueError):
+        raise ValueError("时长只能是 %s 分钟；你给的是 %r"
+                         % ("/".join(str(x) for x in DURATIONS), duration))
+    if duration not in DURATIONS:
+        raise ValueError("时长只能是 %s 分钟；你给的是 %r"
+                         % ("/".join(str(x) for x in DURATIONS), duration))
+    if got[1] % 15:
+        raise ValueError("Focusmate 只认 15 分钟整点（:00/:15/:30/:45），%s 不行" % start)
+    data = load_rules(path)
+    if any(r["weekday"] == label and r["start"] == start for r in data["rules"]):
+        raise ValueError("%s %s 已经有长期规则了" % (label, start))
+    rec = {"weekday": label, "start": start, "duration": duration, "created_at": _now()}
+    data["rules"].append(rec)
+    data["rules"].sort(key=lambda r: (r["weekday"], r["start"]))
+    save_rules(data, path)
+    return rec
+
+
+def remove_rule(weekday, hhmm, path=None):
+    label = str(weekday or "").strip().lower()[:3]
+    got = parse_hhmm(hhmm)
+    start = fmt_hhmm(*got) if got else str(hhmm)
+    data = load_rules(path)
+    removed = [r for r in data["rules"] if r["weekday"] == label and r["start"] == start]
+    if removed:
+        data["rules"] = [r for r in data["rules"]
+                         if not (r["weekday"] == label and r["start"] == start)]
+        save_rules(data, path)
+    return removed[0] if removed else None
+
+
 def all_sessions(download, layouts):
     """下载结果 + 自定义 layout → 所有日期的 session（不写任何文件）。"""
     out = []
@@ -428,10 +648,58 @@ def all_sessions(download, layouts):
     return out
 
 
+def plan_rows(download, layouts, extras=None, rules=None):
+    """一天一天排好的全部 session + 一次性 + 长期规则，统一成一种形状。
+
+    形状：``{"date"|None, "weekday", "start", "duration", "source", ...}``。
+    ``source`` 是 ``period`` / ``extra`` / ``rule``，界面和警告用得上。
+    """
+    rows = []
+    for s in all_sessions(download, layouts):
+        rec = dict(s)
+        rec["source"] = "period"
+        rec["weekday"] = None
+        rows.append(rec)
+    ex = extras if extras is not None else load_extras()
+    for day, items in sorted((ex.get("dates") or {}).items()):
+        for item in items:
+            rows.append({"date": day, "weekday": None, "start": item["start"],
+                         "duration": int(item["duration"]), "source": "extra",
+                         "note": item.get("note") or ""})
+    rl = rules if rules is not None else load_rules()
+    for item in rl.get("rules") or []:
+        rows.append({"date": None, "weekday": item["weekday"], "start": item["start"],
+                     "duration": int(item["duration"]), "source": "rule"})
+    return rows
+
+
+def sessions_for_day(download, layouts, day, extras=None):
+    """某一天**排好的** session（不含 API，不含长期规则展开）：时段 + 一次性。"""
+    iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+    out = []
+    for s in all_sessions(download, layouts):
+        if s.get("date") != iso:
+            continue
+        rec = dict(s)
+        rec.setdefault("period_id", rec.get("period_id") or "")
+        rec["source"] = "period"
+        out.append(rec)
+    ex = extras if extras is not None else load_extras()
+    for item in extras_for_date(ex, iso):
+        out.append({"date": iso, "start": item["start"], "duration": int(item["duration"]),
+                    "start_min": _minutes(*parse_hhmm(item["start"])),
+                    "end": _fmt_min(_minutes(*parse_hhmm(item["start"]))
+                                    + int(item["duration"])),
+                    "period_id": "", "source": "extra"})
+    out.sort(key=lambda s: s.get("start_min") if s.get("start_min") is not None
+             else _minutes(*parse_hhmm(s["start"])))
+    return out
+
+
 # ---------------------------------------------------------------- data.csv
 
 
-def render_data_csv(download, layouts, date_specific=True):
+def render_data_csv(download, layouts, date_specific=True, extras=None, rules=None):
     """生成 daemon 读取的 data.csv。
 
     新链路默认写**精确日期**行（``YYYY-MM-DD,HH:MM,50``），因为下载窗口是
@@ -440,29 +708,41 @@ def render_data_csv(download, layouts, date_specific=True):
     """
     lines = [
         "# 由 download_calendar.py / session_plan.py 生成 @ %s" % _now(),
-        "# 来源：temp/calendar-download.json + temp/session-layouts.json",
+        "# 来源：temp/calendar-download.json + temp/session-layouts.json"
+        " + temp/session-extras.json + temp/session-rules.json",
         "# 格式：YYYY-MM-DD,HH:MM,duration（也兼容旧的 weekday,HH:MM,duration）",
     ]
-    for s in all_sessions(download, layouts):
-        if date_specific:
-            day = s.get("date")
-            if not day:
-                continue
-            lines.append("%s,%s,%d" % (day, s["start"], int(s["duration"])))
+    seen = set()
+    for s in plan_rows(download, layouts, extras=extras, rules=rules):
+        if s.get("source") == "rule" or not date_specific:
+            if s.get("source") == "rule":
+                key = (s["weekday"], s["start"])
+                token = s["weekday"]
+            else:
+                # 兼容旧测试/旧调用方：按 weekday 写
+                try:
+                    day = datetime.date.fromisoformat(s["date"])
+                except (TypeError, ValueError):
+                    continue
+                token = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][day.weekday()]
+                key = (token, s["start"])
         else:
-            # 兼容旧测试/旧调用方：按 weekday 写
-            try:
-                day = datetime.date.fromisoformat(s["date"])
-            except (TypeError, ValueError):
+            token = s.get("date")
+            if not token:
                 continue
-            wd = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][day.weekday()]
-            lines.append("%s,%s,%d" % (wd, s["start"], int(s["duration"])))
+            key = (token, s["start"])
+        if key in seen:
+            # 一次性 session 和时段排出来的撞了：以时段/规则为准，不重复写
+            continue
+        seen.add(key)
+        lines.append("%s,%s,%d" % (token, s["start"], int(s["duration"])))
     return "\n".join(lines) + "\n"
 
 
-def write_data_csv(download, layouts, path=None):
+def write_data_csv(download, layouts, path=None, extras=None, rules=None):
     path = path or os.environ.get("TI_DATA_CSV") or DATA_CSV
-    text = render_data_csv(download, layouts, date_specific=True)
+    text = render_data_csv(download, layouts, date_specific=True,
+                           extras=extras, rules=rules)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
                                dir=os.path.dirname(path) or ".")
@@ -477,6 +757,14 @@ def write_data_csv(download, layouts, path=None):
         except OSError:
             pass
     return path
+
+
+def plan_counts(download, layouts, extras=None, rules=None):
+    """``{"period": n, "extra": n, "rule": n}`` —— 界面/警告用的一眼统计。"""
+    out = {"period": 0, "extra": 0, "rule": 0}
+    for row in plan_rows(download, layouts, extras=extras, rules=rules):
+        out[row.get("source", "period")] = out.get(row.get("source", "period"), 0) + 1
+    return out
 
 
 def period_for_session(periods, start):
@@ -536,6 +824,18 @@ def cmd_show(argv=None):
         print("%s %s %-4s %s–%s  %s  %s"
               % (p["date"], p["id"], p.get("type") or "",
                  p.get("start"), p.get("end"), p.get("name") or "", body))
+
+    extras = load_extras()
+    if extras.get("dates"):
+        print("\n一次性 session（只属于那一天）：")
+        for day, items in sorted(extras["dates"].items()):
+            print("  %s  %s" % (day, "  ".join("%s(%d)" % (r["start"], r["duration"])
+                                               for r in items)))
+    rules = load_rules()
+    if rules.get("rules"):
+        print("\n长期规则（按星期几重复）：")
+        for r in rules["rules"]:
+            print("  %s  %s(%d)" % (r["weekday"], r["start"], r["duration"]))
     return 0
 
 

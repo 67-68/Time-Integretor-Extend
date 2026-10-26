@@ -10,6 +10,9 @@
   session 上；完成时间从 ``GET /v1/tasks`` 的 ``completedAt`` 读，不猜。
 - 完成后写一份只增不改的归档 ``data/task-archive.json``。归档里同时保留：
   本地任务字段、对应 session（日期/时间/API session id）、Focusmate 的完成时间。
+- 任务可以声明成**每周重复**（``repeat``）：记下「周几 + 起点 + 时长」，到那一周
+  就自动挂到同一时刻、同一时长的那场 session 上。排布被改了（例如 50 拆成
+  25+25）就不是同一场了 —— 这一周的重复任务自然消失，但 repeat 设置本身不变。
 
 这个模块不碰网络、不碰 data.csv，也不认识 rich。warden / bridge 都只调用这里。
 """
@@ -27,7 +30,9 @@ DEFAULT_TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
 DEFAULT_ARCHIVE_FILE = os.path.join(DATA_DIR, "task-archive.json")
 
 # 这些键是本地簿记，不属于用户字段。用户仍然可以随便写别的字段。
-RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate"}
+RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate", "repeat"}
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 def _now():
@@ -83,9 +88,44 @@ def _coerce_task(raw, fallback_id=None):
         task["session"] = None
     if not isinstance(task.get("focusmate"), dict):
         task["focusmate"] = {}
+    task["repeat"] = _coerce_repeat(task.get("repeat"))
     task.setdefault("created_at", _now())
     task.setdefault("updated_at", task["created_at"])
     return task
+
+
+def _coerce_repeat(raw):
+    """把重复设置修成可用形状；坏的就当没设置。"""
+    if not isinstance(raw, dict):
+        return None
+    wd = raw.get("weekday")
+    if isinstance(wd, int) and 0 <= wd <= 6:
+        label = WEEKDAYS[wd]
+    else:
+        label = str(wd or "").strip().lower()[:3]
+        if label not in WEEKDAYS:
+            return None
+    start = str(raw.get("start") or "").strip()
+    if not re.match(r"^\d{1,2}:\d{2}$", start):
+        return None
+    try:
+        duration = int(raw.get("duration"))
+    except (TypeError, ValueError):
+        duration = None
+    out = {
+        "weekday": WEEKDAYS.index(label),
+        "weekday_label": label,
+        "start": "%02d:%02d" % tuple(int(x) for x in start.split(":")),
+        "duration": duration,
+        "created_at": str(raw.get("created_at") or _now()),
+        "occurrences": {},
+    }
+    occ = raw.get("occurrences")
+    if isinstance(occ, dict):
+        for day, rec in occ.items():
+            if isinstance(rec, dict):
+                out["occurrences"][str(day)] = dict(rec)
+    return out
 
 
 def _clean_store(raw):
@@ -246,6 +286,127 @@ class TaskStore(object):
         self.save(store)
         return found
 
+    # -- 每周重复 -----------------------------------------------------
+    def set_repeat(self, task_id, weekday, start, duration=None):
+        """把任务标成每周重复：``weekday`` 0-6（或 mon..sun），``start`` HH:MM。
+
+        ``duration`` 是**锚定**用的：只有那一周同一时刻、同一时长的那场 session
+        才算这次重复的落点。排布改了（拆分/换时长）就不再匹配 —— 这一周的重复
+        任务消失，但 repeat 设置原封不动留着，下一周照旧。
+        """
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if task["id"] == int(task_id):
+                found = task
+                break
+        if found is None:
+            raise ValueError("没有任务 %s" % task_id)
+        if isinstance(weekday, int):
+            label = WEEKDAYS[weekday % 7]
+        else:
+            label = str(weekday or "").strip().lower()[:3]
+        if label not in WEEKDAYS:
+            raise ValueError("星期几认不出来：%r（mon..sun / 周一..周日）" % (weekday,))
+        m = re.match(r"^(\d{1,2}):(\d{2})$", str(start or "").strip())
+        if not m:
+            raise ValueError("时间要写成 HH:MM；你给的是 %r" % (start,))
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("时间超出范围：%r" % (start,))
+        if minute % 15:
+            raise ValueError("Focusmate 只认 15 分钟整点，%r 不行" % (start,))
+        if duration is not None:
+            try:
+                duration = int(str(duration).strip())
+            except (TypeError, ValueError):
+                raise ValueError("时长得是数字；你给的是 %r" % (duration,))
+        kept = (found.get("repeat") or {}).get("occurrences") or {}
+        found["repeat"] = {
+            "weekday": WEEKDAYS.index(label),
+            "weekday_label": label,
+            "start": "%02d:%02d" % (hour, minute),
+            "duration": duration,
+            "created_at": _now(),
+            "occurrences": kept,
+        }
+        found["updated_at"] = _now()
+        self.save(store)
+        return found
+
+    def clear_repeat(self, task_id):
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if task["id"] == int(task_id):
+                found = task
+                break
+        if found is None:
+            raise ValueError("没有任务 %s" % task_id)
+        found["repeat"] = None
+        found["updated_at"] = _now()
+        self.save(store)
+        return found
+
+    def repeated_tasks(self, weekday=None):
+        """所有重复任务；``weekday`` 给了就只要那天会重复的。"""
+        out = []
+        for task in self.load()["tasks"]:
+            rep = task.get("repeat")
+            if not rep:
+                continue
+            if weekday is not None and rep.get("weekday") != int(weekday) % 7:
+                continue
+            out.append(task)
+        return out
+
+    @staticmethod
+    def repeat_occurrence(task, day, sessions):
+        """这个任务在 ``day`` 那天落在哪一场上；落不上返回 None。
+
+        ``sessions`` 是那天**排好的** session（``start`` / ``duration`` 够用）。
+        匹配条件是「同一星期几 + 同一时刻 + 同一时长」：时长对不上就是排布被改过
+        （例如 50 拆成 25+25），这一周的重复任务就不落。
+        """
+        rep = task.get("repeat") if isinstance(task, dict) else None
+        if not rep:
+            return None
+        want_wd = day.weekday() if hasattr(day, "weekday") else int(day) % 7
+        if int(rep.get("weekday", -1)) != want_wd:
+            return None
+        for sess in sessions or []:
+            if sess.get("start") != rep.get("start"):
+                continue
+            if rep.get("duration") is not None and int(sess.get("duration") or 0) != int(rep["duration"]):
+                continue
+            return sess
+        return None
+
+    def attach_occurrence(self, task_id, day, session, focusmate=None):
+        """记下一次重复的落点（本地 session + Focusmate 侧 task id）。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if task["id"] == int(task_id):
+                found = task
+                break
+        if found is None:
+            raise ValueError("没有任务 %s" % task_id)
+        rep = found.get("repeat") or {}
+        occ = rep.setdefault("occurrences", {})
+        rec = dict(occ.get(iso) or {})
+        rec["session"] = dict(session or {})
+        if focusmate:
+            rec["focusmate"] = dict(focusmate)
+        rec["updated_at"] = _now()
+        occ[iso] = rec
+        found["repeat"] = rep
+        found["session"] = dict(session or {})
+        found["updated_at"] = _now()
+        self.save(store)
+        return found
+
     # -- 摘要 / 展示 ---------------------------------------------------
     @staticmethod
     def _one_line(value):
@@ -359,20 +520,43 @@ class TaskStore(object):
         for task in store["tasks"]:
             fm = task.get("focusmate") or {}
             rid = fm.get("task_id") or fm.get("id")
-            if not rid:
-                continue
-            remote = by_id.get(str(rid))
-            if not remote:
-                continue
-            matched.append(task["id"])
-            done_at = remote.get("completedAt") or remote.get("completed_at")
-            if done_at:
-                if fm.get("completed_at") != done_at:
-                    fm["completed_at"] = done_at
-                    task["focusmate"] = fm
-                    task["updated_at"] = _now()
-                    dirty = True
-                if self.archive_completed(task, remote):
+            remote = by_id.get(str(rid)) if rid else None
+            if remote:
+                matched.append(task["id"])
+                done_at = remote.get("completedAt") or remote.get("completed_at")
+                if done_at:
+                    if fm.get("completed_at") != done_at:
+                        fm["completed_at"] = done_at
+                        task["focusmate"] = fm
+                        task["updated_at"] = _now()
+                        dirty = True
+                    if self.archive_completed(task, remote):
+                        n += 1
+            # 每周重复：每次落点的 Focusmate task 是独立实体，单独对一次
+            occ = ((task.get("repeat") or {}).get("occurrences") or {})
+            for day, rec in sorted(occ.items()):
+                ofm = rec.get("focusmate") or {}
+                orid = ofm.get("task_id") or ofm.get("id")
+                if not orid:
+                    continue
+                remote2 = by_id.get(str(orid))
+                if not remote2:
+                    continue
+                done_at = remote2.get("completedAt") or remote2.get("completed_at")
+                if not done_at:
+                    continue
+                if ofm.get("completed_at") == done_at and rec.get("archived_at"):
+                    continue
+                ofm["completed_at"] = done_at
+                rec["focusmate"] = ofm
+                rec["archived_at"] = _now()
+                occ[day] = rec
+                task.setdefault("repeat", {})["occurrences"] = occ
+                task["updated_at"] = _now()
+                dirty = True
+                if task["id"] not in matched:
+                    matched.append(task["id"])
+                if self.archive_completed(dict(task, session=rec.get("session")), remote2):
                     n += 1
         if dirty:
             self.save(store)

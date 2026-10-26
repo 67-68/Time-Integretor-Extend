@@ -28,6 +28,9 @@ def check_true(label, got):
 TMP = tempfile.mkdtemp(prefix="task-ui-test-")
 os.environ["TI_CALENDAR_DOWNLOAD"] = os.path.join(TMP, "download.json")
 os.environ["TI_SESSION_LAYOUTS"] = os.path.join(TMP, "layouts.json")
+os.environ["TI_SESSION_EXTRAS"] = os.path.join(TMP, "extras.json")
+os.environ["TI_SESSION_RULES"] = os.path.join(TMP, "rules.json")
+os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
 os.environ["TI_TASK_ARCHIVE"] = os.path.join(TMP, "archive.json")
 

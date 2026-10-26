@@ -51,6 +51,8 @@ print("== 落盘：验证失败 = 零副作用 ==")
 TMP = tempfile.mkdtemp(prefix="session-plan-test-")
 DL = os.path.join(TMP, "download.json")
 LP = os.path.join(TMP, "layouts.json")
+XP = os.path.join(TMP, "extras.json")
+RP = os.path.join(TMP, "rules.json")
 data = sp.build_periods([], "2026-10-26", 1, profiles=["工作"])
 data["periods"] = [dict(P), {"id": "T2", "date": "2026-10-26", "start": "15:00",
                             "end": "16:00", "type": "工作", "name": "托福 准备"}]
@@ -88,6 +90,67 @@ check("下一周只保留 weekday 规则",
       [(s["start"], s["duration"]) for s in
        sch.day_slots(entries, datetime.date(2026, 11, 2), {})],
       [("09:00", "50")])
+
+# ---------------------------------------------------------------- 一次性 / 长期规则
+
+print("== session 的范围：一次性（某一天）vs --permanent（按星期几重复）==")
+DL2 = {
+    "version": 1, "generated_at": "x", "start_date": "2026-10-26", "days": 8,
+    "profiles": ["工作", "空闲"], "events": [],
+    "periods": [
+        {"id": "T1", "date": "2026-10-26", "start": "11:00", "end": "13:00",
+         "type": "工作", "name": "SAT 准备", "calendar": "工作", "title": "SAT 准备"},
+        {"id": "T1", "date": "2026-10-27", "start": "11:00", "end": "13:00",
+         "type": "工作", "name": "SAT 准备", "calendar": "工作", "title": "SAT 准备"},
+    ],
+}
+sp.save_download(DL2, DL)
+sp.save_layouts(sp.empty_layouts(), LP)
+iso = "2026-10-26"
+
+sp.add_extra("2026-10-26", "11:15", 50, path=XP)
+sp.add_extra("2026-10-27", "21:15", 25, path=XP)
+sp.add_rule("mon", "09:00", 25, path=RP)
+
+csv = sp.render_data_csv(sp.load_download(DL), sp.load_layouts(LP),
+                         extras=sp.load_extras(XP), rules=sp.load_rules(RP))
+lines = [ln for ln in csv.splitlines() if ln and not ln.startswith("#")]
+check("一次性 session 只写那一天", "2026-10-26,11:15,50" in lines, True)
+check("另一天的一次性 session 不串过去", "2026-10-27,21:15,25" in lines, True)
+check("长期规则写成按星期几", "mon,09:00,25" in lines, True)
+check("时段排布的日期行还在", "2026-10-26,11:00,50" in lines, True)
+check("一次性 session 不会被复制成每周", [ln for ln in lines if "11:15" in ln],
+      ["2026-10-26,11:15,50"])
+check("plan_counts 分开数",
+      sp.plan_counts(sp.load_download(DL), sp.load_layouts(LP),
+                     extras=sp.load_extras(XP), rules=sp.load_rules(RP)),
+      {"period": 4, "extra": 2, "rule": 1})
+
+entries, warns = sch.parse_text(csv)
+check("生成的 csv 能被 schedule.py 解析", warns, [])
+slots_26 = [(s["start"], s["duration"]) for s in
+            sch.day_slots(entries, datetime.date(2026, 10, 26), {})]
+check("那天有周一的长期规则 + 时段 + 一次性",
+      slots_26, [("09:00", "25"), ("11:00", "50"), ("11:15", "50"), ("12:00", "50")])
+slots_28 = [(s["start"], s["duration"]) for s in
+            sch.day_slots(entries, datetime.date(2026, 10, 28), {})]
+check("周三只有周一那条长期规则不出现（一次性也没了）", slots_28, [])
+
+try:
+    sp.add_extra("2026-10-26", "11:15", 25, path=XP)
+    check("同一天同刻重复被拒", False, True)
+except ValueError as e:
+    check_true("重复时点名那一天", "2026-10-26" in str(e))
+try:
+    sp.add_rule("mon", "09:00", 25, path=RP)
+    check("同一条长期规则重复被拒", False, True)
+except ValueError as e:
+    check_true("重复规则被拒", "已经有" in str(e))
+check("删掉一次性 session", sp.remove_extra("2026-10-27", "21:15", path=XP)["start"], "21:15")
+check("删掉长期规则", sp.remove_rule("mon", "09:00", path=RP)["start"], "09:00")
+check("过期的一次性 session 会被清掉",
+      sp._drop_old_extras({"dates": {"2000-01-01": [{"start": "09:00"}]}},
+                          datetime.date(2026, 10, 26))["dates"], {})
 
 print()
 if fails:

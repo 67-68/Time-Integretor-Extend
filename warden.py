@@ -14,7 +14,7 @@
 
 视图（Tab 切换）
 ----------------
-按 **Tab** 在多个视图间循环切换，视图显示在命令提示上面。现有四个：
+按 **Tab** 在多个视图间循环切换，视图显示在命令提示上面。现有五个：
 
 1. **契约**（默认）：时段 / session / 任务表 + 命令。前面四列是日历下载层的
    时段 ID / 时段 / 类型 / 名称；同一时段只有第一行显示，后续行留空。
@@ -26,11 +26,23 @@
    任意视图敲 `stat` 都能切过去；`stat refresh` 立刻增量刷新（只拉缺口 + 最近几天，
    不是把两千多条重拉一遍），`stat refresh full` 才是全量重拉；缓存新鲜时一次网络都不打。
 4. **任务**：本地 JSON 任务库（字段不校验）+ 挂到 session + Focusmate 完成归档。
-   `task create/delete/modify/assign/select/sync`；`task assign` 成功后才写本地，
-   Focusmate 侧 task id / completedAt 都会记回来。
+   `task create/delete/modify/assign/select/repeat/sync`；`task assign` 成功后才写
+   本地，Focusmate 侧 task id / completedAt 都会记回来。`--repeat 周几@HH:MM` 让任务
+   每周重复：只在「同一星期几、同一时刻、同一时长」的那场 session 上落地；排布被
+   改过（例如 50 拆成 25+25）时这一周就不落，但 repeat 设置本身不变。
+5. **设置**：`settings_store.SETTINGS` 里注册的全部设置项（id / 当前值 / 默认值 /
+   解释），`set <id> <value>` 修改，不写 value = 恢复默认。现有两项：
+   `edit-tomorrow`（今天可以先安排明天，过了凌晨回到 24 小时窗口）和
+   `tomorrow-plan`（明日时间安排 = 一个每周重复任务）。
+
+**状态框**（契约视图最上面那一块 ASCII 框）：上面是「契约（data.csv 周几）」的
+执行情况，下面是警告（`repl_kit.WarningBoard`）—— data.csv 解析问题、layout 坏了、
+今天没有落上每周重复任务…… 警告由框架画、由 warden 每帧重算；`warn off` 只藏警告，
+`warn on` 回来。
 
 视图可扩展：继承 `View` + `@register_view` 即可；每个视图用 `commands()` 声明自己
-认哪些命令、用 `idle_hint()` 声明空闲提示，`to_view()` 把它交给 `repl_kit`。
+认哪些命令、用 `idle_hint()` 声明空闲提示、用 `status_box()` 声明「状态」框里自己那几行，
+`to_view()` 把它交给 `repl_kit`。
 
 提示行和 paper_tui 是同一套：空闲时由 `repl_kit.Hint` 排成
 `命令: session  cancel  mute   (Tab 切专注视图)`；输入命令后自动换成
@@ -186,6 +198,7 @@ import schedule as sch  # noqa: E402  data.csv 的解析与编辑（唯一实现
 import session_plan as sp  # noqa: E402  日历下载层 / 时段 layout / 精确日期 csv
 import task_store as ts  # noqa: E402  本地任务库 + Focusmate 完成归档
 import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + 算数字 + 缓存
+import settings_store as cfg  # noqa: E402  设置项注册表 + data/settings.json
 
 BRIDGE_JS = os.path.join(HERE, "scripts", "bridge.mjs")
 
@@ -489,15 +502,20 @@ class Bridge(object):
 # 未来想加「统计」「历史」视图，照抄 FocusView 的结构就行。
 
 def _cmd(name, handler, summary, aliases=(), section="命令", usage="",
-         options=(), hint=None):
+         options=(), hint=None, completer=None, values=None):
     """一条 repl_kit 命令。
 
     命令的「叫什么 / 干什么 / 怎么用 / 补全什么 / 提示什么」都放在这一条记录里，
     由 repl_kit 统一排版成 help 表和提示行 —— 和 paper_tui 用的是同一套。
     """
+    kwargs = {}
+    if completer is not None:
+        kwargs["completer"] = completer
+    if values:
+        kwargs["values"] = dict(values)
     return repl_kit.Command(
         name=name, handler=handler, summary=summary, aliases=tuple(aliases),
-        section=section, usage=usage, options=tuple(options), hint=hint,
+        section=section, usage=usage, options=tuple(options), hint=hint, **kwargs
     )
 
 
@@ -527,13 +545,15 @@ def _hint_day(parts):
 
 
 def _hint_session(parts):
+    if "--permanent" not in " ".join(parts) and len(parts) <= 1:
+        return repl_kit.Hint("参数", ("HH:MM", "25|50|75"),
+                             note="--permanent 才写进日历；不写 = 只加这一天")
     if len(parts) >= 3:
         return repl_kit.Hint("取值", ("25", "50", "75"))
     if len(parts) >= 2:
         return repl_kit.Hint("取值", ("25", "50", "75"),
                              note="也可以写 11:15-12:05")
-    return repl_kit.Hint("参数", ("HH:MM", "25|50|75"),
-                         note="或 HH:MM-HH:MM")
+    return repl_kit.Hint("选项", ("--permanent",), note="写进日历（按星期几重复）")
 
 
 def _hint_relocate(parts):
@@ -577,13 +597,25 @@ def _hint_period(parts):
     return repl_kit.Hint("参数", ("T1", "50", "50"), note="按 25/50/75 排这个时段")
 
 
+def _hint_set(parts):
+    if len(parts) >= 2:
+        return repl_kit.Hint("取值", ("on", "off"), note="不写 = 恢复默认")
+    return repl_kit.Hint("参数", ("<设置 id>", "<value>"),
+                         note="完整清单在「设置」视图；不写 value = 恢复默认")
+
+
 def _hint_task(parts):
     if not parts:
-        return repl_kit.Hint("动作", ("create", "delete", "modify", "assign", "select", "sync"),
+        return repl_kit.Hint("动作", ("create", "delete", "modify", "assign", "select",
+                                      "repeat", "sync"),
                              note="字段随便写，不校验")
     action = parts[0].lower() if len(parts) else ""
     if action == "create":
-        return repl_kit.Hint("参数", ("[id]", "key=value..."), note="不给 id 就自动编号")
+        return repl_kit.Hint("参数", ("[id]", "key=value...", "--repeat 周几@HH:MM"),
+                             note="不给 id 就自动编号")
+    if action in ("repeat", "recurring"):
+        return repl_kit.Hint("参数", ("<任务 ID>", "周几@HH:MM|off"),
+                             note="每周那一天、那一场自动挂上")
     if action in ("delete", "select"):
         return repl_kit.Hint("参数", ("<任务 ID>",))
     if action == "modify":
@@ -591,7 +623,8 @@ def _hint_task(parts):
     if action == "assign":
         return repl_kit.Hint("参数", ("<session ID>",),
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
-    return repl_kit.Hint("参数", ("create", "delete", "modify", "assign", "select", "sync"))
+    return repl_kit.Hint("参数", ("create", "delete", "modify", "assign", "select",
+                                  "repeat", "sync"))
 
 
 class View(object):
@@ -615,6 +648,13 @@ class View(object):
 
     def status_line(self):
         """提示符上方那行「随时在变的数字」，纯文本（无 markup）。None = 不需要定时刷新。"""
+        return None
+
+    def status_box(self):
+        """「状态」框（ASCII 边框）里本视图自己的那几行；None = 这个视图不要框。
+
+        警告由框架追加（repl_kit 的 WarningBoard），这里只管业务状态。
+        """
         return None
 
     def idle_hint(self):
@@ -646,6 +686,16 @@ class View(object):
                  options=("refresh", "full"), hint=_hint_stat),
             _cmd("status", lambda a: None, "只重画看板", ("s",), "通用",
                  usage="status", hint=_hint_actions("status", note="只重画看板")),
+            _cmd("set", w.cmd_set,
+                 "改一个设置：set <id> <value>（不写 value = 恢复默认；任何视图都能敲）",
+                 usage="set <设置 id> <value>",
+                 completer=lambda prior: [row["id"] for row in w.settings.rows()],
+                 hint=_hint_set),
+            _cmd("warn", w.cmd_warn,
+                 "状态框里的警告：warn on|off（不写 = 取反）",
+                 ("warnings",), "通用", usage="warn [on|off]",
+                 options=("on", "off"),
+                 hint=_hint_actions("on", "off", note="不写就是取反")),
             _cmd("task", w.cmd_task,
                  "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
                  usage="task <create|delete|modify|assign|select|sync> ...",
@@ -680,6 +730,7 @@ class View(object):
             registry=self.build_registry(),
             hint=self.hint_line,
             status=self.status_line,
+            status_box=self.status_box,
             render=w.frame,
             on_enter=w.enter_view,
             prompt=w.prompt_text,
@@ -709,11 +760,14 @@ class ContractView(View):
             note="Tab 切下一个视图（专注 → 统计 → 任务）",
         )
 
+    def status_box(self):
+        """「状态」框里属于本视图的那几行（警告由框架追加在后面）。"""
+        return self.w.render_status_rows()
+
     def render(self):
         out = [self.w.render_table()]
         if self.w.rows_note:
             out.append(Text("  " + self.w.rows_note, style="dim"))
-        out.append(self.w.render_contract())
         return out
 
     def unknown_hint(self):
@@ -731,9 +785,9 @@ class ContractView(View):
                  options=("-1", "0", "1"),
                  hint=_hint_day),
             _cmd("session", w.cmd_session,
-                 "创建一场，或按时段排布：session HH:MM LEN / session T1 50 50",
-                 usage="session <HH:MM> <25|50|75> | session <T1> [25|50|75 ...]",
-                 options=("25", "50", "75"),
+                 "加一场（默认只加这一天；--permanent 才写进日历）",
+                 usage="session [--permanent] <HH:MM> <25|50|75> | session <T1> [25|50|75 ...]",
+                 options=("--permanent", "25", "50", "75"),
                  hint=_hint_session),
             _cmd("period", w.cmd_period_layout,
                  "改一个时段的 session 排布：period T1 50 50",
@@ -1044,12 +1098,13 @@ class TaskView(View):
 
     命令统一以 ``task`` 开头（需求里的语法）：::
 
-        task create [id] [field=value ...]
+        task create [id] [field=value ...] [--repeat 周几@HH:MM]
         task delete <id>
         task modify <id> <field> <新值>
         task assign <session ID>            # 默认当前选中的任务
         task assign <任务 ID> <session ID>  # 显式指定
         task select <id>
+        task repeat <id> <周几@HH:MM|off>   # 每周重复（只影响那一天的那一场）
         task sync                           # GET /v1/tasks → 把 completedAt 归档
 
     任务字段不校验：想记 due / priority / notes / 任何 key 都行。
@@ -1063,8 +1118,9 @@ class TaskView(View):
 
     def idle_hint(self):
         return repl_kit.Hint(
-            "命令", ("task create", "task delete", "task modify", "task assign", "task sync"),
-            note="字段不校验 · Tab 切视图",
+            "命令", ("task create", "task delete", "task modify", "task assign",
+                     "task repeat", "task sync"),
+            note="字段不校验 · --repeat 每周重复 · Tab 切视图",
         )
 
     def status_line(self):
@@ -1093,7 +1149,9 @@ class TaskView(View):
                      "  task create title=写论文 due=明天\n"
                      "  task create 3 title=复习数学          ← 显式 ID\n"
                      "  task modify 3 due 后天\n"
-                     "  task assign 2                        ← 挂到表格里的 #2 session",
+                     "  task assign 2                        ← 挂到表格里的 #2 session\n"
+                     "  task create title=明日时间安排 --repeat mon@22:15"
+                     "   ← 每周一 22:15 那场自动挂上",
                      style="dim"),
                 title="[bold]Task · 任务[/]", border_style="magenta", box=box.ROUNDED)
 
@@ -1105,6 +1163,7 @@ class TaskView(View):
         t = Table(title="Task · 本地 JSON 任务库", box=box.SIMPLE_HEAVY,
                   header_style="bold magenta", title_justify="left", expand=False)
         t.add_column("ID", justify="right", style="bold", no_wrap=True)
+        t.add_column("重复", no_wrap=True)
         t.add_column("session", no_wrap=True)
         t.add_column("Focusmate", no_wrap=True)
         t.add_column("完成时间", no_wrap=True)
@@ -1126,7 +1185,11 @@ class TaskView(View):
                     vals.append(w.task_store._one_line((task.get("fields") or {}).get(k)))
             else:
                 vals.append(w.task_store.summarize(task))
-            t.add_row(str(task["id"]), Text(sess_txt, style=style),
+            rep = task.get("repeat") or {}
+            rep_txt = ("🔁 %s@%s" % (rep.get("weekday_label"), rep.get("start"))
+                       if rep else "—")
+            t.add_row(str(task["id"]), Text(rep_txt, style="magenta" if rep else "dim"),
+                      Text(sess_txt, style=style),
                       Text(fm_txt, style=style), Text(done, style=style),
                       *[Text(v, style=style) for v in vals])
 
@@ -1151,6 +1214,55 @@ class TaskView(View):
         out.append(Panel(at, title="[bold]Task Archive · 完成归档[/]",
                          border_style="dim", box=box.ROUNDED))
         return out
+
+
+@register_view
+class SettingsView(View):
+    """设置视图：把所有设置项（哪怕从没改过）连同解释列出来，``set`` 改。
+
+    需求：展示**所有**设置和他们的介绍，用 ``set {设置的 id} {value}`` 改内容。
+    设置本身是数据（``settings_store.SETTINGS``），这里不硬编码任何一条。
+    """
+
+    key = "5"
+    name = "设置"
+    label = "设置 / 规则"
+
+    def idle_hint(self):
+        return repl_kit.Hint("命令", ("set", "settings", "help", "quit"),
+                             note="Tab 切视图 · 不写 value = 恢复默认")
+
+    def unknown_hint(self):
+        return "「设置」视图只认 set / settings（Shift+Tab 切回去干别的）。"
+
+    def commands(self):
+        w = self.w
+        return [
+            _cmd("settings", lambda a: w.cmd_settings(show=True),
+                 "重新列出全部设置（也是只重画看板）", ("list",),
+                 usage="settings", hint=_hint_actions("settings", note="只重画看板")),
+        ]
+
+    def render(self):
+        w = self.w
+        rows = w.settings.rows()
+        t = Table(title="Settings · 设置（改过的标 *；set <id> <value> 修改）",
+                  box=box.SIMPLE_HEAVY, header_style="bold cyan",
+                  title_justify="left", expand=False)
+        t.add_column("设置 ID", no_wrap=True, style="bold")
+        t.add_column("当前值", no_wrap=True, style="green")
+        t.add_column("默认", no_wrap=True, style="dim")
+        t.add_column("说明", no_wrap=False, overflow="fold")
+        for row in rows:
+            ident = Text(("* " if row["changed"] else "  ") + row["id"],
+                         style="bold yellow" if row["changed"] else "bold")
+            t.add_row(ident, Text(row["value_display"], style="green"),
+                      Text(str(row["default"])), Text(row["desc"], style="dim"))
+        hint = Text("set 的取值：", style="dim")
+        hint.append("  ".join("set %s %s" % (r["id"],
+                                             "|".join(r["values"]) if r["values"] else "…")
+                              for r in rows), style="cyan")
+        return [t, hint]
 
 
 # ---------------------------------------------------------------- 输入（Tab 切视图 / 原地刷新）
@@ -1240,6 +1352,17 @@ class Warden(object):
         # 日历下载层 / 时段 layout：每次 frame 重新读（人手可能刚改过）
         self.download = sp.load_download()
         self.layouts = sp.load_layouts()
+        # 设置项（edit-tomorrow / tomorrow-plan ...）：界面里全部列出来，
+        # 改的时候写 data/settings.json；没改过的项跟着默认值走。
+        self.settings = cfg.SettingStore()
+        # 警告板：框架负责画在「状态」框里，这里只负责"有什么问题"。
+        # 每次操作 / 每 5 秒重算一次（见 refresh_warnings）。
+        self.warnings = repl_kit.WarningBoard()
+        self.warnings_at = 0.0
+        self.warnings_sig = ()
+        # 重算 data.csv 时被"计划里没有"冲掉的行（例如手写的旧契约）：
+        # 记下来当警告显示，别让人以为契约凭空消失了。
+        self.csv_dropped = []
         # 提示行 / 补全 / 视图切换 / 状态行的定时刷新 / 帧的擦除重画，
         # 全部交给 repl_kit（prompt_toolkit 按单元格 diff，只写变化的那几格）。
         shell_kwargs = dict(
@@ -1251,6 +1374,13 @@ class Warden(object):
             focus_key="c-o",           # Ctrl+O：循环专注模式
             on_focus=self.cycle_focus_mode,
             intercept=self.intercept,
+            # 注：警告默认显示、且只在「契约」视图显示（用户要求）。
+            warnings=self.warnings,
+            warnings_view=("契约",),
+            show_warnings=True,
+            status_title="状态",
+            # 每帧画框之前先重算警告：框和看板永远是同一时刻的事实
+            warnings_refresh=self.refresh_warnings,
         )
         # 看板自己就是最下面那块内容；补全菜单浮在它上面，不再在输入行
         # 下面留 8 行空白（留了就会把看板/提示挤出屏幕）。
@@ -1288,12 +1418,22 @@ class Warden(object):
             return None
         return sessions[0]["start"] if sessions else None
 
-    def task_for_session(self, day, start):
+    def task_for_session(self, day, start, duration=None):
+        """这一场挂的是哪个任务：本地 assignment 优先，其次「每周重复」落点。"""
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         for task in self.task_store.list():
             sess = task.get("session") or {}
             if sess.get("date") == iso and sess.get("start") == start:
                 return task
+        sessions = self.sessions_for_day_plan(day)
+        for task in self.task_store.repeated_tasks(day.weekday()):
+            hit = self.task_store.repeat_occurrence(task, day, sessions)
+            if not hit or hit.get("start") != start:
+                continue
+            if duration is not None and hit.get("duration") is not None \
+                    and int(hit["duration"]) != int(duration):
+                continue
+            return task
         return None
 
     def attach_period_info(self, row, day=None):
@@ -1310,12 +1450,15 @@ class Warden(object):
             row["period"] = None
             row["period_id"] = None
             row["period_first"] = False
-        task = self.task_for_session(day, row.get("startLabel"))
+        task = self.task_for_session(day, row.get("startLabel"), row.get("durationMin"))
         if task:
             row["task"] = task
-            row["task_text"] = self.task_store.summarize(task)
+            row["task_repeat"] = bool(task.get("repeat"))
+            prefix = "🔁 " if row["task_repeat"] else ""
+            row["task_text"] = prefix + self.task_store.summarize(task)
         else:
             row["task"] = None
+            row["task_repeat"] = False
             row["task_text"] = ""
         return row
 
@@ -1355,6 +1498,7 @@ class Warden(object):
         """当前视图的整块看板。repl_kit 每帧调它一次，按单元格 diff 上屏。"""
         # 每次画之前重读 data.csv：契约可能在别处被人手改了（这就是控制面）
         self.reload_entries()
+        self.refresh_warnings()
         parts = [self.render_header()]
         body = self.view.render()
         if body is not None:
@@ -1367,8 +1511,12 @@ class Warden(object):
     def paint(self, prompt_row=True):
         """画一整帧到 console：--status / --exec / 测试用。
 
-        交互模式下不走这里，走 repl_kit 的 chrome。
+        交互模式下不走这里，走 repl_kit 的 chrome（框架会把「状态」框和看板
+        一起拼出来）。这里手动补上同一块框，保证 --status 看到的和交互时一样。
         """
+        box = self.shell.status_box()
+        if box is not None:
+            self.console.print(box.renderable())
         self.console.print(self.frame())
         st = self.live_status()
         if st is not None:
@@ -1608,7 +1756,8 @@ class Warden(object):
                                                    slot["start"])
             else:
                 row["contract"] = "%s,%s,%s" % (slot["weekday"], slot["start"], slot["duration"])
-            row["zone"] = sch.zone_name(start, now)
+            row["zone"] = self.effective_zone(sch.zone_name(start, now), day)
+            row["zone_raw"] = sch.zone_name(start, now)
             row["date"] = day.isoformat()
             rows.append(row)
 
@@ -1677,6 +1826,21 @@ class Warden(object):
         self.rows_at = time.time()
         self.rebuild_rows(now_ms)
 
+    def effective_zone(self, zone, day):
+        """``edit-tomorrow`` 设置：开着时，明天（以及之后）按草稿区算。
+
+        需求：晚上 11 点想排明天早上 10 点（本来已经进 24 小时窗口 = 执行区，
+        取消要敲宣言）—— 打开这个设置就是零阻力。过了凌晨，明天变成今天，
+        又回到正常的 24 小时窗口规则（那时日期已经变了，不需要额外判断）。
+        """
+        if zone == "locked" and self.settings.get_bool("edit-tomorrow"):
+            try:
+                if day > datetime.date.today():
+                    return "draft"
+            except TypeError:
+                return zone
+        return zone
+
     @staticmethod
     def phase_of(start_ms, end_ms, now_ms):
         if now_ms < start_ms:
@@ -1712,6 +1876,8 @@ class Warden(object):
             return "locked" if "draft" not in seen else "mixed"
         if seen:
             return "draft"
+        if self.sel_date > now.date() and self.settings.get_bool("edit-tomorrow"):
+            return "draft"
         return "locked" if self.sel_date == now.date() else "draft"
 
     def _day_cell(self):
@@ -1730,6 +1896,9 @@ class Warden(object):
         cell.append("%s  %s %s" % (day.isoformat(), sch.cn_weekday_of_day(day), name), style="bold")
         cell.append("\n")
         cell.append(zone_txt[0], style=zone_txt[1])
+        if off > 0 and self.settings.get_bool("edit-tomorrow"):
+            cell.append("\n（edit-tomorrow 开着：未来的日子先按草稿区，凌晨后回到 24h 规则）",
+                        style="dim green")
         return cell
 
     def _window_cell(self):
@@ -1902,46 +2071,153 @@ class Warden(object):
             )
         return t
 
-    def render_contract(self):
+    def render_status_rows(self):
+        """「状态」框的正文：契约执行情况 + 一次性/长期规则 + 临时挪动 + 文件位置。
+
+        用户要求：这一行（原来这里挂的「永不重订名单（N 条）」）换成警告，
+        并且「契约（data.csv 周几）」和警告一起装进同一个 ASCII「状态」框。
+        永不重订名单本体只在「统计」视图里逐行列。
+        """
+        rows = []
         plan = self.plan_summary()
         day = self.sel_date
-        txt = Text()
+        wd_cn = sch.cn_weekday_of_day(day)
         if plan is None:
-            txt.append("契约：", style="bold")
-            txt.append("data.csv 里没有 %s 的规则（这天不排 session）"
-                       % sch.cn_weekday_of_day(day), style="dim")
+            rows.append(("契约：data.csv 里没有 %s 的规则（这天不排 session）" % wd_cn,
+                         "dim"))
+        elif plan["booked"] is None:
+            rows.append(("契约（data.csv %s）：计划 %d 场 · 订没订看不出来"
+                         "（state.json 快照，不是真数据）" % (wd_cn, plan["total"]),
+                         "yellow"))
+        elif not plan["missing"]:
+            rows.append(("契约（data.csv %s）：计划 %d 场 · 已落地 %d 场 ✅ 一场不缺"
+                         % (wd_cn, plan["total"], plan["booked"]), "bold green"))
         else:
-            txt.append("契约（data.csv %s）：" % sch.cn_weekday_of_day(day), style="bold")
-            txt.append("计划 %d 场" % plan["total"])
-            if plan["booked"] is None:
-                txt.append("  · 订没订看不出来（这是 state.json 快照，不是真数据）",
-                           style="yellow")
-            else:
-                txt.append(" · 已落地 %d 场" % plan["booked"])
-                missing = plan["missing"]
-                if not missing:
-                    txt.append("  ✅ 一场不缺", style="bold green")
-                elif self.day_zone() in ("draft", "past"):
-                    txt.append("  · %d 场还没被吃进去（草稿区/过去，正常）" % len(missing),
-                               style="green")
-                else:
-                    txt.append("  ⚠ 缺 %d 场：" % len(missing), style="bold red")
-                    txt.append("、".join("%s(%smin)" % (r["startLabel"], r.get("durationMin") or "?")
-                                         for r in missing), style="red")
-                    txt.append("   —— daemon 会在下一轮补", style="dim")
-        ab = ks.load_verdicts()["abandoned"]
-        if ab:
-            # 名单本体只在「统计」视图里逐行列（用户要求：平常视图不展示他们）。
-            # 这里只留一句指路，免得不知道去哪儿看。
-            txt.append("\n永不重订名单（%d 条）：stat 命令 / 「统计」视图" % len(ab),
-                       style="dim red")
+            rows.append(("契约（data.csv %s）：计划 %d 场 · 已落地 %d 场 · ⚠ 缺 %d 场：%s"
+                         % (wd_cn, plan["total"], plan["booked"], len(plan["missing"]),
+                            "、".join("%s(%smin)" % (r["startLabel"],
+                                                     r.get("durationMin") or "?")
+                                      for r in plan["missing"])),
+                         "red"))
+            if self.day_zone() in ("draft", "past"):
+                rows.append(("  （草稿区/过去：还没被吃进去是正常的，daemon 下一轮会补）",
+                             "dim"))
+
+        # 契约的三个来源：时段排布 / 一次性 session / 长期规则
+        try:
+            counts = sp.plan_counts(self.download, self.layouts)
+        except Exception:                       # noqa: BLE001 - 坏文件不该炸框
+            counts = {}
+        if counts:
+            pieces = ["时段排布 %d" % counts.get("period", 0)]
+            if counts.get("extra"):
+                pieces.append("一次性 %d" % counts["extra"])
+            if counts.get("rule"):
+                pieces.append("长期规则 %d" % counts["rule"])
+            rows.append(("来源：" + " · ".join(pieces)
+                         + "   （session = 只加这一天；session --permanent = 写进日历）",
+                         "dim"))
+
         relocated = [r for r in self.rows if r.get("planned") and r.get("relocation")]
         if relocated:
-            txt.append("\n临时挪动（只影响这一天，不改 data.csv）：", style="bold")
-            txt.append("、".join("%s→%s" % (r.get("relocated_from") or "?", r["startLabel"])
-                                 for r in relocated), style="magenta")
-        txt.append("   [%s]" % sch.data_csv_path(), style="dim")
-        return txt
+            rows.append(("临时挪动（只影响这一天，不改 data.csv）：" +
+                         "、".join("%s→%s" % (r.get("relocated_from") or "?",
+                                              r["startLabel"]) for r in relocated),
+                         "magenta"))
+        rows.append((sch.data_csv_path(), "dim"))
+        return rows
+
+    # -- 警告（repl_kit.WarningBoard）-----------------------------------
+
+    def sessions_for_day_plan(self, day=None):
+        """那一天**排好的** session（时段 + 一次性；不含 API、不含长期规则展开）。"""
+        day = day or self.sel_date
+        return sp.sessions_for_day(self.download, self.layouts, day)
+
+    def repeated_task_for(self, day, session):
+        """这一场有没有落上「每周重复任务」；没有就 None。"""
+        sessions = self.sessions_for_day_plan(day)
+        for task in self.task_store.repeated_tasks(day.weekday()):
+            hit = self.task_store.repeat_occurrence(task, day, sessions)
+            if hit and hit.get("start") == session.get("start"):
+                return task
+        return None
+
+    def _suggest_repeat_spec(self, day=None, sessions=None):
+        """建议的 --repeat 取值：那天最后一场的时间（没有就 22:15）。"""
+        day = day or datetime.date.today()
+        sessions = sessions if sessions is not None else self.sessions_for_day_plan(day)
+        start = sessions[-1]["start"] if sessions else "22:15"
+        return "%s@%s" % (cfg.WEEKDAYS[day.weekday()], start)
+
+    def collect_warnings(self):
+        """现在有哪些「问题」要显示在状态框里。纯本地计算，不联网、不写盘。"""
+        out = []
+        # 1) data.csv 解析问题（schedule.py 给的 warning）。最多列 3 条：
+        #    状态框是给人一眼看"哪里不对"的，不是日志。
+        entry_warnings = [str(t) for t in (self.entry_warnings or []) if str(t).strip()]
+        for text in entry_warnings[:3]:
+            if "重复" in text:
+                hint = ("同一天同一时刻只能留一行：删掉多余的，"
+                        "或改成 session --permanent 只留一条长期规则")
+            else:
+                hint = "格式：mon,HH:MM,50 或 YYYY-MM-DD,HH:MM,50（时长 25/50/75）"
+            out.append(repl_kit.Warning(text, level="error", source="data.csv", hint=hint))
+        if len(entry_warnings) > 3:
+            out.append(repl_kit.Warning(
+                "data.csv 还有 %d 条解析问题没列出来" % (len(entry_warnings) - 3),
+                level="error", source="data.csv",
+                hint="python3 schedule.py show 看全部"))
+        # 2) 时段 layout 坏了（排不出来）
+        for period in self.periods_for_day(self.sel_date):
+            try:
+                sp.sessions_for_period(period, self.layouts)
+            except ValueError as e:
+                out.append(repl_kit.Warning(
+                    "%s %s 的排布坏了：%s" % (period.get("date"), period.get("id"), e),
+                    level="error", source="layout",
+                    hint="period %s 25 50 重新排，或删掉 temp/session-layouts.json 里那条"
+                         % period.get("id")))
+        # 3) 重算 data.csv 时被冲掉的旧行（备份仍在 temp/data.csv.bak）
+        if self.csv_dropped:
+            out.append(repl_kit.Warning(
+                "重算 data.csv 冲掉了 %d 行旧契约（%s%s）"
+                % (len(self.csv_dropped), "、".join(self.csv_dropped[:2]),
+                   "…" if len(self.csv_dropped) > 2 else ""),
+                level="warn", source="data.csv",
+                hint="用 session --permanent 加回长期规则，或把这些行放回日历/一次性 session"))
+        # 4) 每周重复任务：今天有没有落上
+        today = datetime.date.today()
+        today_sessions = self.sessions_for_day_plan(today)
+        landed = []
+        if today_sessions:
+            for task in self.task_store.repeated_tasks(today.weekday()):
+                if self.task_store.repeat_occurrence(task, today, today_sessions):
+                    landed.append(task)
+        if self.settings.get("tomorrow-plan") and not self.task_store.repeated_tasks():
+            out.append(repl_kit.Warning(
+                "设置里填了「明日时间安排」（%s），但没有对应的重复任务"
+                % self.settings.get("tomorrow-plan"),
+                level="warn", source="重复任务",
+                hint="task create title=明日时间安排 --repeat %s"
+                     % self.settings.get("tomorrow-plan")))
+        elif not landed:
+            out.append(repl_kit.Warning(
+                "今天的 session 里没有「明日时间安排」这类每周重复任务",
+                level="warn", source="重复任务",
+                hint="task create title=明日时间安排 --repeat %s"
+                     % self._suggest_repeat_spec(today, today_sessions)))
+        return out
+
+    def refresh_warnings(self, force=False, max_age=5.0):
+        """重算警告板（每次操作之后 / 最多 5 秒一次；不联网、不写盘）。"""
+        now = time.time()
+        if not force and self.warnings_at and now - self.warnings_at < max_age:
+            return self.warnings
+        self.warnings.set_all(self.collect_warnings())
+        self.warnings_at = now
+        self.warnings_sig = self.warnings.signature()
+        return self.warnings
 
     def render_messages(self):
         t = Table.grid(padding=(0, 1))
@@ -2289,6 +2565,8 @@ class Warden(object):
             return self.cmd_task_modify(rest)
         if action == "assign":
             return self.cmd_task_assign(rest)
+        if action in ("repeat", "recurring"):
+            return self.cmd_task_repeat(rest)
         if action == "select":
             return self.cmd_task_select(rest)
         if action in ("sync", "refresh", "reconcile"):
@@ -2296,12 +2574,37 @@ class Warden(object):
         if action in ("list", "ls", "show"):
             self.say("任务 %d 条；看本视图表格即可。" % len(self.task_store.list()), "info")
             return False
-        raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/sync）" % action)
+        raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/repeat/sync）"
+                         % action)
 
     def cmd_task_create(self, args):
-        """task create [id] [key=value ...] —— 字段不校验；给了 id 就用它。"""
+        """task create [id] [key=value ...] [--repeat 周几@HH:MM]
+
+        字段不校验；给了 id 就用它。``--repeat`` 把任务标成**每周重复**：到那一周
+        就自动挂到同一时刻、同一时长的那场 session 上（拆分/改时长后这一周就不挂，
+        但 repeat 设置不变）。
+        """
         toks = [str(a).strip() for a in args if str(a).strip()]
         explicit = None
+        repeat_spec = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            low = tok.lower()
+            if low in ("--repeat", "-r"):
+                if i + 1 >= len(toks):
+                    raise ValueError("--repeat 后面要跟 周几@HH:MM（例如 mon@22:15）")
+                repeat_spec = toks[i + 1]
+                i += 2
+                continue
+            if low.startswith("--repeat="):
+                repeat_spec = tok.split("=", 1)[1]
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        toks = kept
         if toks and re.match(r"^\d+$", toks[0]) and "=" not in toks[0]:
             explicit = int(toks[0])
             toks = toks[1:]
@@ -2316,9 +2619,53 @@ class Warden(object):
         if loose:
             fields.setdefault("title", " ".join(loose))
         task = self.task_store.create(fields, task_id=explicit)
+        if repeat_spec:
+            task = self.cmd_task_repeat([str(task["id"]), repeat_spec], quiet=True)
         self.selected_task_id = task["id"]
         self.say("✅ 任务 %d 已创建（字段：%s）"
                  % (task["id"], self.task_store.summarize(task) or "空"), "ok")
+        return task
+
+    def cmd_task_repeat(self, args, quiet=False):
+        """task repeat <id> <周几@HH:MM|off> —— 设置 / 取消每周重复。
+
+        不写时刻时用今天最后一场的时间当锚点；duration 取那场 session 的时长，
+        所以它只在「同一时刻、同一时长」的 session 上落地。
+        """
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        if not toks:
+            raise ValueError("用法：task repeat <任务 ID> <周几@HH:MM|off>")
+        task = self.task_store.get(toks[0])
+        if len(toks) == 1:
+            rep = task.get("repeat")
+            if not rep:
+                self.say("任务 %d 不是重复任务。" % task["id"], "info")
+            else:
+                self.say("任务 %d 每周 %s %s（%s min；落点 %d 次）"
+                         % (task["id"], rep.get("weekday_label"), rep.get("start"),
+                            rep.get("duration") or "?", len(rep.get("occurrences") or {})),
+                         "info")
+            return task
+        spec = toks[1].lower()
+        if spec in ("off", "none", "clear", "cancel"):
+            task = self.task_store.clear_repeat(task["id"])
+            self.say("✅ 任务 %d 的每周重复已取消。" % task["id"], "ok")
+            return task
+        parsed = cfg.parse_repeat_spec(toks[1])
+        # 锚点：同一天里同一时刻那场 session 的时长（找不到就用 50）
+        day = datetime.date.today()
+        day += datetime.timedelta(days=(parsed["weekday"] - day.weekday()) % 7)
+        anchored = None
+        for sess in self.sessions_for_day_plan(day):
+            if sess.get("start") == parsed["start"]:
+                anchored = sess
+                break
+        duration = int(anchored["duration"]) if anchored else 50
+        task = self.task_store.set_repeat(task["id"], parsed["weekday_label"],
+                                         parsed["start"], duration)
+        if not quiet:
+            self.say("✅ 任务 %d 每周 %s %s 重复（锚定 %dmin 那场）"
+                     % (task["id"], parsed["weekday_label"], parsed["start"], duration), "ok")
         return task
 
     def cmd_task_delete(self, args):
@@ -2414,8 +2761,64 @@ class Warden(object):
                  % (task["id"], session_idx, res.get("taskId") or "?"), "ok")
         return True
 
+    def materialize_repeats(self):
+        """把「每周重复任务」挂到选中那天的 session 上（本地 + Focusmate）。
+
+        只有真的落上了（同一时刻、同一时长）才挂：排布被拆开/改时长后这一周就
+        没有落点 —— repeat 设置不动，下一周照旧。Focusmate 写入必须复核成功才
+        落本地，失败就把错误抛给调用方，绝不假成功。
+        """
+        day = self.sel_date
+        sessions = self.sessions_for_day_plan(day)
+        iso = day.isoformat()
+        done = []
+        for task in self.task_store.repeated_tasks(day.weekday()):
+            hit = self.task_store.repeat_occurrence(task, day, sessions)
+            if not hit:
+                continue
+            occ = (task.get("repeat") or {}).get("occurrences") or {}
+            already = (occ.get(iso) or {}).get("focusmate") or {}
+            if already.get("task_id"):
+                continue
+            row = next((r for r in self.rows
+                        if r.get("planned") and r["startLabel"] == hit["start"]), None)
+            session = {
+                "index": self.rows.index(row) + 1 if row in self.rows else None,
+                "date": iso,
+                "start": hit["start"],
+                "end": hit.get("end"),
+                "duration": hit.get("duration"),
+                "focusmate_session_id": (row or {}).get("id"),
+            }
+            focusmate = {}
+            if row is not None and row.get("id") and not self.offline:
+                title = self.task_store.focusmate_title(task)
+                notes = (task.get("fields") or {}).get("notes") or ""
+                res = self.bridge.call("add_task", timeout=240,
+                                       startMs=row["startMs"], meetingId=row["id"],
+                                       title=title, notes=str(notes))
+                if not res.get("verified"):
+                    raise ValueError("重复任务 %d 没能挂到 %s %s（Focusmate 没确认）"
+                                     % (task["id"], iso, hit["start"]))
+                focusmate = {"task_id": res.get("taskId"),
+                             "session_id": row["id"], "attached_at": ts._now(),
+                             "title": title}
+            self.task_store.attach_occurrence(task["id"], day, session, focusmate)
+            done.append((task["id"], hit["start"]))
+        return done
+
     def cmd_task_sync(self, quiet=False):
-        """GET /v1/tasks → 读 completedAt，给已完成任务写归档。"""
+        """GET /v1/tasks → 读 completedAt，给已完成任务写归档。
+
+        顺带把「每周重复」落到选中那天的 session 上（落不上就算了，那是排布变了）。
+        """
+        if not self.offline:
+            try:
+                for task_id, start in self.materialize_repeats():
+                    self.say("🔁 任务 %d 已挂到 %s %s" % (task_id, self.sel_date, start), "ok")
+            except Exception as e:                      # noqa: BLE001
+                self.had_error = True
+                self.say("重复任务挂载失败：%s" % e, "warn")
         res = self.bridge.call("tasks", timeout=180)
         remote = res.get("tasks") if isinstance(res, dict) else res
         n, matched = self.task_store.reconcile(remote or [])
@@ -2424,6 +2827,49 @@ class Warden(object):
             self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
                      % (len(matched), n), "ok")
         return True
+
+    # -- 设置 / 警告开关 -------------------------------------------------
+
+    def cmd_settings(self, args=None, show=False):
+        """settings —— 只把设置视图的内容说一遍（界面本身在 SettingsView 里）。"""
+        rows = self.settings.rows()
+        self.say("设置 %d 项：%s" % (len(rows), "、".join(
+            "%s=%s" % (r["id"], r["value_display"]) for r in rows)), "info")
+        return rows
+
+    def cmd_set(self, args):
+        """set <id> <value> —— 改一个设置项；不写 value = 恢复默认值。"""
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        if not toks:
+            raise ValueError("用法：set <设置 id> <value>；现有：%s"
+                             % "、".join(r["id"] for r in self.settings.rows()))
+        setting_id = toks[0]
+        if len(toks) == 1:
+            value = self.settings.reset(setting_id)
+            self.say("✅ %s 已恢复默认值（%s）" % (setting_id, value or "（空）"), "ok")
+        else:
+            value = self.settings.set(setting_id, " ".join(toks[1:]))
+            self.say("✅ %s = %s" % (setting_id, value or "（未设置）"), "ok")
+        # 设置可能立即改变行为（比如 edit-tomorrow 影响草稿/执行区判定）
+        if setting_id == "tomorrow-plan" and value:
+            self.say("   想让它真的挂到 session 上，再建一条同名重复任务："
+                     "task create title=明日时间安排 --repeat %s" % value, "info")
+        self.refresh_warnings(force=True)
+        return value
+
+    def cmd_warn(self, args):
+        """warn on|off —— 状态框里的警告要不要显示（不写 = 取反）。"""
+        token = str(args[0]).strip().lower() if args else ""
+        if token in ("on", "true", "1"):
+            on = self.shell.set_warnings(True)
+        elif token in ("off", "false", "0"):
+            on = self.shell.set_warnings(False)
+        elif not token:
+            on = self.shell.set_warnings()
+        else:
+            raise ValueError("用法：warn on|off（不写就是取反）")
+        self.say("状态框警告：%s" % ("显示" if on else "隐藏"), "info")
+        return on
 
     def _drop_contract_row(self, idx, row):
         """草稿区：把 data.csv 里那行删掉。零阻力、不问任何问题 —— 这就是「自由」。
@@ -2487,6 +2933,120 @@ class Warden(object):
             self.refresh()
         return True
 
+    def _period_row_is_stale(self, row, new_by_start):
+        """这一行 API session 还符合新排布吗？（按起点 + 时长判断）"""
+        start = row.get("startLabel")
+        if start not in new_by_start:
+            return True
+        dur = row.get("durationMin")
+        try:
+            return dur is not None and int(dur) != int(new_by_start[start])
+        except (TypeError, ValueError):
+            return True
+
+    def _forget_layout_state(self, rows):
+        """清掉被 warden 主动取消的旧 state 记录，避免 daemon 误记 sin。"""
+        if not rows:
+            return
+        try:
+            state = ks.load_state()
+            slots = state.setdefault("slots", {})
+            removed = 0
+            for row in rows:
+                try:
+                    day = datetime.date.fromisoformat(row.get("date"))
+                except (TypeError, ValueError):
+                    day = self.sel_date
+                key = sch.key_of(day, row.get("startLabel"))
+                if key in slots:
+                    slots.pop(key, None)
+                    removed += 1
+            if removed:
+                ks.save_state(state)
+                self.say("已清掉 %d 条旧 booked state（不会误记 sin）。" % removed, "info")
+        except Exception as e:                        # noqa: BLE001
+            self.say("清理旧 state 失败（daemon 可能多记一笔 sin）：%s" % e, "warn")
+
+    def _cancel_stale_period_sessions(self, period, new_sessions):
+        """改 layout 前，把旧排布里已经订上的 API session 对齐掉。
+
+        为什么必须做：data.csv 换成 22:15(25)+22:45(25) 之后，API 里原先那场
+        22:15(50) 不会自己消失；daemon 只补订、不擅自杀旧场，于是 50min/25min
+        会同时存在。这里在改契约之前先把「起点或时长不再匹配」的场次取消。
+        执行区里的取消仍走同一道宣言闸门 —— 不能靠改 layout 绕过 Warden。
+        """
+        if self.offline or not self.authoritative:
+            return True
+        new_by_start = {s["start"]: int(s["duration"]) for s in new_sessions}
+        stale = []
+        for row in self.rows:
+            if not row.get("id"):
+                continue
+            if row.get("date") != period.get("date"):
+                continue
+            if sp.period_for_session([period], row.get("startLabel")) is None:
+                continue
+            if self._period_row_is_stale(row, new_by_start):
+                stale.append(row)
+        if not stale:
+            return True
+
+        past = [r for r in stale if r.get("zone") == "past"]
+        live = [r for r in stale if r.get("zone") != "past"]
+        if past:
+            self.say("有 %d 场旧 session 已经过去；过去的场次不取消、不补订。"
+                     % len(past), "warn")
+        if not live:
+            return True
+
+        info = Table.grid(padding=(0, 2))
+        info.add_column(style="bold", no_wrap=True)
+        info.add_column()
+        info.add_row("时段", "%s  %s–%s  %s"
+                     % (period.get("id"), period.get("start"), period.get("end"),
+                        period.get("name") or period.get("type") or ""))
+        for row in live:
+            info.add_row("要取消", "#%s  %s–%s（%smin）"
+                         % (self.rows.index(row) + 1, row.get("startLabel"),
+                            row.get("endLabel") or "?", row.get("durationMin") or "?"))
+        info.add_row("新排布", "  ".join("%s–%s(%d)"
+                                       % (s["start"], s["end"], s["duration"])
+                                       for s in new_sessions) or "（空）")
+        self.emit(Panel(info, title="[bold red]⚠ 改排布：旧 session 需要先取消[/]",
+                        border_style="red", box=box.HEAVY))
+
+        locked = [r for r in live if r.get("zone") == "locked"]
+        if locked:
+            if not self.require_declaration(
+                    "改 %s 的排布，并取消 %d 场执行区旧 session"
+                    % (period.get("id"), len(locked))):
+                self.say("没认罪，排布和 session 都没动。", "warn")
+                return False
+
+        cancelled = []
+        try:
+            for row in live:
+                self.say("取消旧 session %s–%s（%smin）…"
+                         % (row.get("startLabel"), row.get("endLabel") or "?",
+                            row.get("durationMin") or "?"), "cmd")
+                res = self.bridge.call("cancel", timeout=180,
+                                       startMs=row["startMs"], meetingId=row["id"])
+                if not res.get("verified"):
+                    self.had_error = True
+                    raise ValueError("旧 session %s 取消后复核还在；排布没改，避免两套 session 并存。"
+                                     % row.get("startLabel"))
+                self.say("✅ 已取消旧 session %s" % row.get("startLabel"), "ok")
+                self.api_rows = [r for r in self.api_rows
+                                 if not (r.get("id") == row.get("id")
+                                         and r.get("startMs") == row.get("startMs"))]
+                cancelled.append(row)
+        finally:
+            # 关键：旧 session 是 warden 主动取消的，不是用户手动搞丢的。
+            # 清掉 state 里的旧 booked 记录，否则 daemon 下一轮会记一笔 sin 并锁死 TUI。
+            # 同一个起点如果新排布还要用，它会以新 duration 重新进入待订队列。
+            self._forget_layout_state(cancelled)
+        return True
+
     def cmd_period_layout(self, args):
         """period T1 50 50 / session T1 50 50 —— 改一个时段的 session 排布。
 
@@ -2494,6 +3054,9 @@ class Warden(object):
           - 时长只认 25/50/75（Focusmate 的限制）；
           - 第一场从时段起点开始，之后每场从上一场结束后的下一个 15 分钟整点开始；
           - 任何一场超出时段终点 → 直接报错，**layout 和 data.csv 都不动**。
+
+        改排布时若 API 里已有旧 session（例如原来 22:15 50，现在要 22:15 25 +
+        22:45 25），先取消不再匹配的旧场，再写新契约。执行区的取消仍要敲宣言。
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
@@ -2503,55 +3066,116 @@ class Warden(object):
             raise ValueError("时段 ID 要像 T1 / T2；你给的是 %r" % period_id)
         period_id = period_id.upper()
         durations = toks[1:]
+
+        # 先刷新一次，拿到当前 API 里的真实 session（id / duration）。
+        # 拉不到就别改 —— 否则没法判断旧场次要不要取消，会留下 50/25 并存。
+        if not self.offline and time.time() - self.rows_at > 20:
+            if not self.refresh(quiet=True):
+                raise ValueError("拉不到当前 API session；先 refresh 成功再改排布，"
+                                 "避免旧场次和新场次并存。")
+
+        periods = self.periods_for_day(self.sel_date)
+        period = next((p for p in periods if p.get("id") == period_id), None)
+        if period is None:
+            raise ValueError("没有时段 %s（%s 的时段：%s）"
+                             % (period_id, self.sel_date.isoformat(),
+                                "、".join(p.get("id", "?") for p in periods) or "无"))
+        # 纯计算先验证；这里失败 = 零副作用。
+        effective = durations if durations else sp.default_durations(period)
+        new_sessions = sp.plan_period(period, effective)
+
+        # 旧 API session 先对齐，否则 50min / 25min 会并存。
+        if not self._cancel_stale_period_sessions(period, new_sessions):
+            return False
+
         if not durations:
-            # 只给 T1 = 撤销自定义排布，回到默认 50/25。
             removed = sp.remove_layout(self.sel_date, period_id)
             if removed is None:
                 raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
             self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
         else:
-            sessions = sp.set_layout(self.sel_date, period_id, durations)
+            sp.set_layout(self.sel_date, period_id, durations)
             body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
-                             for s in sessions)
+                             for s in new_sessions)
             self.say("✅ %s %s → %s" % (self.sel_date.isoformat(), period_id, body), "ok")
-        # 从下载层 + 所有 layout 重新生成 data.csv。写在 layout 成功之后。
-        download = sp.load_download()
-        layouts = sp.load_layouts()
-        csv = sp.render_data_csv(download, layouts, date_specific=True)
-        sch.backup()
-        sch._write(sch.DATA_CSV, csv)
-        self.reload_entries()
-        self.say("data.csv 已按下载层重算（精确日期行）；daemon 下一轮会读新契约。", "info")
+
+        # 从下载层 + 所有 layout + 一次性 + 长期规则重新生成 data.csv。
+        # 写在 layout 成功之后。
+        if self.rewrite_data_csv_from_plan():
+            self.say("data.csv 已按下载层重算（精确日期行）。", "info")
+
         if not self.offline:
+            # 新排布里执行区的场次需要立刻补订；先让 bridge 放开 profile。
+            self._release_browser("daemon 下单要独占同一个 Chromium profile")
+            self.say("立刻触发一轮 check（keep_session.py check）…", "cmd")
+            rc, out, err = run_keep_session("check", timeout=600)
+            for line in (out or "").splitlines()[-20:]:
+                self.say(line)
+            if rc != 0:
+                self.had_error = True
+                self.say("❌ check 退出码 %d%s（新契约已落盘，daemon 后续还会补）"
+                         % (rc, ("：" + err) if err else ""), "error")
             self.rebuild_rows()
             self.refresh(quiet=True)
         return True
 
     def cmd_session(self, args):
-        """session HH:MM LEN / session HH:MM-HH:MM —— 创建一场：先写进契约表（data.csv），
-        再立刻触发一轮 check。
+        """session [--permanent] HH:MM LEN | HH:MM-HH:MM | T1 50 50
 
-        也支持按时段改排布：``session T1 50 50``（等同于 ``period T1 50 50``）。
-        起点–终点的写法（如 `session 11:15-12:05`）会推出时长（这里是 50）。
-        创建零阻力 —— 有阻力的是**取消**。
-        下单本身不在这里实现：薄封装 keep_session.py check，业务逻辑一份就够。
+        - 默认：**只加在这一天**（一次性；存 temp/session-extras.json，不写进日历）。
+          起点–终点的写法（`session 11:15-12:05`）会推出时长（这里是 50）。
+        - `--permanent`：写进日历（temp/session-rules.json 里一条**按星期几重复**的
+          长期规则）→ 以后每个这个星期几都会有这一场。
+        - 第一个 token 是 T1 这种时段 ID 时，等同于 period T1 50 50（改排布）。
+
+        创建零阻力 —— 有阻力的是**取消**。下单本身不在这里实现：薄封装
+        keep_session.py check，业务逻辑一份就够。
         """
-        if args and re.match(r"^[Tt]\d+$", str(args[0]).strip()):
-            return self.cmd_period_layout(args)
-        hhmm, dur = parse_session_spec(args)     # 不合法会抛 ValueError（给人话提示）
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        permanent = False
+        rest = []
+        for tok in toks:
+            low = tok.lower()
+            if low in ("--permanent", "-p", "--perm", "permanent"):
+                permanent = True
+            else:
+                rest.append(tok)
+        if rest and re.match(r"^[Tt]\d+$", rest[0]):
+            return self.cmd_period_layout(rest)
+
+        hhmm, dur = parse_session_spec(rest)     # 不合法会抛 ValueError（给人话提示）
         day = self.sel_date
         weekday = sch.weekday_of_day(day)
-        lineno = sch.add_row(None, weekday, hhmm, dur)
-        self.reload_entries()
-        self.say("✅ 契约表已写：data.csv 第 %d 行 %s,%s,%s" % (lineno, weekday, hhmm, dur), "ok")
-        self.say("   按星期几重复 → 以后每个%s都会有这一场。"
-                 % sch.cn_weekday_of_day(day), "warn")
+        if permanent:
+            rec = sp.add_rule(weekday, hhmm, dur)
+            self.say("✅ 已写进日历（按星期几重复）：每个%s %s 一场 %dmin"
+                     % (sch.cn_weekday_of_day(day), rec["start"], rec["duration"]), "ok")
+            self.say("   长期规则存在 %s（sync/populate 之后仍然在）。"
+                     % sp.rules_path(), "info")
+            row_token = weekday
+        else:
+            iso, rec = sp.add_extra(day, hhmm, dur)
+            self.say("✅ 只加在 %s 这一天：%s %dmin（一次性，不进日历）"
+                     % (iso, rec["start"], rec["duration"]), "ok")
+            self.say("   想让它每周都出现，用 session --permanent %s %d。"
+                     % (rec["start"], rec["duration"]), "info")
+            row_token = iso
+
+        if self.rewrite_data_csv_from_plan():
+            self.say("data.csv 已按下载层重算（含一次性 / 长期规则）。", "info")
+        else:
+            # 没有下载层（旧的手写 data.csv 模式）：只能直接加一行
+            lineno = sch.add_row(None, row_token, hhmm, dur)
+            self.reload_entries()
+            self.say("✅ 契约表已写：data.csv 第 %d 行 %s,%s,%s"
+                     % (lineno, row_token, hhmm, dur), "ok")
 
         got = sch.parse_hhmm(hhmm)
         start = datetime.datetime(day.year, day.month, day.day, got[0], got[1])
-        zone = sch.zone_name(start, datetime.datetime.now())
+        zone = self.effective_zone(sch.zone_name(start, datetime.datetime.now()), day)
         if zone == "draft":
-            self.say("   它在草稿区（>24h）：这一轮不会订它，等它滑进执行区会自动被吃。", "info")
+            self.say("   它在草稿区（>24h 或 edit-tomorrow 放行）：这一轮不会订它，"
+                     "等它滑进执行区会自动被吃。", "info")
         elif zone == "past":
             self.say("   ⚠ 这个时间已经过了：这一轮不会订（对下一个%s才生效）。"
                      % sch.cn_weekday_of_day(day), "warn")
@@ -2567,6 +3191,34 @@ class Warden(object):
             self.had_error = True
             self.say("❌ check 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
         self.refresh()
+        return True
+
+    def rewrite_data_csv_from_plan(self):
+        """下载层 + layout + 一次性 + 长期规则 → 重算 data.csv。
+
+        没有下载层（说明这台机器还在用"手写 data.csv"那套）就返回 False，
+        调用方退回 schedule.add_row —— 绝不拿空计划把人家手写的契约冲掉。
+        """
+        download = sp.load_download()
+        if not download.get("periods"):
+            return False
+        layouts = sp.load_layouts()
+        csv = sp.render_data_csv(download, layouts, date_specific=True)
+        before = [ln.strip() for ln in sch.read_text().splitlines()
+                  if ln.strip() and not ln.lstrip().startswith("#")]
+        after = set(ln.strip() for ln in csv.splitlines()
+                    if ln.strip() and not ln.lstrip().startswith("#"))
+        sch.backup()
+        sch._write(sch.DATA_CSV, csv)
+        # 下载层/排布/一次性/长期规则之外的旧行会被冲掉 —— 记下来，下次画框报警。
+        self.csv_dropped = [ln for ln in before if ln not in after]
+        self.reload_entries()
+        self.reload_periods()
+        if self.csv_dropped:
+            self.say("⚠ 重算 data.csv 冲掉了 %d 行（下载层/layout/一次性/长期规则里没有的）："
+                     "%s%s；旧文件备份在 %s"
+                     % (len(self.csv_dropped), "、".join(self.csv_dropped[:3]),
+                        "…" if len(self.csv_dropped) > 3 else "", sch.BACKUP_CSV), "warn")
         return True
 
     def cmd_force_check(self):
@@ -2683,18 +3335,24 @@ class Warden(object):
         t.add_column(style="bold", no_wrap=True, justify="right")
         t.add_column()
         for cmd, desc in [
-            ("Tab", "切换视图：契约 → 专注 → 统计 → 任务 → 契约（循环）"),
+            ("Tab", "切换视图：契约 → 专注 → 统计 → 任务 → 设置 → 契约（循环）"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
             ("stat refresh full", "统计：丢掉缓存、全量重拉（默认只增量拉缺口 + 最近几天）"),
             ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),
             ("day -1|0|1|YYYY-MM-DD", "切换看哪一天（草稿区随便看）"),
-            ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
+            ("session HH:MM LEN", "只加这一天的 session（一次性），再立刻触发一轮 check"),
+            ("session --permanent HH:MM LEN", "写进日历：按星期几重复的长期规则"),
             ("session HH:MM-HH:MM", "同上，但用起点–终点（如 11:15-12:05 → 50min）"),
             ("session T1 50 50", "按时段改排布：T1 的第一场从时段起点开始，超时就报错"),
             ("period T1 25 25 25 25", "同 session T1 ...；只给 T1 = 撤销自定义，恢复默认"),
+            ("set <id> <value>（设置视图）", "改设置；不写 value = 恢复默认。settings 重新列出全部"),
+            ("warn on|off", "状态框里的警告显示开关（不写 = 取反）"),
             ("task create ...", "在「任务」视图建任务：task create [id] [field=value ...]"),
             ("task delete/modify ...", "task delete <id> / task modify <id> <field> <值>"),
             ("task assign <session ID>", "把选中的任务挂到表格 #N 的 session，并自动写 Focusmate task"),
+            ("task create ... --repeat mon@22:15",
+             "建每周重复任务：每周一 22:15 那场自动挂上（拆分后那一周就不挂）"),
+            ("task repeat <id> 周几@HH:MM|off", "给已有任务加上/取消每周重复"),
             ("task sync", "GET /v1/tasks，把 completedAt 连同 session 写进完成归档"),
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
             ("relocate N ±MM", "临时把 #N 提前/推后：不写 data.csv；推后一天一次，且不能跨天"),
@@ -2720,6 +3378,9 @@ class Warden(object):
             "统计视图：只读，stat 走缓存、stat refresh 只增量拉缺口 + 最近几天；"
             "它不改 data.csv、不碰 API 写接口。\n"
             "任务视图：task 命令在任何视图都能敲；任务字段不校验，JSON 存在 data/tasks.json。\n"
+            "设置视图：列出所有设置项和解释；set <id> <value> 改，"
+            "edit-tomorrow / tomorrow-plan 见那里的说明。\n"
+            "状态框（契约视图最上面）：契约执行情况 + 警告；warn off 可以藏掉警告。\n"
             "时段 ID（T1/T2）来自下载层 temp/calendar-download.json；"
             "同段后续行留空是正常的。[/]"
         )
@@ -2740,7 +3401,11 @@ class Warden(object):
     # -- 派发（框架的 intercept 钩子 + 一个给测试/--exec 用的瘦包装）------
 
     def guard(self, fn):
-        """把一条命令的异常翻译成人话 —— 交互路径和测试路径用的是同一套。"""
+        """把一条命令的异常翻译成人话 —— 交互路径和测试路径用的是同一套。
+
+        跑完（成功或失败）都重算一次警告板：状态框里永远是"现在"的问题，
+        不用谁记得在每条命令末尾补一句 refresh_warnings。
+        """
         def run(args):
             try:
                 fn(args)
@@ -2754,6 +3419,8 @@ class Warden(object):
             except Exception as e:  # 兜底：别让一条命令把 TUI 掀了
                 self.had_error = True
                 self.say("意外错误：%s: %s" % (type(e).__name__, e), "error")
+            finally:
+                self.refresh_warnings(force=True)
         return run
 
     def exit_tui(self):

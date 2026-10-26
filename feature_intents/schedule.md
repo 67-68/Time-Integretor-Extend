@@ -32,6 +32,12 @@ YYYY-MM-DD,HH:MM,duration   —— 只在这个精确日期生效（日历一周
 同一时刻同时存在日期行和 weekday 行时，**日期行优先**（更具体者胜）。
 `download_calendar.py populate` 的新链路写日期行；旧的 weekday 行仍完全兼容。
 
+> 2026-10 起 `data.csv` 在下载层这条链路上是**生成物**（`session_plan.render_data_csv`：
+> 时段排布 → 日期行，`temp/session-extras.json` → 一次性日期行，
+> `temp/session-rules.json` → weekday 行）。手写仍然有效（daemon/TUI 解析不变），
+> 但只要跑过一次 `populate` / `session`，文件就会按上面的来源重算 ——
+> 重算冲掉的旧行会被 warden 记成警告（附 `temp/data.csv.bak` 备份）。
+
 也可以把「起点–终点」直接写成区间，时长由区间推出（更贴近日历/看板上的写法）：
 
 ```

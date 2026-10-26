@@ -9,7 +9,9 @@
 iCloud 日历（只 工作 / 空闲，今天 + 7 天）
   → temp/calendar-download.json   原始事件 + 按时段编号的 T1/T2/...
   → temp/session-layouts.json     用户对每个时段的自定义时长序列
-  → data.csv                      精确日期行（YYYY-MM-DD,HH:MM,duration）
+  → temp/session-extras.json      一次性 session（`session HH:MM LEN`，只属于那一天）
+  → temp/session-rules.json       长期规则（`session --permanent`，按星期几重复）
+  → data.csv                      精确日期行（YYYY-MM-DD,HH:MM,duration）+ weekday 规则行
 ```
 
 `temp/calendar.md` 是同一份下载层的人读版（时段表 + 默认切分预览）。
@@ -25,12 +27,34 @@ iCloud 日历（只 工作 / 空闲，今天 + 7 天）
   - `T1 25 25 25 25` → 11:00–11:25, 11:30–11:55, 12:00–12:25, 12:30–12:55
   - `T1 50 50 50` → **报错，零副作用**（第三场会越过 13:00）
 
+## session 的作用范围（一次性 vs 长期）
+
+`data.csv` 是**生成物**（下载层 + layout + 一次性 + 长期规则 → 重算），所以临时加的
+一场不能直接手写进去 —— 下一次 `populate` 会把它冲掉。两个独立的小文件接住它：
+
+| 文件 | 谁写 | 语义 |
+|---|---|---|
+| `temp/session-extras.json` | `session HH:MM LEN` | **一次性**：只属于那一天，日期行，不复制到下周 |
+| `temp/session-rules.json` | `session --permanent HH:MM LEN` | **长期**：按星期几重复（`mon,09:00,25`），sync 之后仍在 |
+
+`plan_rows()` 把三者合并成一种形状（`source = period / extra / rule`），
+`render_data_csv()` 去重后写出去；`sessions_for_day()` 给界面/重复任务用。
+`plan_counts()` 是给状态框和 populate 用的「时段 n / 一次性 n / 长期规则 n」。
+
+重算 `data.csv` 时如果冲掉了不在计划里的旧行，warden 会把它们记进警告
+（`self.csv_dropped`，附 `temp/data.csv.bak` 备份），不会静默消失。
+
 ## 落盘安全
 
 - `plan_period()` 纯计算、不写文件。
 - `set_layout()` 先完整验证，再写 `session-layouts.json`；验证失败不留半截 layout。
 - `data.csv` 只在 layout 成功后重算；daily schedule 的精确日期行优先于旧的
   weekday 循环规则（同一时刻日期行覆盖）。
+- **旧 API session 对齐**：改 layout 前，先找出同一时段内「起点或时长不再匹配
+  新排布」的已订 session 并取消，否则会出现 `22:15(50)` 和 `22:15(25)+22:45(25)`
+  并存的脏状态。执行区的取消仍要过 Warden 的宣言闸门，不能靠改 layout 绕过。
+- 取消成功后才写新 layout / data.csv，然后立刻触发一轮 `keep_session.py check`
+  补订新场次。
 - `schedule.py` 同时支持 `YYYY-MM-DD,HH:MM,duration` 与旧格式，daemon 不需要改接口。
 
 ## 命令
@@ -42,6 +66,8 @@ iCloud 日历（只 工作 / 空闲，今天 + 7 天）
 | `download_calendar.py layout T1 50 50 [--date ...]` | 验证并保存一个时段的排布 |
 | `download_calendar.py show` | 打印所有时段及其当前 session |
 | TUI `session T1 50 50` / `period T1 50 50` / 裸 `T1 50 50` | 同上 |
+| TUI `session HH:MM LEN` | 只加这一天（一次性），立刻 check |
+| TUI `session --permanent HH:MM LEN` | 写进日历（按星期几重复） |
 
 ## 边界
 

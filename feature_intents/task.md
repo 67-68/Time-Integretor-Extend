@@ -42,9 +42,30 @@ TUI（任务视图 / 任意视图都认 `task`）：
 | `task modify <id> <field> <新值>` | 改任意字段 |
 | `task select <id>` | 选中任务（`task assign <session>` 的默认目标） |
 | `task assign [<任务ID>] <session ID>` | 先挂 Focusmate，成功后落本地 |
-| `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档 |
+| `task repeat <id> <周几@HH:MM\|off>` | 设置 / 取消每周重复 |
+| `task create ... --repeat 周几@HH:MM` | 一步建「每周重复任务」 |
+| `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
 
 CLI：`python3 task_store.py list|create|delete|modify|show|reconcile`。
+
+## 每周重复任务（repeated task）
+
+抽象出来的一层：任务可以带一个 `repeat`，描述「周几 + 起点 + 锚定时长」。
+
+```json
+"repeat": {"weekday": 0, "weekday_label": "mon", "start": "22:15",
+           "duration": 50, "created_at": "...",
+           "occurrences": {"2026-10-26": {"session": {...}, "focusmate": {...}}}}
+```
+
+- **只支持每周重复**：设在周一 22:15，就只影响周一那一场；周二周三不受影响。
+- 落点判据是「同一星期几 + 同一时刻 + 同一时长」：
+  `task_store.repeat_occurrence(task, day, sessions)`。
+- 所以**排布被改了，这一周就不落**：50 拆成 25+25 之后，两场 session 的时长都不是
+  50，重复任务在这一周消失 —— 但 `repeat` 设置本身一个字不改，下一周照旧。
+- `task sync` 会把落上的那一场挂到 Focusmate（`add_task` 复核成功才写本地），
+  并把 `occurrences[日期]` 记下来；完成时间同样从 `completedAt` 归档。
+- 界面上这一行的 task 列会带 `🔁` 前缀（说明它是重复任务自动挂上的，不是手 assign 的）。
 
 ## Focusmate 集成
 
