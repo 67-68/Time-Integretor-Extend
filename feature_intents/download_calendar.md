@@ -8,12 +8,18 @@
 ## 数据流
 
 ```
-iCloud 日历 ──CalDAV──▶ 事件 ──过滤/切分──▶ 一周 session 计划 ──▶ data.csv
-                                              └──▶ temp/calendar.md（给人看的中间产物）
+iCloud 日历（只下载 工作 + 空闲）
+  ──CalDAV──▶ 事件 ──▶ temp/calendar-download.json（原始事件 + T1/T2 时段）
+                              ├──▶ temp/calendar.md（人读版）
+                              └──▶ temp/session-layouts.json（每段自定义排布）
+                                        └──▶ data.csv（精确日期行）
+
+TUI：session T1 50 50 / period T1 25 25 25 25
 ```
 
 `data.csv` 是 `keep_session.py`（每天 check）唯一的目标来源。两者解耦：
-日历变了就手动重跑 `populate`，daemon 不关心日历，只读 csv。
+日历变了就手动重跑 `download` + `populate`，daemon 不关心日历，只读 csv。
+实现细节见 [`session_plan.md`](./session_plan.md)。
 
 ## 切分规则
 
@@ -86,11 +92,17 @@ iCloud 的密码必须是 **App 专用密码**（appleid.apple.com → 登录与
 | `install-deps` | 把 caldav 装到 `temp/pylibs` |
 | `login` / `logout` | 存/删凭据（login 会当场连一次验证并列出日历） |
 | `status [--live]` | 看依赖版本 / 配置（密码打码）/ 产物；`--live` 真连一次列日历 |
-| `fetch` | 只拉日历出 `temp/calendar.md`，不碰 `data.csv` |
-| `populate` | 拉 → 切 → 写 `data.csv`（**一次性，只手动触发**） |
+| `fetch` / `download` | 只下载 工作+空闲 → 中间层 JSON + `calendar.md`，不碰 `data.csv` |
+| `populate` | 下载层 + 时段 layout → `data.csv`（**一次性，只手动触发**） |
+| `populate --from-download` | 复用已有下载层，不联网 |
+| `layout T1 50 50` | 改一个时段的排布；超时/非法时长直接报错，零副作用 |
+| `show` | 打印所有时段和当前 session 排布 |
 
-通用选项：`--days 7`、`--start YYYY-MM-DD`、`--ignore`、`--use`、
-`--include-all-day`、`--md PATH`、`--dry-run`；`populate` 另有 `--force` / `--no-md`。
+通用选项：`--days 8`（今天 + 之后 7 天）、`--start YYYY-MM-DD`、
+`--profiles 工作 空闲`、`--layouts PATH`、`--download-json PATH`、
+`--include-all-day`、`--md PATH`、`--dry-run`；`populate` 另有
+`--from-download` / `--force` / `--no-md`。`--ignore` / `--use` 只在
+日历里没有目标 profile 的旧模式回退时使用。
 
 **离线模式**：`--ics a.ics`（可重复给多个，用来看多个分组）直接从本地 `.ics`
 读，不联网。分组名取 `X-WR-CALNAME`，没有就用文件名。测试和排查都靠它。

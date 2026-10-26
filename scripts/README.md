@@ -174,3 +174,16 @@ stdout   {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 - 别加并发、别缩短间隔。账号安全 > 自动化便利。
 - 与 MCP 共用 profile，跑完浏览器会自动关；异常退出可能留锁，
   清掉 `~/.focusmate-mcp/browser-data/SingletonLock` 再试。
+
+
+## Warden bridge 新增命令（任务系统）
+
+常驻桥 `scripts/bridge.mjs` 除了 title/mute/cancel，还提供：
+
+| 命令 | 作用 |
+|---|---|
+| `tasks` | `GET /v1/tasks`，返回 task 的 id/title/completedAt/attachments |
+| `add_task` | 给某场 session 建 Focusmate task（DOM：Add task → 填 → Create task），再用 API 复核 attachment |
+
+Warden 的 `task assign` 只会在 `add_task` 返回 `verified=true` 后写本地任务，
+不会出现「本地以为挂上了、Focusmate 其实没有」的假成功。

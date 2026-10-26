@@ -110,6 +110,31 @@ def normalize_weekday(raw):
     return WEEKDAY_ALIASES.get(v)
 
 
+def parse_iso_date(raw):
+    """'2026-10-26' → datetime.date；不是合法精确日期返回 None。"""
+    s = (raw or "").strip()
+    if len(s) != 10:
+        return None
+    try:
+        return datetime.date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def normalize_day(raw):
+    """星期几 / * / 精确日期 → (kind, value)。
+
+    这是 data.csv 同时支持「按星期几循环」和「只生效一次的精确日期」的入口。
+    """
+    day = parse_iso_date(raw)
+    if day is not None:
+        return "date", day.isoformat()
+    norm = normalize_weekday(raw)
+    if norm is not None:
+        return "weekday", norm
+    return None
+
+
 def parse_hhmm(raw):
     """严格的 HH:MM → (hour, minute)；不合法返回 None。"""
     s = (raw or "").strip()
@@ -178,8 +203,10 @@ def key_of(day, slot_or_start):
 def parse_text(text, weekday=None, filename="data.csv"):
     """解析整个文件内容。
 
-    weekday 非 None 时只留「该星期几 + 每天」的行（daemon 老接口用得上）。
-    返回 (slots, warnings)；slots 按 (weekday 顺序, 时间) 排好序。
+    每行支持 ``weekday,HH:MM,duration``（旧的循环规则），也支持
+    ``YYYY-MM-DD,HH:MM,duration``（只生效一次的精确日期，日历一周计划用这个）。
+    ``weekday`` 非 None 时只留「该星期几 + 每天 + 该星期几的日期行」的行
+    （daemon 老接口用得上）。返回 (slots, warnings)；slots 已排序。
     """
     slots = []
     warnings = []
@@ -192,8 +219,8 @@ def parse_text(text, weekday=None, filename="data.csv"):
         if len(parts) == 3:
             day, hhmm, duration = parts[0], parts[1], parts[2]
         elif len(parts) == 2:
-            if normalize_weekday(parts[0]) is not None and parse_hhmm(parts[0]) is None:
-                # "mon,11:15-12:05" / "mon,11:15"：星期几 + 时间（时长可由区间给出）
+            # 第一个 token 可能星期几、也可能是精确日期；不是就默认「每天」。
+            if normalize_day(parts[0]) is not None and parse_hhmm(parts[0]) is None:
                 day, hhmm, duration = parts[0], parts[1], None
             else:
                 day, hhmm, duration = "*", parts[0], parts[1]
@@ -201,14 +228,19 @@ def parse_text(text, weekday=None, filename="data.csv"):
             # "11:15-12:05"：每天，区间自带时长
             day, hhmm, duration = "*", parts[0], None
         else:
-            warnings.append("%s:%d 格式不对（要 [weekday,]HH:MM,duration 或 [weekday,]HH:MM-HH:MM），已跳过: %r"
+            warnings.append("%s:%d 格式不对（要 [weekday|YYYY-MM-DD,]HH:MM,duration "
+                            "或 [weekday|YYYY-MM-DD,]HH:MM-HH:MM），已跳过: %r"
                             % (filename, lineno, raw.strip()))
             continue
-        norm = normalize_weekday(day)
-        if norm is None:
-            warnings.append("%s:%d 星期几认不出来（要 mon..sun / 周一..周日 / *），已跳过: %r"
-                            % (filename, lineno, raw.strip()))
+        nd = normalize_day(day)
+        if nd is None:
+            warnings.append("%s:%d 日期/星期几认不出来（要 mon..sun / 周一..周日 / * / "
+                            "YYYY-MM-DD），已跳过: %r" % (filename, lineno, raw.strip()))
             continue
+        kind, norm = nd
+        date_iso = norm if kind == "date" else None
+        wd = (WEEKDAYS[datetime.date.fromisoformat(date_iso).weekday()]
+              if date_iso else norm)
         rng = parse_hhmm_range(hhmm)
         if rng is not None:
             hhmm, range_duration = rng
@@ -231,21 +263,36 @@ def parse_text(text, weekday=None, filename="data.csv"):
         if duration not in DURATIONS:
             warnings.append("%s:%d 时长只能是 25/50/75，已跳过: %r" % (filename, lineno, duration))
             continue
-        if weekday is not None and norm not in ("*", weekday):
+        if weekday is not None and wd not in ("*", weekday):
             continue
-        key = (norm, hhmm)
+        key = (kind, norm, hhmm)
         if key in seen:
             warnings.append("%s:%d 重复的 %s %s，已跳过" % (filename, lineno, norm, hhmm))
             continue
         seen.add(key)
         got = parse_hhmm(hhmm)                  # 到这里 hhmm 一定是规范的 HH:MM
-        slots.append({"weekday": norm, "start": hhmm, "duration": duration,
-                      "hour": got[0], "minute": got[1], "lineno": lineno,
-                      "raw": raw.rstrip("\n")})
-    slots.sort(key=lambda s: (WEEKDAYS.index(s["weekday"]) if s["weekday"] in WEEKDAYS else -1,
-                              s["hour"], s["minute"]))
+        slot = {"weekday": wd, "start": hhmm, "duration": duration,
+                "hour": got[0], "minute": got[1], "lineno": lineno,
+                "raw": raw.rstrip("\n")}
+        if date_iso:
+            slot["date"] = date_iso
+            slot["day_kind"] = "date"
+        else:
+            slot["date"] = None
+            slot["day_kind"] = "weekday"
+        slots.append(slot)
+    slots.sort(key=slot_sort_key)
     return slots, warnings
 
+
+def slot_sort_key(slot):
+    """精确日期行按日期；旧的 weekday 行保持原来的排序（每天 → mon..sun）。"""
+    date_iso = slot.get("date")
+    if date_iso:
+        return (1, date_iso, slot.get("hour", 0), slot.get("minute", 0))
+    wd = slot.get("weekday")
+    return (0, WEEKDAYS.index(wd) if wd in WEEKDAYS else -1,
+            slot.get("hour", 0), slot.get("minute", 0))
 
 def read_text(path=None):
     """读 data.csv；读不到返回空字符串（第一次跑就是这种状态）。"""
@@ -356,12 +403,28 @@ def remove_relocation(day, from_hhmm, path=None):
 
 
 def _day_slots_raw(entries, day):
-    """某一天**没有临时挪动时**的契约：星期几匹配 + 每天，按时间排序、同时刻只留一条。"""
+    """某一天**没有临时挪动时**的契约。
+
+    精确日期行只在日期完全相等时生效；旧的 weekday 行仍按「该星期几 + 每天」匹配。
+    同一时刻只留一条：**精确日期优先于循环规则**，同优先级按文件顺序先到先得。
+    """
     wd = weekday_of_day(day)
-    out, used = [], set()
+    iso = day.isoformat()
+    exact, recurring = [], []
     for slot in entries:
-        if slot["weekday"] not in ("*", wd):
+        if slot.get("date"):
+            if slot["date"] == iso:
+                exact.append(slot)
+        elif slot["weekday"] in ("*", wd):
+            recurring.append(slot)
+
+    out, used = [], set()
+    for slot in exact:
+        if slot["start"] in used:
             continue
+        used.add(slot["start"])
+        out.append(slot)
+    for slot in recurring:
         if slot["start"] in used:
             continue
         used.add(slot["start"])
@@ -470,21 +533,32 @@ def fmt_row(weekday, hhmm, duration):
     return "%s,%s,%s" % (weekday, hhmm, duration)
 
 
-def _row_sort_key(weekday, hhmm):
+def _row_sort_key(day_token, hhmm):
     got = parse_hhmm(hhmm) or (0, 0)
-    return (WEEKDAYS.index(weekday) if weekday in WEEKDAYS else -1, got[0], got[1])
+    day = parse_iso_date(day_token)
+    if day is not None:
+        return (0, day.isoformat(), got[0], got[1])
+    wd = normalize_weekday(day_token)
+    return (1, WEEKDAYS.index(wd) if wd in WEEKDAYS else -1, got[0], got[1])
 
 
 def add_row(path=None, weekday="*", hhmm="", duration="50"):
-    """插一行（按 weekday+时间排好序插进去，保持文件整洁）。
+    """插一行（按日期/星期几 + 时间排序插进去，保持文件整洁）。
 
+    weekday 可以是 mon..sun / * / 周一..周日，也可以是精确日期 YYYY-MM-DD。
     hhmm 可以是 'HH:MM'，也可以是 'HH:MM-HH:MM' 区间（区间自带时长，覆盖 duration）。
     返回插到了第几行（1 起）。参数不合法 / 已存在 → ValueError（给 TUI 直接显示）。
     """
     path = data_csv_path(path)
-    norm = normalize_weekday(weekday)
-    if norm is None:
-        raise ValueError("星期几认不出来：%r（要 mon..sun / 周一..周日 / *）" % weekday)
+    nd = normalize_day(weekday)
+    if nd is None:
+        raise ValueError("日期/星期几认不出来：%r（要 mon..sun / 周一..周日 / * / YYYY-MM-DD）"
+                         % weekday)
+    kind, norm = nd
+    day_token = norm
+    weekday_value = (WEEKDAYS[datetime.date.fromisoformat(norm).weekday()]
+                     if kind == "date" else norm)
+    norm_weekday = weekday_value
     rng = parse_hhmm_range(hhmm)
     if rng is not None:
         hhmm, duration = rng                     # 区间自带时长（如 11:15-12:05 → 50）
@@ -504,11 +578,14 @@ def add_row(path=None, weekday="*", hhmm="", duration="50"):
     lines = read_text(path).splitlines()
     entries, _ = parse_text("\n".join(lines), filename=os.path.basename(path))
     for slot in entries:
-        if slot["weekday"] == norm and slot["start"] == hhmm:
-            raise ValueError("data.csv 第 %d 行已经有 %s %s 了" % (slot["lineno"], norm, hhmm))
+        same_day = (slot.get("date") == day_token if kind == "date"
+                    else (not slot.get("date") and slot["weekday"] == norm_weekday))
+        if same_day and slot["start"] == hhmm:
+            raise ValueError("data.csv 第 %d 行已经有 %s %s 了"
+                             % (slot["lineno"], day_token, hhmm))
 
-    new = fmt_row(norm, hhmm, duration)
-    want = _row_sort_key(norm, hhmm)
+    new = fmt_row(day_token, hhmm, duration)
+    want = _row_sort_key(day_token, hhmm)
     insert_at = len(lines)
     for idx, raw in enumerate(lines):
         body = raw.split("#", 1)[0].strip()
@@ -516,13 +593,15 @@ def add_row(path=None, weekday="*", hhmm="", duration="50"):
             continue
         parts = [p.strip() for p in body.split(",")]
         if len(parts) == 2:
-            day, hh = "*", parts[0]
+            if normalize_day(parts[0]) is not None and parse_hhmm(parts[0]) is None:
+                day, hh = parts[0], parts[1]
+            else:
+                day, hh = "*", parts[0]
         elif len(parts) == 3:
             day, hh = parts[0], parts[1]
         else:
             continue
-        day = normalize_weekday(day)
-        if day is None or parse_hhmm(hh) is None:
+        if normalize_day(day) is None or parse_hhmm(hh) is None:
             continue
         if _row_sort_key(day, hh) > want:
             insert_at = idx

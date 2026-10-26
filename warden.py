@@ -14,9 +14,10 @@
 
 视图（Tab 切换）
 ----------------
-按 **Tab** 在多个视图间循环切换，视图显示在命令提示上面。现有三个：
+按 **Tab** 在多个视图间循环切换，视图显示在命令提示上面。现有四个：
 
-1. **契约**（默认）：上面那套表格 + 命令。
+1. **契约**（默认）：时段 / session / 任务表 + 命令。前面四列是日历下载层的
+   时段 ID / 时段 / 类型 / 名称；同一时段只有第一行显示，后续行留空。
 2. **专注**：目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态；
    `stop` = 消耗一次暂停，**Shift+Tab** = 循环普通 / 做题 / 写作模式。
 3. **统计**：生涯累计（总场次 / 每天平均 / 空天 / 峰值 / 中位数与 p25）/ 按月 /
@@ -24,6 +25,9 @@
    平常视图不铺开）。取数与口径在 `stats.py`（只读公开 API，1 小时缓存）；
    任意视图敲 `stat` 都能切过去；`stat refresh` 立刻增量刷新（只拉缺口 + 最近几天，
    不是把两千多条重拉一遍），`stat refresh full` 才是全量重拉；缓存新鲜时一次网络都不打。
+4. **任务**：本地 JSON 任务库（字段不校验）+ 挂到 session + Focusmate 完成归档。
+   `task create/delete/modify/assign/select/sync`；`task assign` 成功后才写本地，
+   Focusmate 侧 task id / completedAt 都会记回来。
 
 视图可扩展：继承 `View` + `@register_view` 即可；每个视图用 `commands()` 声明自己
 认哪些命令、用 `idle_hint()` 声明空闲提示，`to_view()` 把它交给 `repl_kit`。
@@ -179,6 +183,8 @@ except ImportError:
 
 import keep_session as ks  # noqa: E402  只用来读 daemon 状态 / 起停 daemon / 罪与判决
 import schedule as sch  # noqa: E402  data.csv 的解析与编辑（唯一实现）
+import session_plan as sp  # noqa: E402  日历下载层 / 时段 layout / 精确日期 csv
+import task_store as ts  # noqa: E402  本地任务库 + Focusmate 完成归档
 import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + 算数字 + 缓存
 
 BRIDGE_JS = os.path.join(HERE, "scripts", "bridge.mjs")
@@ -565,6 +571,29 @@ def _hint_stat(parts):
                          note="默认走 1 小时缓存")
 
 
+def _hint_period(parts):
+    if len(parts) >= 2:
+        return repl_kit.Hint("时长", ("25", "50", "75"), note="可连续给多个；超时就报错")
+    return repl_kit.Hint("参数", ("T1", "50", "50"), note="按 25/50/75 排这个时段")
+
+
+def _hint_task(parts):
+    if not parts:
+        return repl_kit.Hint("动作", ("create", "delete", "modify", "assign", "select", "sync"),
+                             note="字段随便写，不校验")
+    action = parts[0].lower() if len(parts) else ""
+    if action == "create":
+        return repl_kit.Hint("参数", ("[id]", "key=value..."), note="不给 id 就自动编号")
+    if action in ("delete", "select"):
+        return repl_kit.Hint("参数", ("<任务 ID>",))
+    if action == "modify":
+        return repl_kit.Hint("参数", ("<任务 ID>", "<字段>", "<新值>"), note="字段不校验")
+    if action == "assign":
+        return repl_kit.Hint("参数", ("<session ID>",),
+                             note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
+    return repl_kit.Hint("参数", ("create", "delete", "modify", "assign", "select", "sync"))
+
+
 class View(object):
     """一个视图 = 一套命令 + 一块看板 + 一行状态。
 
@@ -617,6 +646,11 @@ class View(object):
                  options=("refresh", "full"), hint=_hint_stat),
             _cmd("status", lambda a: None, "只重画看板", ("s",), "通用",
                  usage="status", hint=_hint_actions("status", note="只重画看板")),
+            _cmd("task", w.cmd_task,
+                 "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
+                 usage="task <create|delete|modify|assign|select|sync> ...",
+                 options=("create", "delete", "modify", "assign", "select", "sync"),
+                 hint=_hint_task),
         ]
 
     def build_registry(self):
@@ -671,8 +705,8 @@ class ContractView(View):
     def idle_hint(self):
         return repl_kit.Hint(
             "命令",
-            ("session", "cancel", "mute", "title", "day", "sync", "help", "quit"),
-            note="Tab 切专注视图",
+            ("session", "period", "cancel", "mute", "title", "day", "sync", "help", "quit"),
+            note="Tab 切下一个视图（专注 → 统计 → 任务）",
         )
 
     def render(self):
@@ -696,10 +730,15 @@ class ContractView(View):
                  usage="day <-1|0|1|YYYY-MM-DD>",
                  options=("-1", "0", "1"),
                  hint=_hint_day),
-            _cmd("session", w.cmd_session, "创建一场：HH:MM LEN 或 HH:MM-HH:MM",
-                 usage="session <HH:MM> <25|50|75>",
+            _cmd("session", w.cmd_session,
+                 "创建一场，或按时段排布：session HH:MM LEN / session T1 50 50",
+                 usage="session <HH:MM> <25|50|75> | session <T1> [25|50|75 ...]",
                  options=("25", "50", "75"),
                  hint=_hint_session),
+            _cmd("period", w.cmd_period_layout,
+                 "改一个时段的 session 排布：period T1 50 50",
+                 usage="period <T1> [25|50|75 ...]", options=("25", "50", "75"),
+                 hint=_hint_period),
             _cmd("relocate", w.cmd_relocate, "临时把 #N 提前/推后：relocate N ±MM",
                  usage="relocate <n> ±MM",
                  options=("-30", "-15", "+15", "+30"),
@@ -999,6 +1038,121 @@ class StatsView(View):
 
 
 
+@register_view
+class TaskView(View):
+    """任务视图：本地 JSON 任务库 + 挂到 session + Focusmate 完成归档。
+
+    命令统一以 ``task`` 开头（需求里的语法）：::
+
+        task create [id] [field=value ...]
+        task delete <id>
+        task modify <id> <field> <新值>
+        task assign <session ID>            # 默认当前选中的任务
+        task assign <任务 ID> <session ID>  # 显式指定
+        task select <id>
+        task sync                           # GET /v1/tasks → 把 completedAt 归档
+
+    任务字段不校验：想记 due / priority / notes / 任何 key 都行。
+    给 session 挂任务时会**自动**走 bridge 在 Focusmate 那一场建同名 task，
+    成功后才把 Focusmate 的 task id 记回本地，失败就什么都不写。
+    """
+
+    key = "4"
+    name = "任务"
+    label = "任务 / 归档"
+
+    def idle_hint(self):
+        return repl_kit.Hint(
+            "命令", ("task create", "task delete", "task modify", "task assign", "task sync"),
+            note="字段不校验 · Tab 切视图",
+        )
+
+    def status_line(self):
+        return None
+
+    def unknown_hint(self):
+        return ("「任务」视图认 task create/delete/modify/assign/select/sync；"
+                "Shift+Tab 切回去再干别的。")
+
+    def commands(self):
+        w = self.w
+        return [
+            _cmd("refresh", lambda a: w.cmd_task_sync(quiet=False),
+                 "拉 GET /v1/tasks，把已完成任务的 completedAt 归档",
+                 ("r", "reload"), usage="refresh",
+                 hint=_hint_actions("refresh", note="同步 Focusmate task 完成时间")),
+        ]
+
+    def render(self):
+        w = self.w
+        tasks = w.task_store.list()
+        selected = w.selected_task_id
+        if not tasks:
+            return Panel(
+                Text("还没有任务。\n"
+                     "  task create title=写论文 due=明天\n"
+                     "  task create 3 title=复习数学          ← 显式 ID\n"
+                     "  task modify 3 due 后天\n"
+                     "  task assign 2                        ← 挂到表格里的 #2 session",
+                     style="dim"),
+                title="[bold]Task · 任务[/]", border_style="magenta", box=box.ROUNDED)
+
+        keys = []
+        for t in tasks:
+            for k in (t.get("fields") or {}):
+                if k not in keys:
+                    keys.append(k)
+        t = Table(title="Task · 本地 JSON 任务库", box=box.SIMPLE_HEAVY,
+                  header_style="bold magenta", title_justify="left", expand=False)
+        t.add_column("ID", justify="right", style="bold", no_wrap=True)
+        t.add_column("session", no_wrap=True)
+        t.add_column("Focusmate", no_wrap=True)
+        t.add_column("完成时间", no_wrap=True)
+        for k in keys:
+            t.add_column(str(k), no_wrap=True, overflow="crop")
+        if not keys:
+            t.add_column("内容", no_wrap=True, overflow="crop")
+        for task in tasks:
+            style = "bold reverse" if task.get("id") == selected else ""
+            sess = task.get("session") or {}
+            sess_txt = ("%s %s" % (sess.get("date") or "?", sess.get("start") or "?"
+                                  )) if sess else "—"
+            fm = task.get("focusmate") or {}
+            fm_txt = fm.get("task_id") or "—"
+            done = fm.get("completed_at") or "—"
+            vals = []
+            if keys:
+                for k in keys:
+                    vals.append(w.task_store._one_line((task.get("fields") or {}).get(k)))
+            else:
+                vals.append(w.task_store.summarize(task))
+            t.add_row(str(task["id"]), Text(sess_txt, style=style),
+                      Text(fm_txt, style=style), Text(done, style=style),
+                      *[Text(v, style=style) for v in vals])
+
+        out = [t]
+        arch = w.task_store.load_archive().get("records") or []
+        at = Table.grid(padding=(0, 1))
+        at.add_column(style="dim", no_wrap=True)
+        at.add_column(no_wrap=True)
+        at.add_column(style="dim")
+        if not arch:
+            at.add_row("", Text("（还没有完成归档；task sync 会读 GET /v1/tasks 的 "
+                                "completedAt）", style="dim"))
+        for rec in arch[-8:]:
+            fm = rec.get("focusmate") or {}
+            sess = rec.get("session") or {}
+            at.add_row(
+                "· " + str(rec.get("task_id") or "?"),
+                "%s ← %s %s" % (str(fm.get("completed_at") or "?"),
+                                sess.get("date") or "?", sess.get("start") or "?"),
+                (rec.get("fields") or {}).get("title") or
+                w.task_store._one_line(rec.get("fields"))[:60])
+        out.append(Panel(at, title="[bold]Task Archive · 完成归档[/]",
+                         border_style="dim", box=box.ROUNDED))
+        return out
+
+
 # ---------------------------------------------------------------- 输入（Tab 切视图 / 原地刷新）
 
 
@@ -1079,6 +1233,13 @@ class Warden(object):
         self.stat = None
         self.stat_note = ""
         self.stat_at = None         # 内存里这份统计是什么时候拿的（超 TTL 就重拉）
+        # 任务系统：本地 JSON + 第四视图。selected_task_id 是 task assign 的默认目标。
+        self.task_store = ts.TaskStore()
+        self.selected_task_id = None
+        self.task_sync_at = 0.0
+        # 日历下载层 / 时段 layout：每次 frame 重新读（人手可能刚改过）
+        self.download = sp.load_download()
+        self.layouts = sp.load_layouts()
         # 提示行 / 补全 / 视图切换 / 状态行的定时刷新 / 帧的擦除重画，
         # 全部交给 repl_kit（prompt_toolkit 按单元格 diff，只写变化的那几格）。
         shell_kwargs = dict(
@@ -1109,6 +1270,54 @@ class Warden(object):
         self.entries, self.entry_warnings = sch.load_entries()
         self.csv_fp = sch.fingerprint()
         return self.entries
+
+    def reload_periods(self):
+        """重读日历下载层 + 时段 layout（T1/T2 和每段的 session 起点）。"""
+        self.download = sp.load_download()
+        self.layouts = sp.load_layouts()
+        return self.download
+
+    def periods_for_day(self, day=None):
+        return sp.periods_for_date(self.download, day or self.sel_date)
+
+    def period_first_start(self, period):
+        """这个时段第一场 session 的 HH:MM；没排出来就是 None。"""
+        try:
+            sessions = sp.sessions_for_period(period, self.layouts)
+        except ValueError:
+            return None
+        return sessions[0]["start"] if sessions else None
+
+    def task_for_session(self, day, start):
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        for task in self.task_store.list():
+            sess = task.get("session") or {}
+            if sess.get("date") == iso and sess.get("start") == start:
+                return task
+        return None
+
+    def attach_period_info(self, row, day=None):
+        """给一行表格补上「时段 ID / 时段 / 类型 / 名称 / task」。"""
+        day = day or self.sel_date
+        period = sp.period_for_session(self.periods_for_day(day), row.get("startLabel"))
+        if period:
+            row["period"] = dict(period)
+            row["period_id"] = period.get("id")
+            first = self.period_first_start(period)
+            # 需求：同一时段的第一行显示 T1/时段/类型/名称，后续行留空。
+            row["period_first"] = bool(first is None or first == row.get("startLabel"))
+        else:
+            row["period"] = None
+            row["period_id"] = None
+            row["period_first"] = False
+        task = self.task_for_session(day, row.get("startLabel"))
+        if task:
+            row["task"] = task
+            row["task_text"] = self.task_store.summarize(task)
+        else:
+            row["task"] = None
+            row["task_text"] = ""
+        return row
 
     def plan_rows_for(self, day):
         return sch.day_slots(self.entries, day)
@@ -1221,9 +1430,17 @@ class Warden(object):
         return None
 
     def enter_view(self):
-        """进视图时的懒加载：第一次进统计视图就把数据拉上（之后走内存/磁盘缓存）。"""
+        """进视图时的懒加载：统计拉数；任务视图第一次进时同步完成时间。"""
         if isinstance(self.view, StatsView) and self.stat is None:
             self.cmd_stat()
+        elif isinstance(self.view, TaskView) and not self.offline:
+            has_fm = any((t.get("focusmate") or {}).get("task_id")
+                         for t in self.task_store.list())
+            if has_fm and time.time() - self.task_sync_at > 60:
+                try:
+                    self.cmd_task_sync(quiet=True)
+                except Exception as e:                    # noqa: BLE001
+                    self.say("任务完成时间同步失败（不影响本地任务）：%s" % e, "warn")
 
     def cmd_stat(self, force=False, full=False):
         """拉生涯统计：stats.load 走缓存 + 增量刷新；失败不掀 TUI。
@@ -1356,6 +1573,7 @@ class Warden(object):
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         now = datetime.datetime.now()
         day = self.sel_date
+        self.reload_periods()
         plan = self.plan_rows_for(day)
         plan_labels = set(s["start"] for s in plan)
         api_by_label = {}
@@ -1391,6 +1609,7 @@ class Warden(object):
             else:
                 row["contract"] = "%s,%s,%s" % (slot["weekday"], slot["start"], slot["duration"])
             row["zone"] = sch.zone_name(start, now)
+            row["date"] = day.isoformat()
             rows.append(row)
 
         for r in self.api_rows:
@@ -1403,9 +1622,19 @@ class Warden(object):
             row["raw"] = ""
             row["contract"] = ""
             row["zone"] = sch.zone_name(start, now)
+            row["date"] = start.date().isoformat()
             rows.append(row)
 
         rows.sort(key=lambda r: r["startMs"])
+        for row in rows:
+            try:
+                self.attach_period_info(row, datetime.date.fromisoformat(row["date"]))
+            except (KeyError, ValueError):
+                row.setdefault("period", None)
+                row.setdefault("period_id", None)
+                row.setdefault("period_first", False)
+                row.setdefault("task", None)
+                row.setdefault("task_text", "")
         self.rows = rows
 
     def _fallback_rows(self, why):
@@ -1587,19 +1816,26 @@ class Warden(object):
             else:
                 title += "  [yellow](快照)[/]"
 
+        if not self.rows:
+            empty = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold magenta",
+                          title_justify="left", expand=False)
+            empty.add_column("状态")
+            empty.add_row("（这天上既没有契约、也没有 session）")
+            return empty
         t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold magenta",
                   title_justify="left", expand=False)
+        t.add_column("时段 ID", no_wrap=True)
+        t.add_column("时段", no_wrap=True)
+        t.add_column("时段类型", no_wrap=True)
+        t.add_column("时段名称", no_wrap=True, overflow="crop")
         t.add_column("ID", justify="right", style="bold", no_wrap=True)
         t.add_column("时间", no_wrap=True)
         t.add_column("时长", justify="right", no_wrap=True)
         t.add_column("状态", no_wrap=True)
         t.add_column("静音", justify="center", no_wrap=True)
         t.add_column("契约", no_wrap=True)
-        t.add_column("标题", overflow="fold")
-
-        if not self.rows:
-            t.add_row("-", "-", "-", "（这天上既没有契约、也没有 session）", "-", "-", "")
-            return t
+        t.add_column("标题", overflow="crop", no_wrap=True)
+        t.add_column("task", no_wrap=True, overflow="crop")
 
         live_idx = None
         for i, r in enumerate(self.rows):
@@ -1641,7 +1877,20 @@ class Warden(object):
             if r.get("matched"):
                 # 注意：Text.append **不解析 markup**，所以要给 style 而不是塞 "[cyan]…[/]"
                 label.append("  · 已匹配", style="cyan")
+            period = r.get("period") or {}
+            first = bool(r.get("period_first"))
+            pid = period.get("id") if first else ""
+            pspan = ("%s–%s" % (period.get("start"), period.get("end"))
+                     if first and period else "")
+            ptype = (period.get("type") or period.get("calendar") or "") if first else ""
+            pname = (period.get("name") or period.get("title") or "") if first else ""
+            task_text = r.get("task_text") or ""
+            task_cell = Text(task_text, style="bold green" if task_text else "dim")
             t.add_row(
+                Text(pid or "", style="bold magenta"),
+                Text(pspan, style="cyan"),
+                Text(ptype, style="cyan"),
+                Text(pname, style="cyan"),
                 str(idx),
                 "%s–%s" % (r["startLabel"], r.get("endLabel") or "?"),
                 ("%dmin" % dur) if dur else "?",
@@ -1649,6 +1898,7 @@ class Warden(object):
                 qtxt,
                 Text(r.get("contract") or "—", style="dim"),
                 label,
+                task_cell,
             )
         return t
 
@@ -2022,6 +2272,159 @@ class Warden(object):
             self.refresh(quiet=True)
         return True
 
+    # -- 任务系统 ------------------------------------------------------
+
+    def cmd_task(self, args):
+        """TaskView 的唯一入口：task <create|delete|modify|assign|select|sync|list> ..."""
+        toks = [str(a) for a in args]
+        if not toks:
+            raise ValueError("用法：task create/delete/modify/assign/select/sync ...")
+        action = toks[0].lower()
+        rest = toks[1:]
+        if action == "create":
+            return self.cmd_task_create(rest)
+        if action == "delete":
+            return self.cmd_task_delete(rest)
+        if action == "modify":
+            return self.cmd_task_modify(rest)
+        if action == "assign":
+            return self.cmd_task_assign(rest)
+        if action == "select":
+            return self.cmd_task_select(rest)
+        if action in ("sync", "refresh", "reconcile"):
+            return self.cmd_task_sync(quiet=False)
+        if action in ("list", "ls", "show"):
+            self.say("任务 %d 条；看本视图表格即可。" % len(self.task_store.list()), "info")
+            return False
+        raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/sync）" % action)
+
+    def cmd_task_create(self, args):
+        """task create [id] [key=value ...] —— 字段不校验；给了 id 就用它。"""
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        explicit = None
+        if toks and re.match(r"^\d+$", toks[0]) and "=" not in toks[0]:
+            explicit = int(toks[0])
+            toks = toks[1:]
+        fields, loose = {}, []
+        for tok in toks:
+            if "=" in tok:
+                key, value = tok.split("=", 1)
+                if key:
+                    fields[key] = value
+            else:
+                loose.append(tok)
+        if loose:
+            fields.setdefault("title", " ".join(loose))
+        task = self.task_store.create(fields, task_id=explicit)
+        self.selected_task_id = task["id"]
+        self.say("✅ 任务 %d 已创建（字段：%s）"
+                 % (task["id"], self.task_store.summarize(task) or "空"), "ok")
+        return task
+
+    def cmd_task_delete(self, args):
+        if not args:
+            raise ValueError("用法：task delete <任务 ID>")
+        task = self.task_store.delete(args[0])
+        if self.selected_task_id == task["id"]:
+            self.selected_task_id = None
+        self.say("✅ 已删除任务 %d：%s" % (task["id"], self.task_store.summarize(task)), "ok")
+        return True
+
+    def cmd_task_modify(self, args):
+        if len(args) < 3:
+            raise ValueError("用法：task modify <任务 ID> <字段> <新值>")
+        task_id, field = args[0], args[1]
+        value = " ".join(str(x) for x in args[2:])
+        task = self.task_store.modify(task_id, field, value)
+        self.say("✅ 任务 %d.%s = %r" % (task["id"], field, value), "ok")
+        return task
+
+    def cmd_task_select(self, args):
+        if not args:
+            raise ValueError("用法：task select <任务 ID>")
+        task = self.task_store.get(args[0])
+        self.selected_task_id = task["id"]
+        self.say("已选中任务 %d：%s" % (task["id"], self.task_store.summarize(task)), "cmd")
+        return task
+
+    def _task_for_assign(self):
+        if self.selected_task_id is not None:
+            try:
+                return self.task_store.get(self.selected_task_id)
+            except ValueError:
+                self.selected_task_id = None
+        tasks = self.task_store.list()
+        if not tasks:
+            raise ValueError("还没有任务：先 task create ...")
+        # 没选中时默认最近创建的那条。想精确指定就 task select / assign <任务ID> <sessionID>。
+        task = tasks[-1]
+        self.selected_task_id = task["id"]
+        return task
+
+    def cmd_task_assign(self, args):
+        """task assign <session ID>（默认当前任务）或 task assign <任务ID> <session ID>。
+
+        写入顺序：先在 Focusmate 给那一场建 task 并复核，成功后才落本地；
+        失败不产生半截 assignment。
+        """
+        if not args:
+            raise ValueError("用法：task assign <session ID>（先 task select/create）")
+        if len(args) >= 2:
+            task = self.task_store.get(args[0])
+            session_token = args[1]
+        else:
+            task = self._task_for_assign()
+            session_token = args[0]
+        session_idx, row = self.pick(session_token)
+        if row.get("id") is None:
+            raise ValueError("session #%d 还没有 Focusmate session id（没订上/快照），"
+                             "不能挂 task。先 refresh 成功一次。" % session_idx)
+        date_iso = row.get("date") or self.sel_date.isoformat()
+        session = {
+            "index": session_idx,
+            "date": date_iso,
+            "start": row.get("startLabel"),
+            "end": row.get("endLabel"),
+            "duration": row.get("durationMin"),
+            "focusmate_session_id": row.get("id"),
+        }
+        fields = task.get("fields") or {}
+        title = self.task_store.focusmate_title(task)
+        notes = (fields.get("notes") or fields.get("description") or "")
+        if not isinstance(notes, str):
+            notes = str(notes)
+        self.say("把任务 %d「%s」挂到 session #%d（%s %s）…"
+                 % (task["id"], title, session_idx, date_iso, row.get("startLabel")), "cmd")
+        res = self.bridge.call("add_task", timeout=240,
+                               startMs=row["startMs"], meetingId=row["id"],
+                               title=title, notes=notes)
+        if not res.get("verified"):
+            self.had_error = True
+            raise ValueError("Focusmate 里没能确认 task 已挂上；本地任务没改，避免假成功。")
+        # Focusmate 成功之后才落本地。
+        self.task_store.assign(task["id"], session)
+        self.task_store.attach_focusmate(task["id"], {
+            "task_id": res.get("taskId") or (res.get("task") or {}).get("id"),
+            "session_id": row["id"],
+            "attached_at": ts._now(),
+            "title": title,
+        }, session=session)
+        self.selected_task_id = task["id"]
+        self.say("✅ 任务 %d 已挂到 session #%d；Focusmate task id=%s"
+                 % (task["id"], session_idx, res.get("taskId") or "?"), "ok")
+        return True
+
+    def cmd_task_sync(self, quiet=False):
+        """GET /v1/tasks → 读 completedAt，给已完成任务写归档。"""
+        res = self.bridge.call("tasks", timeout=180)
+        remote = res.get("tasks") if isinstance(res, dict) else res
+        n, matched = self.task_store.reconcile(remote or [])
+        self.task_sync_at = time.time()
+        if not quiet:
+            self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
+                     % (len(matched), n), "ok")
+        return True
+
     def _drop_contract_row(self, idx, row):
         """草稿区：把 data.csv 里那行删掉。零阻力、不问任何问题 —— 这就是「自由」。
 
@@ -2084,15 +2487,57 @@ class Warden(object):
             self.refresh()
         return True
 
+    def cmd_period_layout(self, args):
+        """period T1 50 50 / session T1 50 50 —— 改一个时段的 session 排布。
+
+        需求里的规则原样实现：
+          - 时长只认 25/50/75（Focusmate 的限制）；
+          - 第一场从时段起点开始，之后每场从上一场结束后的下一个 15 分钟整点开始；
+          - 任何一场超出时段终点 → 直接报错，**layout 和 data.csv 都不动**。
+        """
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        if not toks:
+            raise ValueError("用法：period T1 50 50（时段 ID 看表格第一列）")
+        period_id = toks[0]
+        if not re.match(r"^[Tt]\d+$", period_id):
+            raise ValueError("时段 ID 要像 T1 / T2；你给的是 %r" % period_id)
+        period_id = period_id.upper()
+        durations = toks[1:]
+        if not durations:
+            # 只给 T1 = 撤销自定义排布，回到默认 50/25。
+            removed = sp.remove_layout(self.sel_date, period_id)
+            if removed is None:
+                raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
+            self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
+        else:
+            sessions = sp.set_layout(self.sel_date, period_id, durations)
+            body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
+                             for s in sessions)
+            self.say("✅ %s %s → %s" % (self.sel_date.isoformat(), period_id, body), "ok")
+        # 从下载层 + 所有 layout 重新生成 data.csv。写在 layout 成功之后。
+        download = sp.load_download()
+        layouts = sp.load_layouts()
+        csv = sp.render_data_csv(download, layouts, date_specific=True)
+        sch.backup()
+        sch._write(sch.DATA_CSV, csv)
+        self.reload_entries()
+        self.say("data.csv 已按下载层重算（精确日期行）；daemon 下一轮会读新契约。", "info")
+        if not self.offline:
+            self.rebuild_rows()
+            self.refresh(quiet=True)
+        return True
+
     def cmd_session(self, args):
         """session HH:MM LEN / session HH:MM-HH:MM —— 创建一场：先写进契约表（data.csv），
         再立刻触发一轮 check。
 
+        也支持按时段改排布：``session T1 50 50``（等同于 ``period T1 50 50``）。
         起点–终点的写法（如 `session 11:15-12:05`）会推出时长（这里是 50）。
-        写出去的是**星期几**规则（data.csv 的格式），所以会影响所有同星期几的周。
         创建零阻力 —— 有阻力的是**取消**。
         下单本身不在这里实现：薄封装 keep_session.py check，业务逻辑一份就够。
         """
+        if args and re.match(r"^[Tt]\d+$", str(args[0]).strip()):
+            return self.cmd_period_layout(args)
         hhmm, dur = parse_session_spec(args)     # 不合法会抛 ValueError（给人话提示）
         day = self.sel_date
         weekday = sch.weekday_of_day(day)
@@ -2153,19 +2598,27 @@ class Warden(object):
         这里**不重写**日历逻辑：薄封装 download_calendar.py，和 schedule.py 一样是唯一真源。
         `sync --days 3` 之类的参数原样透传给 populate。
         """
-        self.say("sync：跑 download_calendar.py populate "
-                 "（重新拉日历 → 覆盖 data.csv，旧文件备份到 temp/data.csv.bak）…", "cmd")
-        rc, out, err = run_download_calendar("populate", *args, timeout=300)
-        for line in (out or "").splitlines()[-25:]:
+        self.say("sync：先 download（工作/空闲 → 中间层），再 populate "
+                 "（中间层 + 时段 layout → data.csv）…", "cmd")
+        rc, out, err = run_download_calendar("download", *args, timeout=300)
+        for line in (out or "").splitlines()[-20:]:
             self.say(line)
         if rc != 0:
             self.had_error = True
-            self.say("❌ sync 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
+            self.say("❌ download 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
             if not (err or out):
                 self.say("   （download_calendar.py 没有输出；先跑 "
                          "python3 download_calendar.py status 看配置/依赖）", "warn")
             return False
-        self.say("✅ data.csv 已同步（日历 → 契约表）。", "ok")
+        rc, out, err = run_download_calendar("populate", "--from-download", *args,
+                                             timeout=300)
+        for line in (out or "").splitlines()[-25:]:
+            self.say(line)
+        if rc != 0:
+            self.had_error = True
+            self.say("❌ populate 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
+            return False
+        self.say("✅ data.csv 已同步（下载层 → 时段 layout → 精确日期契约）。", "ok")
         self.reload_entries()
         self.refresh()
         return True
@@ -2230,13 +2683,19 @@ class Warden(object):
         t.add_column(style="bold", no_wrap=True, justify="right")
         t.add_column()
         for cmd, desc in [
-            ("Tab", "切换视图：契约 → 专注 → 统计 → 契约（循环）"),
+            ("Tab", "切换视图：契约 → 专注 → 统计 → 任务 → 契约（循环）"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
             ("stat refresh full", "统计：丢掉缓存、全量重拉（默认只增量拉缺口 + 最近几天）"),
             ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),
             ("day -1|0|1|YYYY-MM-DD", "切换看哪一天（草稿区随便看）"),
             ("session HH:MM LEN", "创建一场：先写 data.csv，再立刻触发一轮 check"),
             ("session HH:MM-HH:MM", "同上，但用起点–终点（如 11:15-12:05 → 50min）"),
+            ("session T1 50 50", "按时段改排布：T1 的第一场从时段起点开始，超时就报错"),
+            ("period T1 25 25 25 25", "同 session T1 ...；只给 T1 = 撤销自定义，恢复默认"),
+            ("task create ...", "在「任务」视图建任务：task create [id] [field=value ...]"),
+            ("task delete/modify ...", "task delete <id> / task modify <id> <field> <值>"),
+            ("task assign <session ID>", "把选中的任务挂到表格 #N 的 session，并自动写 Focusmate task"),
+            ("task sync", "GET /v1/tasks，把 completedAt 连同 session 写进完成归档"),
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
             ("relocate N ±MM", "临时把 #N 提前/推后：不写 data.csv；推后一天一次，且不能跨天"),
             ("mute N on|off", "把 #N 静音；不写 on/off 就是取反"),
@@ -2259,7 +2718,10 @@ class Warden(object):
             "专注视图：只认 stop（消耗暂停）和 Shift+Tab（切模式），"
             "预约那套命令在那边一律没用。\n"
             "统计视图：只读，stat 走缓存、stat refresh 只增量拉缺口 + 最近几天；"
-            "它不改 data.csv、不碰 API 写接口。[/]"
+            "它不改 data.csv、不碰 API 写接口。\n"
+            "任务视图：task 命令在任何视图都能敲；任务字段不校验，JSON 存在 data/tasks.json。\n"
+            "时段 ID（T1/T2）来自下载层 temp/calendar-download.json；"
+            "同段后续行留空是正常的。[/]"
         )
         return False
 
@@ -2342,6 +2804,11 @@ class Warden(object):
         if parts is None:
             return True
         if not parts:
+            return True
+        # 直接敲 `T1 50 50`（契约视图）等价于 `period T1 50 50`。
+        if (isinstance(self.view, ContractView)
+                and re.match(r"^[Tt]\d+$", parts[0])):
+            self.guard(self.cmd_period_layout)(parts)
             return True
         if self.shell.registry.get(parts[0].lower()) is None:
             self.say(self.view.unknown_hint(), "warn")

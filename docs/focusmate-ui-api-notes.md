@@ -567,3 +567,87 @@ cd temp/focusmate-mcp
 PROFILE_DIR=/tmp/fm-profile node ../../test/probe_title2.mjs
 rm -rf /tmp/fm-profile     # 别忘了删，里面有登录凭据
 ```
+
+---
+
+## 10. 2026-10-23 界面改版：日历时间轴换成 24 小时制（自动预定全挂的直接原因）
+
+**现象**：`keep_session` 从 2026-10-23 09:32 起每一场都报同一个错，而且都是"环境失败"：
+
+```
+book-session-attempt-2 failed: locator.waitFor: Timeout 3000ms exceeded.
+  - waiting for locator('text="5pm"').first() to be visible
+```
+
+**原因**：日历时间轴的**小时标签格式变了**，`text="5pm"` 已经不存在，所以
+`scrollToTime()` 永远等不到 → 每次下单必然超时。格子本身（48px/15min）和点击逻辑没变。
+
+### 10.1 改了什么（实测）
+
+| 元素 | 旧（≤2026-10-22） | 新（2026-10-23 起） |
+|---|---|---|
+| 小时刻度 | `5pm` / `12am` | **`17:00` / `00:00`**（补零 24 小时制） |
+| 分钟刻度 | 无 | `:15` / `:30` / `:45` |
+| 时间轴容器 | （全局文本） | `fm-calendar-timeslot-labels`，标签 `position:absolute`，`top = 小时 × 192px` |
+| 每 15 分钟一行 | 48px | 48px（**没变**） |
+| 日期表头 | `Sat 24` | `Sat 24`（**没变**） |
+| 日列 | — | `fm-calendar-day`，每日 96 个 `div.relative.h-[48px]`（第 N 行 = 第 N 个 15 分钟） |
+| 底部确认按钮 | `Book 1 Session` | `Book 1 session`（只是大小写，正则忽略大小写即可） |
+| 已订卡片上的时间 | `4:30pm - 5:20pm` | `16:30 - 17:20` |
+
+**结论：凡是按"12 小时制"写的选择器 / 正则全部作废**，包括
+`booking.ts` 的 `scrollToTime` / `clickSlotByCoordinates` 里量 `HH(am|pm)` 的那段，
+以及 `list-sessions.ts` 里 `(\d{1,2}:\d{2}[ap]m)` 的正则（现在两种都认，向后兼容）。
+
+### 10.2 这次一起踩到的坑（都已修）
+
+1. **原地补点 = 直接下单。** 选中格子后，**同一坐标上会渲染出一个格子内的 "Book" 按钮**。
+   所以"第一次点击没等到 Book 按钮就再点一次"这个兜底，实际上是**真的会把 session 订掉**。
+   因此补点之后必须拿到落地证据（sessionId / 新增的 `/session/<id>` 链接）才准报成功，
+   否则一律抛错交给上层用官方 API 复核 —— 绝不能像以前那样 `verified=false` 也当成功。
+2. **`fm-session-selector-outline` 会拦截 `locator.click()`。** 它是 hover/选中高亮层（`z-30`），
+   Playwright 判定"被别的元素拦截"，一直重试到超时。必须量出坐标后用 `page.mouse.click(x, y)`。
+3. **点不出 Book 按钮 ≠ 订上了。** 已订格子、和已有 session 冲突的格子（outline 带
+   `pointer-events-none` + 50% 透明）点下去只会打开右侧 Session Info 面板，不会出现确认按钮。
+4. **时间轴标签要限定容器。** 已订卡片上也有 `17:00` 这样的纯文本，
+   全局 `text="17:00"` 会先撞上卡片 → 滚动/测量全错位。用
+   `fm-calendar-timeslot-labels` 里的那个。
+5. **顶部有个常驻的 "Book" 按钮**（Book Now）。确认按钮的 locator 必须严格匹配
+   `Book N session`，否则"格子没选中"也会被判成"按钮可见"，然后去点顶部按钮，装作订上了。
+6. **选中是累加的**：连着点两格会变成 `Book 2 sessions`。`confirmBooking` 现在会拒绝 >1 的情况。
+
+### 10.3 现在的实现（`temp/focusmate-mcp/src/automation/pages/booking.ts`）
+
+- `selectTimeSlot()`：`slotIndex = (小时*60+分钟)/15`，先 `clickSlotCell()` 点格子，
+  失败再退回 `clickSlotByCoordinates()`（按时间轴标签几何算坐标，两种标签格式都认）。
+- `clickSlotCell()`：`fm-calendar-day[n] > div.relative.h-[48px]` 第 `slotIndex` 个，
+  `scrollIntoViewIfNeeded` → 量中心 → `mouse.move` + `mouse.click`。
+- `scrollToTime()`：在 `fm-calendar-timeslot-labels` 里按**精确文本**找 `HH:00`，滚到容器中间。
+- `confirmBooking()`：只认 `Book N session`，且 `N>1` 直接拒绝。
+
+**回归验证**（2026-10-24 实测）：`book_session` 连续订上 10-25 16:00 / 17:00，
+`keep_session` 日志从"环境失败"变回 `复核通过：API 确认该 session 已存在`。
+
+---
+
+## 11. Task 完成时间：`GET /v1/tasks` 的 `completedAt`
+
+任务完成时间**不用猜**：`GET /v1/tasks` 返回的每个 task 带 `completedAt` 字段
+（`test/tasks_api.mjs` 已经在 dump 这个字段）。形状与 attachment 一起出现：
+
+```json
+{
+  "id": "936bd726-…",
+  "title": "写论文",
+  "description": "先写 intro",
+  "completedAt": "2026-10-26T12:00:00.000Z",
+  "attachments": [{"type": "session", "externalId": "<session UUID>"}]
+}
+```
+
+因此本地任务归档可以同时记下：
+- 本地任务字段；
+- 对应的 session（日期 / 时刻 / Focusmate session id）；
+- Focusmate task id；
+- Focusmate 的 `completedAt`（真正完成时间）。
+如果某条 remote task 没有 `completedAt`，就只匹配不归档，绝不伪造完成时间。

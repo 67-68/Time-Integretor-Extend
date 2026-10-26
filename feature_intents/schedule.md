@@ -20,13 +20,17 @@ data.csv 是这套系统的**控制面**（人手写）也是唯一真源。两�
 
 ## 文件格式
 
-纯文本 CSV，`#` 之后是注释（整行忽略 / 行尾忽略），空行忽略。每行三种写法：
+纯文本 CSV，`#` 之后是注释（整行忽略 / 行尾忽略），空行忽略。每行写法：
 
 ```
 HH:MM,duration              —— 每天
 weekday,HH:MM,duration      —— 只在 weekday 生效（mon..sun，也认「周一」「星期一」）
 *,HH:MM,duration            —— 同「每天」
+YYYY-MM-DD,HH:MM,duration   —— 只在这个精确日期生效（日历一周计划用这个）
 ```
+
+同一时刻同时存在日期行和 weekday 行时，**日期行优先**（更具体者胜）。
+`download_calendar.py populate` 的新链路写日期行；旧的 weekday 行仍完全兼容。
 
 也可以把「起点–终点」直接写成区间，时长由区间推出（更贴近日历/看板上的写法）：
 

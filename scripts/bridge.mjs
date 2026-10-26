@@ -23,6 +23,8 @@
  *     title    startMs meetingId? title       改标题
  *     mute     startMs meetingId? quiet       开/关 quiet mode
  *     cancel   startMs meetingId? source?     取消（**破坏性**，调用方负责把关）
+ *     tasks                             列 Task Manager 的 task（含 completedAt）
+ *     add_task startMs title? notes?    给某场 session 挂 Focusmate task（DOM + API 复核）
 
  *   ⚠️ 信封的 `id`（请求号）和「哪一场 session」**必须**用不同的字段名。
  *   踩过：两者都叫 id 时，Python 侧 `req.update(kw)` 会把请求号覆盖成 UUID，
@@ -248,6 +250,100 @@ async function requireMeeting(startMs, id) {
   return { meeting: m, meetings };
 }
 
+// ---------------------------------------------------------------- task helpers
+
+function normalizeTask(t) {
+  return {
+    id: t.id,
+    title: t.title || "",
+    description: t.description || "",
+    completedAt: t.completedAt || t.completed_at || null,
+    createdAt: t.createdAt || t.created_at || null,
+    attachments: (t.attachments || []).map((a) => ({
+      type: a.type || a.attachmentType || "",
+      externalId: a.externalId ?? a.id ?? "",
+    })),
+  };
+}
+
+async function listTasksRaw() {
+  const r = await callApi("GET", "/tasks");
+  if (r.status !== 200) {
+    throw new Error("GET /tasks 失败：HTTP " + r.status + " " + String(r.text || "").slice(0, 300));
+  }
+  const arr = r.json?.tasks ?? (Array.isArray(r.json) ? r.json : r.json?.data ?? []);
+  return Array.isArray(arr) ? arr : [];
+}
+
+async function pickTextLocator(candidates) {
+  for (const loc of candidates) {
+    const n = await loc.count().catch(() => 0);
+    if (n > 0) {
+      const first = loc.first();
+      await first.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
+      return first;
+    }
+  }
+  return null;
+}
+
+/** 走真实 UI 给 session 挂 task，然后用 GET /tasks 复核 attachment。 */
+async function addTaskViaDom(meeting, title, notes) {
+  const start = new Date(meeting.startMs);
+  const p2 = (n) => String(n).padStart(2, "0");
+  // 2026-10-23 后看板改成 24 小时制；旧 12 小时制卡片也要兼容。
+  const start24 = `${p2(start.getHours())}:${p2(start.getMinutes())}`;
+  const startOld = lib.fmtTimeLabel(start);
+  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const startRe = new RegExp(`(?:${esc(start24)}|${esc(startOld)})\\b`);
+  const tile = page.locator("fm-booked-session-tile").filter({ hasText: startRe }).first();
+  if ((await tile.count()) === 0) {
+    throw new Error(`页面上找不到起点 ${start24} 的 session 卡片`);
+  }
+  await tile.scrollIntoViewIfNeeded().catch(() => {});
+  const box = await tile.boundingBox();
+  if (!box) throw new Error("session 卡片没有 boundingBox（不可见？）");
+  await page.mouse.click(box.x + box.width - 30, box.y + Math.round(box.height * 0.35));
+  await page.waitForTimeout(4000);
+
+  const panelText = await page.locator("body").innerText().catch(() => "");
+  const panelMatches = panelText.includes(`Session at ${start24}`) ||
+                       panelText.includes(`Session at ${startOld}`);
+  if (!panelMatches) {
+    throw new Error(`右侧面板不是 ${start24} 那一场；什么都没改`);
+  }
+  const addTask = await pickTextLocator([
+    page.getByText("Add task", { exact: true }),
+    page.getByRole("button", { name: /^Add task$/ }),
+    page.getByText(/^Add task$/),
+  ]);
+  if (!addTask) {
+    throw new Error('面板里找不到 "Add task"（Task Manager Labs 关掉了？或这场已有 task）');
+  }
+  await addTask.click();
+  const titleBox = page.locator('textarea[placeholder="Task title"]').first();
+  await titleBox.waitFor({ state: "visible", timeout: 8000 });
+  await titleBox.fill(title);
+  if (notes) {
+    const notesBox = page.locator('textarea[placeholder^="Notes"]').first();
+    if ((await notesBox.count()) > 0) await notesBox.fill(notes);
+  }
+  const createBtn = await pickTextLocator([
+    page.getByText("Create task", { exact: true }),
+    page.getByRole("button", { name: /^Create task$/i }),
+    page.getByText(/^Create task$/i),
+  ]);
+  if (!createBtn) throw new Error('找不到 "Create task" 按钮');
+  await createBtn.click();
+  await page.waitForTimeout(5000);
+  const all = await listTasksRaw();
+  const created = all.find(
+    (t) => (t.title ?? "") === title &&
+      (t.attachments || []).some((a) => (a.externalId ?? a.id) === meeting.id)
+  );
+  return created || null;
+}
+
 // ---------------------------------------------------------------- 命令
 
 const handlers = {
@@ -318,6 +414,31 @@ const handlers = {
       quiet: actual,
       favorites,
       activityType,
+    };
+  },
+
+  async tasks() {
+    const all = await listTasksRaw();
+    const rows = all.map(normalizeTask);
+    return { count: rows.length, tasks: rows };
+  },
+
+  async add_task(req) {
+    const title = String(req.title == null ? "" : req.title).trim();
+    if (!title) throw new Error("task title 不能为空");
+    const notes = req.notes == null ? "" : String(req.notes);
+    if (title.length > 500) throw new Error("task title 最长 500 字符，现在是 " + title.length);
+    const { meeting } = await requireMeeting(req.startMs, req.meetingId);
+    const created = await addTaskViaDom(meeting, title, notes);
+    const normalized = created ? normalizeTask(created) : null;
+    return {
+      verified: !!normalized,
+      sessionId: meeting.id,
+      sessionTime: meeting.startMs,
+      title,
+      notes,
+      taskId: normalized ? normalized.id : null,
+      task: normalized,
     };
   },
 

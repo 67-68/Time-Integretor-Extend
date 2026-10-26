@@ -317,3 +317,15 @@ python3 warden.py install-deps
   用户要求删掉，改成和取消共用的宣言闸门。
 - **cancel 的地狱级阻力**：曾经是「红面板 → 手打开始时间 → 6 秒冷静期 → DELETE」。
   现在按区分层：草稿区零阻力、执行区敲宣言。`CANCEL_COOLDOWN` 常量已删。
+
+
+## 2026-10 追加：时段列 + 任务视图
+
+- 契约表增加 `时段 ID | 时段 | 类型 | 名称` 四列；同一时段只有第一行显示，
+  后续行留空（避免把同属 T1 的 session 误看成 T2）。
+- 来源是 `temp/calendar-download.json`；没有下载层时这四列留空，旧流程照常。
+- 第四个视图 `任务 / 归档`：`task create/delete/modify/assign/select/sync`。
+  任务挂 session 时自动在 Focusmate 建 task；完成时间用 `GET /v1/tasks` 的
+  `completedAt`，归档到 `data/task-archive.json`。
+- `session T1 50 50` / `period T1 50 50` / 裸 `T1 50 50` 改时段排布；
+  任何一场超出时段终点 → 报错，layout 和 data.csv 都不动。

@@ -469,7 +469,8 @@ check_true("sync 给了人话反馈", any("已同步" in m[2] for m in wd.messag
 calls = []
 wd = mkwarden()
 check("sync 透传参数（--days 3）", wd.cmd_sync(["--days", "3"]), True)
-check("sync 参数原样给了 populate", calls[-1], ("populate", "--days", "3"))
+check("sync 参数原样给了 populate",
+      calls[-1], ("populate", "--from-download", "--days", "3"))
 
 calls = []
 w.run_download_calendar = lambda *a, **kw: (calls.append(a), (1, "", "缺少依赖 caldav"))[1]
@@ -482,7 +483,7 @@ ran = []
 w.run_keep_session = lambda *a, **kw: (ran.append(a), (0, "round done", ""))[1]
 check("handle 认识 sync", wd.handle("sync") in (True, False), True)
 check("sync 走的是 download_calendar，不是 keep_session",
-      calls[-1][0], "populate")
+      calls[-1][0], "download")
 check("sync 不会顺手跑 keep_session check", ran, [])
 
 # ---------------------------------------------------------------- day 命令
@@ -705,7 +706,8 @@ check("快照模式标出「快照」而不是「缺」", "快照" in out and " 
 # ---------------------------------------------------------------- 视图（Tab 切换）
 
 print("== 视图：注册 + Tab 切换 ==")
-check("注册了契约/专注/统计三个视图", [v.name for v in w.VIEWS], ["契约", "专注", "统计"])
+check("注册了契约/专注/统计/任务四个视图", [v.name for v in w.VIEWS],
+      ["契约", "专注", "统计", "任务"])
 wd = mkwarden()
 check("默认契约视图", (wd.view.name, wd.view_index), ("契约", 0))
 wd.handle("tab")
@@ -713,7 +715,9 @@ check("tab 切到专注", (wd.view.name, wd.view_index), ("专注", 1))
 wd.handle("\t")
 check("再一个 Tab 切到统计（Tab 是循环）", (wd.view.name, wd.view_index), ("统计", 2))
 wd.handle("\t")
-check("第三个 Tab 转回契约", (wd.view.name, wd.view_index), ("契约", 0))
+check("第三个 Tab 切到任务", (wd.view.name, wd.view_index), ("任务", 3))
+wd.handle("\t")
+check("第四个 Tab 转回契约", (wd.view.name, wd.view_index), ("契约", 0))
 wd.cycle_view()
 check("cycle_view 切到专注", wd.view.name, "专注")
 wd.cycle_view(-1)

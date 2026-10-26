@@ -3,8 +3,11 @@
 
 它在整套系统里的位置
 --------------------
-    iCloud 日历 ──CalDAV──▶ 事件 ──切分──▶ 一周 session 计划 ──▶ data.csv
-                                                  └──▶ temp/calendar.md（中间产物，给人看）
+    iCloud 日历（只 工作/空闲）
+        ──CalDAV──▶ 事件 ──▶ temp/calendar-download.json（T1/T2 时段）
+                                  ├──▶ temp/calendar.md（人读版）
+                                  └──▶ temp/session-layouts.json（用户排布）
+                                            └──▶ data.csv（精确日期行）
 
     data.csv 是 keep_session.py（每天 check）唯一的目标来源。
     本脚本**只生成计划、不下单**；下单永远是 keep_session.py 的事。
@@ -37,9 +40,10 @@
     python3 download_calendar.py install-deps           # 一次性：按 requirement.txt 装到 temp/pylibs
     python3 download_calendar.py login                  # 登录 iCloud（App 专用密码），存配置
     python3 download_calendar.py status                 # 看依赖 / 配置 / 有哪几个日历
-    python3 download_calendar.py fetch                  # 只拉日历，出 temp/calendar.md
-    python3 download_calendar.py populate               # 拉 → 切 → 生成未来一周 data.csv
-    python3 download_calendar.py populate --dry-run     # 只打印，不写文件
+    python3 download_calendar.py download               # 只拉 工作/空闲 → 中间层 JSON + md
+    python3 download_calendar.py populate --from-download  # 中间层 + layout → data.csv
+    python3 download_calendar.py layout T1 50 50        # 改一个时段的排布
+    python3 download_calendar.py show                   # 看所有时段和当前 session
     python3 download_calendar.py populate --ics a.ics   # 离线：从本地 .ics 跑，不联网（可重复给）
 
 依赖：caldav（连带 icalendar / recurring-ical-events），装在 temp/pylibs，不污染系统环境。
@@ -55,12 +59,20 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+try:
+    import session_plan as sp
+except Exception:                                    # noqa: BLE001
+    sp = None
 TEMP = os.path.join(HERE, "temp")
 PYLIBS = os.path.join(TEMP, "pylibs")
 CONFIG_FILE = os.path.join(TEMP, "calendar.json")
 DEFAULT_MD = os.path.join(TEMP, "calendar.md")
 DATA_CSV = os.path.join(HERE, "data.csv")
 BACKUP_CSV = os.path.join(TEMP, "data.csv.bak")
+DEFAULT_DOWNLOAD_JSON = os.path.join(TEMP, "calendar-download.json")
+DEFAULT_PROFILES = ["工作", "空闲"]
 
 DEFAULT_URL = "https://caldav.icloud.com"
 DEFAULT_IGNORE = ["上课", "休息"]
@@ -375,16 +387,26 @@ def events_from_ical(ics_text, calendar_name, horizon_start, horizon_end):
     return out
 
 
-def fetch_caldav(cfg, horizon_start, horizon_end):
-    """连 CalDAV 把窗口内的事件全拉下来。返回 (events, 所有日历名)。"""
+def fetch_caldav(cfg, horizon_start, horizon_end, profiles=None):
+    """连 CalDAV 把窗口内的事件拉下来。返回 (events, 所有日历名)。
+
+    ``profiles`` 给了（默认 工作/空闲）时只查询这些日历；如果一个都没匹配到，
+    退回查询全部，让上层按旧规则处理 —— 这样别的日历结构也不会静默变空。
+    """
     client = connect(cfg)
     events, names = [], []
     try:
         principal = client.principal()
         cals = list(principal.calendars())
-        for cal in cals:
+        named = [(safe_display_name(c), c) for c in cals]
+        names = [n for n, _ in named]
+        wanted = set(profiles or [])
+        selected = [c for n, c in named if n in wanted] if wanted else cals
+        if wanted and not selected:
+            warn("日历里没有找到目标 profile（%s）；退回下载全部分组" % "、".join(sorted(wanted)))
+            selected = cals
+        for cal in selected:
             name = safe_display_name(cal)
-            names.append(name)
             try:
                 objs = cal.search(start=horizon_start.astimezone(datetime.timezone.utc),
                                   end=horizon_end.astimezone(datetime.timezone.utc),
@@ -506,6 +528,33 @@ def grouped_out(ev, ignore, use):
     return name in (ignore or [])
 
 
+def select_profile_events(events, wanted_profiles, ignore, use, include_all_day=False):
+    """先做「只下载工作 + 空闲」这一层过滤。
+
+    真实日历里同时有 工作/空闲/上课/休息/提醒 等分组。新链路只关心前两个。
+    为了让老的离线测试和「没有这两个分组」的日历仍可用，如果这批事件里**一个**
+    目标 profile 都没有，就退回旧的 ignore/use 过滤（并给出 warning）。
+    返回 (selected_events, mode, used_profiles)。
+    """
+    profiles = list(dict.fromkeys(p for p in (wanted_profiles or []) if p))
+    present = set((ev.calendar or "").strip() for ev in events)
+    used = [p for p in profiles if p in present]
+    if used:
+        out = []
+        for ev in events:
+            if (ev.calendar or "").strip() not in profiles:
+                continue
+            if ev.all_day and not include_all_day:
+                continue
+            out.append(ev)
+        return out, "profiles", used
+    if profiles:
+        warn("日历里没有找到目标 profile（%s）；退回旧的 ignore/use 过滤"
+             % "、".join(profiles))
+    out = [ev for ev in events if not grouped_out(ev, ignore, use)]
+    return out, "legacy", []
+
+
 def plan_week(events, start_date, days, ignore, use, include_all_day, now):
     """把事件切成 session 计划。今天只保留还没开始的。
 
@@ -593,6 +642,32 @@ def render_csv(plans, meta):
     return "\n".join(lines) + "\n"
 
 
+def make_download(meta):
+    """把本次拉到的日历事件变成中间层 JSON（含 T1/T2 编号的时段）。"""
+    if sp is None:
+        return None
+    events = meta.get("selected_events") or []
+    profiles = meta.get("used_profiles") or None
+    data = sp.build_periods(events, meta["start_date"], meta["days"], profiles=profiles)
+    data["generated_at"] = meta.get("stamp") or stamp()
+    data["source"] = meta.get("source") or ""
+    data["all_calendars"] = meta.get("calendars") or []
+    data["mode"] = meta.get("download_mode") or "legacy"
+    return data
+
+
+def download_json_path(args=None):
+    return (getattr(args, "download_json", None) if args else None) or DEFAULT_DOWNLOAD_JSON
+
+
+def write_download(data, path=None):
+    if data is None or sp is None:
+        return None
+    path = path or DEFAULT_DOWNLOAD_JSON
+    write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return path
+
+
 def render_md(plans, meta):
     L = []
     L.append("# 日历 → Focusmate session 计划")
@@ -604,6 +679,10 @@ def render_md(plans, meta):
     L.append("- 忽略分组：%s" % ("、".join(meta["ignore"]) or "（无）"))
     if meta["use"]:
         L.append("- 白名单分组：%s" % "、".join(meta["use"]))
+    if meta.get("profiles"):
+        L.append("- 下载 profile：%s（实际命中：%s）"
+                 % ("、".join(meta["profiles"]),
+                    "、".join(meta.get("used_profiles") or []) or "无，退回旧过滤"))
     L.append("- 规则：<25min 丢弃；起点对齐 :00/:15/:30/:45；优先 50min，不够退 25min")
     L.append("- 日历里看到的分组：%s" % ("、".join(meta["calendars"]) or "（无）"))
     L.append("")
@@ -620,6 +699,21 @@ def render_md(plans, meta):
                     len(p.sessions), sum(d for _, d in p.sessions)))
     L.append("| **合计** |  | **%d** | **%d min** |" % (total, total_min))
     L.append("")
+
+    # 中间层：下载下来、按天编号的时段。用户就是用这些 T1/T2 改排布的。
+    periods = (meta.get("periods") or {}).get("periods") if isinstance(
+        meta.get("periods"), dict) else None
+    if periods:
+        L.append("## 时段（下载层，T1/T2 可用来改 session 排布）")
+        L.append("")
+        L.append("| 日期 | 时段 ID | 时间段 | 类型 | 名称 |")
+        L.append("|------|---------|--------|------|------|")
+        for period in periods:
+            L.append("| %s | %s | %s–%s | %s | %s |"
+                     % (period.get("date"), period.get("id"), period.get("start"),
+                        period.get("end"), period.get("type") or "",
+                        period.get("name") or ""))
+        L.append("")
 
     for p in plans:
         L.append("## %s %s" % (CN_WEEKDAYS[p.date.weekday()], p.date.isoformat()))
@@ -686,10 +780,17 @@ def write_text(path, text):
 
 
 def build(load_fn, args):
-    """拉事件 → 排一周。返回 (plans, meta)。"""
+    """拉事件 → 过滤 profile → 排一周。返回 (plans, meta, selected_events)。
+
+    ``args.profiles`` / ``temp/calendar.json`` 的 ``download_calendars`` 决定只下载
+    哪几个日历（默认 工作 + 空闲）。如果没有一个目标 profile 存在，退回旧的
+    ignore/use 语义，避免把一个结构不同的日历直接清空。
+    """
     cfg = load_config()
     ignore = args.ignore if args.ignore is not None else (cfg.get("ignore_calendars") or DEFAULT_IGNORE)
     use = args.use if args.use is not None else (cfg.get("use_calendars") or [])
+    profiles = (args.profiles if getattr(args, "profiles", None)
+                else cfg.get("download_calendars") or DEFAULT_PROFILES)
     start_date = (datetime.date.fromisoformat(args.start) if args.start
                   else datetime.datetime.now().date())
     now = datetime.datetime.now(LOCAL_TZ)
@@ -697,15 +798,25 @@ def build(load_fn, args):
     horizon_end = horizon_start + datetime.timedelta(days=args.days)
 
     events, names = load_fn(horizon_start, horizon_end)
-    plans = plan_week(events, start_date, args.days, ignore, use, args.include_all_day, now)
+    selected, mode, used = select_profile_events(
+        events, profiles, ignore, use, args.include_all_day)
+    # profile 模式：候选只有 工作/空闲，ignore/use 不参与。
+    # legacy 模式：把**全部事件**交给 plan_week，让它照旧把 ignored 事件列进 md。
+    plan_events = selected if mode == "profiles" else events
+    plan_ignore = [] if mode == "profiles" else ignore
+    plan_use = [] if mode == "profiles" else use
+    plans = plan_week(plan_events, start_date, args.days, plan_ignore, plan_use,
+                      args.include_all_day, now)
 
     if args.ics:
         source = "本地 .ics：%s" % "、".join(args.ics)
     else:
         source = "CalDAV · %s（%s）" % (cfg.get("url") or DEFAULT_URL, cfg.get("username") or "?")
     meta = {"stamp": stamp(), "source": source, "ignore": ignore, "use": use,
-            "calendars": names, "days": args.days}
-    return plans, meta, events
+            "calendars": names, "days": args.days, "start_date": start_date,
+            "profiles": list(profiles), "used_profiles": used,
+            "download_mode": mode, "selected_events": selected}
+    return plans, meta, selected
 
 
 def print_summary(plans, meta, events):
@@ -741,29 +852,105 @@ def make_loader(args):
     cfg = load_config()
     if not cfg:
         die("还没有配置。先跑：python3 download_calendar.py login")
-    return lambda a, b: fetch_caldav(cfg, a, b)
+    profiles = getattr(args, "profiles", None) or cfg.get("download_calendars") or DEFAULT_PROFILES
+    return lambda a, b: fetch_caldav(cfg, a, b, profiles=profiles)
 
 
 def cmd_fetch(args):
+    """只下载日历（工作 + 空闲），写中间层 JSON 和给人看的 md，不碰 data.csv。"""
     plans, meta, events = build(make_loader(args), args)
+    download = make_download(meta)
+    meta["periods"] = download
     print_summary(plans, meta, events)
     md = render_md(plans, meta)
-    out = args.md or DEFAULT_MD
+    md_out = args.md or DEFAULT_MD
     if args.dry_run:
         info("")
         info(md)
+        if download is not None:
+            info("---- 中间层 JSON（预览，不写：%s）----" % download_json_path(args))
+            info(json.dumps(download, ensure_ascii=False, indent=2))
         return 0
-    write_text(out, md)
+    write_text(md_out, md)
+    jpath = write_download(download, download_json_path(args))
     info("")
-    info("md 写到 %s" % out)
+    info("md 写到 %s" % md_out)
+    if jpath:
+        info("日历中间层写到 %s（%d 个时段）"
+             % (jpath, len((download or {}).get("periods") or [])))
+    return 0
+
+
+def _print_download_summary(download):
+    periods = (download or {}).get("periods") or []
+    info("")
+    info("中间层：%d 个时段（%d 个事件，profile：%s）"
+         % (len(periods), len((download or {}).get("events") or []),
+            "、".join((download or {}).get("profiles") or []) or "旧过滤"))
+    for day in sorted(set(p.get("date") for p in periods)):
+        items = [p for p in periods if p.get("date") == day]
+        info("  %s  %s" % (day, "  ".join(
+            "%s %s–%s %s" % (p.get("id"), p.get("start"), p.get("end"),
+                             p.get("name") or p.get("type") or "")
+            for p in items)))
+
+
+def _populate_from_download(args):
+    """从已经下载好的中间层生成 data.csv；不再联网。"""
+    if sp is None:
+        die("缺少 session_plan.py，无法从下载层生成 session")
+    path = args.from_download if isinstance(args.from_download, str) else None
+    download = sp.load_download(path)
+    if not download.get("periods"):
+        die("没有可用的下载结果（%s）。先跑 download 命令。" % sp.download_path(path))
+    layouts = sp.load_layouts(getattr(args, "layouts", None))
+    sessions = sp.all_sessions(download, layouts)
+    csv = sp.render_data_csv(download, layouts, date_specific=True)
+    _print_download_summary(download)
+    info("")
+    info("按 layout 生成 %d 场 session" % len(sessions))
+
+    if args.dry_run:
+        info("")
+        info("---- data.csv（预览，不写）----")
+        info(csv)
+        return 0
+
+    if not sessions and not args.force:
+        die("下载层里没有生成任何 session —— 检查时段/layout。现有 data.csv 没动。")
+
+    if os.path.exists(DATA_CSV):
+        os.makedirs(TEMP, exist_ok=True)
+        shutil.copy2(DATA_CSV, BACKUP_CSV)
+        info("旧 data.csv 备份到 %s" % BACKUP_CSV)
+    write_text(DATA_CSV, csv)
+    info("")
+    info("data.csv 已更新：%s（精确日期行；daemon 会按日期读取）" % DATA_CSV)
     return 0
 
 
 def cmd_populate(args):
+    """拉/读日历 → 生成 session → 写 data.csv。
+
+    默认会先下载日历（写中间层），再按中间层 + 已保存的 layout 生成。
+    ``--from-download`` 直接复用上一次下载，不联网。
+    """
+    if getattr(args, "from_download", False):
+        return _populate_from_download(args)
+
     plans, meta, events = build(make_loader(args), args)
+    download = make_download(meta)
+    meta["periods"] = download
+    csv = None
+    if meta.get("download_mode") == "profiles" and download is not None:
+        layouts = sp.load_layouts(getattr(args, "layouts", None))
+        csv = sp.render_data_csv(download, layouts, date_specific=True)
+        info("生成模式：日历下载层 → 时段 layout → 精确日期 data.csv")
+        _print_download_summary(download)
+    else:
+        csv = render_csv(plans, meta)
     print_summary(plans, meta, events)
     md = render_md(plans, meta)
-    csv = render_csv(plans, meta)
     md_out = args.md or DEFAULT_MD
 
     if args.dry_run:
@@ -772,7 +959,11 @@ def cmd_populate(args):
         info(csv)
         return 0
 
-    if not any(p.sessions for p in plans) and not args.force:
+    has_sessions = (bool(sp.all_sessions(download,
+                                         sp.load_layouts(getattr(args, "layouts", None))))
+                    if download is not None and meta.get("download_mode") == "profiles"
+                    else any(p.sessions for p in plans))
+    if not has_sessions and not args.force:
         die("这一周没切出任何 session——多半是过滤/模型不对。\n"
             "  确认一下日历内容，或加 --force 强行写空 data.csv，"
             "或加 --include-all-day / 调 --ignore。\n"
@@ -783,6 +974,7 @@ def cmd_populate(args):
         shutil.copy2(DATA_CSV, BACKUP_CSV)
         info("旧 data.csv 备份到 %s" % BACKUP_CSV)
     write_text(DATA_CSV, csv)
+    write_download(download, download_json_path(args))
     if not args.no_md:
         write_text(md_out, md)
         info("md 写到 %s" % md_out)
@@ -790,6 +982,53 @@ def cmd_populate(args):
     info("data.csv 已更新：%s" % DATA_CSV)
     return 0
 
+
+def cmd_layout(args):
+    """改一个时段的 session 排布：layout T1 50 50 [--date YYYY-MM-DD]。
+
+    先完整验证（超了就报错、什么都不写），再把 layout 落盘并重新生成 data.csv。
+    """
+    if sp is None:
+        die("缺少 session_plan.py")
+    day = args.date or datetime.date.today().isoformat()
+    durations = [str(x) for x in args.durations]
+    period_id = args.period_id.upper()
+    try:
+        if args.dry_run:
+            # 验证但**不写 layout**：dry-run 必须零副作用。
+            periods = sp.periods_for_date(args.from_download, day)
+            period = next((p for p in periods if p.get("id") == period_id), None)
+            if period is None:
+                raise ValueError("没有时段 %s（%s）" % (period_id, day))
+            sessions = sp.plan_period(period, durations)
+        else:
+            sessions = sp.set_layout(day, period_id, durations,
+                                     layouts_path_=args.layouts,
+                                     download_path_=args.from_download)
+    except ValueError as e:
+        die(str(e))
+    download = sp.load_download(args.from_download)
+    layouts = sp.load_layouts(args.layouts)
+    csv = sp.render_data_csv(download, layouts, date_specific=True)
+    info("✅ %s %s → %s" % (day, period_id,
+                            "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
+                                      for s in sessions) or "（空）"))
+    if args.dry_run:
+        info("---- data.csv（预览，不写）----")
+        info(csv)
+        return 0
+    if os.path.exists(DATA_CSV):
+        os.makedirs(TEMP, exist_ok=True)
+        shutil.copy2(DATA_CSV, BACKUP_CSV)
+    write_text(DATA_CSV, csv)
+    info("data.csv 已重算：%s" % DATA_CSV)
+    return 0
+
+
+def cmd_show(args):
+    if sp is None:
+        die("缺少 session_plan.py")
+    return sp.cmd_show([])
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
@@ -822,24 +1061,46 @@ def parse_args(argv=None):
     p.set_defaults(func=cmd_status)
 
     def common(p):
-        p.add_argument("--days", type=int, default=7, help="排几天，默认 7")
+        p.add_argument("--days", type=int, default=8,
+                       help="排几天，默认 8（今天 + 之后 7 天）")
         p.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD，默认今天")
-        p.add_argument("--ignore", nargs="*", default=None, help="忽略的分组（默认 上课 休息）")
-        p.add_argument("--use", nargs="*", default=None, help="白名单分组")
+        p.add_argument("--profiles", nargs="*", default=None,
+                       help="只下载这些日历/profile，默认 工作 空闲")
+        p.add_argument("--ignore", nargs="*", default=None, help="旧模式：忽略的分组（默认 上课 休息）")
+        p.add_argument("--use", nargs="*", default=None, help="旧模式：白名单分组")
         p.add_argument("--include-all-day", action="store_true", help="把全天事件当整天可用")
         p.add_argument("--ics", action="append", default=None, help="离线：读本地 .ics（可重复）")
         p.add_argument("--md", default=None, help="md 输出路径，默认 %s" % DEFAULT_MD)
+        p.add_argument("--download-json", default=None,
+                       help="中间层 JSON 路径，默认 %s" % DEFAULT_DOWNLOAD_JSON)
+        p.add_argument("--layouts", default=None,
+                       help="自定义排布 JSON，默认 temp/session-layouts.json")
         p.add_argument("--dry-run", action="store_true", help="只打印，不写文件")
 
-    p = sub.add_parser("fetch", help="只拉日历出 md，不碰 data.csv")
+    p = sub.add_parser("fetch", aliases=["download"],
+                       help="只下载 工作/空闲 日历 → 中间层 JSON + md，不碰 data.csv")
     common(p)
     p.set_defaults(func=cmd_fetch)
 
-    p = sub.add_parser("populate", help="拉日历 → 切 session → 写 data.csv（一次性，手动触发）")
+    p = sub.add_parser("populate", help="日历（下载层）→ 时段 layout → 精确日期 data.csv")
     common(p)
+    p.add_argument("--from-download", nargs="?", const=True, default=False,
+                   help="复用已有的下载层，不联网（可给 JSON 路径）")
     p.add_argument("--force", action="store_true", help="即使一个 session 都没切出来也写")
     p.add_argument("--no-md", action="store_true", help="不写 md")
     p.set_defaults(func=cmd_populate)
+
+    p = sub.add_parser("layout", help="改一个时段的 session 排布：layout T1 50 50")
+    p.add_argument("period_id", help="时段 ID，如 T1")
+    p.add_argument("durations", nargs="+", help="每场时长，只认 25/50/75")
+    p.add_argument("--date", default=None, help="日期 YYYY-MM-DD，默认今天")
+    p.add_argument("--from-download", default=None, help="下载层 JSON 路径")
+    p.add_argument("--layouts", default=None, help="自定义排布 JSON 路径")
+    p.add_argument("--dry-run", action="store_true", help="只打印，不写文件")
+    p.set_defaults(func=cmd_layout)
+
+    p = sub.add_parser("show", help="显示下载层 + 每个时段的 session 排布")
+    p.set_defaults(func=cmd_show)
 
     args = ap.parse_args(argv)
     if not getattr(args, "func", None):
