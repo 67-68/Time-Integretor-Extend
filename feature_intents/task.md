@@ -19,17 +19,48 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
   "next_id": 3,
   "tasks": [{
     "id": 1,
-    "fields": {"title": "写论文", "due": "明天", "任意字段": "任意值"},
+    "fields": {"title": "写论文", "due": "2026-10-26T11:50:00", "due_source": "session"},
     "created_at": "...",
     "updated_at": "...",
+    "status": "active",                  // active / completed / dropped
+    "status_at": null,
+    "tags": ["未完成转移"],                // **本地**标签（不动 OmniFocus）
+    "omnifocus": {"id": "kc-4VLAE_1L", "url": "omnifocus:///task/kc-4VLAE_1L",
+                  "title": "写论文", "linked_at": "...",
+                  "writeback": {"completed": "..."}},
+    "duplicate_of": null,                // 从哪条复制来的
+    "actual_minutes": null,              // 「缺漏完成补充」手填的实际耗时
     "session": {"date": "2026-10-26", "start": "11:00", "end": "11:50",
-                "focusmate_session_id": "..."},
+                "duration": 50, "focusmate_session_id": "..."},
     "focusmate": {"task_id": "...", "session_id": "...", "completed_at": "..."}
   }]
 }
 ```
 
 `fields` 是用户字段的容器，所以字段名不会和内部簿记冲突。
+
+### 状态 / 标签 / OmniFocus 关联（`RESERVED` 里的新成员）
+
+- **`status`**：`active`（默认）/ `completed` / `dropped`。
+  **完成和放弃的任务不隐藏、不删**（需求：session 结束之后「那一场干成了什么」
+  仍然要看得见），表格里只是前面多一个记号：
+
+  | 状态 | 记号 |
+  |---|---|
+  | `active` | （空，表格里显示 `·`） |
+  | `completed` | `✓` |
+  | `dropped` | `✗`；如果带标签「未完成转移」则是 `⤼` |
+
+  老数据没有 `status` 时按 `focusmate.completed_at` 推：有完成时间就是 `completed`。
+- **`tags`**：**本地**标签（和 OmniFocus 的 tag 不是一回事）。目前只有
+  「未完成转移」这一个有语义：它表示「这条记录是被延期/推后走的，活还在，
+  只是换了账本」。
+- **`omnifocus`**：关联到 OmniFocus 任务的 primary key。**只有 primary key 是硬的**，
+  认不出来就不关联（拿标题猜身份比不关联更糟）。写回痕迹记在
+  `omnifocus.writeback` 上（幂等用）。
+- **`duplicate_of`**：这条是从哪条复制来的。收尾里「延期到底成立没成立」
+  就是靠它判的（同一条 OmniFocus 任务的多条本地记录）。
+- **`actual_minutes`**：「缺漏完成补充」手填的实际耗时，归档里也有一份。
 
 ## 命令
 
@@ -48,6 +79,11 @@ TUI（任务视图 / 任意视图都认 `task`）：
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
 | `task archive [N]` | 看归档：按完成日期分组、最近 N 条（默认 5） |
 | `task <任何动作> ... --assign <N>` | 跑完顺手把产出的任务挂到表格 #N（`-a` / `--assign=N` 同义） |
+| `task <id> duplicate [-a N]` | 复制一条（字段 + 本地标签 + **同一条 OmniFocus**），可顺手挂到 #N |
+| `task <id> done [分钟]` | 完成：本地完成 + 归档 + Focusmate 勾上 + **OmniFocus 完成并写回截止时间** |
+| `task <id> drop [--local]` | 放弃：本地放弃；默认**OmniFocus 也放弃**，`--local` 只改本地 |
+| `task <id> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
+| `task import [粘贴文本]` | 从粘贴或**剪贴板**导入任务并自动关联 OmniFocus，可一次多行 |
 
 `--assign N` 是**任何** task 子命令都认的后缀（`_split_assign()` 在 `cmd_task()` 入口
 统一摘掉），所以这些写法都成立：
@@ -95,6 +131,35 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
   并把 `occurrences[日期]` 记下来；完成时间同样从 `completedAt` 归档。
 - 界面上这一行的 task 列会带 `🔁` 前缀（说明它是重复任务自动挂上的，不是手 assign 的）。
 
+## 截止时间 = 它被分配的那场 session 的终点
+
+`task_store.assign()` 里写死的规则（用户需求「任务被分配的 session 时间自动等于
+他的截止时间」）：
+
+```
+11:00–11:50 那场 → fields.due = "2026-10-26T11:50:00"、fields.due_source = "session"
+```
+
+- **覆盖**原来的 `due`（自动的，不是「没写才写」），原值留在
+  `session.previous_due` 里可查。
+- 真正「重写到 OmniFocus」发生在**完成**的时候：`task done` / 收尾 D 会跑
+  `omnifocus_tasks.py set --id <PK> --complete --due <session 终点> --yes`
+  一条命令把「完成 + 截止时间」一起写回去。
+- 写回幂等：`omnifocus.writeback.completed` 记过就不再写第二次。
+- 细节见 [`docs/omnifocus.md`](../docs/omnifocus.md)。
+
+## 收尾（postsession）
+
+session 结束 15 秒后 daemon 把 warden 拉到前台，逐个问没做完的任务
+（A 延期 / B 放弃 / C 重议 / D 缺漏完成补充 / E 快捷推后）。
+本地这边的入口是 `TaskStore.duplicate()` / `drop()` / `complete()` / `archive_local()`，
+流程本身在 [`postsession.md`](./postsession.md)。
+
+- `archive_local()` 记的是**手工补录**的完成（`manual: true` + `actual_minutes`），
+  幂等键 = `(task_id, status_at, "manual")`。
+- `tasks_for_session(day, start, include_done=True)` **默认连完成/放弃的一起返回**：
+  「那场到底干成了什么」要看得见，状态由界面打标记，不是靠查询筛掉。
+
 ## Focusmate 集成
 
 - 挂任务走 `scripts/bridge.mjs` 的 `add_task`：
@@ -139,7 +204,8 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 
 ## 契约视图里的任务展示
 
-- 契约表格 task 列：`2: 写论文 | 5: 复习错题` —— 编号 + 裁剪后的标题，用 ` | ` 分隔。
+- 契约表格 task 列：`2: 写论文 | ✓5: 复习错题` —— 编号 + 裁剪后的标题，用 ` | ` 分隔；
+  完成/放弃的前面多一个记号（`✓` / `✗` / `⤼`），**不会被隐藏**。
 - 排布改了（`period T1 …`）时任务绑定跟着走：没动的场次保留，动过的清掉
   （见 `session_plan.md`；清掉的是绑定，不是任务）。
 - 契约表格下面那块两列任务表格：`number | task | number | task`；已 assign 到

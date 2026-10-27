@@ -14,6 +14,16 @@
 | `cancel.mjs` | 取消 session | 内部 API `DELETE /v1/session/{id}` |
 | `bridge.mjs` | **常驻**桥：一个 Chromium + JSON 行协议，给 `warden.py` 用 | 复用上面同一套内部 API |
 
+`bridge.mjs` 认的命令（JSON 行协议，详见文件头注释）：
+
+```
+ping / snapshot / title / mute / cancel / tasks / add_task / complete_task / release / shutdown
+```
+
+- `add_task startMs title? notes? via?` —— 给某场 session 挂 task（API 优先、DOM 兜底，都复核）；
+- `complete_task taskId` —— 把一条 task 勾完成（候选端点 + `GET /tasks` 复核 `completedAt`，
+  见 `task_attach.mjs` 的 `completeTaskShapes()`；**这条没有真机验证过**）。
+
 `_lib.mjs` 是共用底座（起浏览器、取 token、调内部 API、按时间找 session、CLI 解析）。
 
 > 上面四个 `.mjs` 是「一个脚本干一件事」的 CLI，每次调用冷启动一个 Chromium

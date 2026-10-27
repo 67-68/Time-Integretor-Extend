@@ -83,6 +83,7 @@ stat [refresh]      切到「统计」视图：生涯累计 / 每天分布 / 按
 stat refresh full   统计：丢掉缓存、全量重拉（两千多条；只在怀疑缓存坏了时用）
 status / s          重画看板
 help / quit
+review [HH:MM|日期T时刻]   手动开始一场 session 的收尾（逐个问没做完的任务）
 ```
 
 `sync` 不重写日历逻辑：薄封装 `download_calendar.py populate`（`--days` 等参数原样透传），
@@ -131,7 +132,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 | 1 | 契约（默认） | **状态框（ASCII）+ The Contract Table** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
-| 4 | 任务 | 任务表（含 `重复` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/sync` |
+| 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 
 - **统计视图的数据链在 `stats.py`**（只读公开 API，按 ≤365 天分块拉全量历史，
@@ -187,6 +188,45 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 
 暂停的规则（次数/时长/跨天）在 [`idle_watchdog.md`](./idle_watchdog.md)，
 实现在 `keep_session.pause_status()` / `start_pause()` —— warden 和 daemon 共用同一份。
+
+## 收尾（session 结束 +15s）
+
+契约视图和任务视图里，**表格最上面**会多一块黄色面板：
+
+```
+⏱ 收尾 · 2026-10-27 11:00–11:50
+任务 3：写论文
+  · session 2026-10-27 11:00（截止 2026-10-27T11:50:00）· Focusmate 42cabb17… · OmniFocus kc-4VLAE_1L
+  A  延期   你自己敲命令把任务转移走（复制品 + 旧场次放弃 + 本地标签「未完成转移」）
+  B  放弃   这条真不要了：本地放弃 + OmniFocus 也放弃
+  C  重议   复制一条（指向同一条 OmniFocus 任务），旧的放弃；OmniFocus 不动
+  D  缺漏完成 手动填实际分钟数 → 本地完成 + Focusmate 勾上 + OmniFocus 完成
+  E  快捷推后 和延期一样，但复制品由系统建好、直接塞进下一场
+第 1/2 条 · A 延期 · B 放弃 · C 重议 · D 缺漏完成 · E 快捷推后 · s 跳过 · q 结束收尾
+```
+
+- **谁来催**：daemon（`keep_session.postsession_tick()`，结束 +15 秒）写
+  `temp/keep_session-postsession.json`，再 `osascript app/warden-summon.applescript`
+  把 warden 拉到前台。warden 每帧（自己节流 1 秒）看这个文件，有就接过来。
+- **核对完成状态要联网/起进程**（bridge 的 `GET /v1/tasks` + `omnifocus.py list`），
+  所以这一段在**后台线程**里跑，面板先显示「正在核对…」，核对完才建
+  `postsession.Review` —— 画帧的线程永远不会被卡住。
+- **A 延期阶段是「等你敲命令」**：这一行输入照常派发（例如 `task 3 duplicate -a 5`），
+  派发完回头判「转移到底发生没发生」。这个回头钩子挂在 `guard()` 里，
+  因为 TUI 的交互路径走 repl_kit 的 dispatch，**不经过** `Warden.handle`。
+- 收完之后这一场从 `pending` 挪到 `done`，永不重催。
+- 细节见 [`postsession.md`](./postsession.md)。
+
+## OmniFocus 联动（只单向）
+
+- 「完成 / 放弃 / 截止时间」写回 OmniFocus；「活还在不在、叫什么」以 OmniFocus 为准。
+- 任务被分配到一场 session 上时，**截止时间自动 = 那场的终点**
+  （11:00–11:50 → `2026-10-27T11:50:00`，原值留档在 `session.previous_due`）。
+- 完成的时候用一条命令把「完成 + 截止时间」写回去
+  （`set --id <PK> --complete --due … --yes`），写回痕迹记在 `omnifocus.writeback`。
+- OmniFocus 读不到（没装 / 权限没给）只变成一句警告：收尾照常进行。
+- 「延期 / 快捷推后 / 重议」**不碰** OmniFocus —— 活还在，只是本地换了账本。
+- 关掉：`set omnifocus off`。细节见 [`docs/omnifocus.md`](../docs/omnifocus.md)。
 
 ## 宣言闸门（The Walk of Shame）
 
@@ -362,6 +402,10 @@ python3 warden.py install-deps
 |---|---|---|
 | `edit-tomorrow` | `on` | 今天可以先安排明天：选中「明天」时按**草稿区**处理（晚上 11 点想排明天早上 10 点不用敲宣言）。过了凌晨明天变今天，自动回到 24 小时窗口那套规则。行上仍保留原始判据 `zone_raw`，方便追溯 |
 | `tomorrow-plan` | 空 | 「明日时间安排」：一个每周重复任务的规格（`mon@22:15`）。填了会提示用 `task create ... --repeat` 建出来 |
+| `omnifocus` | `on` | 和 OmniFocus 联动（**只单向**：warden → OmniFocus）。`off` = 一个字节都不碰 |
+| `postsession` | `on` | session 结束 15 秒后把 warden 拉到前台收尾。`off` = 不催（`review` 仍可手动开） |
+| `omnifocus` | `on` | 和 OmniFocus 联动（**只单向**：warden → OmniFocus）。`off` = 一个字节都不碰 |
+| `postsession` | `on` | session 结束 15 秒后把 warden 拉到前台收尾。`off` = 不催（`review` 仍可手动开） |
 
 - 界面列出**全部**设置项（哪怕从没改过）连同解释、当前值和默认值；改过的标 `*`。
 - `set <id> <value>` 改；`set <id>`（不写 value）= 恢复默认。任何视图都能敲。

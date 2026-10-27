@@ -17,6 +17,13 @@
     「明日时间安排」：一个**每周重复任务**（``mon@22:15`` 这种形状），到点了
     自动挂到那一周的对应 session 上。空 = 没设置（于是状态栏会提醒你设置）。
 
+``omnifocus``
+    和 OmniFocus 联动。**只有单向**（warden → OmniFocus）：完成/放弃写回去、
+    收尾时读完成状态；OmniFocus 里的改动不会回流。off = 一个字节都不碰。
+
+``postsession``
+    session 结束 15 秒后把 warden 拉到前台收尾（见 ``postsession.py``）。
+
 这个模块不联网、不依赖 rich；warden 和测试都只调这里。
 """
 from __future__ import annotations
@@ -48,6 +55,25 @@ SETTINGS = [
         "summary": "今天可以先安排明天的 session",
         "desc": "开着时，选中「明天」按草稿区处理（晚上 11 点也能随便排明天早上 10 点）；"
                 "过了凌晨就照常走 24 小时窗口。",
+    },
+    {
+        "id": "omnifocus",
+        "type": "bool",
+        "default": "on",
+        "values": ("on", "off"),
+        "summary": "和 OmniFocus 联动（只单向：warden → OmniFocus）",
+        "desc": "开着 = 任务完成/放弃会写回 OmniFocus，收尾时读 OmniFocus 的完成状态；"
+                "off = 完全不碰 OmniFocus（收尾照常问你，只是不写不读）。",
+    },
+    {
+        "id": "postsession",
+        "type": "bool",
+        "default": "on",
+        "values": ("on", "off"),
+        "summary": "session 结束 15 秒后拉 warden 到前台收尾",
+        "desc": "开着 = 每场结束后 15 秒把 warden 拉到前台，逐个问没做完的任务"
+                "（A 延期 / B 放弃 / C 重议 / D 缺漏完成 / E 快捷推后）；"
+                "off = 不拉、不催（`review` 仍然可以手动开始）。",
     },
     {
         "id": "tomorrow-plan",

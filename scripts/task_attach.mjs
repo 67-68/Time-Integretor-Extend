@@ -122,6 +122,60 @@ export async function attachTaskViaApi(deps, meeting, title, notes) {
   );
 }
 
+/**
+ * 「把一条 task 勾完成」的候选形状：[label, method, path, body]。
+ *
+ * 端点是逆向出来的（Task Manager 的 baseUrl 里出现过 `/tasks/{id}/complete`），
+ * 但**没有公开文档**，所以和 attach 一样按由简到繁试，每一种都拿
+ * `GET /tasks` 复核「completedAt 有值」才算数。
+ */
+export function completeTaskShapes(id, nowIso) {
+  const enc = encodeURIComponent(id);
+  return [
+    ["POST /tasks/{id}/complete", "POST", "/tasks/" + enc + "/complete", {}],
+    ["PUT /tasks/{id}/complete", "PUT", "/tasks/" + enc + "/complete", {}],
+    ["POST /tasks/{id} {completedAt}", "POST", "/tasks/" + enc, { completedAt: nowIso }],
+    ["PUT /tasks/{id} {completedAt}", "PUT", "/tasks/" + enc, { completedAt: nowIso }],
+  ];
+}
+
+/**
+ * 用 API 把一条 task 标成完成，返回**复核过**的 task。
+ *
+ * @param {object} deps { callApi(method,path,body), findTask(id) }
+ */
+export async function completeTaskViaApi(deps, taskId) {
+  const { callApi, findTask } = deps;
+  const attempts = [];
+  const fail = (msg) => {
+    const e = new Error(msg);
+    e.attempts = attempts;
+    return e;
+  };
+  if (!taskId) throw fail("completeTaskViaApi 需要 taskId");
+  const before = await findTask(taskId);
+  if (!before) throw fail("GET /tasks 里没有 id=" + taskId + " 的 task");
+  if (before.completedAt) {
+    return { task: before, attempts, via: "already", already: true };
+  }
+  const nowIso = new Date().toISOString();
+  for (const [label, method, path, body] of completeTaskShapes(taskId, nowIso)) {
+    const r = await callApi(method, path, body);
+    if (!okStatus(r.status)) {
+      attempts.push(label + " → HTTP " + r.status + " " + String(r.text || "").slice(0, 160));
+      continue;
+    }
+    attempts.push(label + " → HTTP " + r.status);
+    const after = await findTask(taskId);
+    if (after && after.completedAt) return { task: after, attempts, via: label };
+    attempts.push("复核：GET /tasks 里 completedAt 还是空");
+  }
+  throw fail(
+    "没能在 API 上把 task " + taskId + " 标成完成。试过：" + attempts.join("；") +
+      "（Focusmate 侧这一步可以手点，本地和 OmniFocus 已经记下了）"
+  );
+}
+
 function brief(e) {
   return String((e && e.message) || e).replace(/\s+/g, " ").slice(0, 200);
 }

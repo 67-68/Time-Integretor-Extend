@@ -30,6 +30,10 @@
     python3 omnifocus_tasks.py set --id <PK> --add-tag 写作 --yes
     python3 omnifocus_tasks.py set --id <PK> --set-tags 工作,Deep --yes
     python3 omnifocus_tasks.py set --id <PK> --clear-tags --yes
+    # 截止时间是「修饰」：可以和 --complete 一条命令一起给（warden 收尾就用这个）
+    python3 omnifocus_tasks.py set --id <PK> --complete --due 2026-10-27T11:50 --yes
+    python3 omnifocus_tasks.py set --id <PK> --due 2026-10-28 --yes
+    python3 omnifocus_tasks.py set --id <PK> --clear-due --yes
 
     # 例：脚本本身也是纯文本，可以直接喂给 osascript
     python3 omnifocus_tasks.py --script | osascript
@@ -418,6 +422,8 @@ SET_OMNIJS_TEMPLATE = r'''
     dropped: !!t.dropDate,
     completion_date: iso(t.completionDate),
     drop_date: iso(t.dropDate),
+    due: iso(t.dueDate),
+    defer: iso(t.deferDate),
     tags: Array.from(t.tags).map(g => g.name),
     tag_paths: Array.from(t.tags).map(tagPath)
   });
@@ -445,8 +451,12 @@ SET_OMNIJS_TEMPLATE = r'''
       (args.tags.add && args.tags.add.length) ||
       (args.tags.remove && args.tags.remove.length)
     );
+    const hasDue = !!(args.due || args.clearDue);
     if (hasState && hasTags) {
       return reply({ ok: false, error: "bad_request", message: "状态操作和标签操作不要混在一条命令里" });
+    }
+    if (hasTags && hasDue) {
+      return reply({ ok: false, error: "bad_request", message: "标签操作和截止时间操作不要混在一条命令里" });
     }
     const before = snapshot(task);
     const allTags = (typeof flattenedTags !== "undefined") ? flattenedTags : database.flattenedTags;
@@ -495,15 +505,20 @@ SET_OMNIJS_TEMPLATE = r'''
         if (setRes.tags.length) task.addTags(setRes.tags);
       } else if (args.tags.clear) {
         task.clearTags();
-      } else {
+      } else if (hasTags) {
         if (removeRes.tags.length) task.removeTags(removeRes.tags);
         if (addRes.tags.length) task.addTags(addRes.tags);
+      }
+      // 截止时间是「修饰」，不独占一次命令：--complete --due … 一条就跑完。
+      if (hasDue) {
+        task.dueDate = args.due ? new Date(args.due) : null;
+        afterTask = task;
       }
     }
     const repeatCloneId = (idOf(afterTask) !== idOf(task)) ? idOf(afterTask) : null;
     const after = args.dryRun ? before : snapshot(afterTask);
     const changed = [];
-    for (const key of ["completed", "dropped", "completion_date", "drop_date", "tags"]) {
+    for (const key of ["completed", "dropped", "completion_date", "drop_date", "due", "tags"]) {
       if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(key);
     }
     return reply({
@@ -1064,7 +1079,8 @@ def build_set_parser():
         prog="omnifocus_tasks.py set",
         description="按 primary key 修改一个 OmniFocus 任务。默认只预览，加 --yes 才真写。",
         epilog=(
-            "状态操作和标签操作分两次跑，不要混在一条命令里。\n"
+            "状态操作和标签操作分两次跑，不要混在一条命令里；"
+            "--due 是修饰，可以跟 --complete/--drop 一起给。\n"
             "标签名可以写叶子名（唯一时）、完整路径（如 Work/Deep）或标签 primary key。\n"
             "退出码：0 成功 / 1 失败 / 2 参数错 / 3 权限被拒 / 4 预览未写 / "
             "5 任务不存在 / 6 标签问题 / 7 拒绝改 project_root。"
@@ -1090,6 +1106,17 @@ def build_set_parser():
         "--at",
         metavar="ISO",
         help="完成/放弃时间（ISO 8601，例如 2026-10-27T09:00:00；默认现在）",
+    )
+    due = parser.add_mutually_exclusive_group()
+    due.add_argument(
+        "--due",
+        metavar="ISO",
+        help="改截止时间（ISO 8601 或 YYYY-MM-DD；可以和 --complete 一起给）",
+    )
+    due.add_argument(
+        "--clear-due",
+        action="store_true",
+        help="清掉截止时间",
     )
     parser.add_argument(
         "--add-tag",
@@ -1220,10 +1247,13 @@ def build_set_payload(args):
 
     if state_ops and tag_modes:
         raise ValueError("状态操作和标签操作不要混在一条命令里，分两次跑")
-    if not state_ops and tag_modes == 0:
+    if tag_modes and (args.due or args.clear_due):
+        raise ValueError("标签操作和截止时间操作不要混在一条命令里，分两次跑")
+    if not state_ops and tag_modes == 0 and not (args.due or args.clear_due):
         raise ValueError(
             "至少给一个操作：--complete / --incomplete / --drop / --undrop，"
-            "或 --add-tag / --remove-tag / --set-tags / --clear-tags"
+            "或 --add-tag / --remove-tag / --set-tags / --clear-tags，"
+            "或 --due / --clear-due"
         )
 
     if args.all_occurrences and not args.drop:
@@ -1235,6 +1265,8 @@ def build_set_payload(args):
             raise ValueError("--at 只能配合 --complete 或 --drop")
         at = _normalize_at(args.at)
 
+    due = _normalize_at(args.due) if args.due else None
+
     ops = []
     if state_ops:
         op = state_ops[0]
@@ -1245,9 +1277,13 @@ def build_set_payload(args):
         ops.append("set-tags:" + ",".join(set_tags))
     elif args.clear_tags:
         ops.append("clear-tags")
-    else:
+    elif add_tags or remove_tags:
         ops.extend("remove-tag:" + tag for tag in remove_tags)
         ops.extend("add-tag:" + tag for tag in add_tags)
+    if due:
+        ops.append("due:" + due)
+    elif args.clear_due:
+        ops.append("clear-due")
 
     return {
         "id": args.id,
@@ -1257,6 +1293,8 @@ def build_set_payload(args):
         "undrop": bool(args.undrop),
         "dropAll": bool(args.all_occurrences),
         "at": at,
+        "due": due,
+        "clearDue": bool(args.clear_due),
         "tags": {
             "add": add_tags,
             "remove": remove_tags,

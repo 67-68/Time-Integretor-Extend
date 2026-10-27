@@ -24,6 +24,8 @@
  *     mute     startMs meetingId? quiet       开/关 quiet mode
  *     cancel   startMs meetingId? source?     取消（**破坏性**，调用方负责把关）
  *     tasks                             列 Task Manager 的 task（含 completedAt）
+ *     complete_task taskId             把一条 task 勾完成（API 候选 + GET 复核
+ *                                      completedAt）；收尾「缺漏完成补充」用它
  *     add_task startMs title? notes? via? 给某场 session 挂 Focusmate task
  *                                       （默认先走内部 API，DOM 兜底；都复核）
  *
@@ -57,7 +59,7 @@
  */
 
 import readline from "readline";
-import { attachTaskViaApi } from "./task_attach.mjs";
+import { attachTaskViaApi, completeTaskViaApi } from "./task_attach.mjs";
 
 // ---------------------------------------------------------------- 独占 stdout
 
@@ -528,6 +530,42 @@ const handlers = {
       taskId: normalized.id,
       task: normalized,
     };
+  },
+
+  async complete_task(req) {
+    const taskId = String(req.taskId || "");
+    if (!taskId) throw new Error("complete_task 要 taskId（Focusmate task 的 id）");
+    const attempts = [];
+    try {
+      const done = await completeTaskViaApi(
+        {
+          callApi,
+          findTask: async (id) => {
+            const all = await listTasksRaw();
+            const hit = all.find((t) => String(t.id) === String(id));
+            return hit ? normalizeTask(hit) : null;
+          },
+        },
+        taskId
+      );
+      attempts.push(...(done.attempts || []));
+      const task = normalizeTask(done.task || {});
+      return {
+        verified: !!task.completedAt,
+        already: !!done.already,
+        via: done.via || null,
+        taskId,
+        task,
+        completedAt: task.completedAt,
+        attempts,
+      };
+    } catch (e) {
+      attempts.push(...((e && e.attempts) || []));
+      const err = new Error((e && e.message ? e.message : String(e)) +
+        (attempts.length ? "｜试过：" + attempts.join("；") : ""));
+      err.attempts = attempts;
+      throw err;
+    }
   },
 
   async cancel(req) {

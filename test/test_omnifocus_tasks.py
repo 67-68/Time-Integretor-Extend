@@ -372,6 +372,8 @@ def set_payload(**overrides):
         "dropAll": False,
         "undrop": False,
         "at": None,
+        "due": None,
+        "clearDue": False,
         "tags": {"add": [], "remove": [], "set": None, "clear": False},
         "dryRun": False,
         "allowProjectRoot": False,
@@ -460,6 +462,24 @@ if shutil.which("node"):
         set_payload(id="t2", complete=True, allowProjectRoot=True, ops=["complete"])
     )
     check("set JS：--allow-project-root 放行", (r["ok"], r["after"]["kind"]), (True, "project_root"))
+
+    # 截止时间是「修饰」：可以和 --complete 一条命令一起给（warden 收尾就靠这个）
+    r = run_set_js(set_payload(complete=True, due="2026-10-27T11:50:00",
+                               ops=["complete", "due:2026-10-27T11:50:00"]))
+    check("set JS：complete + due 一条搞定",
+          (r["after"]["completed"], r["after"]["due"]), (True, "2026-10-27T11:50:00"))
+    check("set JS：changed 里带上 due",
+          sorted(r["changed"]), ["completed", "completion_date", "due"])
+
+    r = run_set_js(set_payload(due="2026-10-28T00:00:00", ops=["due:2026-10-28T00:00:00"]))
+    check("set JS：只改截止时间", (r["ok"], r["after"]["due"], r["after"]["completed"]),
+          (True, "2026-10-28T00:00:00", False))
+
+    r = run_set_js(set_payload(clearDue=True, ops=["clear-due"]))
+    check("set JS：--clear-due", r["after"]["due"], None)
+
+    r = run_set_js(set_payload(clearDue=True, dryRun=True, ops=["clear-due"]))
+    check("set JS：dry-run 不改截止时间", r["changed"], [])
 else:
     print("skip set Node mock（没装 node）")
 
@@ -719,6 +739,9 @@ with tempfile.TemporaryDirectory() as tmp:
         (["set", "--id", "t1", "--set-tags", ""], "空 set-tags"),
         (["set", "--id", "t1", "--add-tag", "x", "--remove-tag", "x"], "同标签又加又删"),
         (["set", "--id", "t1", "--complete", "--all-occurrences"], "--all-occurrences 用错"),
+        (["set", "--id", "t1", "--add-tag", "x", "--due", "2026-10-28"], "标签+截止混用"),
+        (["set", "--id", "t1", "--due", "2026-10-28", "--clear-due"], "due 和 clear-due 互斥"),
+        (["set", "--id", "t1", "--due", "garbage"], "坏 --due"),
     ):
         code, out, err = run_main(argv)
         check("set 参数错：%s → 2" % label, code, 2)
@@ -738,6 +761,16 @@ check("--set-tags 拆逗号并去重", m.build_set_payload(args)["tags"]["set"],
 args = set_parser.parse_args(["--id", "t1", "--drop", "--all-occurrences", "--yes"])
 drop_all_payload = m.build_set_payload(args)
 check("--drop --all-occurrences", (drop_all_payload["dropAll"], drop_all_payload["ops"]), (True, ["drop-all"]))
+args = set_parser.parse_args(["--id", "t1", "--complete", "--due", "2026-10-27T11:50", "--yes"])
+due_payload = m.build_set_payload(args)
+check("--complete --due 一条命令",
+      (due_payload["due"], due_payload["ops"]),
+      ("2026-10-27T11:50", ["complete", "due:2026-10-27T11:50"]))
+check("截止时间不影响 dryRun 判定", due_payload["dryRun"], False)
+args = set_parser.parse_args(["--id", "t1", "--clear-due", "--yes"])
+clear_due = m.build_set_payload(args)
+check("--clear-due",
+      (clear_due["due"], clear_due["clearDue"], clear_due["ops"]), (None, True, ["clear-due"]))
 check_raises(
     "坏 --at 报 ValueError",
     lambda: m.build_set_payload(

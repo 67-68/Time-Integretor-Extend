@@ -13,6 +13,12 @@
     │    没输入 → 记一次违规 + 通知；做题/写作在违规前 30s 先预警。   │
     │    普通第 3 次、做题/写作第 1 次：音量拉到 10% 播放告警音频。    │
     │    暂停期间不念；模式由 warden 专注视图的 Shift+Tab 切换。       │
+    │                                                               │
+    │  同一个睡眠循环里**每秒**还看一眼「收尾」（postsession_tick）：  │
+    │    某场结束满 POSTSESSION_DELAY=15s → 写 temp/keep_session-     │
+    │    postsession.json（pending 队列）+ osascript 把 warden 拉到前台│
+    │    真正的提问/动作在 warden 里（postsession.Review），daemon 只管│
+    │    「准点叫人」。见 feature_intents/postsession.md。            │
     └───────────────────────────────────────────────────────────────┘
         ▲ 读 state / verdicts / sins / idle / pause / 日志（warden TUI 只读文件）
         │
@@ -94,6 +100,7 @@ sys.path.insert(0, HERE)
 
 import main as fm  # noqa: E402  复用 resolve_target / mcp_call / book_once / TOKEN
 import schedule as sch  # noqa: E402  data.csv 的解析/编辑：唯一实现（TUI 也 import 它）
+import postsession as psv  # noqa: E402  收尾：谁该收、什么时候收（纯逻辑 + 状态文件）
 
 LOOP_INTERVAL = 300            # daemon 每轮间隔（秒）
 DEBOUNCE_BASE = 5              # 下单前基础等待（秒）
@@ -207,6 +214,9 @@ def reexec_if_stale():
 IDLE_CHECK = os.environ.get("KEEP_SESSION_IDLE_CHECK", "1").strip().lower() not in (
     "0", "false", "no", "off", "")
 IDLE_POLL_SEC = 5                # daemon 隔多久看一眼空闲时间（秒）
+POSTSESSION_DELAY = psv.DELAY_SEC     # session 结束多久之后拉 warden 收尾（秒）
+POSTSESSION_ENABLED = True            # 设置项 postsession=off 时这里也不拉
+SUMMON_SCRIPT = os.path.join(HERE, "app", "warden-summon.applescript")
 IDLE_MAX_STRIKES = 3             # 兜底值；真正惩罚次数用模式里的 max_strikes
 IDLE_ALERT_AUDIO = os.path.join(HERE, "data", "audio", "赵小六嘶吼.mp3")
 IDLE_ALERT_VOLUME = 10           # 「把音量拉到 10%」
@@ -983,6 +993,97 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
     return strikes
 
 
+# ---------------------------------------------------------------- 收尾（session 结束 +15s）
+#
+# 一场 session 结束是唯一还知道「刚才那 50 分钟干了什么」的时刻，所以这里做一件事：
+# **结束 15 秒之后把 warden 拉到前台，并把这一场写进收尾队列**
+# （temp/keep_session-postsession.json）。真正的提问/动作在 warden 里
+# （postsession.Review），daemon 只负责「准点叫人」。
+#
+# 为什么在 daemon 里做：warden 是人开的 TUI，它可能根本没在看这一场；
+# daemon 一直在跑（每 LOOP_INTERVAL 一轮，两轮之间的睡眠里每秒醒一次），
+# 所以这里是唯一能保证「准时」的地方。
+
+
+def summon_warden(dry_run=False, extra=()):
+    """把 warden 拉到前台（app/warden-summon.applescript 是唯一实现）。
+
+    「找到就聚焦、找不到就新建窗口」那些语义全在 AppleScript 里，这里不重复实现。
+    失败只记日志：叫人失败不该影响订场。
+    """
+    if dry_run:
+        log("  [postsession] dry-run：会跑 osascript %s" % SUMMON_SCRIPT)
+        return True
+    if not os.path.exists(SUMMON_SCRIPT):
+        log("  [postsession] 找不到 %s，跳过唤起" % SUMMON_SCRIPT)
+        return False
+    cmd = ["osascript", SUMMON_SCRIPT] + [str(x) for x in extra]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("  [postsession] 唤起 warden 失败：%s" % e)
+        return False
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        log("  [postsession] 唤起 warden 退出 %d：%s" % (proc.returncode, err or out))
+        return False
+    log("  [postsession] 已唤起 warden：%s" % (out or "ok"))
+    return True
+
+
+def postsession_enabled():
+    """设置里的 postsession 开不开（读不到设置就当开 —— 它是默认行为）。"""
+    if not POSTSESSION_ENABLED:
+        return False
+    try:
+        import settings_store as cfg
+
+        return cfg.SettingStore().get_bool("postsession")
+    except Exception:                      # noqa: BLE001 - 设置坏了不该让 daemon 挂
+        return True
+
+
+def postsession_tick(dry_run=False, now=None, delay=None, summon=None):
+    """每秒叫一次：有没有「刚结束满 15 秒」的场次还等着收尾？
+
+    判据全在 ``postsession.ended_sessions()`` 里（结束 + delay ≤ now < 结束 +
+    delay + 3h，防止机器睡醒之后翻旧账）。已经入过队的不会重复入队
+    （状态文件里 pending / done 都算处理过）。
+    """
+    if not postsession_enabled():
+        return []
+    now = now or datetime.datetime.now()
+    delay = POSTSESSION_DELAY if delay is None else delay
+    try:
+        entries, _warnings = load_entries()
+        slots = psv.slots_around(entries, now=now, days_back=1)
+        due = psv.ended_sessions(slots, now=now, delay=delay)
+    except Exception as e:                 # noqa: BLE001 - data.csv 坏了也不该让 daemon 挂
+        log("  [postsession] 算不出该收尾的场次：%s" % e)
+        return []
+    if not due:
+        return []
+    state = psv.load_state()
+    fresh = [rec for rec in due if rec["key"] not in state["pending"]
+             and rec["key"] not in state["done"]]
+    if not fresh:
+        return []
+    fired = []
+    for rec in fresh:
+        if dry_run:
+            log("  [postsession] dry-run：该收尾 %s（结束 %s）" % (rec["key"], rec["end"]))
+            fired.append(rec)
+            continue
+        psv.mark_pending(rec, now=now)
+        log("  [postsession] %s 结束满 %ds → 已入收尾队列，拉 warden 到前台"
+            % (rec["key"], int(delay)))
+        fired.append(rec)
+    if fired and not dry_run:
+        (summon or summon_warden)(dry_run=dry_run)
+    return fired
+
+
 # ---------------------------------------------------------------- 只读 API
 
 
@@ -1395,6 +1496,12 @@ def cmd_run(dry_run=False):
                     idle_tick(dry_run=dry_run)
                 except Exception as e:
                     log("  [idle] 检查出错（忽略，下轮再试）：%s" % e)
+            # 收尾：每秒看一眼「刚结束满 15 秒」的场次（用户要求准时 15s）。
+            # 睡觉醒来跳过的那些按 LOOKBACK 补，不会漏。
+            try:
+                postsession_tick(dry_run=dry_run)
+            except Exception as e:
+                log("  [postsession] 检查出错（忽略，下一秒再试）：%s" % e)
             time.sleep(min(1, LOOP_INTERVAL - slept))
             slept += 1
     log("run 已退出")
@@ -1535,6 +1642,12 @@ def cmd_daemon_status():
     print("  running: %s%s" % ("是" if alive else "否", " (pid=%d)" % pid if pid else ""))
     if STOP_FILE and os.path.exists(STOP_FILE):
         print("  stop flag: 存在（下轮会退出）")
+    print("  收尾: %s（结束 +%ds 把 warden 拉到前台）"
+          % ("开着" if postsession_enabled() else "关着", POSTSESSION_DELAY))
+    pending = psv.pending_sessions()
+    if pending:
+        print("  待收尾 %d 场：%s"
+              % (len(pending), "、".join(r.get("key") or "?" for r in pending)))
     return 0
 
 

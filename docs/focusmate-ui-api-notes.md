@@ -661,6 +661,24 @@ book-session-attempt-2 failed: locator.waitFor: Timeout 3000ms exceeded.
 }
 ```
 
+**2026-10-27 补充：把 task 勾完成（`complete_task`）**
+
+逆向出来的 Task Manager 路由里有 `/{id}/complete`，所以 `scripts/bridge.mjs` 加了
+一条 `complete_task taskId`（收尾「缺漏完成补充」用它）。和 attach 一样**没有公开
+文档**，所以按由简到繁试候选形状，每一种都 `GET /tasks` 复核「`completedAt` 有值」
+才算成功（`scripts/task_attach.mjs` 的 `completeTaskShapes()`）：
+
+```
+POST /tasks/{id}/complete
+PUT  /tasks/{id}/complete
+POST /tasks/{id}  {completedAt}
+PUT  /tasks/{id}  {completedAt}
+```
+
+⚠️ 这条**没有真机验证过**（沙箱里没有登录态）。跑不通时不欺骗：桥会返回失败 +
+全部尝试记录，warden 会把「Focusmate 没确认勾上（可以手动点一下）」说出来，
+本地和 OmniFocus 那边照常记完成。
+
 因此本地任务归档可以同时记下：
 - 本地任务字段；
 - 对应的 session（日期 / 时刻 / Focusmate session id）；

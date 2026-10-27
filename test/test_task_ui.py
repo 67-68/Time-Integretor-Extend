@@ -198,7 +198,12 @@ check("表格那一行的 task 列也更新了", "写论文" in row1200.get("tas
 wd.bridge.calls = []
 check("--assign=N 这种写法也认",
       wd.handle("task modify %d due 后天 --assign %d" % (new_id, idx1200)), True)
-check("modify 的字段生效", wd.task_store.get(new_id)["fields"]["due"], "后天")
+# 需求：任务被分配到一场 session 上，截止时间**自动**变成那场的终点
+# （12:00 + 50min = 12:50）。手写的那条不丢，留在 session.previous_due 里。
+check("assign 之后截止时间 = 这场 session 的终点",
+      wd.task_store.get(new_id)["fields"]["due"], "2026-10-27T12:50:00")
+check("原来手写的 due 留档在 session.previous_due",
+      wd.task_store.get(new_id)["session"].get("previous_due"), "后天")
 check("又挂了一次（同一场重挂是会走 bridge 的）",
       len([c for c in wd.bridge.calls if c[0] == "add_task"]), 1)
 
