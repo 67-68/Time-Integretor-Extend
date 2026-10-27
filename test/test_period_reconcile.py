@@ -45,6 +45,10 @@ sch.DATA_CSV = os.path.join(TMP, "data.csv")
 sch.BACKUP_CSV = os.path.join(TMP, "data.csv.bak")
 sch.TEMP = TMP
 ks.STATE_FILE = os.path.join(TMP, "state.json")
+# 改排布会取 daemon 那一轮的 round lock、并写「我取消的」挂号单 —— 别落到真目录里
+ks.LOCK_FILE = os.path.join(os.path.dirname(ks.STATE_FILE), "keep_session.lock")
+ks.EXPECTED_FILE = os.path.join(os.path.dirname(ks.STATE_FILE),
+                                "keep_session-expected.json")
 ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
@@ -150,6 +154,34 @@ wd.require_declaration = lambda reason: (_ for _ in ()).throw(AssertionError("�
 check("草稿区直接取消+改", wd.cmd_period_layout(["T5", "25", "25"]), True)
 check("草稿区也取消了旧 session",
       len([c for c in wd.bridge.calls if c[0] == "cancel"]), 1)
+
+print("== 改排布前给 daemon 挂号：别把 warden 自己干的活记成罪 ==")
+open(sch.DATA_CSV, "w", encoding="utf-8").write("")
+wd = mkwarden(True)
+w.run_keep_session = lambda *a, **kw: (0, "round done", "")
+wd.require_declaration = lambda reason: (_ for _ in ()).throw(
+    AssertionError("改排布不该问宣言"))
+# 旧 state：22:15 是 booked（旧 50min）；新排布 25+25 里 22:15 变成 25min
+ks._save_json(ks.STATE_FILE, {"date": ISO, "slots": {
+    "%sT22:15" % ISO: {"status": "booked", "duration": "50"}}})
+check("T5 25 25 受理", wd.cmd_period_layout(["T5", "25", "25"]), True)
+expected = ks.load_expected()["cancels"]
+check_true("22:15 挂了号（旧 50min 那场要被换掉）", "%sT22:15" % ISO in expected)
+check("挂号单写了原因",
+      str(expected["%sT22:15" % ISO].get("reason")).startswith("layout-changed:T5"), True)
+# 模拟 daemon 看到 state=booked 但 API 里没了：有挂号 → 不该记罪
+check("daemon 取挂号成功", ks.take_expected("%sT22:15" % ISO) is not None, True)
+check("取完就没了（一码一用）", "%sT22:15" % ISO in ks.load_expected()["cancels"], False)
+
+print("== 重新排布会撤销「永不重订」判决（不然那几场永远补不回来）==")
+ks.mark_abandoned("%sT22:15" % ISO, why="walk-of-shame", note="误判")
+check("先判成 abandoned", ks.is_abandoned("%sT22:15" % ISO), True)
+wd = mkwarden(True)
+w.run_keep_session = lambda *a, **kw: (0, "round done", "")
+check("再排一次 T5 25 25", wd.cmd_period_layout(["T5", "25", "25"]), True)
+check("判决被撤销（daemon 会重新订）", ks.is_abandoned("%sT22:15" % ISO), False)
+check_true("消息里说了撤销判决",
+           any("永不重订" in m[2] for m in wd.messages))
 
 print("== 改排布：没动的场次保留任务绑定，动过的清掉 ==")
 # 再加一个长时段 T6（11:00–13:00），好摆 50 25 25 / 50 50

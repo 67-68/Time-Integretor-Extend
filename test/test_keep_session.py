@@ -71,7 +71,8 @@ def write_csv(lines):
 
 
 def clear():
-    for p in (ks.STATE_FILE, ks.VERDICTS_FILE, ks.SINS_FILE, ks.SINS_ARCHIVE):
+    for p in (ks.STATE_FILE, ks.VERDICTS_FILE, ks.SINS_FILE, ks.SINS_ARCHIVE,
+              getattr(ks, "EXPECTED_FILE", None)):
         if os.path.exists(p):
             os.remove(p)
     del BOOKED[:]
@@ -259,6 +260,46 @@ check("语法错误的源码 → 不重启", ks.stale_sources(), [])
 ks._SOURCE_MTIMES = saved_mtimes
 ks._BAD_SOURCE_MTIMES = saved_bad
 shutil.rmtree(reload_tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------- 挂号单：自己取消不算罪
+
+print("== 手动取消（没挂号）→ 记罪 ==")
+clear()
+seed("booked", "50")
+write_csv(["# t", "%s,%s,50" % (WD, HHMM)])
+ks.run_once()
+check("state 说 booked、API 里没有 → 记了一笔罪", len(ks.load_sins()["sins"]), 1)
+check("罪因是 booked-but-missing",
+      ks.load_sins()["sins"][0]["what"], "booked-but-missing")
+
+print("== warden 自己改排布取消（有挂号）→ 不记罪，照样重订 ==")
+clear()
+seed("booked", "50")
+write_csv(["# t", "%s,%s,50" % (WD, HHMM)])
+ks.expect_cancel([KEY], reason="layout-changed:T3")
+check("挂号单写进去了", list(ks.load_expected()["cancels"]), [KEY])
+ks.run_once()
+check("不记罪", ks.load_sins()["sins"], [])
+check("挂号单一码一用（用掉就没了）", ks.load_expected()["cancels"], {})
+check("照旧重订了一次", len(BOOKED), 1)
+check("日志里说了是 warden 干的",
+      any("挂号单" in l for l in LOGS), True)
+
+print("== 挂号单过期/不命中 → 还是记罪 ==")
+clear()
+seed("booked", "50")
+write_csv(["# t", "%s,%s,50" % (WD, HHMM)])
+ks.expect_cancel(["2020-01-01T09:00"], reason="stale")
+ks.run_once()
+check("别的 key 的挂号不掩护这一场", len(ks.load_sins()["sins"]), 1)
+
+print("== 重新排布撤销「永不重订」判决 ==")
+clear()
+ks.mark_abandoned(KEY, why="walk-of-shame", note="误判")
+check("先判成 abandoned", ks.is_abandoned(KEY), True)
+check("撤销 1 条", ks.clear_abandoned([KEY]), 1)
+check("撤完就不是 abandoned 了", ks.is_abandoned(KEY), False)
+check("撤销不存在的 key 返回 0", ks.clear_abandoned([KEY]), 0)
 
 
 

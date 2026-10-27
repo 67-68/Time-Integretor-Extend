@@ -3298,6 +3298,73 @@ class Warden(object):
         except (TypeError, ValueError):
             return True
 
+    def _acquire_round_lock(self, timeout=30.0, poll=0.5, on_wait=None):
+        """拿 daemon 那一轮的同一把文件锁（`keep_session.round_lock`）。
+
+        为什么：改排布是「取消旧场 → 清 state → 写新排布」三步。daemon 要是刚好
+        在中间跑一轮，就会看到「state 说 booked、API 里没了」，把 **warden 自己
+        干的活** 记成「你手动取消」的罪，然后 TUI 锁死 —— 用户就是这么被咬的。
+        等不到（daemon 那一轮在下单，可能几十秒）就返回 None，调用方用挂号单兜底。
+        """
+        lock = ks.round_lock()
+        if lock.__enter__():
+            return lock
+        if on_wait:
+            on_wait()
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            time.sleep(poll)
+            lock = ks.round_lock()
+            if lock.__enter__():
+                return lock
+        return None
+
+    def _period_cancel_keys(self, period, new_sessions):
+        """这一时段里「改完排布之后就不该再存在」的 state key（给 daemon 挂号用）。"""
+        kept = set()
+        for sess in new_sessions or []:
+            try:
+                kept.add((str(sess.get("start")), int(sess.get("duration"))))
+            except (TypeError, ValueError):
+                continue
+        date = period.get("date") or self.sel_date.isoformat()
+        keys = set()
+        # 1) 表格里有 id、但新排布里没有同起点同时长的场次
+        for row in self.rows or []:
+            if not row.get("id") or row.get("date") != date:
+                continue
+            start = row.get("startLabel")
+            if sp.period_for_session([period], start) is None:
+                continue
+            try:
+                dur = int(row.get("durationMin"))
+            except (TypeError, ValueError):
+                dur = None
+            if (str(start), dur) not in kept:
+                try:
+                    keys.add(sch.key_of(datetime.date.fromisoformat(date), start))
+                except ValueError:
+                    pass
+        # 2) state 里记着（哪怕表格没显示出来）的槽位，新排布里也不该再有
+        try:
+            slots = (ks.load_state().get("slots") or {})
+        except Exception:                              # noqa: BLE001
+            slots = {}
+        for key, rec in slots.items():
+            if not str(key).startswith(date + "T"):
+                continue
+            start = str(key).split("T", 1)[1]
+            if sp.period_for_session([period], start) is None:
+                continue
+            dur = (rec or {}).get("duration")
+            try:
+                dur = int(dur)
+            except (TypeError, ValueError):
+                dur = None
+            if (start, dur) not in kept:
+                keys.add(str(key))
+        return keys
+
     def _task_bindings_dropped(self, period, new_sessions):
         """排布变了之后，哪些任务绑定会被清掉（纯计算，不改任何东西）。
 
@@ -3504,28 +3571,55 @@ class Warden(object):
         # 排布一变，动过的场次上的任务绑定就该清掉；先算出来，好写进取消前的面板。
         dropped = self._task_bindings_dropped(period, new_sessions)
 
-        # 旧 API session 先对齐，否则 50min / 25min 会并存。
-        if not self._cancel_stale_period_sessions(period, new_sessions, dropped):
-            return False
+        # 重新排布 = 你又想要这几场：先撤掉「永不重订」的判决，否则认过罪的场次
+        # 永远补不回来（daemon 在 due 之前就把 abandoned 的 key 滤掉了）。
+        revived = ks.clear_abandoned(
+            [sch.key_of(self.sel_date, s["start"]) for s in new_sessions])
+        if revived:
+            self.say("撤销 %d 条「永不重订」判决：这几场重新进 daemon 的下单队列。"
+                     % revived, "ok")
 
-        if not durations:
-            removed = sp.remove_layout(self.sel_date, period_id)
-            if removed is None:
-                raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
-            self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
-        else:
-            sp.set_layout(self.sel_date, period_id, durations)
-            body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
-                             for s in new_sessions)
-            self.say("✅ %s %s → %s" % (self.sel_date.isoformat(), period_id, body), "ok")
+        # 取消旧场 → 清 state → 写新排布 这三步必须和 daemon 的一轮互斥（同一把锁），
+        # 否则它会在缝隙里把 warden 自己干的活记成「你手动取消」的罪。
+        lock = self._acquire_round_lock(
+            on_wait=lambda: self.say("daemon 正在跑一轮，等它跑完再改排布（最多等 30 秒）…",
+                                     "cmd"))
+        if lock is None:
+            self.say("daemon 正在跑一轮（等不到 round lock），改成挂号单兜底："
+                     "会让它别把这次改动记成罪。", "warn")
+        try:
+            # 挂号单要写在真正取消**之前**：daemon 任何一轮看到「booked 但 API 没了」
+            # 都会先查它，命中就不记罪（一码一用，不掩护以后真的手动取消）。
+            keys = self._period_cancel_keys(period, new_sessions)
+            if keys:
+                ks.expect_cancel(sorted(keys),
+                                 reason="layout-changed:%s %s" % (period_id, self.sel_date))
 
-        # 排布落盘之后才动任务绑定：没写进去就什么都不清。
-        self.clear_task_bindings_for_layout(period, new_sessions)
+            # 旧 API session 先对齐，否则 50min / 25min 会并存。
+            if not self._cancel_stale_period_sessions(period, new_sessions, dropped):
+                return False
 
-        # 从下载层 + 所有 layout + 一次性 + 长期规则重新生成 data.csv。
-        # 写在 layout 成功之后。
-        if self.rewrite_data_csv_from_plan():
-            self.say("data.csv 已按下载层重算（精确日期行）。", "info")
+            if not durations:
+                removed = sp.remove_layout(self.sel_date, period_id)
+                if removed is None:
+                    raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
+                self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
+            else:
+                sp.set_layout(self.sel_date, period_id, durations)
+                body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
+                                 for s in new_sessions)
+                self.say("✅ %s %s → %s" % (self.sel_date.isoformat(), period_id, body), "ok")
+
+            # 排布落盘之后才动任务绑定：没写进去就什么都不清。
+            self.clear_task_bindings_for_layout(period, new_sessions)
+
+            # 从下载层 + 所有 layout + 一次性 + 长期规则重新生成 data.csv。
+            # 写在 layout 成功之后。
+            if self.rewrite_data_csv_from_plan():
+                self.say("data.csv 已按下载层重算（精确日期行）。", "info")
+        finally:
+            if lock is not None:
+                lock.__exit__(None, None, None)
 
         if not self.offline:
             # 新排布里执行区的场次需要立刻补订；先让 bridge 放开 profile。
@@ -3583,6 +3677,11 @@ class Warden(object):
             self.say("   想让它每周都出现，用 session --permanent %s %d。"
                      % (rec["start"], rec["duration"]), "info")
             row_token = iso
+
+        # 手动加一场 = 我就要这一场：撤掉这一场上的「永不重订」判决，
+        # 否则认过罪的时刻永远补不回来（daemon 在 due 之前就把它滤掉了）。
+        if ks.clear_abandoned([sch.key_of(day, hhmm)]):
+            self.say("撤销这条时刻的「永不重订」判决：重新进 daemon 的下单队列。", "ok")
 
         if self.rewrite_data_csv_from_plan():
             self.say("data.csv 已按下载层重算（含一次性 / 长期规则）。", "info")

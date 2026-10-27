@@ -376,6 +376,12 @@ python3 warden.py install-deps
 - 取消旧场之前会把面板摊开：要取消哪几场、哪些任务绑定会被清掉，一目了然。
 - 任务绑定按「(起点, 时长) 有没有动」保留：没动的场次绑定留着，动过的清掉
   （详见 `session_plan.md` 的「任务绑定」一节）。
+- **改排布不能把 daemon 惹毛**：`period` 的那一段（取消旧场 → 清 state → 写新排布）
+  包在 `keep_session.round_lock()` 里和 daemon 的一轮互斥，并且在真正取消**之前**
+  把会消失的 state key 写进「挂号单」（`ks.expect_cancel`），daemon 见到
+  `booked-but-missing` 先查挂号单、命中就不记罪。另外重新排布会
+  `ks.clear_abandoned(新排布 key)`，把「永不重订」判决撤掉 —— 否则一次误判就让
+  那几场永远补不回来。详见 `session_plan.md`。
 - 第五个视图 `设置 / 规则` + `set <id> <value>`；`edit-tomorrow` 让「明天」临时按
   草稿区处理（`Warden.effective_zone`），`tomorrow-plan` 是「明日时间安排」的规格。
 - `session` 默认**只加这一天**（`temp/session-extras.json`），`session --permanent`

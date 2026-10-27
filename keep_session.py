@@ -137,6 +137,9 @@ STOP_FILE = os.path.join(HERE, "temp", "keep_session.stop")  # 放这个文件 =
 LOCK_FILE = os.path.join(HERE, "temp", "keep_session.lock")  # 防 daemon 与手动 check 同时下单
 VERDICTS_FILE = os.path.join(HERE, "temp", "keep_session-verdicts.json")  # 认罪判决
 SINS_FILE = os.path.join(HERE, "temp", "warden-sins.json")        # 待认罪的罪
+# 「这条是 warden 自己取消的」的挂号单：改排布/程序化取消之前先挂上，
+# daemon 发现 booked-but-missing 时先查这里，命中就不记罪（也不锁死 TUI）。
+EXPECTED_FILE = os.path.join(HERE, "temp", "keep_session-expected.json")
 SINS_ARCHIVE = os.path.join(HERE, "temp", "warden-sins.jsonl")    # 认过的罪（只增不删）
 
 # daemon 热重载：改了这些源码就自重启（pid 不变），不用手动 daemon restart。
@@ -471,6 +474,23 @@ def mark_abandoned(key, why="walk-of-shame", note=""):
     return rec
 
 
+def clear_abandoned(keys):
+    """撤销「永不重订」判决 —— 重新排布那个时段 = 你又想要这几场了。
+
+    没有这一步的话，一次误判（比如改排布被记成"你手动取消"）就能让那几场
+    **永远补不回来**：daemon 在 due 之前就把 abandoned 的 key 滤掉了。
+    返回撤销了几条。
+    """
+    v = load_verdicts()
+    n = 0
+    for key in keys or []:
+        if v["abandoned"].pop(str(key), None) is not None:
+            n += 1
+    if n:
+        save_verdicts(v)
+    return n
+
+
 def load_sins():
     """待认罪的罪：{"sins": [{key, what, at, note}]}。"""
     s = _load_json(SINS_FILE, {})
@@ -478,6 +498,52 @@ def load_sins():
     if not isinstance(s["sins"], list):
         s["sins"] = []
     return s
+
+
+EXPECTED_TTL_HOURS = 6
+
+
+def load_expected():
+    """warden 主动取消的挂号单：{"cancels": {key: {at, reason}}}。"""
+    d = _load_json(EXPECTED_FILE, {})
+    d.setdefault("cancels", {})
+    if not isinstance(d["cancels"], dict):
+        d["cancels"] = {}
+    # 过期的自动清掉：挂号单是「刚刚这件事是我们干的」的短时凭证，不是判决
+    cutoff = (datetime.datetime.now()
+              - datetime.timedelta(hours=EXPECTED_TTL_HOURS)).isoformat(timespec="seconds")
+    for k in [k for k, v in d["cancels"].items()
+              if str((v or {}).get("at") or "") < cutoff]:
+        d["cancels"].pop(k, None)
+    return d
+
+
+def expect_cancel(keys, reason=""):
+    """挂个号：这几场接下来会被 **warden 自己** 取消/改排布取消，不是用户跑路。
+
+    写在真正调 API 取消**之前**，这样 daemon 的任何一轮都看得到；
+    daemon 命中后会把它摘掉（一码一用），不会掩护以后真的手动取消。
+    """
+    keys = [str(k) for k in (keys or []) if str(k).strip()]
+    if not keys:
+        return 0
+    d = load_expected()
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    for k in keys:
+        d["cancels"][k] = {"at": stamp, "reason": reason or "warden"}
+    _save_json(EXPECTED_FILE, d)
+    return len(keys)
+
+
+def take_expected(key):
+    """取挂号单：命中就摘掉并返回记录（一码一用），没命中返回 None。"""
+    d = load_expected()
+    rec = d["cancels"].get(str(key))
+    if rec is None:
+        return None
+    d["cancels"].pop(str(key), None)
+    _save_json(EXPECTED_FILE, d)
+    return rec
 
 
 def record_sin(key, what, note=""):
@@ -1106,8 +1172,13 @@ def _run_once_locked(dry_run=False, force=False):
                 log("  [已过] %s (%smin) 没有这场 session，已经来不及补订了" % (key, slot["duration"]))
                 if rec.get("status") == "booked":
                     # 订过、然后消失了、而且已经开过了：这是硬罪（你没去 / 你事后取消）
-                    record_sin(key, "booked-but-missing-past",
-                               "已过时间才发现 API 里没有（原记录：booked）")
+                    # —— 除非是 warden 自己改排布取消的（挂号单），那不算罪。
+                    if take_expected(key):
+                        log("  %s 已过时间也没了，但是 warden 主动取消的（挂号单命中）"
+                            "—— 不记罪" % key)
+                    else:
+                        record_sin(key, "booked-but-missing-past",
+                                   "已过时间才发现 API 里没有（原记录：booked）")
                 state["slots"][key] = {"status": "missed", "duration": slot["duration"],
                                        "attempts": rec.get("attempts", 0), "past": True}
                 changed = True
@@ -1147,11 +1218,18 @@ def _run_once_locked(dry_run=False, force=False):
 
         # API 没有该 session
         if status == "booked":
-            # 我们以为是 booked，但 API 说没有 → 你手动取消了。
-            # 守擂：照旧重订（机器读不了你的心）；但记一笔罪，TUI 会锁死你来收。
-            log("  %s 原以为已订，但 API 查不到（疑似你手动取消）→ 记罪 + 重新预定" % key)
-            record_sin(key, "booked-but-missing",
-                       "daemon 在 %s 的这轮检查里发现它消失了" % now.strftime("%m-%d %H:%M"))
+            # 我们以为是 booked，但 API 说没有 → 两种可能：
+            #   a) warden 自己取消的（改排布 / 程序化取消）→ 挂号单命中，不算罪；
+            #   b) 你手动取消了 → 记一笔罪，TUI 锁死你来收。
+            # 两种情况都照旧重订（守擂，机器读不了你的心）。
+            expected = take_expected(key)
+            if expected:
+                log("  %s 没了，但是 warden 主动取消的（挂号单：%s）—— 不记罪，重新预定"
+                    % (key, (expected or {}).get("reason") or "warden"))
+            else:
+                log("  %s 原以为已订，但 API 查不到（疑似你手动取消）→ 记罪 + 重新预定" % key)
+                record_sin(key, "booked-but-missing",
+                           "daemon 在 %s 的这轮检查里发现它消失了" % now.strftime("%m-%d %H:%M"))
             rec = {"duration": slot["duration"], "attempts": 0, "status": None}
             state["slots"][key] = rec
             changed = True

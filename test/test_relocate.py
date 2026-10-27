@@ -47,6 +47,10 @@ sch.DATA_CSV = CSV
 sch.BACKUP_CSV = os.path.join(TMP, "data.csv.bak")
 sch.TEMP = TMP
 ks.STATE_FILE = os.path.join(TMP, "state.json")
+# 改排布会取 daemon 那一轮的 round lock、并写「我取消的」挂号单 —— 别落到真目录里
+ks.LOCK_FILE = os.path.join(os.path.dirname(ks.STATE_FILE), "keep_session.lock")
+ks.EXPECTED_FILE = os.path.join(os.path.dirname(ks.STATE_FILE),
+                                "keep_session-expected.json")
 ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")

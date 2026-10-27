@@ -65,6 +65,31 @@ iCloud 日历（只 工作 / 空闲，今天 + 7 天）
     `reason="layout-changed"`），以后它被勾完成时 `task sync` 照样按
     `completedAt` 归档；`completed_at` 不抹（那是历史）。
   - 绑定只在**排布落盘之后**才清：写失败就什么都不清。
+
+### 改排布不能把 daemon 惹毛（三件套）
+
+改排布是「取消旧场 → 清 state → 写新排布」三步。daemon 要是刚好在中间跑一轮，
+就会看到「state 说 booked、API 里没了」→ 按「你手动取消」记一笔罪 → **TUI 锁死**，
+而且那几场被判「永不重订」，新排布里的场次永远补不回来（2026-10-27 真踩过：
+`period T3 50 75` 之后 `20:00` / `21:00` 各记一笔 `booked-but-missing`）。
+
+1. **同一把 round lock**：这三个步骤包在 `keep_session.round_lock()` 里，和 daemon
+   的一轮互斥。等不到锁（daemon 在下单，可能几十秒）会提示并最多等 30 秒；
+   实在等不到就照常改，用第 2 条兜底。
+2. **挂号单**（`temp/keep_session-expected.json`）：真正取消**之前**，
+   把「这一时段里改完就不该再存在的 state key」全部写进去
+   （`ks.expect_cancel(keys, reason="layout-changed:T3 …")`）。
+   daemon 看到 `booked-but-missing` 时先查挂号单：命中 → **不记罪**、照旧重订，
+   并把那条摘掉（一码一用，不掩护以后真的手动取消）。TTL 6 小时，过期自动清。
+   key 的来源有两处：表格里有 id 但新排布不再匹配的场次，以及 state 里记着、
+   新排布里已经不该有的槽位（表格没显示出来的也照样挂号）。
+3. **撤销「永不重订」**：重新排布一个时段 = 你又想要这几场，
+   `ks.clear_abandoned(新排布里所有 key)` 会把 `verdicts.abandoned` 里的判决撤掉，
+   否则认过罪的时刻永远补不回来。`session HH:MM LEN` 加单场时同理
+   （只撤那一场的判决）。
+
+> 注：「永不重订」是宣言真正的牙齿 —— 所以它只由 `cancel N` + 走完宣言的
+> `confess()` 写入，改排布只会**撤销**它，绝不写入。
 - 取消成功后才写新 layout / data.csv，然后立刻触发一轮 `keep_session.py check`
   补订新场次。
 - `schedule.py` 同时支持 `YYYY-MM-DD,HH:MM,duration` 与旧格式，daemon 不需要改接口。
