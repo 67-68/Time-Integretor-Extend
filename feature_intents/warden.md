@@ -190,6 +190,38 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 暂停的规则（次数/时长/跨天）在 [`idle_watchdog.md`](./idle_watchdog.md)，
 实现在 `keep_session.pause_status()` / `start_pause()` —— warden 和 daemon 共用同一份。
 
+### 画一帧要多久（「打字掉帧」是怎么修的）
+
+prompt_toolkit 每敲**一个**字就重画一次 chrome（`on_text_changed` → `invalidate()`），
+而 chrome = 把整块看板用 rich 重新排版成 ANSI（表格 + 任务对照表 + Recent + 状态框）
+再解析回 `FormattedText`。实测（10 行合约表 + 12 条任务）：**一次 27ms**。按 10 字/秒算，
+每秒有 270ms 花在画一模一样的东西上 —— 这就是输入时肉眼可见的掉帧。
+
+三处抠回来的（都有回归测试，见 `test/test_warden.py` 的「打字不掉帧」）：
+
+1. **日志只读尾巴**：`log_tail()` 以前是 `f.read().splitlines()`，每帧读整份 daemon 日志。
+   日志一天长几 MB，这一项就从 0.1ms 涨到几十 ms（越用越卡）。现在从末尾 seek
+   4 KiB 起找够 n 行，再按 `(mtime_ns, size)` 记住结果。66 MB 的日志 → 0.004ms，
+   **日志多大都不再影响打字**。
+2. **画帧缓存**：`WardenShell.frame_text()` / `chrome()` 按「帧键」复用上一帧的 ANSI
+   和 fragments。键 = `frame_rev`（状态变化计数）+ 视图号 + **整秒** + 终端宽高 +
+   警告签名 + `Warden.frame_signature()`（消息条数/最后一条、行数、`id(rows)`、
+   `csv_fp`、review/stat 身份…）。`Warden.invalidate()` 在 `say()` / `intercept()` /
+   `handle()` / `rebuild_rows()` / 警告变化时拍一下。
+   - 键里带整秒 = 看板上最细的时间粒度就是秒（时钟、「多久以前」），所以同一秒里
+     **敲多少个键都是同一帧**；漏拍 invalidate 也最多慢一秒，和 `tick=1.0` 同量级。
+   - 存的是**画完之后**的键：排版这趟自己会改状态（重读 csv、重算警告），拿画之前
+     的键去存会让第一帧画两遍。
+   - 快路径必须和框架原版拼出**逐字一致**的 fragments —— 有一条测试直接拿
+     `repl_kit.ReplShell.chrome()` 对比，改坏立刻红。
+3. **`_terminal_rows()` 别用 `get_app()`**：没有正在跑的 Application 时它会现造一个
+   `DummyApplication`（5ms，还要 load 一遍按键表）。改用 `get_app_or_none()` +
+   退回 `shutil.get_terminal_size()`。
+
+结果：**每次敲键 27ms → 0.1ms**，只剩每秒一次 ~20ms 的整帧重画（`tick=1.0` 本来就要画）。
+注意：别往看板上放**秒以下**的时间（倒计时毫秒、spinner），那会让帧键每秒都对不上、
+缓存等于白做 —— 真需要就放进 `status_line()`（它不在缓存里，逐帧现算）。
+
 ## 收尾（session 结束 +15s）
 
 契约视图和任务视图里，**表格最上面**会多一块黄色面板：

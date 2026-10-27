@@ -214,6 +214,13 @@ except ImportError:
         )
         raise SystemExit(2)
 
+try:  # prompt_toolkit 只是个锦上添花：没有它 repl_kit 会退化成 input() 循环
+    from prompt_toolkit.formatted_text import ANSI, FormattedText, to_formatted_text
+except ImportError:  # pragma: no cover
+    ANSI = None
+    FormattedText = None
+    to_formatted_text = None
+
 import keep_session as ks  # noqa: E402  只用来读 daemon 状态 / 起停 daemon / 罪与判决
 import schedule as sch  # noqa: E402  data.csv 的解析与编辑（唯一实现）
 import session_plan as sp  # noqa: E402  日历下载层 / 时段 layout / 精确日期 csv
@@ -1428,9 +1435,110 @@ class WardenShell(repl_kit.ReplShell):
 
     补全菜单的空间由 repl_kit 的 reserve_space_for_menu 决定；warden 把它
     设成 0（菜单改成浮在看板上面），所以这里只需要给它留 0 行。
+
+    还有一件：**画帧要缓存**。prompt_toolkit 每敲一个字就重画一次 chrome
+    （`on_text_changed` → `invalidate()`），而 chrome 会把整块看板从 rich 重新
+    排版成 ANSI（表格 + 任务对照表 + Recent + 状态框，20ms 上下），再解析回
+    FormattedText（又是几毫秒）。按 10 字/秒算，每秒有 250ms 花在「画一模一样的
+    东西」上 —— 这就是输入时肉眼可见的掉帧。
+
+    所以这里按「帧键」缓存：键一样就直接复用上次的 ANSI 文本和 fragments。
+    看板里唯一自己会动的东西是时钟和「多久以前」，全是秒级，所以同一秒里
+    复用一帧看不出差别；状态一变（`invalidate_frame()`）立刻作废。
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.frame_rev = 0                 # 状态变化计数：变了就必须重排版
+        self.frame_key_hook = None         # (() -> tuple)：业务侧补充的帧键
+        self._frame_memo = None            # (key, ansi_text)
+        self._ansi_memo = None             # (ansi_text, chunks)
+
+    def invalidate_frame(self):
+        """状态变了：下一次 chrome() 必须重新排版（不重排版就是旧画面）。"""
+        self.frame_rev += 1
+        self._frame_memo = None
+
+    def _frame_clock(self):
+        """帧键里的时间位（整秒）。看板上最细的时间粒度就是秒。
+
+        单独抽成一个方法是为了测试能钉住它 —— 不然「同一秒里复用」这种
+        断言会随机踩在秒的边界上。
+        """
+        return int(time.time())
+
+    def frame_key(self):
+        """这一帧的「身份」：键相等 = 画出来的东西相等。
+
+        只用**微秒级**的东西算键：`_terminal_rows()` 走 `get_app_or_none()`，
+        宽度走 `shutil.get_terminal_size()`。窗口大小一变键就变（prompt_toolkit
+        本来也会因为 resize 重画）。
+        """
+        try:
+            width = shutil.get_terminal_size((80, 24)).columns
+        except Exception:                             # noqa: BLE001
+            width = 80
+        key = [self.frame_rev, self.view_index, self._frame_clock(), width,
+               self._terminal_rows(), bool(self.show_warnings)]
+        try:
+            key.append(self.warnings.signature())
+        except Exception:                             # noqa: BLE001
+            key.append(object())
+        if self.frame_key_hook is not None:
+            try:
+                key.extend(self.frame_key_hook())
+            except Exception:                         # noqa: BLE001 - 键算不出来就别用缓存
+                key.append(object())
+        return tuple(key)
+
     def frame_text(self):
+        key = self.frame_key()
+        memo = self._frame_memo
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        raw = self._build_frame_text()
+        # 记的是**画完之后**的键：排版这一趟本身可能改了状态（重读 data.csv、
+        # 重算警告、收尾面板刚起步），拿画之前的键去存，下一次就对不上、
+        # 白重画一遍（第一帧永远是「画了->又画一遍」）。
+        self._frame_memo = (self.frame_key(), raw)
+        return raw
+
+    def chrome(self, text=""):
+        """父类的 chrome + 「看板没变就别重新解析 ANSI」的缓存。
+
+        父类每次都把整块看板的 ANSI 交给 prompt_toolkit 的解析器（几十行，
+        几毫秒）。看板没变时那几毫秒纯属白烧，所以把 fragments 也存下来。
+        拼装顺序和父类一致：看板 → 提示行 → 状态行 → 提示符。
+        """
+        dashboard = self.frame_text()
+        chunks = None
+        if dashboard:
+            memo = self._ansi_memo
+            if memo is not None and memo[0] is dashboard:
+                chunks = list(memo[1])
+            else:
+                chunks = self._dashboard_chunks(dashboard)
+                self._ansi_memo = (dashboard, tuple(chunks))
+        else:
+            chunks = []
+        hint = self.hint_line(text)
+        if hint:
+            chunks.append((self.pt_hint_class, hint + "\n"))
+        status = self.status_line()
+        if status:
+            chunks.append((self.pt_status_class, status + "\n"))
+        chunks.append((self.pt_prompt_class, self.prompt))
+        return FormattedText(chunks) if FormattedText is not None else chunks
+
+    @staticmethod
+    def _dashboard_chunks(dashboard):
+        """ANSI 文本 → prompt_toolkit 的 fragments（和父类同一套规则）。"""
+        if "\x1b" in dashboard and ANSI is not None:
+            return list(to_formatted_text(ANSI(dashboard)))
+        return [("", dashboard)]
+
+    def _build_frame_text(self):
+        """真正排版一次（贵：rich 要测量 / 换行 / 裁切整块看板）。"""
         raw = super().frame_text()
         if not raw:
             return raw
@@ -1457,12 +1565,23 @@ class WardenShell(repl_kit.ReplShell):
 
         优先问 prompt_toolkit 的 output（离屏渲染/测试时它才是真的）；
         拿不到再退回终端尺寸。两者在真 TTY 下是同一个数。
+
+        这里**不能**用 `get_app()`：没有正在跑的 Application 时它会现造一个
+        DummyApplication（好几毫秒，还要 load 一遍按键表），而这个函数每画一帧
+        都要调一次 —— 以前打字掉帧有一部分就是它。
         """
         try:
-            from prompt_toolkit.application.current import get_app
-            return get_app().output.get_size().rows
-        except Exception:
-            return shutil.get_terminal_size((80, 24)).lines
+            from prompt_toolkit.application.current import get_app_or_none
+        except ImportError:                           # pragma: no cover - 老版本
+            get_app_or_none = None
+        if get_app_or_none is not None:
+            try:
+                app = get_app_or_none()
+                if app is not None:
+                    return app.output.get_size().rows
+            except Exception:                         # noqa: BLE001
+                pass
+        return shutil.get_terminal_size((80, 24)).lines
 
 
 class Warden(object):
@@ -1511,6 +1630,9 @@ class Warden(object):
         self.review = None
         self.review_check = None
         self.review_at = 0.0
+        # 「现在」是几点：None = 跟着墙上时钟走。测试/回放可以钉死它，
+        # 否则「3 小时内才自动催」这条规则会让用例在钟点变了之后莫名其妙地红。
+        self.review_now = None
         self._snapshot_cache = {}
         self._last_line = ""
         # 警告板：框架负责画在「状态」框里，这里只负责"有什么问题"。
@@ -1543,9 +1665,46 @@ class Warden(object):
         # 看板自己就是最下面那块内容；补全菜单浮在它上面，不再在输入行
         # 下面留 8 行空白（留了就会把看板/提示挤出屏幕）。
         # 老版本 repl_kit 没有这个参数就退回默认值（WardenShell 会按 8 行算）。
-        if "reserve_space_for_menu" in inspect.signature(WardenShell).parameters:
+        # 注意要问 repl_kit.ReplShell（WardenShell 自己只是 *args/**kwargs 透传）。
+        if "reserve_space_for_menu" in inspect.signature(repl_kit.ReplShell).parameters:
             shell_kwargs["reserve_space_for_menu"] = 0
         self.shell = WardenShell(**shell_kwargs)
+        # 画帧缓存要认识「业务状态变没变」：把签名挂上去（见 frame_signature）。
+        self.shell.frame_key_hook = self.frame_signature
+
+    # -- 画帧缓存 -------------------------------------------------------
+
+    def invalidate(self):
+        """告诉画帧缓存「刚才那个画面不算数了」。
+
+        看板不会每帧重排版了（见 `WardenShell.frame_text` 的缓存），所以凡是
+        能改变画面的动作都得在这儿拍一下。漏拍也不会画错超过一秒 —— 帧键里
+        带着 `int(time.time())`，最坏是慢一秒，和 `tick=1.0` 是一个量级。
+        """
+        shell = getattr(self, "shell", None)
+        hook = getattr(shell, "invalidate_frame", None)
+        if hook is not None:
+            try:
+                hook()
+            except Exception:                          # noqa: BLE001 - 画面旧一秒也别崩
+                pass
+
+    def frame_signature(self):
+        """画帧缓存要看的那些「便宜的事实」（贵的东西留在 key 之外）。
+
+        只放**不求值就便宜**的东西：长度、身份、指纹、警告签名。任何一项变了
+        就重排版。`messages` 取最后一条（带秒级时间戳），所以 Recent 不会滞后。
+        """
+        msgs = self.messages or ()
+        return (
+            len(msgs), msgs[-1] if msgs else (),
+            len(self.rows), id(self.rows),
+            self.rows_note or "", self.rows_source or "",
+            self.bridge_note or "", bool(self.had_error),
+            self.csv_fp, len(self.entries),
+            id(self.review), id(self.review_check),
+            id(getattr(self, "stat", None)),
+        )
 
     # -- 选中的那一天
 
@@ -1737,6 +1896,7 @@ class Warden(object):
         stamp = now_local().strftime("%H:%M:%S")
         self.messages.append((stamp, kind, text))
         del self.messages[:-MESSAGE_KEEP]
+        self.invalidate()
 
     def emit(self, renderable=None):
         """帧外打印：帮助面板 / 宣言闸门 / `>>>` 回显。
@@ -1917,12 +2077,41 @@ class Warden(object):
         return {"pid": pid, "alive": alive, "state": st, "snapshot": snap}
 
     def log_tail(self, n=1):
+        """daemon 日志的最后 n 行 —— **只读文件尾部**。
+
+        以前是 ``f.read().splitlines()``：每画一帧（也就是每敲一个字）都要把整份
+        日志读进来再切分。日志一天长几 MB，这一项就从 0.1ms 涨到几十毫秒，
+        而且越用越卡。现在从末尾 seek 一小块，并且按 (mtime, size) 记住结果。
+        """
         try:
-            with open(ks.LOG_FILE, encoding="utf-8", errors="replace") as f:
-                lines = f.read().splitlines()
-            return lines[-n:] if lines else []
+            st = os.stat(ks.LOG_FILE)
         except OSError:
             return []
+        sig = (st.st_mtime_ns, st.st_size, n)
+        memo = getattr(self, "_log_tail_memo", None)
+        if memo is not None and memo[0] == sig:
+            return memo[1]
+        lines = []
+        try:
+            with open(ks.LOG_FILE, "rb") as f:
+                want = 4096
+                while True:
+                    start = max(0, st.st_size - want)
+                    f.seek(start)
+                    lines = f.read().decode("utf-8", "replace").splitlines()
+                    if start == 0:
+                        break
+                    if len(lines) > n:            # 尾部够用了
+                        lines = lines[1:]         # 首行可能被截断在半条上
+                        break
+                    if want >= st.st_size:
+                        break
+                    want *= 4
+        except OSError:
+            return []
+        tail = [line for line in lines if line.strip()][-n:]
+        self._log_tail_memo = (sig, tail)
+        return tail
 
     def refresh(self, quiet=False, timeout=180):
         """拉一次**选中那一天**的 session，并和 data.csv 的契约合并成表格行。
@@ -2043,6 +2232,7 @@ class Warden(object):
                 row.setdefault("tasks", [])
                 row.setdefault("task_text", "")
         self.rows = rows
+        self.invalidate()          # 表格换了内容 → 画帧缓存作废
 
     def _fallback_rows(self, why):
         """拿不到 bridge 时，用 daemon 写下的 state.json 快照（只有时间，没有标题/静音）。"""
@@ -2494,9 +2684,12 @@ class Warden(object):
         now = time.time()
         if not force and self.warnings_at and now - self.warnings_at < max_age:
             return self.warnings
+        before = self.warnings.signature()
         self.warnings.set_all(self.collect_warnings())
         self.warnings_at = now
         self.warnings_sig = self.warnings.signature()
+        if self.warnings_sig != before:            # 警告变了 → 画面得重排版
+            self.invalidate()
         return self.warnings
 
     def render_messages(self):
@@ -4040,7 +4233,8 @@ class Warden(object):
         except Exception:                          # noqa: BLE001
             done_keys = set()
         try:
-            rows = psv.unreviewed_sessions(self.task_store, entries, done_keys=done_keys)
+            rows = psv.unreviewed_sessions(self.task_store, entries,
+                                           done_keys=done_keys, now=self.review_now)
         except Exception:                          # noqa: BLE001
             return None, False
         if not rows:
@@ -4903,6 +5097,8 @@ class Warden(object):
         「你刚才那条算不算把任务转移走了」。
         """
         self._last_line = line
+        # 这条命令可能改画面（表格/任务/消息/警告）：先作废上一次的画帧缓存。
+        self.invalidate()
         # 罪案区的全局锁：除了敲宣言，什么都不受理。
         # （Shift+Tab / Ctrl+O 是框架的键绑定，不经过这里 —— 和以前一样能按。）
         sins = self.pending_sins()
@@ -4973,6 +5169,7 @@ class Warden(object):
             return False
         # 收尾在「延期」阶段会等你敲一条转移命令 —— 敲完得回头看一眼成没成
         self.after_dispatch_review(line)
+        self.invalidate()          # 这条命令改了什么，下一帧就得画出来
         return True
 
     def render_lockdown_panel(self):

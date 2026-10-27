@@ -7,6 +7,7 @@
 """
 import builtins
 import contextlib
+import dataclasses
 import datetime
 import importlib.util
 import io
@@ -892,6 +893,9 @@ check("frame() 交出 renderable 而不是字符串", isinstance(frame, w.Group)
 
 # chrome 的头一段就是那块看板
 shell = wd.shell
+# 钉住终端高度：这一组比的是「看板内容」，不是裁切。非 TTY 下没有 prompt_toolkit
+# 的 Application，行数退回 shutil 默认值（24）；真 TTY 下由 app.output 给。
+shell._terminal_rows = lambda: 80
 chrome = shell.chrome("")
 # 看板是 rich 渲染出来的 ANSI，prompt_toolkit 会把它拆成很多片段，所以拼起来看
 chrome_text = "".join(fragment[1] for fragment in chrome)
@@ -915,6 +919,62 @@ console3 = Console(file=buf3, width=100, force_terminal=False)
 wd3 = w.Warden(console3, FakeBridge(), no_clear=False, offline=True)
 wd3.paint()
 check("非 TTY（管道/测试）不写任何 ANSI", "\x1b[" in buf3.getvalue(), False)
+
+print("== 打字不掉帧：同一秒里不重复排版，状态一变立刻重排版 ==")
+wd_fast = mkwarden()
+shell_fast = wd_fast.shell
+shell_fast._terminal_rows = lambda: 80
+shell_fast._frame_clock = lambda: 5000          # 钉住「现在」，免得踩秒边界
+_built = {"n": 0}
+
+
+def _counting_render():
+    """包一层 view.render：数一数到底排版了几次。"""
+    _built["n"] += 1
+    return wd_fast.frame()
+
+
+_i = shell_fast.view_index
+shell_fast._views[_i] = dataclasses.replace(shell_fast._views[_i], render=_counting_render)
+first_frame = shell_fast.frame_text()
+check("第一帧真的排版了一次", _built["n"], 1)
+check("同一秒里再画 → 直接复用上一个字符串（同一个对象）",
+      shell_fast.frame_text() is first_frame, True)
+check("复用 = 一次都没重新排版", _built["n"], 1)
+check("连敲 10 个键也不新增排版", [shell_fast.chrome("task s") for _ in range(10)]
+      and _built["n"], 1)
+wd_fast.say("状态变了", "info")
+check("状态一变 → 下一次就重排版", (shell_fast.frame_text(), _built["n"])[1], 2)
+check("重排版之后新消息就在画面上", "状态变了" in plain(shell_fast.frame_text()), True)
+shell_fast._frame_clock = lambda: 5001
+shell_fast.frame_text()
+check("跨过一秒 → 自然重排版（时钟得走）", _built["n"], 3)
+check("窗口大小变了也要重排版",
+      (shell_fast.invalidate_frame(), shell_fast.frame_text(), _built["n"])[2], 4)
+# 快路径必须和框架原版拼出一样的东西（不然就是「快但画错了」）
+_fast = [(style, text) for style, text in shell_fast.chrome("task ")]
+_slow = [(style, text) for style, text in w.repl_kit.ReplShell.chrome(shell_fast, "task ")]
+check("快路径和框架原版逐字一致", _fast, _slow)
+
+print("== 打字不掉帧：日志只读尾巴（daemon 日志能长到几十 MB）==")
+_real_log = ks.LOG_FILE
+log_path = os.path.join(TMP, "big.log")
+with open(log_path, "w", encoding="utf-8") as f:
+    for i in range(20000):
+        f.write("第 %d 行日志\n" % i)
+ks.LOG_FILE = log_path
+try:
+    check("尾巴是最后一行", wd_fast.log_tail(1), ["第 19999 行日志"])
+    check("能要不止一行", wd_fast.log_tail(3),
+          ["第 19997 行日志", "第 19998 行日志", "第 19999 行日志"])
+    memo = wd_fast.log_tail(1)
+    check("文件没变就直接用上次的结果（不再读盘）", wd_fast.log_tail(1) is memo, True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("新的一行\n")
+    check("追加之后能读到新尾巴", wd_fast.log_tail(1), ["新的一行"])
+    check("文件没了也不炸", (os.remove(log_path), wd_fast.log_tail(1))[1], [])
+finally:
+    ks.LOG_FILE = _real_log
 
 # 提示符：欠着罪时换成「宣言> 」
 check("没欠账时用默认提示符", wd3.prompt_text(), None)

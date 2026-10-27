@@ -670,6 +670,9 @@ wd.offline = False
 wd.review = None
 wd.review_check = None
 wd.review_at = 0.0
+# 「现在」钉在这场的 40 分钟后。自动催只看 3 小时内，用墙上时钟的话这组用例
+# 就只在 17:35 之后那三个钟头里是绿的，过点就无缘无故地红。
+wd.review_now = AT
 wd._maybe_start_review()
 check_true("队列空也会自己起核对", wd.review_check is not None)
 for _ in range(200):
@@ -690,6 +693,12 @@ check("收完记进 done（下次开机不再催）",
 wd.review_at = 0.0
 wd._maybe_start_review()
 check("再问一遍也不会重复催", wd.review, None)
+# 3 小时以外的旧账不自动催（翻旧账是 inspect-due 的事）
+wd.review_now = datetime.datetime(2026, 10, 28, 9, 0)
+wd.review_at = 0.0
+wd._maybe_start_review()
+check("3 小时以外的旧账不自动翻", wd.review_check, None)
+wd.review_now = None
 wd.reload_entries = _real_reload
 wd.review = None
 for old in store.list():
