@@ -1,2 +1,6 @@
 temp/
 __pycache__/
+
+# 运行时状态（每台机器自己一份；归档 data/task-archive.json 不忽略——那是记录，可以进 git）
+data/tasks.json
+data/settings.json

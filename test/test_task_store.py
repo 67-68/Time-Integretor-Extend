@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """task_store.py 回归测试：任意字段 CRUD + session 关联 + Focusmate 完成归档。"""
+import contextlib
+import io
 import json
 import os
 import sys
@@ -77,6 +79,21 @@ check("归档里有 session 信息", arch[0]["session"]["start"], "11:00")
 check("归档里保留任务字段", arch[0]["fields"]["title"], "写论文")
 check("reconcile 幂等：第二次不重复归档", store.reconcile(remote)[0], 0)
 check("归档文件仍是 1 条", len(store.load_archive()["records"]), 1)
+
+print("== 归档 CLI：一个 JSON 文件，一眼能看 ==")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc = ts.main(["--file", TASKS, "--archive", ARCHIVE, "archive"])
+out = buf.getvalue()
+check("archive 退出码 0", rc, 0)
+check("archive 打印归档路径", ARCHIVE in out, True)
+check("archive 有条数", "共 1 条" in out, True)
+check("archive 按完成日期分组", "2026-10-26  1 条" in out, True)
+check("archive 列出任务和 session", "#1" in out and "11:00" in out, True)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    ts.main(["--file", TASKS, "--archive", ARCHIVE, "archive", "--json"])
+check("--json 原样打出整个文件", '"records"' in buf.getvalue(), True)
 
 print("== 坏 JSON 不炸 ==")
 with open(TASKS, "w", encoding="utf-8") as f:

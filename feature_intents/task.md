@@ -41,12 +41,33 @@ TUI（任务视图 / 任意视图都认 `task`）：
 | `task delete <id>` | 删除 |
 | `task modify <id> <field> <新值>` | 改任意字段 |
 | `task select <id>` | 选中任务（`task assign <session>` 的默认目标） |
-| `task assign [<任务ID>] <session ID>` | 先挂 Focusmate，成功后落本地 |
+| `task assign [<任务ID>] <session ID>` | 先挂 Focusmate，成功后落本地；成功即刻重排表格（task 列马上有内容） |
 | `task repeat <id> <周几@HH:MM\|off>` | 设置 / 取消每周重复 |
 | `task create ... --repeat 周几@HH:MM` | 一步建「每周重复任务」 |
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
+| `task archive [N]` | 看归档：按完成日期分组、最近 N 条（默认 5） |
+| `task <任何动作> ... --assign <N>` | 跑完顺手把产出的任务挂到表格 #N（`-a` / `--assign=N` 同义） |
 
-CLI：`python3 task_store.py list|create|delete|modify|show|reconcile`。
+`--assign N` 是**任何** task 子命令都认的后缀（`_split_assign()` 在 `cmd_task()` 入口
+统一摘掉），所以这些写法都成立：
+
+```text
+task create title=写论文 --assign 3
+task create title=复习 --repeat mon@22:15 --assign 3
+task modify 1 due 后天 --assign 3
+task select 1 --assign 3        # 等价于 task assign 1 3
+```
+
+它复用的是 `cmd_task_assign()` 那一条路径（先 Focusmate 复核、成功才落本地），
+所以不会出现"本地记了、Focusmate 没有"的半截状态；`delete` / `sync` 这类不产出任务的
+动作带 `--assign` 只会得到一句提示，什么都不改。
+
+**已知坑（已修，有回归测试）**：`task assign` 成功之后必须 `rebuild_rows()` ——
+表格的 `task` 列是 `rebuild_rows()` 里算的，不重排就一直是旧值，
+表现就是「消息区说挂上了，表格 task 列却空着」。
+
+CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`。
+`archive` 默认按完成日期分组列出来，`--json` 原样打印整个文件，`--limit N` 只看最近 N 条。
 
 ## 每周重复任务（repeated task）
 
@@ -76,6 +97,35 @@ CLI：`python3 task_store.py list|create|delete|modify|show|reconcile`。
   看不到就不伪造：只匹配、不写完成时间。
 - 归档记录包含：归档时间、本地任务字段、对应 session（日期/时间/API session id）、
   Focusmate task id 与 `completedAt`。
+
+## 归档文件形状（`data/task-archive.json`）
+
+一个 JSON 文件、只增不改、一条完成记录一个 object：
+
+```json
+{
+  "version": 1,
+  "records": [{
+    "archived_at": "2026-10-27T08:19:02",
+    "task_id": 1,
+    "fields": {"title": "写论文", "due": "周二", "notes": "先写 intro"},
+    "session": {"index": 3, "date": "2026-10-26", "start": "11:15",
+                "end": "12:05", "duration": 50, "focusmate_session_id": "9f2c…-sess"},
+    "focusmate": {"task_id": "936bd726-task", "title": "写论文",
+                  "description": null,
+                  "completed_at": "2026-10-26T04:20:00.000Z",
+                  "attachments": []}
+  }]
+}
+```
+
+- 幂等键 = `(task_id, focusmate.task_id, focusmate.completed_at)`：同一条不会再写第二次
+  （`reconcile` 反复跑不会让文件变长）。
+- `focusmate.completed_at` 是 Focusmate 的原样字符串（UTC），**不猜、不补**；
+  没有它就只算"匹配到"、不归档。
+- 每周重复任务的每一次落点单独一条（`session` 是那一周的 session）。
+- `data/tasks.json` / `data/settings.json` 是本机运行时状态（已 gitignore）；
+  `data/task-archive.json` 不忽略 —— 那是记录，可以进 git。
 
 ## 边界
 

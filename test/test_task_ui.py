@@ -161,6 +161,47 @@ check("本地 task 关联成功", wd.task_store.get(5)["session"]["start"], "11:
 check("Focusmate task id 记回本地",
       wd.task_store.get(5)["focusmate"]["task_id"], "ft-1")
 
+# 回归：assign 成功之后**不用手动 rebuild**，表格里的 task 列就该有了
+# （用户报的正是「assign 到 #3 成功了，但表格 task 列空着」）
+row1100 = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
+check("assign 之后表格 task 列立刻有内容（不用手动 refresh）",
+      row1100.get("task_text") != "", True)
+check_true("assign 之后 task 列显示的就是那条任务", "论文" in row1100.get("task_text", ""))
+
+print("== task ... --assign N：任何子命令都能顺手挂 ==")
+row1200 = [r for r in wd.rows if r["startLabel"] == "12:00"][0]
+idx1200 = wd.rows.index(row1200) + 1
+wd.bridge.calls = []
+check("task create ... --assign N 受理",
+      wd.handle("task create title=写论文 --assign %d" % idx1200), True)
+new_id = max(t["id"] for t in wd.task_store.list())
+check("任务建出来了", wd.task_store.get(new_id)["fields"]["title"], "写论文")
+check("顺手挂到了那一场",
+      wd.task_store.get(new_id)["session"]["start"], "12:00")
+check("Focusmate 也只调了一次 add_task",
+      len([c for c in wd.bridge.calls if c[0] == "add_task"]), 1)
+row1200 = [r for r in wd.rows if r["startLabel"] == "12:00"][0]
+check("表格那一行的 task 列也更新了", "写论文" in row1200.get("task_text", ""), True)
+
+wd.bridge.calls = []
+check("--assign=N 这种写法也认",
+      wd.handle("task modify %d due 后天 --assign %d" % (new_id, idx1200)), True)
+check("modify 的字段生效", wd.task_store.get(new_id)["fields"]["due"], "后天")
+check("又挂了一次（同一场重挂是会走 bridge 的）",
+      len([c for c in wd.bridge.calls if c[0] == "add_task"]), 1)
+
+check("--assign 后面没给 ID → 报错不改东西", wd.handle("task create title=空挂 --assign"), True)
+check_true("给了人话提示", "--assign 后面要跟" in wd.messages[-1][2])
+check("没建出这条任务",
+      [t for t in wd.task_store.list() if (t.get("fields") or {}).get("title") == "空挂"], [])
+
+wd.bridge.calls = []
+wd.handle("task delete %d --assign 1" % new_id)
+check("delete 带 --assign：不动 bridge", [c for c in wd.bridge.calls if c[0] == "add_task"], [])
+check_true("并且说清 --assign 用错地方了",
+           any("没有可挂的任务" in m[2] for m in wd.messages))
+wd.handle("task create 5 title=论文 notes=先写intro")
+
 check("task sync 受理", wd.handle("task sync"), True)
 check("本地记 completedAt", wd.task_store.get(5)["focusmate"]["completed_at"],
       "2026-10-26T12:00:00Z")
@@ -175,7 +216,8 @@ check("表格 task 列用 trim 后的一行",
       [r.get("task_text") for r in wd.rows if r["startLabel"] == "11:00"][0],
       "1. 论文  2. 先写intro  3. 明天")
 
-wd.handle("task delete 5")
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
 check("task delete", wd.task_store.list(), [])
 
 shutil.rmtree(TMP, ignore_errors=True)

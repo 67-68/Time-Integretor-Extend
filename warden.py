@@ -607,12 +607,15 @@ def _hint_set(parts):
 def _hint_task(parts):
     if not parts:
         return repl_kit.Hint("动作", ("create", "delete", "modify", "assign", "select",
-                                      "repeat", "sync"),
+                                      "repeat", "sync", "archive"),
                              note="字段随便写，不校验")
     action = parts[0].lower() if len(parts) else ""
     if action == "create":
-        return repl_kit.Hint("参数", ("[id]", "key=value...", "--repeat 周几@HH:MM"),
+        return repl_kit.Hint("参数", ("[id]", "key=value...", "--repeat 周几@HH:MM",
+                                      "--assign N"),
                              note="不给 id 就自动编号")
+    if action in ("archive", "history", "归档"):
+        return repl_kit.Hint("参数", ("<N>",), note="不给就列最近 5 条")
     if action in ("repeat", "recurring"):
         return repl_kit.Hint("参数", ("<任务 ID>", "周几@HH:MM|off"),
                              note="每周那一天、那一场自动挂上")
@@ -624,7 +627,8 @@ def _hint_task(parts):
         return repl_kit.Hint("参数", ("<session ID>",),
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
     return repl_kit.Hint("参数", ("create", "delete", "modify", "assign", "select",
-                                  "repeat", "sync"))
+                                  "repeat", "sync", "archive"),
+                         note="任何动作都能带 --assign N")
 
 
 class View(object):
@@ -698,8 +702,9 @@ class View(object):
                  hint=_hint_actions("on", "off", note="不写就是取反")),
             _cmd("task", w.cmd_task,
                  "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
-                 usage="task <create|delete|modify|assign|select|sync> ...",
-                 options=("create", "delete", "modify", "assign", "select", "sync"),
+                 usage="task <create|delete|modify|assign|select|repeat|sync|archive> ... [--assign N]",
+                 options=("create", "delete", "modify", "assign", "select", "repeat",
+                          "sync", "archive", "--assign", "--repeat"),
                  hint=_hint_task),
         ]
 
@@ -1098,7 +1103,7 @@ class TaskView(View):
 
     命令统一以 ``task`` 开头（需求里的语法）：::
 
-        task create [id] [field=value ...] [--repeat 周几@HH:MM]
+        task create [id] [field=value ...] [--repeat 周几@HH:MM] [--assign N]
         task delete <id>
         task modify <id> <field> <新值>
         task assign <session ID>            # 默认当前选中的任务
@@ -1106,6 +1111,10 @@ class TaskView(View):
         task select <id>
         task repeat <id> <周几@HH:MM|off>   # 每周重复（只影响那一天的那一场）
         task sync                           # GET /v1/tasks → 把 completedAt 归档
+        task archive [N]                    # 看归档（data/task-archive.json）
+
+    任何子命令都能带 ``--assign N``（表格里的 session ID）：命令跑完顺手挂上去，
+    例如 ``task create title=写论文 --assign 3``。
 
     任务字段不校验：想记 due / priority / notes / 任何 key 都行。
     给 session 挂任务时会**自动**走 bridge 在 Focusmate 那一场建同名 task，
@@ -2551,12 +2560,69 @@ class Warden(object):
     # -- 任务系统 ------------------------------------------------------
 
     def cmd_task(self, args):
-        """TaskView 的唯一入口：task <create|delete|modify|assign|select|sync|list> ..."""
+        """TaskView 的唯一入口：task <create|delete|modify|assign|select|repeat|sync|archive> ...
+
+        任何子命令后面都可以跟 ``--assign <表格里的 session ID>``（``-a`` 同义）：
+        命令跑完、拿到一条任务之后，顺手把它挂到那一场 session 上。
+
+            task create title=写论文 --assign 3
+            task create title=复习 --repeat mon@22:15 --assign 3
+            task modify 1 due 后天 --assign 3
+
+        「挂」永远是同一套：先在 Focusmate 建 task 并复核，成功后才落本地
+        （见 :meth:`cmd_task_assign`），所以 ``--assign`` 不会产生假成功的半截状态。
+        """
         toks = [str(a) for a in args]
         if not toks:
-            raise ValueError("用法：task create/delete/modify/assign/select/sync ...")
-        action = toks[0].lower()
-        rest = toks[1:]
+            raise ValueError("用法：task create/delete/modify/assign/select/repeat/sync/archive ...")
+        assign_to, kept = self._split_assign(toks)
+        if not kept:
+            raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）")
+        action = kept[0].lower()
+        rest = kept[1:]
+        result = self._dispatch_task(action, rest)
+        if assign_to is not None:
+            self._apply_assign(result, assign_to, action)
+        return result
+
+    @staticmethod
+    def _split_assign(toks):
+        """把 ``--assign N`` / ``--assign=N`` / ``-a N`` 从参数里摘出来。"""
+        assign_to = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            low = tok.lower()
+            if low in ("--assign", "-a"):
+                if i + 1 >= len(toks):
+                    raise ValueError("--assign 后面要跟表格里的 session ID（例如 --assign 3）")
+                assign_to = toks[i + 1]
+                i += 2
+                continue
+            if low.startswith("--assign="):
+                assign_to = tok.split("=", 1)[1]
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return assign_to, kept
+
+    def _apply_assign(self, result, session_token, action):
+        """``--assign`` 的收尾：拿到任务就挂，拿不到就说一声（不改任何东西）。"""
+        task_id = None
+        if isinstance(result, dict) and result.get("id") is not None:
+            task_id = result["id"]
+        elif isinstance(result, (int, str)) and str(result).isdigit():
+            task_id = int(result)
+        if task_id is None:
+            self.say("`--assign` 只对会产出任务的动作用得上（create/modify/select）；"
+                     "%s 没有可挂的任务，忽略。" % action, "warn")
+            return None
+        self.selected_task_id = task_id
+        return self.cmd_task_assign([str(task_id), str(session_token)])
+
+    def _dispatch_task(self, action, rest):
         if action == "create":
             return self.cmd_task_create(rest)
         if action == "delete":
@@ -2565,6 +2631,8 @@ class Warden(object):
             return self.cmd_task_modify(rest)
         if action == "assign":
             return self.cmd_task_assign(rest)
+        if action in ("archive", "history", "归档"):
+            return self.cmd_task_archive(rest)
         if action in ("repeat", "recurring"):
             return self.cmd_task_repeat(rest)
         if action == "select":
@@ -2574,8 +2642,34 @@ class Warden(object):
         if action in ("list", "ls", "show"):
             self.say("任务 %d 条；看本视图表格即可。" % len(self.task_store.list()), "info")
             return False
-        raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/repeat/sync）"
-                         % action)
+        raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/repeat/"
+                         "sync/archive）" % action)
+
+    def cmd_task_archive(self, args, limit=5):
+        """task archive [N] —— 看完成归档（data/task-archive.json，只增不改）。"""
+        records = [r for r in (self.task_store.load_archive().get("records") or [])
+                   if isinstance(r, dict)]
+        try:
+            limit = int(args[0]) if args else limit
+        except (TypeError, ValueError):
+            raise ValueError("task archive [N]：N 是看最近几条")
+        self.say("归档 %s：%d 条（只增不改；同一任务+task+完成时间只记一次）"
+                 % (self.task_store.archive, len(records)), "info")
+        if not records:
+            self.say("   还没有归档：任务在 Focusmate 上有 completedAt 之后，task sync 会补进来。",
+                     "info")
+            return records
+        for rec in records[-limit:]:
+            fm = rec.get("focusmate") or {}
+            sess = rec.get("session") or {}
+            fields = rec.get("fields") or {}
+            title = (fields.get("title") or fields.get("name")
+                     or self.task_store._one_line(fields)[:60] or "（空任务）")
+            self.say("   #%s %s ← session %s %s · 完成 %s"
+                     % (rec.get("task_id") or "?", title,
+                        sess.get("date") or "?", sess.get("start") or "?",
+                        fm.get("completed_at") or "?"), "ok")
+        return records
 
     def cmd_task_create(self, args):
         """task create [id] [key=value ...] [--repeat 周几@HH:MM]
@@ -2757,6 +2851,17 @@ class Warden(object):
             "title": title,
         }, session=session)
         self.selected_task_id = task["id"]
+        session["task_id"] = res.get("taskId") or (res.get("task") or {}).get("id")
+        # 表格里那一行的 task 列是 rebuild_rows 时算出来的：不重排就还是旧的
+        # （用户看到的正是「assign 成功但 task 列空着」）。先本地重排，再尽量刷新。
+        row["task"] = dict(task)
+        row["task_text"] = self.task_store.summarize(task)
+        self.rebuild_rows()
+        if not self.offline:
+            try:
+                self.refresh(quiet=True)
+            except Exception:                       # noqa: BLE001 - 刷新失败不影响已完成的挂载
+                pass
         self.say("✅ 任务 %d 已挂到 session #%d；Focusmate task id=%s"
                  % (task["id"], session_idx, res.get("taskId") or "?"), "ok")
         return True
@@ -3350,9 +3455,12 @@ class Warden(object):
             ("task create ...", "在「任务」视图建任务：task create [id] [field=value ...]"),
             ("task delete/modify ...", "task delete <id> / task modify <id> <field> <值>"),
             ("task assign <session ID>", "把选中的任务挂到表格 #N 的 session，并自动写 Focusmate task"),
+            ("task ... --assign N", "任何 task 子命令都能带：跑完顺手挂到表格 #N，"
+                                    "如 task create title=写论文 --assign 3"),
             ("task create ... --repeat mon@22:15",
              "建每周重复任务：每周一 22:15 那场自动挂上（拆分后那一周就不挂）"),
             ("task repeat <id> 周几@HH:MM|off", "给已有任务加上/取消每周重复"),
+            ("task archive [N]", "看完成归档（data/task-archive.json，只增不改）"),
             ("task sync", "GET /v1/tasks，把 completedAt 连同 session 写进完成归档"),
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
             ("relocate N ±MM", "临时把 #N 提前/推后：不写 data.csv；推后一天一次，且不能跨天"),

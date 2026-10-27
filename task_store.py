@@ -644,6 +644,11 @@ def main(argv=None):
     p.add_argument("task_id", type=int)
     p.set_defaults(func=lambda a, st: _cli_show(st, a.task_id))
 
+    p = sub.add_parser("archive", help="看完成归档（那条只增不改的 JSON）")
+    p.add_argument("--limit", type=int, default=0, help="只看最近 N 条（默认全看）")
+    p.add_argument("--json", action="store_true", dest="as_json", help="原样打印整个文件")
+    p.set_defaults(func=lambda a, st: _cli_archive(st, a))
+
     p = sub.add_parser("reconcile", help="用 GET /v1/tasks 的 JSON 补归档（不联网）")
     p.add_argument("json_file", help="GET /v1/tasks 的响应 JSON 文件")
     p.set_defaults(func=lambda a, st: _cli_reconcile(st, a.json_file))
@@ -695,6 +700,40 @@ def _cli_modify(store, ns):
 
 def _cli_show(store, task_id):
     print(json.dumps(store.get(task_id), ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cli_archive(store, ns):
+    data = store.load_archive()
+    records = [r for r in (data.get("records") or []) if isinstance(r, dict)]
+    if ns.as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    print("归档文件：%s" % store.archive)
+    if not records:
+        print("（还没有归档。任务在 Focusmate 上有了 completedAt 之后，"
+              "task sync / reconcile 会补进来）")
+        return 0
+    print("共 %d 条（只增不改；同一 (任务, Focusmate task, 完成时间) 只记一次）\n" % len(records))
+    shown = records[-ns.limit:] if ns.limit else records
+    by_day = {}
+    for rec in shown:
+        fm = rec.get("focusmate") or {}
+        done = str(fm.get("completed_at") or "")
+        day = done[:10] or "（没有完成时间）"
+        by_day.setdefault(day, []).append(rec)
+    for day in sorted(by_day):
+        print("%s  %d 条" % (day, len(by_day[day])))
+        for rec in by_day[day]:
+            fm = rec.get("focusmate") or {}
+            sess = rec.get("session") or {}
+            fields = rec.get("fields") or {}
+            title = (fields.get("title") or fields.get("name")
+                     or store._one_line(fields)[:60] or "（空任务）")
+            print("  · #%s  %s  ←  session %s %s  · 完成 %s  · 归档 %s"
+                  % (rec.get("task_id") or "?", title,
+                     sess.get("date") or "?", sess.get("start") or "?",
+                     fm.get("completed_at") or "?", rec.get("archived_at") or "?"))
     return 0
 
 
