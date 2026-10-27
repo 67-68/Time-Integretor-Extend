@@ -527,6 +527,79 @@ check("pick 完整 key", psv.pick(pick_rows, "2026-10-27T11:00")["start"], "11:0
 check("pick 对不上 → None", psv.pick(pick_rows, "09:00"), None)
 
 
+# ---------------------------------------------------------------- inspect-due
+
+print("== inspect-due：主动看过期没做完的任务 ==")
+for old in store.list():
+    store.delete(old["id"])
+NOW = datetime.datetime(2026, 10, 27, 12, 0)
+made = {}
+for title, due in (("过期 2 小时", "2026-10-27T10:00:00"),
+                   ("过期 1 天", "2026-10-26T09:00:00"),
+                   ("半小时后", "2026-10-27T12:30:00"),
+                   ("没截止", None),
+                   ("今天到期（只给日期）", "2026-10-27")):
+    fields = {"title": title}
+    if due:
+        fields["due"] = due
+    made[title] = store.create(fields)["id"]
+check("只挑已过期的（按截止时间从早到晚）",
+      [t["fields"]["title"] for t in psv.due_candidates(store, now=NOW)],
+      ["过期 1 天", "过期 2 小时"])
+check("within_minutes 把快到期的也算上",
+      [t["fields"]["title"] for t in psv.due_candidates(store, now=NOW, within_minutes=60)],
+      ["过期 1 天", "过期 2 小时", "半小时后"])
+check("--all 不按截止时间筛（有截止的排前面，没截止的最后）",
+      [t["fields"]["title"] for t in psv.due_candidates(store, now=NOW, include_no_due=True)],
+      ["过期 1 天", "过期 2 小时", "半小时后", "今天到期（只给日期）", "没截止"])
+check("完成/放弃的不催", (store.complete(made["过期 1 天"]),
+                        [t["id"] for t in psv.due_candidates(store, now=NOW)]),
+      (store.get(made["过期 1 天"]), [made["过期 2 小时"]]))
+check("只给日期的 due 当天 23:59 才算过期",
+      psv.parse_due("2026-10-27"), datetime.datetime(2026, 10, 27, 23, 59))
+check("认不出的 due 不算过期", psv.parse_due("明天"), None)
+check("过期时长白话", psv._fmt_age(2 * 3600 + 12 * 60), "2 小时 12 分")
+
+wd.review = None
+wd.begin_inspect_due(psv.due_candidates(store, now=NOW), label="过期未完成任务", sync=False)
+check_true("inspect-due 能进收尾", wd.review is not None)
+check("标题是「过期未完成任务」", wd.review.headline(), "过期未完成任务")
+check("只问过期的", [t["id"] for t in wd.review.tasks], [made["过期 2 小时"]])
+check_true("面板画得出来", wd.review_panel() is not None)
+check("面板里能看到「截止」和「已过期」",
+      "已过期" in "".join(t for t, _s in wd.review.lines()), True)
+before_state = psv.load_state()
+check("选 b 放弃", wd.intercept("b"), True)
+check("放弃之后这条真的放弃了", store.get(made["过期 2 小时"])["status"], ts.STATUS_DROPPED)
+check("inspect-due 收完不留 postsession 记录",
+      psv.load_state()["pending"], before_state["pending"])
+check("也不写 done（没有那一场可以翻篇）",
+      psv.load_state()["done"], before_state["done"])
+check("inspect-due 之后账干净了", psv.due_candidates(store, now=NOW), [])
+wd.review = None
+check("inspect-due 没东西可看时直接返回", wd.cmd_inspect_due([], now=NOW), None)
+check("inspect-due --all 会连没截止的一起看",
+      wd.cmd_inspect_due(["--all"], now=NOW) is not None, True)
+wd.review = None
+# 状态框里要能看见「该查账了」，否则没人知道有这条命令
+warns = [str(item.message if hasattr(item, "message") else item)
+         for item in wd.collect_warnings()]
+check("过期任务会在状态框里提醒",
+      any("过了截止时间" in text for text in warns), True)
+check_true("提醒里直接给出命令",
+           any("inspect-due" in str(getattr(item, "hint", "")) for item in wd.collect_warnings()))
+# 两个视图都注册了这条命令
+view_names = [v.name for v in wd.view_impls]
+check("任务 / 契约视图都在", ("任务" in view_names and "契约" in view_names), True)
+for name in ("任务", "契约"):
+    impl = [v for v in wd.view_impls if v.name == name][0]
+    registry = impl.to_view().registry
+    check("%s视图认 inspect-due" % name, registry.get("inspect-due") is not None, True)
+    check("%s视图认别名 due" % name, registry.get("due") is not None, True)
+wd.review = None
+for old_task in store.list():
+    store.delete(old_task["id"])
+
 # ---------------------------------------------------------------- 收尾：自动 + 手动
 
 print("== warden：收尾流程 ==")

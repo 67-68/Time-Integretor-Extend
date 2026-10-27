@@ -84,6 +84,7 @@ stat refresh full   统计：丢掉缓存、全量重拉（两千多条；只在
 status / s          重画看板
 help / quit
 review [HH:MM|日期T时刻]   手动开始一场 session 的收尾（逐个问没做完的任务）
+inspect-due [分钟] [--all] 主动 inspect 过期没做完的任务（同一套 A~E）
 ```
 
 `sync` 不重写日历逻辑：薄封装 `download_calendar.py populate`（`--days` 等参数原样透传），
@@ -132,7 +133,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 | 1 | 契约（默认） | **状态框（ASCII）+ The Contract Table** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
-| 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` |
+| 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 
 - **统计视图的数据链在 `stats.py`**（只读公开 API，按 ≤365 天分块拉全量历史，
@@ -216,6 +217,19 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
   因为 TUI 的交互路径走 repl_kit 的 dispatch，**不经过** `Warden.handle`。
 - 收完之后这一场从 `pending` 挪到 `done`，永不重催。
 - 细节见 [`postsession.md`](./postsession.md)。
+
+**`inspect-due`：主动查账**。自动催只盯「刚结束的那一场」；过期了却压根没挂过场次、
+或者那场早就翻篇的任务，用这条命令拉出来过一遍（同一套 A~E）：
+
+```
+inspect-due          已经过了截止时间的
+inspect-due 60       未来 60 分钟内要到的也算
+inspect-due --all    不按截止时间筛（没做完的都看）
+```
+
+面板标题是「过期未完成任务」，每条多一行「截止 …，已过期 2 小时」。
+结束时不写 postsession 状态文件（没有那一场可以翻篇）。
+过期任务同时会出现在状态框的警告里，提示你敲这条命令。
 
 ## OmniFocus 联动（只单向）
 

@@ -49,6 +49,10 @@
 流程在 `postsession.py`（纯逻辑）+ 这里的 `_maybe_start_review` / `begin_review`；
 细节见 [`feature_intents/postsession.md`](feature_intents/postsession.md)。
 
+**`inspect-due`（主动查账）**：不看「哪一场」，而是把**过期还没做完**的任务
+（`inspect-due 60` = 未来 60 分钟内到期的也算，`--all` = 不按截止时间筛）
+拉进同一套状态机过一遍。过期任务还会出现在状态框的警告里，提示敲这条命令。
+
 **状态框**（契约视图最上面那一块 ASCII 框）：上面是「契约（data.csv 周几）」的
 执行情况，下面是警告（`repl_kit.WarningBoard`）—— data.csv 解析问题、layout 坏了、
 今天没有落上每周重复任务…… 警告由框架画、由 warden 每帧重算；`warn off` 只藏警告，
@@ -889,6 +893,13 @@ class ContractView(View):
                  "手动开始一场 session 的收尾（逐个问没做完的任务）", ("收尾",),
                  usage="review [HH:MM | 日期T时刻]",
                  hint=_hint_actions("review", note="结束后 15 秒 daemon 会自动拉你回来收尾")),
+            _cmd("inspect-due", w.cmd_inspect_due,
+                 "主动 inspect 过期没做完的任务（同一套 A/B/C/D/E）",
+                 ("inspect_due", "due", "过期", "查账"),
+                 usage="inspect-due [分钟] [--all]",
+                 options=("--all", "60"),
+                 hint=_hint_actions("--all", "60", "120",
+                                    note="不给参数 = 看已经过期的；给分钟数 = 提前看")),
             _cmd("start", lambda a: w.cmd_start(), "启动 daemon",
                  usage="start", hint=_hint_actions("start", note="启动 daemon")),
             _cmd("stop", lambda a: w.cmd_stop(), "停用 daemon（要敲宣言）",
@@ -1205,8 +1216,8 @@ class TaskView(View):
 
     def idle_hint(self):
         return repl_kit.Hint(
-            "命令", ("task create", "task 8 -a 1", "task delete", "task modify",
-                     "task assign", "task sync"),
+            "命令", ("task create", "task 8 -a 1", "task duplicate", "inspect-due",
+                     "task sync", "review"),
             note="字段不校验 · task 8 ≡ task select 8 · Tab 切视图",
         )
 
@@ -1214,7 +1225,8 @@ class TaskView(View):
         return None
 
     def unknown_hint(self):
-        return ("「任务」视图认 task create/delete/modify/assign/select/sync"
+        return ("「任务」视图认 task create/delete/modify/assign/select/duplicate/"
+                "drop/done/link/import/sync、review、inspect-due"
                 "（也可以直接写任务 ID，如 task 8 -a 1）；"
                 "Shift+Tab 切回去再干别的。")
 
@@ -1229,6 +1241,13 @@ class TaskView(View):
                  "手动开始一场 session 的收尾（逐个问没做完的任务）", ("收尾",),
                  usage="review [HH:MM | 日期T时刻]",
                  hint=_hint_actions("review", note="A 延期 / B 放弃 / C 重议 / D 补录 / E 推后")),
+            _cmd("inspect-due", w.cmd_inspect_due,
+                 "主动 inspect 过期没做完的任务（同一套 A/B/C/D/E）",
+                 ("inspect_due", "due", "过期", "查账"),
+                 usage="inspect-due [分钟] [--all]",
+                 options=("--all", "60"),
+                 hint=_hint_actions("--all", "60", "120",
+                                    note="不给参数 = 看已经过期的；给分钟数 = 提前看")),
         ]
 
     def render(self):
@@ -1245,7 +1264,8 @@ class TaskView(View):
                      "  task assign 2                        ← 挂到表格里的 #2 session\n"
                      "  task 3 -a 2                          ← 同上（裸 ID = select）\n"
                      "  task create title=明日时间安排 --repeat mon@22:15"
-                     "   ← 每周一 22:15 那场自动挂上",
+                     "   ← 每周一 22:15 那场自动挂上\n"
+                     "  inspect-due                          ← 主动看「过期还没做完」的任务",
                      style="dim"),
                 title="[bold]Task · 任务[/]", border_style="magenta", box=box.ROUNDED)
 
@@ -2410,6 +2430,19 @@ class Warden(object):
                    "…" if len(self.csv_dropped) > 2 else ""),
                 level="warn", source="data.csv",
                 hint="用 session --permanent 加回长期规则，或把这些行放回日历/一次性 session"))
+        # 3.5) 过期还没做完的任务：给 `inspect-due` 一个入口（不然这条命令没人知道）
+        try:
+            overdue = psv.due_candidates(self.task_store)
+        except Exception:                      # noqa: BLE001 - 警告板不能因为这里坏掉
+            overdue = []
+        if overdue:
+            first = overdue[0]
+            title = self.task_store.focusmate_title(first, max_len=18)
+            out.append(repl_kit.Warning(
+                "%d 条任务过了截止时间还没做完（最早：%s「%s」）"
+                % (len(overdue), first.get("id"), title),
+                level="warn", source="task",
+                hint="敲 inspect-due 逐个过一遍（A 延期 / B 放弃 / C 重议 / D 补录 / E 推后）"))
         # 4) 每周重复任务：今天有没有落上
         today = datetime.date.today()
         today_sessions = self.sessions_for_day_plan(today)
@@ -3697,8 +3730,14 @@ class Warden(object):
     def next_session_after(self, task, max_days=2):
         """这条任务「下一场」放哪儿：同一场之后最近的那个 slot（跨天也找）。"""
         sess = task.get("session") or {}
-        day_iso = sess.get("date") or self.sel_date.isoformat()
-        start = str(sess.get("start") or "")
+        if sess.get("date") and sess.get("start"):
+            day_iso = str(sess["date"])
+            start = str(sess["start"])
+        else:
+            # 没挂过场次（`inspect-due` 里的过期任务常常这样）：从「现在」往后找
+            now = datetime.datetime.now()
+            day_iso = now.date().isoformat()
+            start = now.strftime("%H:%M")
         try:
             day = datetime.date.fromisoformat(day_iso)
         except ValueError:
@@ -3796,6 +3835,74 @@ class Warden(object):
                  % (self.review.headline(), len(opened)), "cmd")
         return self.review
 
+    def begin_inspect_due(self, tasks, label=None, sync=True, within_minutes=0):
+        """``inspect-due``：把「过期还没做完」的任务拉进同一套收尾状态机。
+
+        和 session 收尾唯一的区别：**没有那一场 session 可以「翻篇」**，
+        所以结束时不写 postsession 状态文件（见 :meth:`close_review`）。
+        """
+        entry = {"kind": "due", "key": "due",
+                 "label": label or "过期未完成任务",
+                 "within_minutes": int(within_minutes or 0),
+                 "checked_at": datetime.datetime.now().isoformat(timespec="seconds")}
+        if sync:
+            self.sync_completion_state(entry)
+        opened = []
+        for task in tasks or []:
+            try:
+                current = self.task_store.get(task["id"])
+            except ValueError:
+                continue
+            if self.task_store.is_open(current):
+                opened.append(current)
+        self.rebuild_rows()
+        if not opened:
+            self.say("🔍 没有到期还没做完的任务 —— 账是干净的。", "ok")
+            self.review = None
+            return None
+        self.review = psv.Review(self.task_store, entry, opened, hooks=self.review_hooks())
+        self.say("🔍 %s：%d 条要过一遍（A/B/C/D/E，s 跳过，q 结束）。"
+                 % (self.review.headline(), len(opened)), "cmd")
+        return self.review
+
+    def cmd_inspect_due(self, args=None, now=None):
+        """``inspect-due [分钟] [--all]`` —— 主动 inspect 没做完、已经到期的任务。
+
+        和「session 结束自动催」共用同一套状态机（A 延期 / B 放弃 / C 重议 /
+        D 缺漏完成 / E 快捷推后），区别只在**谁触发**：
+
+            inspect-due           所有已经过了截止时间、还没做完的任务
+            inspect-due 60        未来 60 分钟内要到的也算（提前看一眼）
+            inspect-due --all     连没有截止时间的一起（「主动看没完成的任务」）
+        """
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        include_no_due = False
+        within = 0
+        for tok in toks:
+            low = tok.lower()
+            if low in ("--all", "all", "全部"):
+                include_no_due = True
+                continue
+            if low in ("--no-due", "nodue"):
+                include_no_due = True
+                continue
+            try:
+                within = max(0, int(tok))
+            except ValueError:
+                raise ValueError("inspect-due 的参数要么是分钟数，要么是 --all；"
+                                 "你给的是 %r" % tok) from None
+        candidates = psv.due_candidates(self.task_store, now=now, within_minutes=within,
+                                        include_no_due=include_no_due)
+        label = "过期未完成任务"
+        if include_no_due:
+            label = "未完成任务（含没设截止时间的）"
+        elif within:
+            label = "截止时间在未来 %d 分钟内的未完成任务" % within
+        if not candidates:
+            self.say("🔍 没有%s —— 账是干净的。" % label, "ok")
+            return None
+        return self.begin_inspect_due(candidates, label=label, within_minutes=within)
+
     def focus_day(self, day_iso):
         """把看板切到某一天（收尾时用：那一场在哪天就看哪天）。"""
         try:
@@ -3878,7 +3985,11 @@ class Warden(object):
             body = Text()
             for text, style in self.review.lines():
                 body.append(text + "\n", style=style or None)
-            return Panel(body, title="[bold yellow]⏱ 收尾 · %s[/]" % self.review.headline(),
+            if self.review.due_mode():
+                head = "🔍 inspect-due · %s" % self.review.headline()
+            else:
+                head = "⏱ 收尾 · %s" % self.review.headline()
+            return Panel(body, title="[bold yellow]%s[/]" % head,
                          border_style="yellow", box=box.HEAVY)
         if self.review_check is not None:
             entry = self.review_check.get("entry") or {}
@@ -3901,10 +4012,16 @@ class Warden(object):
         review, self.review = self.review, None
         if review is None:
             return None
-        try:
-            psv.mark_done(review.session, note=note or "reviewed")
-        except OSError:
+        if review.due_mode():
+            # 过期检查没有「那一场」可以翻篇：不写 postsession 状态文件。
+            # 任务本身已经被改成 completed / dropped（或跳过时保持 active），
+            # 所以下次 inspect-due 自然不会再问一遍。
             pass
+        else:
+            try:
+                psv.mark_done(review.session, note=note or "reviewed")
+            except OSError:
+                pass
         self.rebuild_rows()
         if review.skipped:
             self.say("收尾结束；跳过了 %d 条（它们还是「进行中」）。" % len(review.skipped), "warn")

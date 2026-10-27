@@ -12,6 +12,10 @@
       → 每一条没做完的任务问你一次，A/B/C/D/E 选一个
       → 全部处理完，这一场才算翻篇
 
+除了「session 结束自动催」，还有一条**主动**入口：``inspect-due``
+—— 把「过期还没做完」的任务（不管它挂在哪一场、或者根本没挂）拉出来，
+用同一套状态机逐个过一遍。见 :func:`due_candidates`。
+
 五个选项（用户原话见 feature_intents/postsession.md）：
 
     A 延期      用户自己敲命令把任务转移走；转移成功之后，旧的那条标成「放弃」+
@@ -229,6 +233,57 @@ def ended_sessions(slots_by_day, now=None, delay=DELAY_SEC, lookback=LOOKBACK_SE
     return sorted(out, key=lambda r: (r["date"], r["start"]))
 
 
+def parse_due(value):
+    """``fields.due`` → 本地 naive datetime；认不出（"明天" 这种手写）返回 None。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # 只给了日期：当那天结束（23:59）——「今天到期」不该在 00:00 就判过期。
+    # 注意要在 fromisoformat 之前判：Python 3.11 起 "2026-10-27" 也能被它解析成零点。
+    if len(text) == 10:
+        try:
+            return datetime.datetime.combine(datetime.date.fromisoformat(text),
+                                             datetime.time(23, 59))
+        except ValueError:
+            return None
+    probe = text[:-1] + "+00:00" if text.upper().endswith("Z") else text
+    try:
+        got = datetime.datetime.fromisoformat(probe)
+    except ValueError:
+        return None
+    if got.tzinfo is not None:
+        got = got.astimezone().replace(tzinfo=None)
+    return got
+
+
+def due_candidates(store, now=None, within_minutes=0, include_no_due=False):
+    """「该看一眼」的未完成任务：截止时间已过（或快到了），按截止时间从早到晚。
+
+    ``inspect-due`` 背后的取数逻辑，故意放在这里（纯逻辑、好测）：
+
+    - 只看 ``status == active`` 的（完成/放弃的不催）；
+    - ``within_minutes=0``（默认）= 已经过期；给 60 就是「未来 60 分钟内要到的也算」；
+    - ``include_no_due=True``（``inspect-due --all``）= **不按截止时间筛**，
+      所有未完成的都带上（有截止的按时间排前面，没截止／认不出的排最后）
+      —— 「主动 inspect 没完成的任务」那条路上会用得着。
+    """
+    now = now or datetime.datetime.now()
+    horizon = now + datetime.timedelta(minutes=max(0, int(within_minutes or 0)))
+    rows = []
+    for task in store.list():
+        if not store.is_open(task):
+            continue
+        due = parse_due((task.get("fields") or {}).get("due"))
+        if due is None:
+            if include_no_due:
+                rows.append((datetime.datetime.max, task))
+            continue
+        if include_no_due or due <= horizon:
+            rows.append((due, task))
+    rows.sort(key=lambda pair: (pair[0], pair[1].get("id") or 0))
+    return [task for _due, task in rows]
+
+
 def slots_around(entries, now=None, days_back=1, days_fwd=0):
     """data.csv 规则 → ``[(date, slots)]``，覆盖昨天今天（跨午夜那点边角也算）。"""
     import schedule as sch
@@ -246,6 +301,18 @@ def slots_around(entries, now=None, days_back=1, days_fwd=0):
 
 
 # ---------------------------------------------------------------- 收尾本身
+
+
+def _fmt_age(seconds):
+    """过期时长的白话写法：``3 小时 12 分`` / ``8 分钟``。"""
+    seconds = int(max(0, seconds))
+    if seconds < 3600:
+        return "%d 分钟" % max(1, seconds // 60)
+    hours, rest = divmod(seconds, 3600)
+    if hours < 24:
+        return "%d 小时 %d 分" % (hours, rest // 60) if rest >= 60 else "%d 小时" % hours
+    days, rest = divmod(hours, 24)
+    return "%d 天 %d 小时" % (days, rest) if rest else "%d 天" % days
 
 
 def _parse_minutes(text):
@@ -348,8 +415,14 @@ class Review(object):
         return not self.closed and self.current() is not None
 
     # -- 给界面用的文字 -----------------------------------------------
+    def due_mode(self):
+        """这一轮是不是 ``inspect-due``（不是某一场 session 的收尾）。"""
+        return (self.session or {}).get("kind") == "due"
+
     def headline(self):
         sess = self.session
+        if self.due_mode():
+            return sess.get("label") or "过期未完成任务"
         return "%s %s–%s 收尾" % (sess.get("date") or "?", sess.get("start") or "?",
                                   sess.get("end") or "?")
 
@@ -376,17 +449,26 @@ class Review(object):
         out = []
         task = self.current()
         if task is None:
-            out.append(("这场没有待收尾的任务。", "dim"))
+            out.append(("没有再要看的任务了。" if self.due_mode()
+                        else "这场没有待收尾的任务。", "dim"))
             return out
         omni = task.get("omnifocus") or {}
         fm = task.get("focusmate") or {}
         sess = task.get("session") or {}
         out.append(("任务 %s：%s" % (task["id"], self.title_of(task)), "bold yellow"))
         bits = []
+        due_text = (task.get("fields") or {}).get("due") or "?"
         if sess.get("start"):
             bits.append("session %s %s（截止 %s）"
-                        % (sess.get("date"), sess.get("start"),
-                           (task.get("fields") or {}).get("due") or "?"))
+                        % (sess.get("date"), sess.get("start"), due_text))
+        elif (task.get("fields") or {}).get("due"):
+            due = parse_due(task["fields"]["due"])
+            overdue = ""
+            if due is not None:
+                secs = (self.now - due).total_seconds()
+                if secs > 0:
+                    overdue = "，已过期 %s" % _fmt_age(secs)
+            bits.append("截止 %s%s" % (due_text, overdue))
         if fm.get("task_id"):
             bits.append("Focusmate %s…" % str(fm["task_id"])[:8])
         if omni.get("id"):
