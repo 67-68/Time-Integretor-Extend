@@ -52,7 +52,7 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
 | 层 | 判据 | 代价 |
 |---|---|---|
 | 草稿区 | `start > now+24h` | 零阻力：`session` 加、`cancel` 删，直接改 data.csv |
-| 执行区 | `now < start ≤ now+24h` | `cancel` 必须**一字不差敲完 152 字宣言** |
+| 执行区 | `now < start ≤ now+24h` | `cancel` 必须**一字不差敲完 152 字宣言**（改排布 `period`/`session T1 …` 不用） |
 | 罪案区 | state 说 booked、API 里查不到 | **全局锁死**：除宣言外任何命令都不受理（含 `session` / `day` / `stop`）；罪落盘，关掉重开照样锁 |
 | 过去 | `start ≤ now` | 只能看：不取消也不补订 |
 
@@ -370,8 +370,12 @@ python3 warden.py install-deps
   `completedAt`，归档到 `data/task-archive.json`。
 - `session T1 50 50` / `period T1 50 50` / 裸 `T1 50 50` 改时段排布；
   任何一场超出时段终点 → 报错，layout 和 data.csv 都不动。
-- 改排布时若该时段已有 API session 且起点/时长不再匹配，先取消旧场（执行区
-  仍要敲宣言），再写新 layout + data.csv，最后立刻 `check` 补订新场次。
+- 改排布时若该时段已有 API session 且起点/时长不再匹配，先取消旧场
+  （**改排布不要宣言**，用户明确要求：计划随你改，障碍只在 `cancel N`），
+  再写新 layout + data.csv，最后立刻 `check` 补订新场次。
+- 取消旧场之前会把面板摊开：要取消哪几场、哪些任务绑定会被清掉，一目了然。
+- 任务绑定按「(起点, 时长) 有没有动」保留：没动的场次绑定留着，动过的清掉
+  （详见 `session_plan.md` 的「任务绑定」一节）。
 - 第五个视图 `设置 / 规则` + `set <id> <value>`；`edit-tomorrow` 让「明天」临时按
   草稿区处理（`Warden.effective_zone`），`tomorrow-plan` 是「明日时间安排」的规格。
 - `session` 默认**只加这一天**（`temp/session-extras.json`），`session --permanent`

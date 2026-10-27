@@ -311,6 +311,38 @@ class TaskStore(object):
         self.save(store)
         return found
 
+    def unassign(self, task_id, reason=None):
+        """断掉 session 绑定（**任务本身留着**）。
+
+        跑排布改动时用：那一场被取消/改时长，任务就不该再挂在它身上。
+        Focusmate 侧那条 task 记进 ``focusmate.previous``（连同当时的 session 和
+        ``reason``），这样它以后被勾完成时 `reconcile` 还能按 completedAt 归档。
+        完成时间 ``completed_at`` 不抹掉 —— 那是历史，不是绑定。
+        """
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if task["id"] == int(task_id):
+                found = task
+                break
+        if found is None:
+            raise ValueError("没有任务 %s" % task_id)
+        fm = found.setdefault("focusmate", {})
+        old_id = fm.get("task_id") or fm.get("id")
+        if old_id:
+            fm.setdefault("previous", []).append({
+                "task_id": old_id,
+                "session": dict(found.get("session") or {}) or None,
+                "replaced_at": _now(),
+                "reason": reason or "unassigned",
+            })
+        for key in ("task_id", "id", "session_id", "attached_at", "title", "via"):
+            fm.pop(key, None)
+        found["session"] = None
+        found["updated_at"] = _now()
+        self.save(store)
+        return found
+
     def attach_focusmate(self, task_id, focusmate_task, session=None):
         """记下 Focusmate 侧 task id / session id；不覆盖已经归档的完成记录。"""
         store = self.load()

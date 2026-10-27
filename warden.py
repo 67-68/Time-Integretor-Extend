@@ -644,8 +644,8 @@ def _hint_task(parts):
     action = parts[0].lower() if len(parts) else ""
     if action == "create":
         return repl_kit.Hint("参数", ("[id]", "key=value...", "--repeat 周几@HH:MM",
-                                      "--assign N"),
-                             note="不给 id 就自动编号")
+                                      "--assign N", "--note 备注"),
+                             note="不给 id 就自动编号 · --note 塞网址最有用")
     if action in ("archive", "history", "归档"):
         return repl_kit.Hint("参数", ("<N>",), note="不给就列最近 5 条")
     if action in ("repeat", "recurring"):
@@ -663,7 +663,7 @@ def _hint_task(parts):
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
     return repl_kit.Hint("参数", ("create", "delete", "modify", "note", "assign",
                                   "select", "repeat", "sync", "archive"),
-                         note="任何动作都能带 --assign N")
+                         note="任何动作都能带 --assign N / --note 备注")
 
 
 class View(object):
@@ -739,7 +739,7 @@ class View(object):
                  "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
                  usage="task <create|delete|modify|note|assign|select|repeat|sync|archive> ... [--assign N]",
                  options=("create", "delete", "modify", "note", "assign", "select", "repeat",
-                          "sync", "archive", "--assign", "--repeat"),
+                          "sync", "archive", "--assign", "--note", "--repeat"),
                  hint=_hint_task),
         ]
 
@@ -2672,25 +2672,30 @@ class Warden(object):
     def cmd_task(self, args):
         """TaskView 的唯一入口：task <create|delete|modify|assign|select|repeat|sync|archive> ...
 
-        任何子命令后面都可以跟 ``--assign <表格里的 session ID>``（``-a`` 同义）：
-        命令跑完、拿到一条任务之后，顺手把它挂到那一场 session 上。
+        任何子命令后面都可以跟两个后缀（都能组合）：
+          ``--assign <session ID>``（``-a`` 同义）= 顺手挂到那一场
+          ``--note <备注>``（``-n`` 同义）= 顺手写备注（可以塞网址）
 
             task create title=写论文 --assign 3
-            task create title=复习 --repeat mon@22:15 --assign 3
-            task modify 1 due 后天 --assign 3
+            task create title=写论文 -n "材料在这 https://example.com/x" --assign 3
+            task modify 1 due 后天 --note=下午再弄
+            task select 1 -n "https://notion.so/xxx"
 
         「挂」永远是同一套：先在 Focusmate 建 task 并复核，成功后才落本地
         （见 :meth:`cmd_task_assign`），所以 ``--assign`` 不会产生假成功的半截状态。
         """
         toks = [str(a) for a in args]
         if not toks:
-            raise ValueError("用法：task create/delete/modify/assign/select/repeat/sync/archive ...")
+            raise ValueError("用法：task create/delete/modify/note/assign/select/repeat/sync/archive ...")
         assign_to, kept = self._split_assign(toks)
+        note_text, kept = self._split_note(kept)
         if not kept:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）")
         action = kept[0].lower()
         rest = kept[1:]
         result = self._dispatch_task(action, rest)
+        if note_text is not None:
+            self._apply_note(result, note_text, action)
         if assign_to is not None:
             self._apply_assign(result, assign_to, action)
         return result
@@ -2717,6 +2722,73 @@ class Warden(object):
             kept.append(tok)
             i += 1
         return assign_to, kept
+
+    @staticmethod
+    def _split_note(toks):
+        """把 ``--note 文本`` / ``-n 文本`` / ``--note=文本`` 从参数里摘出来。
+
+        和 ``--assign`` 一样是「任何 task 子命令都能带」的后缀：
+        命令跑完拿到任务之后顺手写备注。
+        备注是自由文本，**一路吃到下一个 ``--flag`` 为止**，所以不用加引号：
+
+            task create title=写论文 --note 材料在这 https://example.com/x --assign 3
+
+        ``--note=文本`` / ``--note=``（等号后为空 = 清空）也行；
+        备注本身以 ``-`` 开头时用等号写法。
+        """
+        note = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            low = tok.lower()
+            if low in ("--note", "-n"):
+                # 备注是自由文本：一路吃到下一个 --flag 为止，所以
+                # `--note 材料在这 https://x` 不用加引号。
+                j = i + 1
+                parts = []
+                while j < len(toks) and not str(toks[j]).startswith("-"):
+                    parts.append(str(toks[j]))
+                    j += 1
+                if not parts:
+                    raise ValueError("--note 后面要跟备注文本（例如 --note https://…）")
+                note = " ".join(parts)
+                i = j
+                continue
+            if low.startswith("--note="):
+                note = tok.split("=", 1)[1]
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return note, kept
+
+    NO_TASK_ACTIONS = ("delete", "sync", "refresh", "reconcile", "archive", "history",
+                       "归档", "list", "ls", "show")
+
+    def _apply_note(self, result, text, action):
+        """``--note`` 的收尾：给刚被创建/修改/选中的那条任务写备注。"""
+        if action in self.NO_TASK_ACTIONS:
+            self.say("`--note` 对 %s 没意义（它不产出任务，没有能写备注的对象），忽略。"
+                     % action, "warn")
+            return None
+        task_id = None
+        if isinstance(result, dict) and result.get("id") is not None:
+            task_id = result["id"]
+        elif self.selected_task_id is not None:
+            task_id = self.selected_task_id
+        if task_id is None:
+            self.say("`--note` 没找到要写备注的任务：先 task create / task select。", "warn")
+            return None
+        try:
+            task = self.task_store.set_notes(task_id, text)
+        except ValueError:
+            self.say("`--note`：任务 %s 已经不在了（%s 之后没得写），忽略。"
+                     % (task_id, action), "warn")
+            return None
+        self.say("✅ 任务 %d 备注：%s"
+                 % (task["id"], self.task_store.notes(task) or "（空）"), "ok")
+        return task
 
     def _apply_assign(self, result, session_token, action):
         """``--assign`` 的收尾：拿到任务就挂，拿不到就说一声（不改任何东西）。"""
@@ -3226,6 +3298,61 @@ class Warden(object):
         except (TypeError, ValueError):
             return True
 
+    def _task_bindings_dropped(self, period, new_sessions):
+        """排布变了之后，哪些任务绑定会被清掉（纯计算，不改任何东西）。
+
+        判据：**(起点, 时长) 完全一致才算「这场没动」**。
+        50 25 25 → 50 50 时第一场还是 11:00(50)，它挂的任务留着；
+        50 25 → 25 50 时没有一场对得上，两场的绑定全清。
+        """
+        return [task for task, _key in self._task_bindings_split(period, new_sessions)[1]]
+
+    def _task_bindings_split(self, period, new_sessions):
+        """把这一时段里挂着任务分两堆：(留着的, 要清掉的)，元素是 (task, key)。"""
+        kept_keys = set()
+        for sess in new_sessions or []:
+            try:
+                kept_keys.add((str(sess.get("start")), int(sess.get("duration"))))
+            except (TypeError, ValueError):
+                continue
+        date = period.get("date") or self.sel_date.isoformat()
+        keep, drop = [], []
+        for task in self.task_store.list():
+            sess = task.get("session") or {}
+            if sess.get("date") != date:
+                continue
+            if sp.period_for_session([period], sess.get("start")) is None:
+                continue
+            try:
+                key = (str(sess.get("start")), int(sess.get("duration")))
+            except (TypeError, ValueError):
+                key = (str(sess.get("start")), None)
+            (keep if key in kept_keys else drop).append((task, key))
+        return keep, drop
+
+    def clear_task_bindings_for_layout(self, period, new_sessions):
+        """排布改了：留下来的场次保留任务绑定，动过的场次清掉绑定。
+
+        任务本身**不删**（还是任务库里的），只是不再挂在那一场上；
+        Focusmate 侧那条 task 记进 ``focusmate.previous``，
+        以后它要是被勾了完成，`task sync` 照样能按 completedAt 归档。
+        """
+        _keep, drop = self._task_bindings_split(period, new_sessions)
+        if not drop:
+            return []
+        cleared = []
+        for task, key in drop:
+            try:
+                self.task_store.unassign(task.get("id"), reason="layout-changed")
+            except ValueError:
+                continue
+            cleared.append(task)
+            self.say("清掉任务 %d「%s」的绑定（原来 %s %s，这一场排布改了）"
+                     % (task.get("id"), self.task_store.summarize(task, max_len=24),
+                        (task.get("session") or {}).get("date") or period.get("date"),
+                        key[0]), "warn")
+        return cleared
+
     def _forget_layout_state(self, rows):
         """清掉被 warden 主动取消的旧 state 记录，避免 daemon 误记 sin。"""
         if not rows:
@@ -3249,13 +3376,17 @@ class Warden(object):
         except Exception as e:                        # noqa: BLE001
             self.say("清理旧 state 失败（daemon 可能多记一笔 sin）：%s" % e, "warn")
 
-    def _cancel_stale_period_sessions(self, period, new_sessions):
+    def _cancel_stale_period_sessions(self, period, new_sessions, dropped_tasks=()):
         """改 layout 前，把旧排布里已经订上的 API session 对齐掉。
 
         为什么必须做：data.csv 换成 22:15(25)+22:45(25) 之后，API 里原先那场
         22:15(50) 不会自己消失；daemon 只补订、不擅自杀旧场，于是 50min/25min
         会同时存在。这里在改契约之前先把「起点或时长不再匹配」的场次取消。
-        执行区里的取消仍走同一道宣言闸门 —— 不能靠改 layout 绕过 Warden。
+
+        **改排布不要宣言**（用户明确要求）：排布是「计划」，点 UI 就能调；
+        有阻力的是**取消单场**（`cancel N` 那条路仍然要敲宣言，一点没放松）。
+        为了不让人稀里糊涂丢东西，取消前照样把面板列出来，并把会被清掉的任务
+        绑定一起写清楚。
         """
         if self.offline or not self.authoritative:
             return True
@@ -3294,16 +3425,14 @@ class Warden(object):
         info.add_row("新排布", "  ".join("%s–%s(%d)"
                                        % (s["start"], s["end"], s["duration"])
                                        for s in new_sessions) or "（空）")
-        self.emit(Panel(info, title="[bold red]⚠ 改排布：旧 session 需要先取消[/]",
-                        border_style="red", box=box.HEAVY))
-
-        locked = [r for r in live if r.get("zone") == "locked"]
-        if locked:
-            if not self.require_declaration(
-                    "改 %s 的排布，并取消 %d 场执行区旧 session"
-                    % (period.get("id"), len(locked))):
-                self.say("没认罪，排布和 session 都没动。", "warn")
-                return False
+        for task in dropped_tasks:
+            sess = task.get("session") or {}
+            info.add_row("清任务绑定", "#%s %s @%s"
+                         % (task.get("id"),
+                            self.task_store.summarize(task, max_len=24),
+                            sess.get("start") or "?"))
+        self.emit(Panel(info, title="[bold yellow]⚠ 改排布：旧 session 会被取消[/]",
+                        border_style="yellow", box=box.HEAVY))
 
         cancelled = []
         try:
@@ -3338,7 +3467,13 @@ class Warden(object):
           - 任何一场超出时段终点 → 直接报错，**layout 和 data.csv 都不动**。
 
         改排布时若 API 里已有旧 session（例如原来 22:15 50，现在要 22:15 25 +
-        22:45 25），先取消不再匹配的旧场，再写新契约。执行区的取消仍要敲宣言。
+        22:45 25），先取消不再匹配的旧场，再写新契约。
+
+        **改排布不需要宣言**（用户明确要求）：计划怎么摆是你的事；
+        真正有阻力的是取消单场（`cancel N`）。
+        任务绑定按「(起点, 时长) 有没有动」处理：没动的场次绑定留着
+        （50 25 25 → 50 50，第一场还是 11:00(50)，任务照旧），
+        动过的场次绑定清掉（50 25 → 25 50，两场都变 → 两个任务的绑定都清）。
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
@@ -3366,8 +3501,11 @@ class Warden(object):
         effective = durations if durations else sp.default_durations(period)
         new_sessions = sp.plan_period(period, effective)
 
+        # 排布一变，动过的场次上的任务绑定就该清掉；先算出来，好写进取消前的面板。
+        dropped = self._task_bindings_dropped(period, new_sessions)
+
         # 旧 API session 先对齐，否则 50min / 25min 会并存。
-        if not self._cancel_stale_period_sessions(period, new_sessions):
+        if not self._cancel_stale_period_sessions(period, new_sessions, dropped):
             return False
 
         if not durations:
@@ -3380,6 +3518,9 @@ class Warden(object):
             body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
                              for s in new_sessions)
             self.say("✅ %s %s → %s" % (self.sel_date.isoformat(), period_id, body), "ok")
+
+        # 排布落盘之后才动任务绑定：没写进去就什么都不清。
+        self.clear_task_bindings_for_layout(period, new_sessions)
 
         # 从下载层 + 所有 layout + 一次性 + 长期规则重新生成 data.csv。
         # 写在 layout 成功之后。

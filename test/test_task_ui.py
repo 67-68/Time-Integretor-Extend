@@ -266,6 +266,49 @@ check("create note= 也收敛成 notes",
 wd.handle("task note %d" % note_id)
 check("task note 不带文本 = 清空", wd.task_store.get(note_id)["fields"]["notes"], "")
 
+print("== --note / -n：任何 task 子命令都能带 ==")
+wd.handle("task create title=带备注的 -n https://example.com/a")
+nid = max(t["id"] for t in wd.task_store.list())
+check("-n 在 create 上生效", wd.task_store.get(nid)["fields"]["notes"],
+      "https://example.com/a")
+wd.handle("task modify %d due 明天 --note=https://example.com/b" % nid)
+check("--note= 也认", wd.task_store.get(nid)["fields"]["notes"], "https://example.com/b")
+check("原来的 modify 照样生效", wd.task_store.get(nid)["fields"]["due"], "明天")
+wd.handle("task select %d -n 材料在这 https://example.com/c" % nid)
+check("select 上也能带，且备注带空格不用加引号",
+      wd.task_store.get(nid)["fields"]["notes"], "材料在这 https://example.com/c")
+wd.handle("task note %d" % nid)
+wd.handle("task create title=清空备注 --note=x")
+cid = max(t["id"] for t in wd.task_store.list())
+wd.handle("task modify %d any 1 --note=" % cid)
+check("--note= 空 = 清空", wd.task_store.get(cid)["fields"]["notes"], "")
+wd.messages = []
+wd.handle("task delete %d --note 想写也写不上" % cid)
+check_true("对 delete 带 --note：只警告不炸",
+           any("没意义" in m[2] for m in wd.messages))
+check("任务确实删掉了", [t["id"] for t in wd.task_store.list() if t["id"] == cid], [])
+wd.messages = []
+wd.handle("task create title=空备注 --note")
+check_true("--note 后面没给文本 → 人话提示",
+           any("--note 后面要跟备注文本" in m[2] for m in wd.messages))
+check("没建出这条任务",
+      [t for t in wd.task_store.list() if (t.get("fields") or {}).get("title") == "空备注"], [])
+
+print("== --note 和 --assign 能一起用 ==")
+row1500b = [r for r in wd.rows if r["startLabel"] == "15:00"][0]
+wd.bridge.calls = []
+wd.handle("task create title=组合 --note 材料在这 https://example.com/combo --assign %d"
+          % (wd.rows.index(row1500b) + 1))
+combo = max(t["id"] for t in wd.task_store.list())
+check("备注写上了（带空格也吃全）",
+      wd.task_store.get(combo)["fields"]["notes"], "材料在这 https://example.com/combo")
+check("也挂到那一场了", wd.task_store.get(combo)["session"]["start"], "15:00")
+check("bridge 只被叫了一次",
+      len([c for c in wd.bridge.calls if c[0] == "add_task"]), 1)
+check("Focusmate 收到的 description 就是备注",
+      [c for c in wd.bridge.calls if c[0] == "add_task"][0][1]["notes"],
+      "材料在这 https://example.com/combo")
+
 print("== 完成之后：消息和归档面板都要有备注（含可点网址）==")
 wd.bridge.calls = []
 row1500 = [r for r in wd.rows if r["startLabel"] == "15:00"][0]

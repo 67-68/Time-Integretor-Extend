@@ -136,6 +136,31 @@ recs = store2.load_archive()["records"]
 check("归档里的场次各自对得上",
       sorted(r["session"]["start"] for r in recs), ["09:00", "11:00"])
 
+print("== unassign：断绑定，但任务和完成时间都留着 ==")
+u = store2.create({"title": "会被断开的"})
+sess_u = {"index": 1, "date": "2026-10-26", "start": "11:00", "end": "11:50",
+          "duration": 50, "focusmate_session_id": "sess-U"}
+store2.assign(u["id"], sess_u)
+store2.attach_focusmate(u["id"], {"task_id": "ft-U", "session_id": "sess-U",
+                                  "completed_at": "2026-10-26T11:50:00Z"},
+                        session=sess_u)
+store2.unassign(u["id"], reason="layout-changed")
+after = store2.get(u["id"])
+check("任务还在", after["fields"]["title"], "会被断开的")
+check("session 断了", after["session"], None)
+check("Focusmate task_id 清掉", after["focusmate"].get("task_id"), None)
+check("完成时间不抹（那是历史）",
+      after["focusmate"].get("completed_at"), "2026-10-26T11:50:00Z")
+prev = after["focusmate"]["previous"][0]
+check("旧 task 记进 previous", prev["task_id"], "ft-U")
+check("previous 里带着当时那场 session", prev["session"]["start"], "11:00")
+check("previous 记着原因", prev["reason"], "layout-changed")
+try:
+    store2.unassign(999)
+    check("断不存在的任务应报错", False, True)
+except ValueError as e:
+    check_true("不存在的任务给明确错误", "没有任务 999" in str(e))
+
 print("== 归档记录里带备注 ==")
 store.set_notes(1, "材料在这 https://example.com/set3")
 store3 = ts.TaskStore(os.path.join(TMP, "t3.json"), os.path.join(TMP, "a3.json"))

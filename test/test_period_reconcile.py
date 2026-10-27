@@ -128,14 +128,19 @@ body = [l for l in open(sch.DATA_CSV, encoding="utf-8").read().splitlines()
 check("新 data.csv 只有 25+25", body,
       ["%s,22:15,25" % ISO, "%s,22:45,25" % ISO])
 
-print("== 宣言没敲对：什么都不动 ==")
+print("== 改排布不要宣言（执行区也一样）==")
 open(sch.DATA_CSV, "w", encoding="utf-8").write("ORIGINAL\n")
 wd = mkwarden(True)
-wd.require_declaration = lambda reason: False
-before_calls = len(wd.bridge.calls)
-check("拒绝后返回 False", wd.cmd_period_layout(["T5", "25", "25"]), False)
-check("没有取消任何东西", [c for c in wd.bridge.calls if c[0] == "cancel"], [])
-check("data.csv 完全没动", open(sch.DATA_CSV, encoding="utf-8").read(), "ORIGINAL\n")
+# 谁问宣言谁就炸：改排布这条路上不该出现宣言闸门
+wd.require_declaration = lambda reason: (_ for _ in ()).throw(
+    AssertionError("改排布不该问宣言，问的是 %r" % reason))
+check("执行区改排布：不敲宣言直接生效", wd.cmd_period_layout(["T5", "25", "25"]), True)
+check("照样先取消了旧 session",
+      len([c for c in wd.bridge.calls if c[0] == "cancel"]), 1)
+check("data.csv 换成了新排布",
+      [l for l in open(sch.DATA_CSV, encoding="utf-8").read().splitlines()
+       if l and not l.startswith("#")],
+      ["%s,22:15,25" % ISO, "%s,22:45,25" % ISO])
 
 print("== 草稿区不受宣言限制 ==")
 open(sch.DATA_CSV, "w", encoding="utf-8").write("ORIGINAL\n")
@@ -145,6 +150,61 @@ wd.require_declaration = lambda reason: (_ for _ in ()).throw(AssertionError("�
 check("草稿区直接取消+改", wd.cmd_period_layout(["T5", "25", "25"]), True)
 check("草稿区也取消了旧 session",
       len([c for c in wd.bridge.calls if c[0] == "cancel"]), 1)
+
+print("== 改排布：没动的场次保留任务绑定，动过的清掉 ==")
+# 再加一个长时段 T6（11:00–13:00），好摆 50 25 25 / 50 50
+data["periods"].append({"id": "T6", "date": ISO, "start": "11:00", "end": "13:00",
+                        "type": "工作", "name": "SAT", "calendar": "工作", "title": "SAT"})
+sp.save_download(data)
+sp.set_layout(ISO, "T6", [50, 25, 25])
+wd = mkwarden(False)
+w.run_keep_session = lambda *a, **kw: (0, "round done", "")
+wd.require_declaration = lambda reason: (_ for _ in ()).throw(
+    AssertionError("改排布不该问宣言"))
+print("   旧排布：", [("%s(%d)" % (x["start"], x["duration"]))
+                     for x in sp.sessions_for_period(
+                         [p for p in wd.periods_for_day(TODAY) if p["id"] == "T6"][0],
+                         wd.layouts)])
+t1 = wd.task_store.create({"title": "第一场 50min"})
+t2 = wd.task_store.create({"title": "第二场 25min"})
+t3 = wd.task_store.create({"title": "第三场 25min"})
+for task, start, dur in ((t1, "11:00", 50), (t2, "12:00", 25), (t3, "12:30", 25)):
+    wd.task_store.assign(task["id"], {"index": 1, "date": ISO, "start": start,
+                                      "duration": dur, "focusmate_session_id": "s-" + start})
+    wd.task_store.attach_focusmate(task["id"], {"task_id": "fmt-" + start},
+                                   session={"date": ISO, "start": start, "duration": dur})
+
+check("T6 50 50 受理", wd.cmd_period_layout(["T6", "50", "50"]), True)
+check("11:00 那场没动 → 任务绑定留着",
+      wd.task_store.get(t1["id"])["session"]["start"], "11:00")
+check("12:00 那场被拆掉了 → 绑定清掉", wd.task_store.get(t2["id"])["session"], None)
+check("12:30 那场也没了 → 绑定清掉", wd.task_store.get(t3["id"])["session"], None)
+check("任务本身还在（只是不挂了）",
+      [t["id"] for t in wd.task_store.list()], [t1["id"], t2["id"], t3["id"]])
+prev = wd.task_store.get(t2["id"])["focusmate"]
+check("旧 Focusmate task 记进 previous（完成时间还能归档）",
+      [x["task_id"] for x in prev.get("previous") or []], ["fmt-12:00"])
+check("previous 里记着为什么清", prev["previous"][0]["reason"], "layout-changed")
+check_true("消息里说了清掉哪条绑定",
+           any("清掉任务 %d" % t2["id"] in m[2] for m in wd.messages))
+
+print("== 改排布：连保留的那场也动了 → 全清 ==")
+wd.messages = []
+check("T6 25 50 受理", wd.cmd_period_layout(["T6", "25", "50"]), True)
+check("11:00 那场从 50min 变 25min → 绑定也清掉",
+      wd.task_store.get(t1["id"])["session"], None)
+check("这一时段里没有任务还挂着",
+      [t["id"] for t in wd.task_store.list() if t.get("session")], [])
+
+print("== 改排布：时长一样、起点也一样 → 一个都不清 ==")
+wd.task_store.assign(t1["id"], {"index": 1, "date": ISO, "start": "11:00",
+                                "duration": 25, "focusmate_session_id": "s-11:00"})
+wd.messages = []
+check("T6 25 50 再来一次（排布没变）", wd.cmd_period_layout(["T6", "25", "50"]), True)
+check("没动过的场次绑定还在",
+      wd.task_store.get(t1["id"])["session"]["start"], "11:00")
+check_true("没有清绑定的消息",
+           not any("清掉任务" in m[2] for m in wd.messages))
 
 shutil.rmtree(TMP, ignore_errors=True)
 print()

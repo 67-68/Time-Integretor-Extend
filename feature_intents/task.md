@@ -112,8 +112,15 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 
 ## 备注（`notes`）
 
-- **第一等公民，但仍是普通字段**：`task note <id> <文本|网址>` 写、`task note <id>`
-  清空；`task create title=x note=…` / `备注=…` / `modify <id> note …` 都收敛成
+- **两种写法，任选**：
+  - 后缀（推荐，和 `--assign` 一样任何子命令都能带）：
+    `task create title=写论文 --note 材料在这 https://example.com/x --assign 3`、
+    `task select 1 -n https://notion.so/xxx`。
+    备注是自由文本，**一路吃到下一个 `--flag` 为止**，不用加引号；
+    `--note=文本` / `--note=`（清空）也行；不产出任务的动作（`delete`/`sync`/
+    `archive`…）带 `--note` 只会得到一句"没意义"。
+  - 子命令：`task note <id> <文本|网址>` 写、`task note <id>` 清空。
+- `task create title=x note=…` / `备注=…` / `modify <id> note …` 都收敛成
   `fields["notes"]`（`FIELD_ALIASES`），免得表格里同时出现 `note`/`notes`/`备注` 三列。
 - 读用 `task_store.notes(task)`（`notes` / `note` / `备注` 都认）。
 - 挂 Focusmate task 时备注也当 `description` 传过去。
@@ -126,6 +133,8 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 ## 契约视图里的任务展示
 
 - 契约表格 task 列：`2: 写论文 | 5: 复习错题` —— 编号 + 裁剪后的标题，用 ` | ` 分隔。
+- 排布改了（`period T1 …`）时任务绑定跟着走：没动的场次保留，动过的清掉
+  （见 `session_plan.md`；清掉的是绑定，不是任务）。
 - 契约表格下面那块两列任务表格：`number | task | number | task`；已 assign 到
   session 的染红，没挂的深蓝（当前选中的再 reverse）。
 
