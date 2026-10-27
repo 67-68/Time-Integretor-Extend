@@ -90,6 +90,14 @@ help / quit
 且一个 session 都没切出来时会拒绝覆盖）。和 cancel/stop 不同，sync 不需要敲宣言 ——
 它是「重新拉目标」，不是「放弃目标」。
 
+`refresh`（`r`）是**纯读**：只调 bridge 的 `snapshot` 拉选中那天的 session，再和
+data.csv 的契约合并重排表格（所以 ID 会重编号），**不会订任何东西**。
+"缺"那几行刷一万遍也还是"缺"。订场只有一条路径 —— `keep_session.py` 的 daemon
+（`book_session` + API 复核），warden 里没有任何预订入口，也不该有：
+TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后触发一轮 `check`
+（`session` / `period` / `relocate` / `force-check`）。同理，任务视图里的
+`refresh` 只跑 `GET /v1/tasks` 同步完成时间，也不订场。
+
 `relocate` 和 `sync` 相反：它**不写 data.csv**，只把「某一天 + 原 HH:MM」映射到新时间
 写进 `temp/keep_session-relocations.json`。`schedule.day_slots()` 是唯一入口，所以 warden
 和 daemon 会同时看到「原 slot 消失、新 slot 出现」；过了这一天，记录不再命中任何日期，

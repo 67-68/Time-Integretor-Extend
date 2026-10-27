@@ -41,6 +41,7 @@ TUI（任务视图 / 任意视图都认 `task`）：
 | `task delete <id>` | 删除 |
 | `task modify <id> <field> <新值>` | 改任意字段 |
 | `task select <id>` | 选中任务（`task assign <session>` 的默认目标） |
+| `task <id>` | ← 和 `task select <id>` **完全等价**（裸 ID 就是 select） |
 | `task assign [<任务ID>] <session ID>` | 先挂 Focusmate，成功后落本地；成功即刻重排表格（task 列马上有内容） |
 | `task repeat <id> <周几@HH:MM\|off>` | 设置 / 取消每周重复 |
 | `task create ... --repeat 周几@HH:MM` | 一步建「每周重复任务」 |
@@ -52,11 +53,17 @@ TUI（任务视图 / 任意视图都认 `task`）：
 统一摘掉），所以这些写法都成立：
 
 ```text
+task 8 -a 1                     # 最省事：选中任务 8 + 挂到表格 #1
 task create title=写论文 --assign 3
 task create title=复习 --repeat mon@22:15 --assign 3
 task modify 1 due 后天 --assign 3
-task select 1 --assign 3        # 等价于 task assign 1 3
+task select 1 --assign 3        # 等价于 task assign 1 3（也等价于 task 1 -a 3）
 ```
+
+**裸 ID 就是 `select`**（`_dispatch_task()` 里 `action.isdigit()` 那一段）：
+`task 8` ≡ `task select 8`，所以 `-a` / `-n` 这两个后缀挂在裸 ID 上也成立。
+裸 ID 后面**再跟别的东西**（`task 8 3`）不算「选中再挂」—— 那会被判成用法错误，
+提示你用 `-a`：挂 session 和挂 task 是两回事，不靠位置猜。
 
 它复用的是 `cmd_task_assign()` 那一条路径（先 Focusmate 复核、成功才落本地），
 所以不会出现"本地记了、Focusmate 没有"的半截状态；`delete` / `sync` 这类不产出任务的

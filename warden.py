@@ -1149,12 +1149,14 @@ class TaskView(View):
         task assign <session ID>            # 默认当前选中的任务
         task assign <任务 ID> <session ID>  # 显式指定
         task select <id>
+        task <id>                           # ↑ 同义：裸 ID 就是 select
+        task <id> -a <session ID>           # 选中 + 挂上去（最省事）
         task repeat <id> <周几@HH:MM|off>   # 每周重复（只影响那一天的那一场）
         task sync                           # GET /v1/tasks → 把 completedAt 归档
         task archive [N]                    # 看归档（data/task-archive.json）
 
     任何子命令都能带 ``--assign N``（表格里的 session ID）：命令跑完顺手挂上去，
-    例如 ``task create title=写论文 --assign 3``。
+    例如 ``task create title=写论文 --assign 3``、``task 8 -a 1``。
 
     任务字段不校验：想记 due / priority / notes / 任何 key 都行。
     备注（``task note`` / ``note=`` / ``备注=``，统一存成 ``notes``）会跟着完成归档
@@ -1169,16 +1171,17 @@ class TaskView(View):
 
     def idle_hint(self):
         return repl_kit.Hint(
-            "命令", ("task create", "task delete", "task modify", "task assign",
-                     "task repeat", "task sync"),
-            note="字段不校验 · --repeat 每周重复 · Tab 切视图",
+            "命令", ("task create", "task 8 -a 1", "task delete", "task modify",
+                     "task assign", "task sync"),
+            note="字段不校验 · task 8 ≡ task select 8 · Tab 切视图",
         )
 
     def status_line(self):
         return None
 
     def unknown_hint(self):
-        return ("「任务」视图认 task create/delete/modify/assign/select/sync；"
+        return ("「任务」视图认 task create/delete/modify/assign/select/sync"
+                "（也可以直接写任务 ID，如 task 8 -a 1）；"
                 "Shift+Tab 切回去再干别的。")
 
     def commands(self):
@@ -1202,6 +1205,7 @@ class TaskView(View):
                      "  task modify 3 due 后天\n"
                      "  task note 3 材料在这 https://example.com/x   ← 完成后会显示（可点）\n"
                      "  task assign 2                        ← 挂到表格里的 #2 session\n"
+                     "  task 3 -a 2                          ← 同上（裸 ID = select）\n"
                      "  task create title=明日时间安排 --repeat mon@22:15"
                      "   ← 每周一 22:15 那场自动挂上",
                      style="dim"),
@@ -2672,10 +2676,14 @@ class Warden(object):
     def cmd_task(self, args):
         """TaskView 的唯一入口：task <create|delete|modify|assign|select|repeat|sync|archive> ...
 
+        裸任务 ID 就是 select（``task 8`` ≡ ``task select 8``），所以最短的挂法是
+        ``task 8 -a 1``。
+
         任何子命令后面都可以跟两个后缀（都能组合）：
           ``--assign <session ID>``（``-a`` 同义）= 顺手挂到那一场
           ``--note <备注>``（``-n`` 同义）= 顺手写备注（可以塞网址）
 
+            task 8 -a 1
             task create title=写论文 --assign 3
             task create title=写论文 -n "材料在这 https://example.com/x" --assign 3
             task modify 1 due 后天 --note=下午再弄
@@ -2826,8 +2834,17 @@ class Warden(object):
         if action in ("list", "ls", "show"):
             self.say("任务 %d 条；看本视图表格即可。" % len(self.task_store.list()), "info")
             return False
+        # 裸任务 ID 就是 select：`task 8` ≡ `task select 8`，
+        # 于是 `task 8 -a 1` = 「选中任务 8 再挂到表格 #1」。
+        if action.isdigit():
+            if rest:
+                raise ValueError("`task %s` 就等于 `task select %s`，后面不用再跟东西；"
+                                 "要挂到 session 用 -a/--assign（例如 task %s -a %s）。"
+                                 % (action, action, action, rest[0]))
+            return self.cmd_task_select([action])
         raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/repeat/"
-                         "sync/archive）" % action)
+                         "sync/archive；也可以直接写任务 ID，如 task 8 ≡ task select 8）"
+                         % action)
 
     def cmd_task_archive(self, args, limit=5):
         """task archive [N] —— 看完成归档（data/task-archive.json，只增不改）。"""
@@ -3872,6 +3889,7 @@ class Warden(object):
             ("task create ...", "在「任务」视图建任务：task create [id] [field=value ...]"),
             ("task delete/modify ...", "task delete <id> / task modify <id> <field> <值>"),
             ("task assign <session ID>", "把选中的任务挂到表格 #N 的 session，并自动写 Focusmate task"),
+            ("task <任务ID> -a <session ID>", "选中并挂上：task 8 -a 1（裸 ID 就等于 task select 8）"),
             ("task ... --assign N", "任何 task 子命令都能带：跑完顺手挂到表格 #N，"
                                     "如 task create title=写论文 --assign 3"),
             ("task create ... --repeat mon@22:15",

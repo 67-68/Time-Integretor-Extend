@@ -223,6 +223,45 @@ check("归档里有 session", arch[0]["session"]["focusmate_session_id"], "sess-
 check("归档里有 Focusmate 完成时间", arch[0]["focusmate"]["completed_at"],
       "2026-10-26T12:00:00Z")
 
+print("== 裸 ID 等价 select：task 8 ≡ task select 8，task 8 -a 1 ==")
+check("task create 77 显式 ID", wd.handle("task create 77 title=裸ID"), True)
+check("task 77 受理（裸 ID）", wd.handle("task 77"), True)
+check("裸 ID 真的选中了任务 77", wd.selected_task_id, 77)
+check_true("说的还是 select 那套话",
+           any("已选中任务 77" in m[2] for m in wd.messages))
+check("task select 77 照样能用", wd.handle("task select 77"), True)
+
+row1200 = [r for r in wd.rows if r["startLabel"] == "12:00"][0]
+idx1200 = wd.rows.index(row1200) + 1
+wd.bridge.calls = []
+check("task 77 -a N：选中 + 挂上一步到位",
+      wd.handle("task 77 -a %d" % idx1200), True)
+check("真的挂到那一场了", wd.task_store.get(77)["session"]["start"], "12:00")
+check("bridge 只调了一次 add_task",
+      len([c for c in wd.bridge.calls if c[0] == "add_task"]), 1)
+check("选中状态落在 77 上", wd.selected_task_id, 77)
+
+check("task 77 -n 也能用",
+      wd.handle("task 77 -n 材料在这 https://example.com/bare"), True)
+check("备注写进去了", wd.task_store.notes(wd.task_store.get(77)),
+      "材料在这 https://example.com/bare")
+
+check("裸 ID 后面再跟东西 → 受理但报错",
+      wd.handle("task 77 %d" % idx1200), True)
+check_true("提示改用 -a/--assign",
+           any("要挂到 session 用 -a/--assign" in m[2] for m in wd.messages))
+check("报错时没改任何绑定", wd.task_store.get(77)["session"]["start"], "12:00")
+
+check("不存在的裸 ID → 受理但报错", wd.handle("task 999"), True)
+check_true("说任务 999 没有",
+           any("没有任务 999" in m[2] for m in wd.messages))
+
+check("未知动作 → 受理但报错", wd.handle("task 装死"), True)
+check_true("错误提示里也提一句裸 ID",
+           any("task 8 ≡ task select 8" in m[2] for m in wd.messages))
+wd.handle("task delete 77")
+check("收尾把 77 删掉", [t for t in wd.task_store.list() if t["id"] == 77], [])
+
 wd.rebuild_rows()
 check("表格 task 列是「编号: 标题」",
       [r.get("task_text") for r in wd.rows if r["startLabel"] == "11:00"][0],
