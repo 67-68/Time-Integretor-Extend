@@ -32,6 +32,26 @@ DEFAULT_ARCHIVE_FILE = os.path.join(DATA_DIR, "task-archive.json")
 # 这些键是本地簿记，不属于用户字段。用户仍然可以随便写别的字段。
 RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate", "repeat"}
 
+# 「备注」：一个普通字段（不是保留字段，字段仍然不校验），但有一套固定别名，
+# 因为它是**有意设计**的：可以往里面塞网址，任务完成后照着去对应地方把活干完。
+NOTES_KEYS = ("notes", "note", "备注")
+
+# 备注字段的别名统一收敛到 ``notes``，免得表格里同时出现 note / notes / 备注 三列
+FIELD_ALIASES = {"note": "notes", "备注": "notes", "remarks": "notes", "remark": "notes"}
+
+
+def _field_name(key):
+    """字段名的规范化（目前只有备注的别名）。"""
+    name = str(key or "").strip()
+    return FIELD_ALIASES.get(name, name)
+
+
+def _norm_fields(fields):
+    out = {}
+    for k, v in (fields or {}).items():
+        out[_field_name(k)] = v
+    return out
+
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
@@ -211,7 +231,7 @@ class TaskStore(object):
         stamp = _now()
         task = {
             "id": nid,
-            "fields": dict(fields),
+            "fields": _norm_fields(fields),
             "created_at": stamp,
             "updated_at": stamp,
             "session": None,
@@ -232,7 +252,7 @@ class TaskStore(object):
 
     def modify(self, task_id, field, value):
         """改一个字段。field 不做白名单校验（用户要任意字段）。"""
-        field = str(field)
+        field = _field_name(field)
         if not field:
             raise ValueError("字段名不能为空")
         if field in RESERVED:
@@ -472,6 +492,19 @@ class TaskStore(object):
             return text[: max(0, max_len - 1)] + "…"
         return text
 
+    def notes(self, task, max_len=None):
+        """任务的备注（``notes`` / ``note`` / ``备注`` 都认）；没有就是空串。"""
+        fields = (task or {}).get("fields") or {}
+        for key in NOTES_KEYS:
+            text = self._one_line(fields.get(key))
+            if text:
+                return text[:max_len] if max_len else text
+        return ""
+
+    def set_notes(self, task_id, text):
+        """写备注（统一写进 ``notes`` 字段；空值 = 清掉）。返回更新后的任务。"""
+        return self.modify(task_id, "notes", "" if text is None else str(text))
+
     def focusmate_title(self, task, max_len=500):
         """给 Focusmate task 用的 title：优先 title/name/摘要字段，否则用整条摘要。"""
         fields = task.get("fields") or {}
@@ -511,6 +544,7 @@ class TaskStore(object):
             "task_id": task.get("id"),
             "fields": dict(task.get("fields") or {}),
             "session": dict(task.get("session") or {}) or None,
+            "notes": self.notes(task) or None,
             "focusmate": {
                 "task_id": remote_task.get("id") or remote_task.get("taskId"),
                 "title": remote_task.get("title"),
@@ -689,6 +723,11 @@ def main(argv=None):
     p.add_argument("value", nargs="+")
     p.set_defaults(func=lambda a, st: _cli_modify(st, a))
 
+    p = sub.add_parser("note", help="写备注：note ID 文本（可以是网址/多行）")
+    p.add_argument("task_id", type=int)
+    p.add_argument("text", nargs="*", help="备注内容；不写 = 清空")
+    p.set_defaults(func=lambda a, st: _cli_note(st, a))
+
     p = sub.add_parser("show", help="显示一条任务")
     p.add_argument("task_id", type=int)
     p.set_defaults(func=lambda a, st: _cli_show(st, a.task_id))
@@ -747,6 +786,14 @@ def _cli_modify(store, ns):
     return 0
 
 
+def _cli_note(store, ns):
+    text = " ".join(ns.text).strip()
+    task = store.set_notes(ns.task_id, text)
+    print("任务 %d 备注%s：%s" % (task["id"], "已清空" if not text else "",
+                               store.notes(task) or "（空）"))
+    return 0
+
+
 def _cli_show(store, task_id):
     print(json.dumps(store.get(task_id), ensure_ascii=False, indent=2))
     return 0
@@ -783,6 +830,9 @@ def _cli_archive(store, ns):
                   % (rec.get("task_id") or "?", title,
                      sess.get("date") or "?", sess.get("start") or "?",
                      fm.get("completed_at") or "?", rec.get("archived_at") or "?"))
+            note = rec.get("notes") or store.notes({"fields": fields})
+            if note:
+                print("      备注：%s" % note)
     return 0
 
 

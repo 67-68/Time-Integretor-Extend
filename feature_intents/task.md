@@ -110,6 +110,25 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 - 归档记录包含：归档时间、本地任务字段、对应 session（日期/时间/API session id）、
   Focusmate task id 与 `completedAt`。
 
+## 备注（`notes`）
+
+- **第一等公民，但仍是普通字段**：`task note <id> <文本|网址>` 写、`task note <id>`
+  清空；`task create title=x note=…` / `备注=…` / `modify <id> note …` 都收敛成
+  `fields["notes"]`（`FIELD_ALIASES`），免得表格里同时出现 `note`/`notes`/`备注` 三列。
+- 读用 `task_store.notes(task)`（`notes` / `note` / `备注` 都认）。
+- 挂 Focusmate task 时备注也当 `description` 传过去。
+- **为什么重要**：用户会把网址塞进备注，任务完成后照着去对应地方干活。所以
+  - 完成的第一时间就在 Recent 里说：`✅ 完成：任务 3「…」· 完成时间 … · 备注：…`；
+  - 归档面板（`Task Archive · 完成归档`）第 4 列显示备注，网址用 **OSC 8 超链接**
+    （`Warden.note_renderable` → `Style(link=url)`）渲染成可点的链接；
+  - 归档 JSON 里额外存一份顶层 `notes`，`task archive` CLI 也会打印「备注：…」。
+
+## 契约视图里的任务展示
+
+- 契约表格 task 列：`2: 写论文 | 5: 复习错题` —— 编号 + 裁剪后的标题，用 ` | ` 分隔。
+- 契约表格下面那块两列任务表格：`number | task | number | task`；已 assign 到
+  session 的染红，没挂的深蓝（当前选中的再 reverse）。
+
 ## 归档文件形状（`data/task-archive.json`）
 
 一个 JSON 文件、只增不改、一条完成记录一个 object：
@@ -121,6 +140,7 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
     "archived_at": "2026-10-27T08:19:02",
     "task_id": 1,
     "fields": {"title": "写论文", "due": "周二", "notes": "先写 intro"},
+    "notes": "先写 intro",
     "session": {"index": 3, "date": "2026-10-26", "start": "11:15",
                 "end": "12:05", "duration": 50, "focusmate_session_id": "9f2c…-sess"},
     "focusmate": {"task_id": "936bd726-task", "title": "写论文",
@@ -133,6 +153,8 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 
 - 幂等键 = `(task_id, focusmate.task_id, focusmate.completed_at)`：同一条不会再写第二次
   （`reconcile` 反复跑不会让文件变长）。
+- 顶层 `notes` 是备注的冗余副本（`fields.notes` 里也有）：归档是**快照**，
+  以后任务被改/删了，完成时那条备注仍然留在这里。
 - `focusmate.completed_at` 是 Focusmate 的原样字符串（UTC），**不猜、不补**；
   没有它就只算"匹配到"、不归档。
 - 每周重复任务的每一次落点单独一条（`session` 是那一周的 session）。

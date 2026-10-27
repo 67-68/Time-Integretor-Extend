@@ -148,6 +148,7 @@ try:
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+    from rich.style import Style
 except ImportError:
     sys.stderr.write(
         "缺少 rich。装一下（只装到项目的 temp/pylibs，不动系统环境）：\n"
@@ -212,11 +213,42 @@ SIN_BEEP_LIMIT = 3
 MESSAGE_SHOW = 3
 MESSAGE_KEEP = 12
 
+# 契约表格 task 列里的每条任务：「1: 任务… | 3: 任务…」。
+# 每条标题单独裁到 TASK_CELL_TITLE_MAX 个字（后面的内容 trim 掉），
+# 别让第一条把第二条挤出屏幕（列的 overflow="crop" 只能整体截断）。
+TASK_CELL_TITLE_MAX = 18
+
 # 帧式重画：把上一帧从终端上抹掉，而不是 Console.clear() 整屏清。
 # 上移 n 行（`\x1b[<n>A`）+ 回行首 + 清到屏幕末尾（`\r\x1b[J`）。
 ERASE_FRAME = "\x1b[%dA\r\x1b[J"
 
 # ---------------------------------------------------------------- 小工具
+
+URL_RE = re.compile(r"https?://[^\s」』）)\]】,，；;]+")
+
+
+def note_renderable(note, max_len=60):
+    """备注 → 一行 rich 渲染件。
+
+    需求背景：备注里可以塞一个网址，任务完成后照着去对应地方把活干完。
+    所以看到网址就用 **OSC 8 超链接**（`Style(link=...)`）渲染 —— iTerm2 /
+    Terminal.app / kitty 之类直接能点开；不支持的终端当普通文本看也不亏。
+    """
+    text = " ".join(str(note or "").split())
+    if not text:
+        return Text("")
+    m = URL_RE.search(text)
+    if m:
+        url = m.group(0)
+        # 备注里除了网址还有别的话时，先显示那句话，再显示可点的网址
+        head = text[:m.start()].strip(" ：:-—")
+        out = Text()
+        if head:
+            out.append(head[:max_len] + "  ", style="dim")
+        out.append("🔗 " + url[:max_len],
+                   style=Style(color="cyan", underline=True, link=url))
+        return out
+    return Text("📝 " + text[:max_len], style="dim")
 
 
 def now_local():
@@ -606,9 +638,9 @@ def _hint_set(parts):
 
 def _hint_task(parts):
     if not parts:
-        return repl_kit.Hint("动作", ("create", "delete", "modify", "assign", "select",
-                                      "repeat", "sync", "archive"),
-                             note="字段随便写，不校验")
+        return repl_kit.Hint("动作", ("create", "delete", "modify", "note", "assign",
+                                      "select", "repeat", "sync", "archive"),
+                             note="字段随便写，不校验 · 备注可以塞网址")
     action = parts[0].lower() if len(parts) else ""
     if action == "create":
         return repl_kit.Hint("参数", ("[id]", "key=value...", "--repeat 周几@HH:MM",
@@ -619,6 +651,9 @@ def _hint_task(parts):
     if action in ("repeat", "recurring"):
         return repl_kit.Hint("参数", ("<任务 ID>", "周几@HH:MM|off"),
                              note="每周那一天、那一场自动挂上")
+    if action in ("note", "notes", "备注"):
+        return repl_kit.Hint("参数", ("<任务 ID>", "<备注文本 / 网址>"),
+                             note="备注会跟着完成归档一起显示（网址可点）")
     if action in ("delete", "select"):
         return repl_kit.Hint("参数", ("<任务 ID>",))
     if action == "modify":
@@ -626,8 +661,8 @@ def _hint_task(parts):
     if action == "assign":
         return repl_kit.Hint("参数", ("<session ID>",),
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
-    return repl_kit.Hint("参数", ("create", "delete", "modify", "assign", "select",
-                                  "repeat", "sync", "archive"),
+    return repl_kit.Hint("参数", ("create", "delete", "modify", "note", "assign",
+                                  "select", "repeat", "sync", "archive"),
                          note="任何动作都能带 --assign N")
 
 
@@ -702,8 +737,8 @@ class View(object):
                  hint=_hint_actions("on", "off", note="不写就是取反")),
             _cmd("task", w.cmd_task,
                  "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
-                 usage="task <create|delete|modify|assign|select|repeat|sync|archive> ... [--assign N]",
-                 options=("create", "delete", "modify", "assign", "select", "repeat",
+                 usage="task <create|delete|modify|note|assign|select|repeat|sync|archive> ... [--assign N]",
+                 options=("create", "delete", "modify", "note", "assign", "select", "repeat",
                           "sync", "archive", "--assign", "--repeat"),
                  hint=_hint_task),
         ]
@@ -773,6 +808,10 @@ class ContractView(View):
         out = [self.w.render_table()]
         if self.w.rows_note:
             out.append(Text("  " + self.w.rows_note, style="dim"))
+        # 契约表格下面那块任务表格（Recent 由框架接在后面）
+        index = self.w.render_task_index()
+        if index is not None:
+            out.append(index)
         return out
 
     def unknown_hint(self):
@@ -1106,6 +1145,7 @@ class TaskView(View):
         task create [id] [field=value ...] [--repeat 周几@HH:MM] [--assign N]
         task delete <id>
         task modify <id> <field> <新值>
+        task note <id> <备注文本|网址>      # 备注：完成之后照着去对应地方干活
         task assign <session ID>            # 默认当前选中的任务
         task assign <任务 ID> <session ID>  # 显式指定
         task select <id>
@@ -1117,6 +1157,8 @@ class TaskView(View):
     例如 ``task create title=写论文 --assign 3``。
 
     任务字段不校验：想记 due / priority / notes / 任何 key 都行。
+    备注（``task note`` / ``note=`` / ``备注=``，统一存成 ``notes``）会跟着完成归档
+    一起显示，里面塞网址就能在完成后直接点开去干活。
     给 session 挂任务时会**自动**走 bridge 在 Focusmate 那一场建同名 task，
     成功后才把 Focusmate 的 task id 记回本地，失败就什么都不写。
     """
@@ -1158,6 +1200,7 @@ class TaskView(View):
                      "  task create title=写论文 due=明天\n"
                      "  task create 3 title=复习数学          ← 显式 ID\n"
                      "  task modify 3 due 后天\n"
+                     "  task note 3 材料在这 https://example.com/x   ← 完成后会显示（可点）\n"
                      "  task assign 2                        ← 挂到表格里的 #2 session\n"
                      "  task create title=明日时间安排 --repeat mon@22:15"
                      "   ← 每周一 22:15 那场自动挂上",
@@ -1207,19 +1250,22 @@ class TaskView(View):
         at = Table.grid(padding=(0, 1))
         at.add_column(style="dim", no_wrap=True)
         at.add_column(no_wrap=True)
-        at.add_column(style="dim")
+        at.add_column(no_wrap=True, overflow="crop")
+        at.add_column(no_wrap=True, overflow="crop")
         if not arch:
             at.add_row("", Text("（还没有完成归档；task sync 会读 GET /v1/tasks 的 "
                                 "completedAt）", style="dim"))
         for rec in arch[-8:]:
             fm = rec.get("focusmate") or {}
             sess = rec.get("session") or {}
+            note = rec.get("notes") or w.task_store.notes({"fields": rec.get("fields")})
             at.add_row(
                 "· " + str(rec.get("task_id") or "?"),
                 "%s ← %s %s" % (str(fm.get("completed_at") or "?"),
                                 sess.get("date") or "?", sess.get("start") or "?"),
                 (rec.get("fields") or {}).get("title") or
-                w.task_store._one_line(rec.get("fields"))[:60])
+                w.task_store._one_line(rec.get("fields"))[:60],
+                note_renderable(note))
         out.append(Panel(at, title="[bold]Task Archive · 完成归档[/]",
                          border_style="dim", box=box.ROUNDED))
         return out
@@ -1472,17 +1518,67 @@ class Warden(object):
             row["task"] = tasks[0]                # 兼容：只关心一条的地方仍然能用
             row["tasks"] = tasks
             row["task_repeat"] = any(t.get("repeat") for t in tasks)
-            parts = []
-            for task in tasks:
-                prefix = "🔁 " if task.get("repeat") else ""
-                parts.append(prefix + self.task_store.summarize(task))
-            row["task_text"] = " · ".join(parts)
+            row["task_text"] = self.task_cell_text(tasks)
         else:
             row["task"] = None
             row["tasks"] = []
             row["task_repeat"] = False
             row["task_text"] = ""
         return row
+
+    def task_cell_text(self, tasks):
+        """契约表格 task 列的正文：``1: 任务… | 3: 任务…``（编号 + 裁剪过的标题）。
+
+        标题优先取 title/name 字段（`focusmate_title`），没有才退回整条摘要 ——
+        编号 + 一长串 ``1. … 2. …`` 在表格里没法看。
+        """
+        parts = []
+        for task in tasks or []:
+            title = self.task_store.focusmate_title(task, max_len=TASK_CELL_TITLE_MAX)
+            prefix = "🔁" if task.get("repeat") else ""
+            parts.append("%s%d: %s" % (prefix, task.get("id"), title))
+        return " | ".join(parts)
+
+    def render_task_index(self):
+        """契约视图里那块「任务表格」：两列（编号+任务 各两对）。
+
+        需求：已 assign 到某个 session 的任务，编号和标题染红；其他保持深蓝。
+        分成左右两栏是为了让任务一多也不会把契约表格挤没。
+        """
+        tasks = self.task_store.list()
+        if not tasks:
+            return None
+        half = (len(tasks) + 1) // 2
+        left = tasks[:half]
+        right = tasks[half:]
+        t = Table(title="Task · 任务（[red]红[/] = 已挂 session）",
+                  box=box.SIMPLE_HEAVY, header_style="bold magenta",
+                  title_justify="left", expand=False)
+        t.add_column("number", justify="left", no_wrap=True)
+        t.add_column("task", no_wrap=True, overflow="crop")
+        t.add_column("number", justify="left", no_wrap=True)
+        t.add_column("task", no_wrap=True, overflow="crop")
+        selected = self.selected_task_id
+        for i in range(len(left)):
+            cells = []
+            for col in (left, right):
+                task = col[i] if i < len(col) else None
+                cells.extend(self._task_index_cells(task, selected))
+            t.add_row(*cells)
+        return t
+
+    def _task_index_cells(self, task, selected):
+        """一行里的一对（编号, 标题）。没任务时给两个空格占位。"""
+        if task is None:
+            return [Text(""), Text("")]
+        assigned = bool(task.get("session"))
+        style = "bold red" if assigned else "dark_blue"
+        if task.get("id") == selected:
+            style += " reverse"
+        title = self.task_store.focusmate_title(task, max_len=TASK_CELL_TITLE_MAX)
+        prefix = "🔁" if task.get("repeat") else ""
+        return [Text(str(task.get("id")), style=style),
+                Text(prefix + title, style=style)]
 
     def plan_rows_for(self, day):
         return sch.day_slots(self.entries, day)
@@ -2643,6 +2739,8 @@ class Warden(object):
             return self.cmd_task_delete(rest)
         if action == "modify":
             return self.cmd_task_modify(rest)
+        if action in ("note", "notes", "备注"):
+            return self.cmd_task_note(rest)
         if action == "assign":
             return self.cmd_task_assign(rest)
         if action in ("archive", "history", "归档"):
@@ -2683,6 +2781,9 @@ class Warden(object):
                      % (rec.get("task_id") or "?", title,
                         sess.get("date") or "?", sess.get("start") or "?",
                         fm.get("completed_at") or "?"), "ok")
+            note = rec.get("notes") or self.task_store.notes({"fields": fields})
+            if note:
+                self.say("      备注：%s" % note, "info")
         return records
 
     def cmd_task_create(self, args):
@@ -2776,6 +2877,20 @@ class Warden(object):
                      % (task["id"], parsed["weekday_label"], parsed["start"], duration), "ok")
         return task
 
+    def cmd_task_note(self, args):
+        """task note <任务 ID> <备注文本>；不写文本 = 清空。
+
+        备注可以是网址（完成之后照着去对应地方把活干完），也可以是任何话。
+        """
+        if not args:
+            raise ValueError("用法：task note <任务 ID> <备注文本>（不写文本 = 清空）")
+        text = " ".join(str(x) for x in args[1:]).strip()
+        task = self.task_store.set_notes(args[0], text)
+        self.say("✅ 任务 %d 备注%s：%s"
+                 % (task["id"], "已清空" if not text else "",
+                    self.task_store.notes(task) or "（空）"), "ok")
+        return task
+
     def cmd_task_delete(self, args):
         if not args:
             raise ValueError("用法：task delete <任务 ID>")
@@ -2845,7 +2960,7 @@ class Warden(object):
         }
         fields = task.get("fields") or {}
         title = self.task_store.focusmate_title(task)
-        notes = (fields.get("notes") or fields.get("description") or "")
+        notes = self.task_store.notes(task) or fields.get("description") or ""
         if not isinstance(notes, str):
             notes = str(notes)
         # 这场可能已经挂着别的任务了 —— Focusmate 侧是 n:n，可以再挂一个，
@@ -2958,12 +3073,42 @@ class Warden(object):
                 self.say("重复任务挂载失败：%s" % e, "warn")
         res = self.bridge.call("tasks", timeout=180)
         remote = res.get("tasks") if isinstance(res, dict) else res
+        before = len(self.task_store.load_archive().get("records") or [])
         n, matched = self.task_store.reconcile(remote or [])
         self.task_sync_at = time.time()
+        if n:
+            self.announce_completions(before)
         if not quiet:
             self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
                      % (len(matched), n), "ok")
         return True
+
+    def announce_completions(self, since, limit=3):
+        """刚归档的那几条任务，把信息（含备注）说一遍。
+
+        需求背景：备注里可以塞网址，完成之后照着去对应地方把活干完 ——
+        所以完成的第一时间就把备注亮出来，而不是等用户自己去翻归档。
+        """
+        records = self.task_store.load_archive().get("records") or []
+        fresh = [r for r in records[since:] if isinstance(r, dict)]
+        for rec in fresh[:limit]:
+            fm = rec.get("focusmate") or {}
+            sess = rec.get("session") or {}
+            fields = rec.get("fields") or {}
+            title = (fields.get("title") or fields.get("name")
+                     or self.task_store._one_line(fields)[:60] or "（空任务）")
+            line = "✅ 完成：任务 %s「%s」· 完成时间 %s · session %s %s" % (
+                rec.get("task_id") or "?", title,
+                fm.get("completed_at") or "?", sess.get("date") or "?",
+                sess.get("start") or "?")
+            note = rec.get("notes") or self.task_store.notes({"fields": fields})
+            if note:
+                line += "\n     备注：%s" % note
+            self.say(line, "ok")
+        if len(fresh) > limit:
+            self.say("…还有 %d 条完成归档（「任务」视图 / task archive 看全部）"
+                     % (len(fresh) - limit), "info")
+        return fresh
 
     # -- 设置 / 警告开关 -------------------------------------------------
 

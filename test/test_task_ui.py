@@ -69,14 +69,22 @@ class FakeBridge(object):
     def __init__(self):
         self.calls = []
         self.last_idle_close = None
+        self.fm_seq = 0
+        self.titles = {}
+        # Focusmate 侧「已经完成」的 task：id → completedAt
+        self.completed = {"ft-1": "2026-10-26T12:00:00Z"}
 
     def call(self, cmd, timeout=240, **kw):
         self.calls.append((cmd, kw))
         if cmd == "add_task":
-            return {"verified": True, "taskId": "ft-1", "task": {"id": "ft-1"}}
+            self.fm_seq += 1
+            tid = "ft-%d" % self.fm_seq
+            self.titles[tid] = kw.get("title")
+            return {"verified": True, "taskId": tid, "task": {"id": tid}, "via": "api"}
         if cmd == "tasks":
-            return {"tasks": [{"id": "ft-1", "title": "论文",
-                               "completedAt": "2026-10-26T12:00:00Z"}]}
+            return {"tasks": [{"id": k, "title": self.titles.get(k, "论文"),
+                               "completedAt": v}
+                              for k, v in self.completed.items()]}
         if cmd == "release":
             return {"released": True}
         if cmd == "snapshot":
@@ -212,9 +220,82 @@ check("归档里有 Focusmate 完成时间", arch[0]["focusmate"]["completed_at"
       "2026-10-26T12:00:00Z")
 
 wd.rebuild_rows()
-check("表格 task 列用 trim 后的一行",
+check("表格 task 列是「编号: 标题」",
       [r.get("task_text") for r in wd.rows if r["startLabel"] == "11:00"][0],
-      "1. 论文  2. 先写intro  3. 明天")
+      "5: 论文")
+
+print("== 契约视图：task 列「编号: 标题」+ 下面那块两列任务表格 ==")
+row1100 = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
+check("task 列带任务编号", row1100["task_text"], "5: 论文")
+# 同一场两个任务 → 用小横杠分隔
+wd.handle("task create title=第二条 --assign %d" % (wd.rows.index(row1100) + 1))
+row1100 = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
+check_true("两条任务用 | 分开且都带编号",
+           re.match(r"^\d+: .+ \| \d+: .+$", row1100["task_text"]) is not None)
+check_true("标题长的那条被 trim 了（带 …）或本来就不长",
+           "…" in row1100["task_text"] or len(row1100["task_text"]) < 40)
+
+contract = [v for v in w.VIEWS if v.key == "1"][0](wd)
+parts = contract.render()
+check("契约视图先给契约表格、再给任务表格", len(parts), 2)
+check("第二块是任务表格", "Task · 任务" in str(getattr(parts[1], "title", "")), True)
+check("两列模式：4 个 column", len(parts[1].columns), 4)
+check("表头是 number / task 各两遍",
+      [str(c.header) for c in parts[1].columns], ["number", "task", "number", "task"])
+
+# 染色：已挂到 session 的 = 红，没挂的 = 深蓝
+task_assigned = wd.task_store.get(5)
+wd.handle("task create title=还没挂的任务")
+task_free = [t for t in wd.task_store.list() if not t.get("session")][0]
+num_a, title_a = wd._task_index_cells(task_assigned, None)
+num_f, title_f = wd._task_index_cells(task_free, None)
+check("已 assign 的编号+标题染红",
+      (str(num_a.style), str(title_a.style)), ("bold red", "bold red"))
+check("没 assign 的保持深蓝",
+      (str(num_f.style), str(title_f.style)), ("dark_blue", "dark_blue"))
+check("编号列显示任务 ID", str(num_a), str(task_assigned["id"]))
+
+print("== 备注：task note / note= 收敛成 notes ==")
+wd.handle("task note 5 材料在这 https://example.com/set3")
+check("task note 写进 notes", wd.task_store.get(5)["fields"]["notes"],
+      "材料在这 https://example.com/set3")
+wd.handle("task create title=带备注 note=https://example.com/b")
+note_id = max(t["id"] for t in wd.task_store.list())
+check("create note= 也收敛成 notes",
+      wd.task_store.get(note_id)["fields"].get("notes"), "https://example.com/b")
+wd.handle("task note %d" % note_id)
+check("task note 不带文本 = 清空", wd.task_store.get(note_id)["fields"]["notes"], "")
+
+print("== 完成之后：消息和归档面板都要有备注（含可点网址）==")
+wd.bridge.calls = []
+row1500 = [r for r in wd.rows if r["startLabel"] == "15:00"][0]
+wd.handle("task create title=完成看备注 note=https://example.com/done --assign %d"
+          % (wd.rows.index(row1500) + 1))
+done_task = max(t["id"] for t in wd.task_store.list())
+ft_id = wd.task_store.get(done_task)["focusmate"]["task_id"]
+wd.bridge.completed[ft_id] = "2026-10-27T12:50:00Z"
+wd.messages = []
+wd.cmd_task_sync(quiet=True)
+check_true("Recent 里报了完成", any("完成：任务 %d" % done_task in m[2] for m in wd.messages))
+check_true("Recent 里带备注", any("https://example.com/done" in m[2] for m in wd.messages))
+arch = wd.task_store.load_archive()["records"]
+check("归档记录里有 notes", [r["notes"] for r in arch if r["task_id"] == done_task],
+      ["https://example.com/done"])
+taskview = [v for v in w.VIEWS if v.key == "4"][0](wd)
+tv = taskview.render()
+panel = [p for p in tv if "完成归档" in str(getattr(p, "title", ""))]
+check("任务视图里有归档面板", len(panel), 1)
+r = note_render = None
+out = io.StringIO()
+Console(file=out, width=200, force_terminal=False).print(panel[0])
+check_true("归档面板里看得到备注", "https://example.com/done" in out.getvalue())
+rend = w.note_renderable("材料在这 https://example.com/set3")
+check("网址被渲染成可点的超链接（OSC 8）",
+      [sp.style.link for sp in rend.spans if getattr(sp.style, "link", None)],
+      ["https://example.com/set3"])
+check_true("备注正文也留着", "材料在这" in str(rend))
+check("note_renderable 空备注给空文本", str(w.note_renderable("")), "")
+check_true("没有网址就只显示文本", "📝" in str(w.note_renderable("下午三点前弄完")))
 
 print("== 同一场 session 可以挂多个 task（重点回归：已有 task 时再加一个）==")
 row1200 = [r for r in wd.rows if r["startLabel"] == "12:00"][0]

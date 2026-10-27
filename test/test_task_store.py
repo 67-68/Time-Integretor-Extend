@@ -80,6 +80,20 @@ check("归档里保留任务字段", arch[0]["fields"]["title"], "写论文")
 check("reconcile 幂等：第二次不重复归档", store.reconcile(remote)[0], 0)
 check("归档文件仍是 1 条", len(store.load_archive()["records"]), 1)
 
+print("== 备注字段：note / notes / 备注 都收敛成 notes ==")
+n1 = store.create({"title": "带备注", "note": "https://example.com/a"})
+check("create 时 note= 收敛成 notes", store.get(n1["id"])["fields"]["notes"],
+      "https://example.com/a")
+check("notes() 读得到", store.notes(store.get(n1["id"])), "https://example.com/a")
+store.modify(n1["id"], "备注", "换个网址 https://example.com/b")
+check("modify 用中文别名也收敛", store.get(n1["id"])["fields"]["notes"],
+      "换个网址 https://example.com/b")
+check("没有备注就是空串", store.notes(store.get(1)), "")
+store.set_notes(n1["id"], "先看 https://example.com/c 再说")
+check("set_notes 直接写", store.notes(store.get(n1["id"])), "先看 https://example.com/c 再说")
+store.set_notes(n1["id"], "")
+check("空值 = 清掉", store.notes(store.get(n1["id"])), "")
+
 print("== 一场 session 能挂多个任务 ==")
 t2 = store.create({"title": "第二条"})
 t3 = store.create({"title": "第三条"})
@@ -121,6 +135,30 @@ check("两条都归档", n2, 2)
 recs = store2.load_archive()["records"]
 check("归档里的场次各自对得上",
       sorted(r["session"]["start"] for r in recs), ["09:00", "11:00"])
+
+print("== 归档记录里带备注 ==")
+store.set_notes(1, "材料在这 https://example.com/set3")
+store3 = ts.TaskStore(os.path.join(TMP, "t3.json"), os.path.join(TMP, "a3.json"))
+y = store3.create({"title": "有备注的任务", "notes": "https://example.com/z"})
+store3.assign(y["id"], {"index": 1, "date": "2026-10-26", "start": "11:00",
+                        "duration": 50, "focusmate_session_id": "sess-Z"})
+store3.attach_focusmate(y["id"], {"task_id": "ft-Z"})
+store3.reconcile({"tasks": [{"id": "ft-Z", "title": "有备注的任务",
+                             "completedAt": "2026-10-26T11:50:00Z"}]})
+rec = store3.load_archive()["records"][0]
+check("归档里有 notes 字段", rec["notes"], "https://example.com/z")
+check("归档里 fields 也留着", rec["fields"]["notes"], "https://example.com/z")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    ts.main(["--file", os.path.join(TMP, "t3.json"),
+             "--archive", os.path.join(TMP, "a3.json"), "note", str(y["id"]), "改成",
+             "https://example.com/new"])
+check("CLI note 能改备注", "https://example.com/new" in buf.getvalue(), True)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    ts.main(["--file", os.path.join(TMP, "t3.json"),
+             "--archive", os.path.join(TMP, "a3.json"), "archive"])
+check("CLI archive 打印备注", "备注：https://example.com/z" in buf.getvalue(), True)
 
 print("== 归档 CLI：一个 JSON 文件，一眼能看 ==")
 buf = io.StringIO()

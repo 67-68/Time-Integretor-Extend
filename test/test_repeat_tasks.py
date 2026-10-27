@@ -200,7 +200,8 @@ wd.api_rows = [{"startMs": 0, "endMs": 0, "startLabel": "22:15", "endLabel": "23
                 "matched": False, "phase": "未开始"}]
 wd.rows_source = "bridge"
 wd.rebuild_rows()
-check("表格那一行自动显示这个重复任务", wd.rows[0]["task_text"], "🔁 明日时间安排")
+check("表格那一行自动显示这个重复任务（编号 + 标题）",
+      wd.rows[0]["task_text"], "🔁%d: 明日时间安排" % 1)
 check("行上标了这是重复任务", wd.rows[0]["task_repeat"], True)
 check("没有落点的日子不会显示任务（周二不看）",
       wd.repeated_task_for(OTHER, {"start": "22:15"}), None)

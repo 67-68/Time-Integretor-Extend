@@ -377,6 +377,13 @@ python3 warden.py install-deps
 - `session` 默认**只加这一天**（`temp/session-extras.json`），`session --permanent`
   才写成按星期几重复的长期规则（`temp/session-rules.json`）；两者都在重算
   `data.csv` 时并进去，sync 不会冲掉。
+- **契约视图的 task 列改成「编号: 标题」**：`2: 写论文 | 5: 复习错题`，每条标题
+  单独裁到 `TASK_CELL_TITLE_MAX`（18）个字再拼，别让第一条把第二条挤出屏幕；
+  标题优先取 `title`/`name` 字段（`focusmate_title`），不是整条 `1. … 2. …` 摘要。
+- **契约表格下面多了一块「任务表格」**（`Warden.render_task_index()`）：两列布局
+  （`number | task | number | task`，左半 + 右半），已 assign 到 session 的任务
+  number 和 title 染**红**，没挂的保持**深蓝**；当前选中的任务再加 reverse。
+  布局顺序 = 契约表格 → 任务表格 → Recent（Recent 仍由 `frame()` 接在后面）。
 - `task create ... --repeat 周几@HH:MM` / `task repeat <id> ...`：每周重复任务，
   只落在「同一星期几 + 同一时刻 + 同一时长」的那场 session 上（拆分后那一周不落，
   设置不变）；`task sync` 负责真的挂到 Focusmate。
