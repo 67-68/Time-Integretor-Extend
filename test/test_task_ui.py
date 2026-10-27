@@ -268,18 +268,19 @@ wd.handle("task delete 77")
 check("收尾把 77 删掉", [t for t in wd.task_store.list() if t["id"] == 77], [])
 
 wd.rebuild_rows()
-check("表格 task 列是「编号: 标题」",
+# task sync 之后这条任务就算「完成」了（Focusmate 的 completedAt）→ 前面带 ✓
+check("表格 task 列是「状态记号 + 编号: 标题」",
       [r.get("task_text") for r in wd.rows if r["startLabel"] == "11:00"][0],
-      "5: 论文")
+      "✓5: 论文")
 
 print("== 契约视图：task 列「编号: 标题」+ 下面那块两列任务表格 ==")
 row1100 = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
-check("task 列带任务编号", row1100["task_text"], "5: 论文")
-# 同一场两个任务 → 用小横杠分隔
+check("task 列带任务编号", row1100["task_text"], "✓5: 论文")
+# 同一场两个任务 → 用 | 分隔；新加的那条还没收工 → 记号是 ·
 wd.handle("task create title=第二条 --assign %d" % (wd.rows.index(row1100) + 1))
 row1100 = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
-check_true("两条任务用 | 分开且都带编号",
-           re.match(r"^\d+: .+ \| \d+: .+$", row1100["task_text"]) is not None)
+check_true("两条任务用 | 分开且都带状态记号",
+           re.match(r"^✓\d+: .+ \| ·\d+: .+$", row1100["task_text"]) is not None)
 check_true("标题长的那条被 trim 了（带 …）或本来就不长",
            "…" in row1100["task_text"] or len(row1100["task_text"]) < 40)
 
@@ -292,7 +293,10 @@ check("表头是 number / task 各两遍",
       [str(c.header) for c in parts[1].columns], ["number", "task", "number", "task"])
 
 # 染色：已挂到 session 的 = 红，没挂的 = 深蓝
-task_assigned = wd.task_store.get(5)
+# （不能用任务 5 了 —— 它已经被 task sync 标成完成，那一行是绿的）
+wd.handle("task create title=染红用 --assign %d" % (wd.rows.index(row1100) + 1))
+task_assigned = [t for t in wd.task_store.list()
+                 if (t.get("fields") or {}).get("title") == "染红用"][0]
 wd.handle("task create title=还没挂的任务")
 task_free = [t for t in wd.task_store.list() if not t.get("session")][0]
 num_a, title_a = wd._task_index_cells(task_assigned, None)
@@ -302,6 +306,18 @@ check("已 assign 的编号+标题染红",
 check("没 assign 的保持深蓝",
       (str(num_f.style), str(title_f.style)), ("dark_blue", "dark_blue"))
 check("编号列显示任务 ID", str(num_a), str(task_assigned["id"]))
+# 状态记号：完成 ✓ / 进行中 ·（表格里「什么都没有」曾经分不清是哪种）
+done_task = wd.task_store.get(5)
+num_d, title_d = wd._task_index_cells(done_task, None)
+check("完成的任务打 ✓", str(title_d).startswith("✓"), True)
+check("完成的染绿", str(num_d.style), "green")
+check("进行中的打 ·", str(title_f).startswith("·"), True)
+check("task_mark：进行中 = ·", wd.task_mark(task_free), "·")
+check("task_mark：完成 = ✓", wd.task_mark(done_task), "✓")
+index_table = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+check_true("任务表格标题里写了记号图例", "✓ 完成" in str(index_table.title))
+check_true("表尾有一行账（几条进行中/完成/放弃）",
+           "%d 条：" % len(wd.task_store.list()) in str(index_table.caption))
 
 print("== 备注：task note / note= 收敛成 notes ==")
 wd.handle("task note 5 材料在这 https://example.com/set3")

@@ -1030,6 +1030,16 @@ class TaskStore(object):
                         task["focusmate"] = fm
                         task["updated_at"] = _now()
                         dirty = True
+                    # 「Focusmate 那边勾了完成」= 这条本地记录收工了。以前这里只归档、
+                    # 不改 status，靠 _coerce_task 的老数据兼容规则兜着 —— 结果同一份数
+                    # 据「读出来是完成、写回去没有状态」，界面上的 ✓ 时有时无
+                    # （用户反馈的「任务状态同步不对」就是它）。这里显式落库。
+                    if task.get("status") not in (STATUS_COMPLETED, STATUS_DROPPED):
+                        task["status"] = STATUS_COMPLETED
+                        task["status_at"] = done_at
+                        task["status_reason"] = "focusmate-completed"
+                        task["updated_at"] = _now()
+                        dirty = True
                     if self.archive_completed(task, remote):
                         n += 1
             # 改挂过场次：旧场次那条 Focusmate task 还在，completedAt 照样要归档，

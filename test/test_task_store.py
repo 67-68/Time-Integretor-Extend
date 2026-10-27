@@ -78,6 +78,16 @@ check("归档里有完成时间", arch[0]["focusmate"]["completed_at"], "2026-10
 check("归档里有 session 信息", arch[0]["session"]["start"], "11:00")
 check("归档里保留任务字段", arch[0]["fields"]["title"], "写论文")
 check("reconcile 幂等：第二次不重复归档", store.reconcile(remote)[0], 0)
+# Focusmate 那边勾了完成 → 本地这条记录也**落库**成 completed（不只是归档）。
+# 以前只靠 _coerce_task 的老数据兼容规则兜：读出来是完成、写回去没状态，
+# 界面上的 ✓ 时有时无（用户反馈的「任务状态同步不对」）。
+check("reconcile 把状态也落成 completed", store.get(1)["status"], ts.STATUS_COMPLETED)
+check("status_at 用 Focusmate 的完成时间",
+      store.get(1)["status_at"], "2026-10-26T12:00:00Z")
+check("原因留痕", store.get(1)["status_reason"], "focusmate-completed")
+check("落盘里也真有 status（不是靠读时兜）",
+      [t.get("status") for t in json.load(open(TASKS))["tasks"] if t["id"] == 1],
+      [ts.STATUS_COMPLETED])
 check("归档文件仍是 1 条", len(store.load_archive()["records"]), 1)
 
 print("== 备注字段：note / notes / 备注 都收敛成 notes ==")

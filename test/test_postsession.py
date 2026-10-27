@@ -460,7 +460,8 @@ store.drop(dropped["id"], tag=ts.TRANSFER_TAG)
 check("转移走的是 ⤼", wd.task_mark(store.get(dropped["id"])), "⤼")
 check("对照表里也带标记", "⤼" in wd.task_cell_text([store.get(dropped["id"])]), True)
 plain = store.create({"title": "进行中"})
-check("进行中不打标记", wd.task_mark(store.get(plain["id"])), "")
+check("进行中打 ·（不能是空串，否则表格里分不清）",
+      wd.task_mark(store.get(plain["id"])), "·")
 
 # 完成 + 关联 OmniFocus → 写回（完成 + 截止时间）
 task2 = store.create({"title": "复习数学"})
@@ -599,6 +600,101 @@ for name in ("任务", "契约"):
 wd.review = None
 for old_task in store.list():
     store.delete(old_task["id"])
+
+# ------------------------------------------------- 老任务没有 fields.due 也不能漏
+
+print("== 截止时间：fields.due 没有就退回 session 终点 ==")
+psv.clear()
+wd.review = None
+for old in store.list():
+    store.delete(old["id"])
+LEGACY_SESS = {"date": "2026-10-27", "start": "11:00", "duration": 50,
+               "focusmate_session_id": "s-legacy"}
+legacy = store.create({"title": "老数据（没有 due）"})
+store.assign(legacy["id"], LEGACY_SESS)
+# 真实的老数据长这样：有 session，但 fields 里没有 due（那个字段是后加的）
+raw = store.load()
+for item in raw["tasks"]:
+    (item.get("fields") or {}).pop("due", None)
+    (item.get("fields") or {}).pop("due_source", None)
+store.save(raw)
+check("这条确实没有 fields.due", (store.get(legacy["id"])["fields"] or {}).get("due"), None)
+check("截止时间退回 session 终点",
+      psv.effective_due(store.get(legacy["id"])),
+      datetime.datetime(2026, 10, 27, 11, 50))
+check("inspect-due 不会把这类任务整批漏掉",
+      [t["id"] for t in psv.due_candidates(store, now=NOW)], [legacy["id"]])
+check("面板上也写清截止 + 已过期",
+      "已过期" in "".join(t for t, _s in
+                         psv.Review(store, {"kind": "due"}, [store.get(legacy["id"])],
+                                    now=NOW).lines()), True)
+check("真有 fields.due 时以它为准",
+      psv.effective_due(store.create({"title": "有 due", "due": "2026-10-27T09:00:00"})),
+      datetime.datetime(2026, 10, 27, 9, 0))
+for old in store.list():
+    store.delete(old["id"])
+
+
+# ------------------------------------------- 场次结束了、但 daemon 队列是空的
+
+print("== 队列空也算得出「这场结束了还没收」 ==")
+psv.clear()
+wd.review = None
+wd.review_check = None
+ENDED = {"date": "2026-10-27", "start": "16:45", "end": "17:35", "duration": 50,
+         "key": "2026-10-27T16:45"}
+late_task = store.create({"title": "那场没做完"})
+store.assign(late_task["id"], ENDED)
+done_task2 = store.create({"title": "那场做完了"})
+store.assign(done_task2["id"], ENDED)
+store.complete(done_task2["id"])
+DAY = datetime.date(2026, 10, 27)
+DAY_ENTRIES = [{"weekday": "tue", "start": "16:45", "hour": 16, "minute": 45,
+                "duration": 50, "type": "工作", "name": "SAT 1H"}]
+AT = datetime.datetime(2026, 10, 27, 18, 15)
+rows = psv.unreviewed_sessions(store, DAY_ENTRIES, now=AT)
+check("算得出那一场", [r["key"] for r in rows], ["2026-10-27T16:45"])
+check("只点名还没做完的那条", rows[0]["open_ids"], [late_task["id"]])
+check("整场都收完了就不催",
+      (store.complete(late_task["id"]),
+       psv.unreviewed_sessions(store, DAY_ENTRIES, now=AT)), (store.get(late_task["id"]), []))
+store.set_status(late_task["id"], ts.STATUS_ACTIVE)
+check("done 里记过的场次不再催",
+      psv.unreviewed_sessions(store, DAY_ENTRIES, now=AT,
+                              done_keys=["2026-10-27T16:45"]), [])
+
+# warden 那一层：队列里没有，也照样把收尾面板拉起来（daemon 只是闹钟）
+_real_reload = wd.reload_entries
+wd.reload_entries = lambda: DAY_ENTRIES
+wd.offline = False
+wd.review = None
+wd.review_check = None
+wd.review_at = 0.0
+wd._maybe_start_review()
+check_true("队列空也会自己起核对", wd.review_check is not None)
+for _ in range(200):
+    if wd.review_check and wd.review_check.get("ready"):
+        break
+    import time as _t
+    _t.sleep(0.02)
+wd.review_at = 0.0
+wd._maybe_start_review()
+check_true("自己算出来的那一场也进收尾", wd.review is not None)
+check("只问没做完的那一条", [t["id"] for t in wd.review.tasks], [late_task["id"]])
+check("面板标题是那一场", wd.review.headline(), "2026-10-27 16:45–17:35 收尾")
+check("面板里写了截止 + 已过期",
+      "已过期" in "".join(t for t, _s in wd.review.lines()), True)
+check("q 结束收尾", (wd.intercept("q"), wd.review), (True, None))
+check("收完记进 done（下次开机不再催）",
+      list(psv.load_state()["done"]), ["2026-10-27T16:45"])
+wd.review_at = 0.0
+wd._maybe_start_review()
+check("再问一遍也不会重复催", wd.review, None)
+wd.reload_entries = _real_reload
+wd.review = None
+for old in store.list():
+    store.delete(old["id"])
+
 
 # ---------------------------------------------------------------- 收尾：自动 + 手动
 

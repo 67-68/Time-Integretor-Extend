@@ -1631,17 +1631,21 @@ class Warden(object):
 
     @staticmethod
     def task_mark(task):
-        """任务的状态标记：``✓`` 完成 / ``✗`` 放弃 / ``⤼`` 转移走 / 空 = 还在进行。
+        """任务的状态标记：``·`` 进行中 / ``✓`` 完成 / ``✗`` 放弃 / ``⤼`` 转移走。
 
         用户要求 session 结束之后「那一场到底干成了什么」仍然看得见，所以
         完成/放弃的任务**不隐藏、不删**，只是前面多一个记号。
+
+        进行中也必须打 ``·``：以前这里返回空串，表格里「没有记号」既可能是
+        「还没做」也可能是「这一格压根没画状态」，用户看不出差别（真实反馈：
+        「契约界面的 task 部分没有显示 task 状态」）。
         """
         status = ts.TaskStore.status_of(task)
         if status == ts.STATUS_COMPLETED:
             return "✓"
         if status == ts.STATUS_DROPPED:
             return "⤼" if ts.TRANSFER_TAG in (task.get("tags") or []) else "✗"
-        return ""
+        return ts.STATUS_MARKS.get(ts.STATUS_ACTIVE) or "·"
 
     def task_cell_text(self, tasks):
         """契约表格 task 列的正文：``1: 任务… | ✓3: 任务…``（编号 + 裁剪过的标题）。
@@ -1670,7 +1674,8 @@ class Warden(object):
         half = (len(tasks) + 1) // 2
         left = tasks[:half]
         right = tasks[half:]
-        t = Table(title="Task · 任务（[red]红[/] = 已挂 session）",
+        t = Table(title="Task · 任务（· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走；"
+                        "[red]红[/] = 已挂 session）",
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
                   title_justify="left", expand=False)
         t.add_column("number", justify="left", no_wrap=True)
@@ -1684,6 +1689,15 @@ class Warden(object):
                 task = col[i] if i < len(col) else None
                 cells.extend(self._task_index_cells(task, selected))
             t.add_row(*cells)
+        # 表尾一行账：这张表里到底几条收工了 —— 光看记号容易被标题淹掉。
+        counts = {ts.STATUS_ACTIVE: 0, ts.STATUS_COMPLETED: 0, ts.STATUS_DROPPED: 0}
+        for task in tasks:
+            counts[ts.TaskStore.status_of(task)] = counts.get(
+                ts.TaskStore.status_of(task), 0) + 1
+        t.caption = ("%d 条：%d 进行中 · %d 完成 · %d 放弃 "
+                     "（收工的不删，只打记号）"
+                     % (len(tasks), counts[ts.STATUS_ACTIVE],
+                        counts[ts.STATUS_COMPLETED], counts[ts.STATUS_DROPPED]))
         return t
 
     def _task_index_cells(self, task, selected):
@@ -3486,7 +3500,25 @@ class Warden(object):
         if not quiet:
             self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
                      % (len(matched), n), "ok")
+            self.report_omnifocus_links()
         return True
+
+    def report_omnifocus_links(self):
+        """说清楚「OmniFocus 那边到底能不能核对」—— 一条都没关联就别让人瞎猜。"""
+        tasks = self.task_store.list()
+        linked = [t for t in tasks if ts.TaskStore.omnifocus_id(t)]
+        if linked:
+            done = sum(1 for t in linked if not self.task_store.is_open(t))
+            self.say("OmniFocus 关联：%d/%d 条任务挂了 primary key（其中 %d 条已收工）。"
+                     % (len(linked), len(tasks), done), "info")
+        else:
+            self.say("OmniFocus 关联：0/%d 条 —— 一条都没挂 primary key，所以核对不到"
+                     " OmniFocus 的完成状态。用 `task import` 粘 omnifocus:///task/… 链接，"
+                     "或 `task <id> link <pk>`。" % len(tasks), "warn")
+        if not self.omnifocus_enabled():
+            self.say("（OmniFocus 现在是关着/不可用：设置 omnifocus=off 或没给自动化权限，"
+                     "这一侧一律跳过。）", "warn")
+        return len(linked)
 
     def announce_completions(self, since, limit=3):
         """刚归档的那几条任务，把信息（含备注）说一遍。
@@ -3970,14 +4002,50 @@ class Warden(object):
         if self.pending_sins():
             # 罪案区锁死：除了宣言什么都不受理，收尾也排在后面（别把面板顶在锁上面）
             return
-        pending = psv.pending_sessions()
-        if not pending:
+        entry, derived = self._next_review_entry()
+        if entry is None:
             return
-        entry = pending[-1]
         self.review_check = {"entry": entry, "ready": False}
         threading.Thread(target=self._review_worker, args=(entry,), daemon=True).start()
-        self.say("⏱ %s %s 那场结束了 —— 正在核对完成状态…"
-                 % (entry.get("date"), entry.get("start")), "cmd")
+        if derived:
+            self.say("⏱ %s %s 那场已经结束、还没收尾（daemon 队列里没有，是本地自己算的）"
+                     " —— 正在核对完成状态…"
+                     % (entry.get("date"), entry.get("start")), "cmd")
+        else:
+            self.say("⏱ %s %s 那场结束了 —— 正在核对完成状态…"
+                     % (entry.get("date"), entry.get("start")), "cmd")
+
+    def _next_review_entry(self):
+        """该收尾的是哪一场 → ``(entry, 是不是本地自己算出来的)``。
+
+        先看 daemon 的队列（`temp/keep_session-postsession.json`）；队列里没有就
+        **自己按 data.csv + 任务库算一遍**（:func:`postsession.unreviewed_sessions`）。
+
+        为什么必须自己算：daemon 只是「闹钟」。它没在跑、队列文件丢了、或者 warden
+        是事后才打开的 —— 这些情况下队列永远是空的，于是「一场结束了、任务还没
+        收尾」这件事**永远不会被问到**，完成状态也就永远落不了库（真实踩过）。
+        收过的场次记在 postsession 状态文件的 done 里，不会重复催。
+        """
+        pending = psv.pending_sessions()
+        if pending:
+            return pending[-1], False
+        if self.offline:
+            return None, False
+        try:
+            entries = self.reload_entries()
+        except Exception:                          # noqa: BLE001 - data.csv 坏了不该没帧
+            return None, False
+        try:
+            done_keys = set(psv.load_state()["done"])
+        except Exception:                          # noqa: BLE001
+            done_keys = set()
+        try:
+            rows = psv.unreviewed_sessions(self.task_store, entries, done_keys=done_keys)
+        except Exception:                          # noqa: BLE001
+            return None, False
+        if not rows:
+            return None, False
+        return rows[-1], True
 
     def review_panel(self):
         """收尾面板（契约 / 任务视图里画在表格下面）。"""

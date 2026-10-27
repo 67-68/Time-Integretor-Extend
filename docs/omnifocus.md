@@ -103,7 +103,9 @@ python3 omnifocus.py get kc-4VLAE_1L
 ## 4. 收尾时「读」一次
 
 `Warden.sync_completion_state()`（收尾入口调它）：
-1. `GET /v1/tasks`（bridge）→ `task_store.reconcile()` → Focusmate 的 `completedAt` 进归档；
+1. `GET /v1/tasks`（bridge）→ `task_store.reconcile()` → Focusmate 的 `completedAt`
+   进归档，**并且把本地 `status` 落成 `completed`**（以前只归档不改状态，靠读文件时
+   的老数据兼容规则兜，于是界面上「有完成却看不见 ✓」，用户反馈过）；
 2. `omnifocus.py list` **一次** → 哪条 OmniFocus 任务已经 `completed`，本地跟着标完成；
 3. `writeback_completions()` 把「本地完成但还没写回」的补写回去。
 

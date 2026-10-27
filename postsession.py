@@ -256,12 +256,29 @@ def parse_due(value):
     return got
 
 
+def effective_due(task):
+    """这条任务的**截止时刻**：``fields.due`` 优先，没有就退回「所挂 session 的终点」。
+
+    为什么要有这一层：``fields.due`` 只在 ``task assign`` 那一刻才写进去。更早的
+    任务（老数据、只从 Focusmate 那边 attach 过来、手改过 JSON 的）根本没有这个
+    字段 —— 但它们明明属于某一早已结束的场次，那场结束就是它们的截止时间。
+    只认 ``fields.due`` 会让 ``inspect-due`` 把这类任务**整批漏掉**（真实踩过：
+    12 条任务、几场都结束了，`inspect-due` 却说「账是干净的」）。
+    """
+    due = parse_due((task.get("fields") or {}).get("due"))
+    if due is not None:
+        return due
+    return parse_due(ts.session_due(task.get("session") or {}))
+
+
 def due_candidates(store, now=None, within_minutes=0, include_no_due=False):
     """「该看一眼」的未完成任务：截止时间已过（或快到了），按截止时间从早到晚。
 
     ``inspect-due`` 背后的取数逻辑，故意放在这里（纯逻辑、好测）：
 
     - 只看 ``status == active`` 的（完成/放弃的不催）；
+    - 截止时间用 :func:`effective_due`：没有 ``fields.due`` 就退回 session 终点
+      （老任务没有 due，但「那场结束了」就是截止，不能因此漏掉）；
     - ``within_minutes=0``（默认）= 已经过期；给 60 就是「未来 60 分钟内要到的也算」；
     - ``include_no_due=True``（``inspect-due --all``）= **不按截止时间筛**，
       所有未完成的都带上（有截止的按时间排前面，没截止／认不出的排最后）
@@ -273,7 +290,7 @@ def due_candidates(store, now=None, within_minutes=0, include_no_due=False):
     for task in store.list():
         if not store.is_open(task):
             continue
-        due = parse_due((task.get("fields") or {}).get("due"))
+        due = effective_due(task)
         if due is None:
             if include_no_due:
                 rows.append((datetime.datetime.max, task))
@@ -282,6 +299,41 @@ def due_candidates(store, now=None, within_minutes=0, include_no_due=False):
             rows.append((due, task))
     rows.sort(key=lambda pair: (pair[0], pair[1].get("id") or 0))
     return [task for _due, task in rows]
+
+
+def unreviewed_sessions(store, entries, now=None, delay=DELAY_SEC,
+                        lookback=LOOKBACK_SEC, done_keys=()):
+    """已经结束、还没收尾、而且**确实还有没做完的任务**的场次（从早到晚）。
+
+    为什么 warden 自己也要算一遍：daemon 只负责「准点叫人」，它写的是
+    ``temp/keep_session-postsession.json``。可是 daemon 没在跑 / 队列文件被删掉 /
+    warden 是后来才打开的 —— 那文件里就什么都没有，而「这一场结束了、还有活没
+    做完」是**本地事实**，不能因为没人叫就假装没有（真实踩过：16:45 那场 17:35
+    结束，18:15 打开 warden，一个收尾面板都没有，完成状态至今没落过库）。
+
+    ``done_keys`` 是已经收过的场次 key（``postsession`` 状态文件里的 done），
+    传进来避免同一次开机重复催。
+    """
+    now = now or datetime.datetime.now()
+    done = {str(k) for k in (done_keys or ())}
+    out = []
+    for rec in ended_sessions(slots_around(entries, now=now, days_back=1),
+                              now=now, delay=delay, lookback=lookback):
+        if rec["key"] in done:
+            continue
+        try:
+            day = datetime.date.fromisoformat(rec["date"])
+        except ValueError:
+            continue
+        tasks = store.tasks_for_session(day, rec["start"])
+        opened = [t for t in tasks if store.is_open(t)]
+        if not opened:
+            continue
+        rec = dict(rec)
+        rec["open_ids"] = [t.get("id") for t in opened]
+        rec["task_count"] = len(tasks)
+        out.append(rec)
+    return out
 
 
 def slots_around(entries, now=None, days_back=1, days_fwd=0):
@@ -457,17 +509,18 @@ class Review(object):
         sess = task.get("session") or {}
         out.append(("任务 %s：%s" % (task["id"], self.title_of(task)), "bold yellow"))
         bits = []
-        due_text = (task.get("fields") or {}).get("due") or "?"
+        due = effective_due(task)
+        due_text = ((task.get("fields") or {}).get("due")
+                    or (due.strftime("%Y-%m-%dT%H:%M") if due else "?"))
+        overdue = ""
+        if due is not None:
+            secs = (self.now - due).total_seconds()
+            if secs > 0:
+                overdue = "，已过期 %s" % _fmt_age(secs)
         if sess.get("start"):
-            bits.append("session %s %s（截止 %s）"
-                        % (sess.get("date"), sess.get("start"), due_text))
-        elif (task.get("fields") or {}).get("due"):
-            due = parse_due(task["fields"]["due"])
-            overdue = ""
-            if due is not None:
-                secs = (self.now - due).total_seconds()
-                if secs > 0:
-                    overdue = "，已过期 %s" % _fmt_age(secs)
+            bits.append("session %s %s（截止 %s%s）"
+                        % (sess.get("date"), sess.get("start"), due_text, overdue))
+        elif due is not None:
             bits.append("截止 %s%s" % (due_text, overdue))
         if fm.get("task_id"):
             bits.append("Focusmate %s…" % str(fm["task_id"])[:8])
