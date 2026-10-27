@@ -251,8 +251,26 @@ class TaskStore(object):
         return found
 
     # -- session / Focusmate -----------------------------------------
+    def tasks_for_session(self, day, start):
+        """这一场（某天 + 起始时刻）上挂着的所有任务，按 ID 升序。
+
+        一场 session 可以挂多个任务（Focusmate 侧 task ↔ session 是 n:n），
+        所以这里返回**列表**，不是单条。
+        """
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        out = []
+        for task in self.list():
+            sess = task.get("session") or {}
+            if sess.get("date") == iso and sess.get("start") == start:
+                out.append(task)
+        return sorted(out, key=lambda t: t.get("id") or 0)
+
     def assign(self, task_id, session):
-        """把任务挂到一场 session 上（只写本地；Focusmate 写入由调用方做）。"""
+        """把任务挂到一场 session 上（只写本地；Focusmate 写入由调用方做）。
+
+        多任务共存：同一场 session 上已经挂了别的任务也没关系 —— 每个任务各存
+        各的 ``session``，这里只覆盖本条任务自己的 assignment。
+        """
         if not isinstance(session, dict):
             raise ValueError("session 必须是一个 dict")
         store = self.load()
@@ -263,6 +281,11 @@ class TaskStore(object):
                 break
         if found is None:
             raise ValueError("没有任务 %s" % task_id)
+        old = found.get("session") or {}
+        if old and (old.get("date"), old.get("start")) != (session.get("date"),
+                                                           session.get("start")):
+            # 换场次了：先记住旧场次，等 attach_focusmate 拿到新 task id 时再归档成 previous
+            found.setdefault("focusmate", {})["previous_session"] = dict(old)
         found["session"] = dict(session)
         found["updated_at"] = _now()
         self.save(store)
@@ -279,6 +302,17 @@ class TaskStore(object):
         if found is None:
             raise ValueError("没有任务 %s" % task_id)
         fm = found.setdefault("focusmate", {})
+        new_id = (focusmate_task or {}).get("task_id") or (focusmate_task or {}).get("id")
+        old_id = fm.get("task_id") or fm.get("id")
+        if old_id and new_id and str(old_id) != str(new_id):
+            # 改挂到别的场次了：旧场次那条 Focusmate task 不会跟着挪（API 没有「挪」，
+            # 我们是又建了一条）。把它记在 previous 里，完成时间照样能归档。
+            fm.setdefault("previous", []).append({
+                "task_id": old_id,
+                # 旧场次是 assign() 换场次前记下的（此时 found["session"] 已经是新的了）
+                "session": fm.pop("previous_session", None) or dict(found.get("session") or {}) or None,
+                "replaced_at": _now(),
+            })
         fm.update(dict(focusmate_task or {}))
         if session is not None:
             found["session"] = dict(session)
@@ -532,6 +566,21 @@ class TaskStore(object):
                         dirty = True
                     if self.archive_completed(task, remote):
                         n += 1
+            # 改挂过场次：旧场次那条 Focusmate task 还在，completedAt 照样要归档，
+            # 用当时记下的 session（不能拿现在的，否则归档里日期是错的）。
+            for old in (fm.get("previous") or []):
+                oid = old.get("task_id")
+                remote3 = by_id.get(str(oid)) if oid else None
+                if not remote3:
+                    continue
+                if not (remote3.get("completedAt") or remote3.get("completed_at")):
+                    continue
+                ghost = dict(task)
+                ghost["session"] = old.get("session") or task.get("session")
+                if self.archive_completed(ghost, remote3):
+                    n += 1
+                    if task["id"] not in matched:
+                        matched.append(task["id"])
             # 每周重复：每次落点的 Focusmate task 是独立实体，单独对一次
             occ = ((task.get("repeat") or {}).get("occurrences") or {})
             for day, rec in sorted(occ.items()):

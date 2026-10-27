@@ -90,8 +90,20 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 
 ## Focusmate 集成
 
-- 挂任务走 `scripts/bridge.mjs` 的 `add_task`（DOM：点 session 卡片 → Add task →
-  填 title/notes → Create task），**API 复核 attachment** 成功后才返回 `verified`。
+- 挂任务走 `scripts/bridge.mjs` 的 `add_task`：
+  **默认先走内部 API**（`POST /v1/tasks` 带 `attachments:[{type:"session",externalId}]`，
+  不行再试 `/tasks/attach`；逻辑在 `scripts/task_attach.mjs`），**DOM 兜底**。
+  两条路都必须用 `GET /v1/tasks` 复核「title 一致 + attachment 指向这场」才算成功。
+- **为什么不能只靠 DOM**：这一场 session **已经有 task** 时，右侧面板里就不再有
+  `Add task` 入口了 —— DOM 路径必然找不到按钮。也就是说「已经有 task 就无法再挂
+  一个」不是权限限制，只是 UI 只给一次入口；API 侧 task ↔ session 是 n:n。
+- 一场 session **可以挂多个任务**：本地每条任务各存各的 `session`，
+  `task_store.tasks_for_session(day, start)` 返回列表；表格 task 列用 ` · `
+  把它们串起来显示（`row["tasks"]` 是列表，`row["task"]` 兼容地给第一条）。
+- **改挂到别的场次**：本地记录改到新场次，但 Focusmate 上旧那条 task 不会跟着挪
+  （API 没有「挪」，我们是又建了一条）。所以 `assign` 会先提醒一句，并把旧 id +
+  旧场次记进 `focusmate.previous[]`；`task sync` 对 previous 里的 id 也照样按
+  `completedAt` 归档，完成时间不会丢（归档里的 session 用**当时**那一场）。
 - Warden 只有看到 `verified=true` 才写 `session` / `focusmate`，避免假成功半截落盘。
 - 完成时间来源：`GET /v1/tasks` 的 `completedAt`（见 docs/focusmate-ui-api-notes.md）。
   看不到就不伪造：只匹配、不写完成时间。

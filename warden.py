@@ -1427,23 +1427,31 @@ class Warden(object):
             return None
         return sessions[0]["start"] if sessions else None
 
-    def task_for_session(self, day, start, duration=None):
-        """这一场挂的是哪个任务：本地 assignment 优先，其次「每周重复」落点。"""
-        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
-        for task in self.task_store.list():
-            sess = task.get("session") or {}
-            if sess.get("date") == iso and sess.get("start") == start:
-                return task
+    def tasks_for_session(self, day, start, duration=None):
+        """这一场挂着的**所有**任务：本地 assignment 优先，其次是「每周重复」落点。
+
+        一场 session 可以挂多个任务（用户会在已有 task 的场次上再挂一个），
+        所以表格里那一格要能显示多条，不能只认第一条。
+        """
+        tasks = self.task_store.tasks_for_session(day, start)
+        taken = {t.get("id") for t in tasks}
         sessions = self.sessions_for_day_plan(day)
         for task in self.task_store.repeated_tasks(day.weekday()):
+            if task.get("id") in taken:
+                continue
             hit = self.task_store.repeat_occurrence(task, day, sessions)
             if not hit or hit.get("start") != start:
                 continue
             if duration is not None and hit.get("duration") is not None \
                     and int(hit["duration"]) != int(duration):
                 continue
-            return task
-        return None
+            tasks.append(task)
+        return tasks
+
+    def task_for_session(self, day, start, duration=None):
+        """这一场挂的第一条任务（老接口，保留给只关心一条的调用方）。"""
+        tasks = self.tasks_for_session(day, start, duration=duration)
+        return tasks[0] if tasks else None
 
     def attach_period_info(self, row, day=None):
         """给一行表格补上「时段 ID / 时段 / 类型 / 名称 / task」。"""
@@ -1459,14 +1467,19 @@ class Warden(object):
             row["period"] = None
             row["period_id"] = None
             row["period_first"] = False
-        task = self.task_for_session(day, row.get("startLabel"), row.get("durationMin"))
-        if task:
-            row["task"] = task
-            row["task_repeat"] = bool(task.get("repeat"))
-            prefix = "🔁 " if row["task_repeat"] else ""
-            row["task_text"] = prefix + self.task_store.summarize(task)
+        tasks = self.tasks_for_session(day, row.get("startLabel"), row.get("durationMin"))
+        if tasks:
+            row["task"] = tasks[0]                # 兼容：只关心一条的地方仍然能用
+            row["tasks"] = tasks
+            row["task_repeat"] = any(t.get("repeat") for t in tasks)
+            parts = []
+            for task in tasks:
+                prefix = "🔁 " if task.get("repeat") else ""
+                parts.append(prefix + self.task_store.summarize(task))
+            row["task_text"] = " · ".join(parts)
         else:
             row["task"] = None
+            row["tasks"] = []
             row["task_repeat"] = False
             row["task_text"] = ""
         return row
@@ -1792,6 +1805,7 @@ class Warden(object):
                 row.setdefault("period_id", None)
                 row.setdefault("period_first", False)
                 row.setdefault("task", None)
+                row.setdefault("tasks", [])
                 row.setdefault("task_text", "")
         self.rows = rows
 
@@ -2834,8 +2848,20 @@ class Warden(object):
         notes = (fields.get("notes") or fields.get("description") or "")
         if not isinstance(notes, str):
             notes = str(notes)
-        self.say("把任务 %d「%s」挂到 session #%d（%s %s）…"
-                 % (task["id"], title, session_idx, date_iso, row.get("startLabel")), "cmd")
+        # 这场可能已经挂着别的任务了 —— Focusmate 侧是 n:n，可以再挂一个，
+        # 只是 UI 面板里不再出现 "Add task"，所以桥那边默认走内部 API（见 bridge.mjs）。
+        prev = task.get("session") or {}
+        moved = bool(prev) and (prev.get("date") != date_iso
+                               or prev.get("start") != row.get("startLabel"))
+        if moved:
+            self.say("注意：任务 %d 原来挂在 %s %s；本地会改记到这场，Focusmate 上那条旧 task "
+                     "不会跟着挪（完成时间照样会归档）。"
+                     % (task["id"], prev.get("date"), prev.get("start")), "warn")
+        already = [t for t in self.task_store.tasks_for_session(date_iso, row.get("startLabel"))
+                   if t.get("id") != task["id"]]
+        self.say("把任务 %d「%s」挂到 session #%d（%s %s）%s…"
+                 % (task["id"], title, session_idx, date_iso, row.get("startLabel"),
+                    "（这场已有 %d 个任务，再去挂一个）" % len(already) if already else ""), "cmd")
         res = self.bridge.call("add_task", timeout=240,
                                startMs=row["startMs"], meetingId=row["id"],
                                title=title, notes=notes)
@@ -2849,21 +2875,27 @@ class Warden(object):
             "session_id": row["id"],
             "attached_at": ts._now(),
             "title": title,
+            "via": res.get("via"),
         }, session=session)
         self.selected_task_id = task["id"]
         session["task_id"] = res.get("taskId") or (res.get("task") or {}).get("id")
         # 表格里那一行的 task 列是 rebuild_rows 时算出来的：不重排就还是旧的
         # （用户看到的正是「assign 成功但 task 列空着」）。先本地重排，再尽量刷新。
-        row["task"] = dict(task)
-        row["task_text"] = self.task_store.summarize(task)
         self.rebuild_rows()
         if not self.offline:
             try:
                 self.refresh(quiet=True)
             except Exception:                       # noqa: BLE001 - 刷新失败不影响已完成的挂载
                 pass
-        self.say("✅ 任务 %d 已挂到 session #%d；Focusmate task id=%s"
-                 % (task["id"], session_idx, res.get("taskId") or "?"), "ok")
+        remote_had = res.get("existingCount")
+        total = (remote_had if isinstance(remote_had, int) else len(already)) + 1
+        extra = ""
+        if total > 1:
+            extra = "（这场现在共 %d 个任务，表格里会一起列出来）" % total
+        via = res.get("via")
+        self.say("✅ 任务 %d 已挂到 session #%d；Focusmate task id=%s%s%s"
+                 % (task["id"], session_idx, res.get("taskId") or "?",
+                    "（via %s）" % via if via else "", extra), "ok")
         return True
 
     def materialize_repeats(self):

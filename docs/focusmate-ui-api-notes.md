@@ -292,7 +292,23 @@ PUT /v1/session/  {"data":{"sessionTime":1791448200000,"title":""}}
 ```
 
 > 也就是说 task 其实也能走 API（`POST /v1/tasks` 带 `attachments:[{type:"session",externalId}]`），
-> 不一定非要 DOM；但 Task Manager 是 Labs，创建配额等逻辑在前端，暂时选了 DOM。
+> 不一定非要 DOM。
+
+**实测补充（2026-10-27）：一场 session 已经挂了 task 时，UI 面板里就没有 `Add task` 了。**
+右侧面板这时候显示的是那条 task 本身（编辑/勾完成），不再给「再加一个」的入口。
+
+但 **task ↔ session 是 n:n**（`attachments` 是数组），所以「一场挂多个 task」在数据层
+完全合法 —— 只是 UI 不给第二次入口。因此 `scripts/bridge.mjs` 的 `add_task` 现在
+**默认先走内部 API**（`scripts/task_attach.mjs`）：
+
+1. `POST /v1/tasks` 带 `attachments:[{type:"session",externalId}]`（服务端不收就退到
+   `POST /v1/tasks/attach`，payload 形状由简到繁试几种）；
+2. 每次都 `GET /v1/tasks` 复核「title 一致 + attachment 指向这场」；
+3. 建出来却没挂上的孤儿 `DELETE /v1/tasks/{id}` 回滚；
+4. 全失败才退回 DOM（DOM 在「这场已有 task」时注定失败，错误信息会直接说明）。
+
+⚠️ `POST /v1/tasks` 的 body 形状**没有公开文档**，上面是候选形状 + 运行时复核，
+不是文档保证。哪天真机验证出来了，把 `taskCreateBodies()` 收敛成一种即可。
 
 ### 3.4 「它不校验权限吗？」
 

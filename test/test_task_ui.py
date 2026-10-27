@@ -216,6 +216,41 @@ check("表格 task 列用 trim 后的一行",
       [r.get("task_text") for r in wd.rows if r["startLabel"] == "11:00"][0],
       "1. 论文  2. 先写intro  3. 明天")
 
+print("== 同一场 session 可以挂多个 task（重点回归：已有 task 时再加一个）==")
+row1200 = [r for r in wd.rows if r["startLabel"] == "12:00"][0]
+idx1200 = wd.rows.index(row1200) + 1
+wd.bridge.calls = []
+check("先挂第一个", wd.handle("task create title=写论文 --assign %d" % idx1200), True)
+check("这场先有一个任务",
+      [t["fields"].get("title") for t in
+       wd.task_store.tasks_for_session(ISO, "12:00")], ["写论文"])
+wd.bridge.calls = []
+check("已经有 task 的场次再挂一个：受理",
+      wd.handle("task create title=复盘 --assign %d" % idx1200), True)
+check("bridge 照样被叫了一次（桥内部先 API 后 DOM）",
+      len([c for c in wd.bridge.calls if c[0] == "add_task"]), 1)
+check("同一场现在挂了两条",
+      [t["fields"].get("title") for t in
+       wd.task_store.tasks_for_session(ISO, "12:00")], ["写论文", "复盘"])
+row1200 = [r for r in wd.rows if r["startLabel"] == "12:00"][0]
+check("表格 task 列两条都显示",
+      ("写论文" in row1200["task_text"], "复盘" in row1200["task_text"]), (True, True))
+check("row['tasks'] 也是两条", len(row1200["tasks"]), 2)
+check("先挂的那条没被覆盖（各自都有 session）",
+      [t["session"]["start"] for t in wd.task_store.tasks_for_session(ISO, "12:00")],
+      ["12:00", "12:00"])
+check_true("消息里说了这场已有几个任务",
+           any("这场已有 1 个任务" in m[2] for m in wd.messages))
+
+print("== 任务改挂到别的场次：会提醒，旧 task 的完成时间也不丢 ==")
+wd.messages = []
+check("task select 5", wd.handle("task select 5"), True)
+check("把 5 改挂到另一场", wd.handle("task assign %d" % idx1200), True)
+check_true("提醒旧场次那条 task 不会跟着挪",
+           any("不会跟着挪" in m[2] for m in wd.messages))
+check("旧场次已记进 previous_session/focusmate",
+      wd.task_store.get(5)["session"]["start"], "12:00")
+
 for t in list(wd.task_store.list()):
     wd.handle("task delete %d" % t["id"])
 check("task delete", wd.task_store.list(), [])

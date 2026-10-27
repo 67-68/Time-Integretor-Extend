@@ -24,8 +24,9 @@
  *     mute     startMs meetingId? quiet       开/关 quiet mode
  *     cancel   startMs meetingId? source?     取消（**破坏性**，调用方负责把关）
  *     tasks                             列 Task Manager 的 task（含 completedAt）
- *     add_task startMs title? notes?    给某场 session 挂 Focusmate task（DOM + API 复核）
-
+ *     add_task startMs title? notes? via? 给某场 session 挂 Focusmate task
+ *                                       （默认先走内部 API，DOM 兜底；都复核）
+ *
  *   ⚠️ 信封的 `id`（请求号）和「哪一场 session」**必须**用不同的字段名。
  *   踩过：两者都叫 id 时，Python 侧 `req.update(kw)` 会把请求号覆盖成 UUID，
  *   桥照常执行、响应也发了，但调用方永远等不到自己那个请求号 —— 表现为「卡死」，
@@ -56,6 +57,7 @@
  */
 
 import readline from "readline";
+import { attachTaskViaApi } from "./task_attach.mjs";
 
 // ---------------------------------------------------------------- 独占 stdout
 
@@ -287,6 +289,51 @@ async function pickTextLocator(candidates) {
   return null;
 }
 
+/** 这一场 session 上现在挂着哪些 task（GET /tasks 里按 attachment 过滤）。 */
+async function tasksForMeeting(meetingId) {
+  if (!meetingId) return [];
+  const all = await listTasksRaw();
+  return all
+    .filter((t) => (t.attachments || []).some((a) => (a.externalId ?? a.id) === meetingId))
+    .map(normalizeTask);
+}
+
+function brief(e) {
+  return String((e && e.message) || e).replace(/\s+/g, " ").slice(0, 200);
+}
+
+async function deleteTaskQuiet(taskId) {
+  if (!taskId) return;
+  try {
+    await callApi("DELETE", "/tasks/" + encodeURIComponent(taskId), {});
+  } catch {
+    /* 清理失败就算了：它只是没挂上的孤儿，报错里已经说明了 */
+  }
+}
+
+/**
+ * 走内部 API 给 session 建 task 并挂上（不碰 DOM）。
+ *
+ * 存在的理由：**这场 session 已经有 task 时，右侧面板里就没有 "Add task" 了**，
+ * DOM 路径必然找不到按钮（用户报的「已经有 task 时无法加入额外的 task」）。
+ * API 侧没这个限制：task ↔ session 是 n:n（`attachments` 是数组）。
+ * 具体怎么试 body 形状、怎么复核、怎么回滚，都在 scripts/task_attach.mjs 里
+ * （纯逻辑，能单测；这里只把真实的 callApi 传进去）。
+ */
+async function createTaskViaApi(meeting, title, notes, attempts) {
+  try {
+    const out = await attachTaskViaApi(
+      { callApi, tasksForMeeting, deleteTask: deleteTaskQuiet },
+      meeting, title, notes
+    );
+    attempts.push(...out.attempts);
+    return out.task;
+  } catch (e) {
+    if (Array.isArray(e.attempts)) attempts.push(...e.attempts);
+    throw e;
+  }
+}
+
 /** 走真实 UI 给 session 挂 task，然后用 GET /tasks 复核 attachment。 */
 async function addTaskViaDom(meeting, title, notes) {
   const start = new Date(meeting.startMs);
@@ -318,7 +365,19 @@ async function addTaskViaDom(meeting, title, notes) {
     page.getByText(/^Add task$/),
   ]);
   if (!addTask) {
-    throw new Error('面板里找不到 "Add task"（Task Manager Labs 关掉了？或这场已有 task）');
+    const already = await tasksForMeeting(meeting.id).catch(() => []);
+    // 面板正文带一小段出来：下次真机排查（按钮改名 / 挪进抽屉 / Labs 关了）一眼能看出来
+    const snippet = String(panelText || "").replace(/\s+/g, " ").trim().slice(0, 400);
+    if (already.length) {
+      throw new Error(
+        '面板里没有 "Add task" —— 这场 session 已经有 ' + already.length + " 个 task（" +
+          already.map((t) => t.title).filter(Boolean).join(" / ") +
+          "），UI 就不再给入口了；这种事走内部 API（bridge 默认路径）。" +
+          (snippet ? " 面板正文：" + snippet : "")
+      );
+    }
+    throw new Error('面板里找不到 "Add task"（Task Manager Labs 关掉了？）' +
+                    (snippet ? " 面板正文：" + snippet : ""));
   }
   await addTask.click();
   const titleBox = page.locator('textarea[placeholder="Task title"]').first();
@@ -429,15 +488,44 @@ const handlers = {
     const notes = req.notes == null ? "" : String(req.notes);
     if (title.length > 500) throw new Error("task title 最长 500 字符，现在是 " + title.length);
     const { meeting } = await requireMeeting(req.startMs, req.meetingId);
-    const created = await addTaskViaDom(meeting, title, notes);
-    const normalized = created ? normalizeTask(created) : null;
+    const existing = await tasksForMeeting(meeting.id).catch(() => []);
+    const attempts = [];
+    // auto（默认）= 先 API 再 DOM；api / dom = 只用那条路（排查用）
+    const via = req.via ? String(req.via) : "auto";
+    let created = null;
+    let usedVia = null;
+    if (via !== "dom") {
+      try {
+        created = await createTaskViaApi(meeting, title, notes, attempts);
+        if (created) usedVia = "api";
+      } catch (e) {
+        attempts.push("API：" + brief(e));
+      }
+    }
+    if (!created && via !== "api") {
+      try {
+        created = await addTaskViaDom(meeting, title, notes);
+        if (created) usedVia = "dom";
+        else attempts.push("DOM：UI 上点完了，但 GET /tasks 里没看到这条 attachment");
+      } catch (e) {
+        attempts.push("DOM：" + brief(e));
+      }
+    }
+    if (!created) {
+      throw new Error("没能挂上 task。" + (attempts.length ? "试过：" + attempts.join("；") : ""));
+    }
+    const normalized = normalizeTask(created);
     return {
-      verified: !!normalized,
+      verified: true,
+      via: usedVia,
+      attempts,
+      existingCount: existing.length,
+      existing: existing.map((t) => ({ id: t.id, title: t.title })),
       sessionId: meeting.id,
       sessionTime: meeting.startMs,
       title,
       notes,
-      taskId: normalized ? normalized.id : null,
+      taskId: normalized.id,
       task: normalized,
     };
   },

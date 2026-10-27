@@ -80,6 +80,48 @@ check("归档里保留任务字段", arch[0]["fields"]["title"], "写论文")
 check("reconcile 幂等：第二次不重复归档", store.reconcile(remote)[0], 0)
 check("归档文件仍是 1 条", len(store.load_archive()["records"]), 1)
 
+print("== 一场 session 能挂多个任务 ==")
+t2 = store.create({"title": "第二条"})
+t3 = store.create({"title": "第三条"})
+same = {"index": 2, "date": "2026-10-26", "start": "11:00", "end": "11:50",
+        "duration": 50, "focusmate_session_id": "sess-1"}
+store.assign(1, same)
+store.assign(t2["id"], dict(same))
+store.assign(t3["id"], dict(same))
+check("tasks_for_session 拿到三条",
+      [t["id"] for t in store.tasks_for_session("2026-10-26", "11:00")], [1, t2["id"], t3["id"]])
+check("别的时段不算", [t["id"] for t in store.tasks_for_session("2026-10-26", "12:00")], [])
+store.assign(t2["id"], {"index": 3, "date": "2026-10-26", "start": "12:00", "end": "12:50",
+                        "duration": 50, "focusmate_session_id": "sess-2"})
+check("重挂到别的场次不影响同场的其他任务",
+      [t["id"] for t in store.tasks_for_session("2026-10-26", "11:00")], [1, t3["id"]])
+check("新场次里只有它自己",
+      [t["id"] for t in store.tasks_for_session("2026-10-26", "12:00")], [t2["id"]])
+
+print("== 任务改挂到别的场次：旧 task 的完成时间也不丢 ==")
+store2 = ts.TaskStore(os.path.join(TMP, "t2.json"), os.path.join(TMP, "a2.json"))
+x = store2.create({"title": "改挂我"})
+old_sess = {"index": 1, "date": "2026-10-26", "start": "11:00", "end": "11:50",
+            "duration": 50, "focusmate_session_id": "sess-A"}
+new_sess = {"index": 2, "date": "2026-10-27", "start": "09:00", "end": "09:50",
+            "duration": 50, "focusmate_session_id": "sess-B"}
+store2.assign(x["id"], old_sess)
+store2.attach_focusmate(x["id"], {"task_id": "ft-A", "session_id": "sess-A"}, session=old_sess)
+store2.assign(x["id"], new_sess)
+store2.attach_focusmate(x["id"], {"task_id": "ft-B", "session_id": "sess-B"}, session=new_sess)
+check("旧 task id 记进 previous",
+      [p["task_id"] for p in store2.get(x["id"])["focusmate"]["previous"]], ["ft-A"])
+check("previous 里留着旧场次",
+      store2.get(x["id"])["focusmate"]["previous"][0]["session"]["start"], "11:00")
+n2, _ = store2.reconcile({"tasks": [
+    {"id": "ft-A", "title": "改挂我", "completedAt": "2026-10-26T11:50:00Z"},
+    {"id": "ft-B", "title": "改挂我", "completedAt": "2026-10-27T09:50:00Z"},
+]})
+check("两条都归档", n2, 2)
+recs = store2.load_archive()["records"]
+check("归档里的场次各自对得上",
+      sorted(r["session"]["start"] for r in recs), ["09:00", "11:00"])
+
 print("== 归档 CLI：一个 JSON 文件，一眼能看 ==")
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):

@@ -183,7 +183,19 @@ stdout   {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 | 命令 | 作用 |
 |---|---|
 | `tasks` | `GET /v1/tasks`，返回 task 的 id/title/completedAt/attachments |
-| `add_task` | 给某场 session 建 Focusmate task（DOM：Add task → 填 → Create task），再用 API 复核 attachment |
+| `add_task` | 给某场 session 建 Focusmate task（默认内部 API，DOM 兜底），再用 API 复核 attachment |
 
 Warden 的 `task assign` 只会在 `add_task` 返回 `verified=true` 后写本地任务，
 不会出现「本地以为挂上了、Focusmate 其实没有」的假成功。
+
+`add_task` 的两条路（`scripts/task_attach.mjs` 里是纯逻辑，可单测）：
+
+1. **内部 API（默认）**：`POST /v1/tasks` 带 `attachments:[{type:"session",externalId}]`；
+   服务端不收就退到 `/tasks/attach`（几种 payload 形状由简到繁试）。
+   建出来了却没挂上的孤儿会 `DELETE /tasks/{id}` 回滚。
+2. **DOM（兜底）**：点卡片 → 右侧面板 → `Add task` → 填 → `Create task`。
+   ⚠️ **这场已经有 task 时面板里没有 `Add task`**，所以默认不走这条路；
+   用户报的「已经有 task 的时候无法加入额外的 task」就是只走 DOM 时的表现。
+
+两条路都用 `GET /v1/tasks` 复核「title 一致 + attachment 指向这场」才算成功，
+失败时错误信息里带全部尝试记录（`attempts`）。
