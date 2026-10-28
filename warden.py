@@ -269,6 +269,20 @@ TASK_CELL_TITLE_MAX = 18
 # 契约表格下面那块任务面板：2 列是底线，屏幕够宽就摊成 3 列、4 列（编号从上往下读）。
 TASK_INDEX_MAX_COLS = 4
 
+# `-a` 的两个特殊取值：不进表格编号，直接按语义办。
+#   none    = 下架（删掉 Focusmate 那条 task，本地断绑定）→ `task 8 -an`
+#   current = 当前这一场（进行中的优先，其次最近一场还没开始的）→ `task 8 -ac`
+# 两个都能写成 `-a none` / `-a current`，也各自有一个紧凑写法（见 SHORT_FLAGS）。
+TASK_SESSION_NONE = ("none", "off", "no", "-", "无", "空", "下架", "卸下")
+TASK_SESSION_CURRENT = ("current", "cur", "now", "当前", "现在", "这一场", "这节")
+
+# 紧凑短选项（repl_kit 的 short 表）：`-an` ≡ `-a none`、`-ac` ≡ `-a current`。
+# 定义成数据而不是散在解析里：补全要能补到它们，提示行也要能念出来。
+TASK_SHORT_FLAGS = (
+    repl_kit.ShortFlag("-an", ("--assign", "none"), note="从 session 下架"),
+    repl_kit.ShortFlag("-ac", ("--assign", "current"), note="挂到当前这一场"),
+)
+
 # ---------------------------------------------------------------- 配色
 # 终端背景**一定是深色**的（用户反馈："有些字根本看不见"）。所以这里只有三条规矩：
 #   1. 不用暗色系：dark_blue / blue 在深色背景上等于隐形。
@@ -684,6 +698,43 @@ def _hint_cancel(parts):
     return repl_kit.Hint("参数", ("<n>",), note="执行区要敲宣言")
 
 
+def _task_command(w):
+    """``task`` 那一条命令：动作、后缀、紧凑短选项、补全都写在一个地方。
+
+    紧凑短选项走 repl_kit 的 ``short`` 表（``-an`` ≡ ``-a none``）：解析、补全、
+    提示三件事都由框架统一办，这里只声明一次（:data:`TASK_SHORT_FLAGS`）。
+    """
+    return repl_kit.Command(
+        name="task",
+        handler=w.cmd_task,
+        summary="任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
+        aliases=(),
+        section="通用",
+        usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
+              " ... [-a <编号|none|current>] [-s <编号>] [-n 备注]",
+        options=("create", "import", "delete", "modify", "note", "assign", "select",
+                 "swap", "repeat", "sync", "archive", "inspect-due",
+                 "--assign", "-a", "--note", "-n", "--from", "-s", "--repeat"),
+        short=TASK_SHORT_FLAGS,
+        completer=lambda prior: task_completer(w, prior),
+        hint=_hint_task,
+    )
+
+
+def task_completer(w, prior):
+    """``task`` 的补全：``-a`` 后面给「编号 + none + current」，动作位置给动作词。
+
+    ``-a`` / ``-s`` 后面补的是**表格编号**（这才是它们要的东西），另加两个特殊
+    取值 —— 不给它们，``-an`` / ``-ac`` 就等于只存在于文档里。
+    """
+    words = [str(part).lower() for part in prior]
+    if words and words[-1] in ("--assign", "-a", "-an", "-ac"):
+        return [str(i) for i in range(1, len(w.rows) + 1)] + ["none", "current"]
+    if words and words[-1] in ("--from", "-s"):
+        return [str(i) for i in range(1, len(w.rows) + 1)]
+    return []
+
+
 def mute_window_for(day, hhmm):
     """``("11:15", 这一天)`` 落在哪条静音窗里 → 记录；不在就是 None。
 
@@ -748,12 +799,50 @@ def _hint_set(parts):
                          note="完整清单在「设置」视图；不写 value = 恢复默认")
 
 
+def _hint_refresh(parts):
+    if any(str(part).lower() in ("--check", "-c", "check") for part in parts):
+        return repl_kit.Hint("参数", ("（跑起来了）",),
+                             note="查「该订没订上」「该挂没挂上」，能修的当场修")
+    return repl_kit.Hint("选项", ("--check", "-c"),
+                         note="不光重拉：还叫 daemon 查一遍、把不对的修掉")
+
+
+TASK_ACTION_WORDS = ("create", "import", "delete", "modify", "note", "assign", "select",
+                     "swap", "repeat", "sync", "archive")
+
+
 def _hint_task(parts):
-    if not parts:
-        return repl_kit.Hint("动作", ("create", "import", "delete", "modify", "note",
-                                      "assign", "select", "repeat", "sync", "archive"),
-                             note="字段随便写，不校验 · 备注可以塞网址")
-    action = parts[0].lower() if len(parts) else ""
+    # repl_kit 递进来的是**整行**的词（含命令名，含正在敲的那半个词），
+    # 而这里只关心 `task` 后面的参数 —— 先把这个命令名摘掉。
+    words = [str(part).lower() for part in parts]
+    if words and words[0] == "task":
+        words = words[1:]
+    if not words:
+        return repl_kit.Hint("动作", TASK_ACTION_WORDS,
+                             note="后缀：-a <编号|none|current> · -s <编号> 批量 · -n 备注"
+                                  " · 字段随便写")
+    if any(tok in words for tok in ("-an", "-ac")):
+        return repl_kit.Hint("参数", ("（不用再跟东西）",),
+                             note="-an ≡ -a none（下架）· -ac ≡ -a current（当前这一场）")
+    if any(tok in words for tok in ("-s", "--from")):
+        return repl_kit.Hint("参数", ("-a <编号>", "-a none"),
+                             note="把这一场上的全部任务转移到那一场 / 全部下架；"
+                                  "没有 -a 就只列出来")
+    if any(tok in words for tok in ("--assign", "-a")):
+        return repl_kit.Hint(
+            "取值", ("<编号>", "none", "current"),
+            note="none = 下架（删掉 Focusmate 那条 task）；current = 当前这一场；"
+                 "紧凑写法 " + repl_kit.flags.describe(TASK_SHORT_FLAGS, with_words=False))
+    # `task 32 swap 21`：动作写在 ID 后面。提示行拿到的是「已经敲完的词」，
+    # 所以 `task 32 ` 这时候 parts 只有 ["32"] —— 提示该给「这个 ID 能干什么」。
+    head = list(words)
+    if head and head[0].isdigit():
+        if len(head) == 1:
+            return repl_kit.Hint("动作", ("swap", "duplicate", "drop", "done", "link", "-a <编号>"),
+                                 note="swap 21 = 和 21 换位置 · -a none 下架 · "
+                                      "-a current 挂到当前这一场")
+        head = head[1:]
+    action = head[0] if head else ""
     if action in ("import", "粘贴", "导入"):
         return repl_kit.Hint("参数", ("（不写）", "[标题](omnifocus:///task/PK)", "-a 3"),
                              note="不写参数 = 读剪贴板（⌘V 到终端只剩标题，这条不会丢链接）")
@@ -774,14 +863,17 @@ def _hint_task(parts):
                              note="备注会跟着完成归档一起显示（网址可点）")
     if action in ("delete", "select"):
         return repl_kit.Hint("参数", ("<任务 ID>",))
+    if action in ("swap", "调换", "换位"):
+        return repl_kit.Hint("参数", ("<任务 ID>", "<任务 ID>"),
+                             note="两条任务互换位置（一条赋闲也行）：task 32 swap 21")
     if action == "modify":
         return repl_kit.Hint("参数", ("<任务 ID>", "<字段>", "<新值>"), note="字段不校验")
     if action == "assign":
         return repl_kit.Hint("参数", ("<session ID>",),
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
-    return repl_kit.Hint("参数", ("create", "import", "delete", "modify", "note",
-                                  "assign", "select", "repeat", "sync", "archive"),
-                         note="任何动作都能带 --assign N / --note 备注")
+    return repl_kit.Hint("参数", TASK_ACTION_WORDS,
+                         note="任何动作都能带 -a <编号|none|current> / -n 备注；"
+                              "-s <编号> 是批量（那一场的全部任务）")
 
 
 class View(object):
@@ -853,12 +945,7 @@ class View(object):
                  ("warnings",), "通用", usage="warn [on|off]",
                  options=("on", "off"),
                  hint=_hint_actions("on", "off", note="不写就是取反")),
-            _cmd("task", w.cmd_task,
-                 "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
-                 usage="task <create|import|delete|modify|note|assign|select|repeat|sync|archive> ... [--assign N]",
-                 options=("create", "import", "delete", "modify", "note", "assign", "select",
-                          "repeat", "sync", "archive", "--assign", "--note", "--repeat"),
-                 hint=_hint_task),
+            _task_command(w),
         ]
 
     def build_registry(self):
@@ -940,10 +1027,11 @@ class ContractView(View):
     def commands(self):
         w = self.w
         return [
-            _cmd("refresh", lambda a: w.refresh(),
-                 "重新拉选中那天的 session（会重编号）", ("r", "reload"),
-                 usage="refresh",
-                 hint=_hint_actions("refresh", note="重拉选中那天的 session（会重编号）")),
+            _cmd("refresh", w.cmd_refresh,
+                 "重新拉选中那天的 session；--check 顺手让 daemon 对账并修正", ("r", "reload"),
+                 usage="refresh [--check]",
+                 options=("--check", "-c"),
+                 hint=_hint_refresh),
             _cmd("day", w.cmd_day, "切换看哪一天（-1/0/1 或 YYYY-MM-DD）",
                  usage="day <-1|0|1|YYYY-MM-DD>",
                  options=("-1", "0", "1"),
@@ -1283,12 +1371,22 @@ class TaskView(View):
         task select <id>
         task <id>                           # ↑ 同义：裸 ID 就是 select
         task <id> -a <session ID>           # 选中 + 挂上去（最省事）
+        task <id> -an                       # 从它那一场下架（≡ -a none）
+        task <id> -ac                       # 挂到当前这一场（≡ -a current）
+        task 32 swap 21                     # 两条任务互换位置（赋闲 ↔ 有场）
+        task -s 5 -a 6                      # 把 #5 上的全部任务转移到 #6
+        task -s 5 -a none                   # 把 #5 上的全部任务下架
         task repeat <id> <周几@HH:MM|off>   # 每周重复（只影响那一天的那一场）
         task sync                           # GET /v1/tasks → 把 completedAt 归档
         task archive [N]                    # 看归档（data/task-archive.json）
 
     任何子命令都能带 ``--assign N``（表格里的 session ID）：命令跑完顺手挂上去，
     例如 ``task create title=写论文 --assign 3``、``task 8 -a 1``。
+    ``-a`` 还有两个特殊取值：``none``（下架：删掉 Focusmate 那条 task，本地断绑定）
+    和 ``current``（当前这一场，进行中的优先）；紧凑写法 ``-an`` / ``-ac`` 由
+    repl_kit 的短选项表统一展开，补全和提示都跟着走。
+    ``-s/--from N`` 是批量：那一场上的**全部**任务一起办事，和 ``-a`` 搭配就是
+    「全量转移」，``-a none`` 就是「全量下架」。
 
     任务字段不校验：想记 due / priority / notes / 任何 key 都行。
     备注（``task note`` / ``note=`` / ``备注=``，统一存成 ``notes``）会跟着完成归档
@@ -1303,9 +1401,10 @@ class TaskView(View):
 
     def idle_hint(self):
         return repl_kit.Hint(
-            "命令", ("task create", "task 8 -a 1", "task duplicate", "inspect-due",
-                     "task sync", "review"),
-            note="字段不校验 · task 8 ≡ task select 8 · Tab 切视图",
+            "命令", ("task create", "task 8 -a 1", "task 8 -an", "task 8 -ac",
+                     "task 32 swap 21", "task -s 5 -a 6", "inspect-due", "review"),
+            note="字段不校验 · task 8 ≡ task select 8 · -an 下架 / -ac 当前这一场"
+                 " · Tab 切视图",
         )
 
     def status_line(self):
@@ -1313,8 +1412,9 @@ class TaskView(View):
 
     def unknown_hint(self):
         return ("「任务」视图认 task create/delete/modify/assign/select/duplicate/"
-                "drop/done/link/import/sync、review、inspect-due"
-                "（也可以直接写任务 ID，如 task 8 -a 1）；"
+                "drop/done/link/import/sync/swap、review、inspect-due"
+                "（也可以直接写任务 ID，如 task 8 -a 1 / task 8 -an / "
+                "task 32 swap 21 / task -s 5 -a 6）；"
                 "Shift+Tab 切回去再干别的。")
 
     def commands(self):
@@ -1951,7 +2051,7 @@ class Warden(object):
             cols = width if isinstance(width, int) and width >= 24 else 80
         return cols
 
-    def task_panel_tasks(self):
+    def task_panel_tasks(self, day=None):
         """这一天任务面板里该出现哪些任务 —— 用户定的两条规矩。
 
         * **今天（以及以后）**：所有没做完的 + 今天被处理过的。
@@ -1961,7 +2061,7 @@ class Warden(object):
         都算一笔，痕迹记在 ``task["history"]``（``TaskStore.mark_processed``）。
         跳过也要记：那一天你问过它、你说先放着 —— 这是那一天发生过的事。
         """
-        day = self.sel_date
+        day = day or self.sel_date
         is_today_or_later = day >= datetime.date.today()
         open_tasks = []
         touched = []
@@ -1974,6 +2074,64 @@ class Warden(object):
             elif records:
                 touched.append(task)
         return open_tasks + touched
+
+    def task_panel_groups(self, day=None):
+        """任务面板的**分组 + 排序** → ``[(组名, [任务…]), …]``。
+
+        需求：「每次 refresh 之后重排序，不然看着一大堆 32、15 的 task 混杂」+
+        「同类任务放一起，未挂 session 的 group 放最前面」。
+
+        分组口径只有一个 —— **位置**（也就是那一场 session）：
+          * ``未挂 session``            ← 永远排第一组（还没安排的活先看见）
+          * ``11:00–11:50 · 50min``     ← 每场 session 一组，按开始时间先后
+        组内按任务 ID 升序：同一个位置上的几条任务彼此是「一起干」的，编号顺序
+        最好认（也最稳定 —— 不会因为一次 refresh 就换位置）。
+        已收工（✓/✗）的任务回它自己那一组，不单独成组：那场干成了什么，就在那场里看。
+        """
+        day = day or self.sel_date
+        tasks = self.task_panel_tasks(day)
+        idle = []
+        buckets = {}
+        order = []
+        for task in tasks:
+            sess = task.get("session") or {}
+            if not sess:
+                idle.append(task)
+                continue
+            key = (sess.get("date") or "", sess.get("start") or "")
+            if key not in buckets:
+                buckets[key] = []
+                order.append(key)
+            buckets[key].append(task)
+        groups = []
+        if idle:
+            groups.append(("未挂 session", sorted(idle, key=lambda t: t.get("id") or 0)))
+        for key in sorted(order):
+            groups.append((self._session_group_label(key, day),
+                           sorted(buckets[key], key=lambda t: t.get("id") or 0)))
+        return groups
+
+    def _session_group_label(self, key, day=None):
+        """``("2026-08-15", "11:00")`` → ``11:00–11:50 · 50min``（别的日期带上日期）。
+
+        终点/时长去表格行里找同一场（表格行的 endLabel/durationMin 是权威的）；
+        找不到就只报开始时间 —— 不猜。
+        """
+        iso, start = key
+        for row in self.rows:
+            if (row.get("date") or "") == iso and row.get("startLabel") == start:
+                end = row.get("endLabel")
+                dur = row.get("durationMin")
+                label = "%s–%s" % (start, end) if end else start
+                if dur:
+                    label += " · %dmin" % dur
+                break
+        else:
+            label = start
+        today = (day or self.sel_date).isoformat()
+        if iso and iso != today:
+            label = "%s %s" % (iso, label)
+        return label
 
     def task_index_title(self, task):
         """任务面板里那一格的字：记号 + （🔁）+ 裁过的标题。"""
@@ -2005,31 +2163,20 @@ class Warden(object):
         return cols, rows
 
     def render_task_index(self):
-        """契约视图里那块「任务面板」：编号+任务 并排，列数看屏幕宽度。
+        """契约视图里那块「任务面板」：**按位置分组**，组内编号+任务并排。
 
-        内容按天决定（见 :meth:`task_panel_tasks`）：今天 = 没做完的 + 今天处理过的，
-        过去那天 = 只有那天处理过的。配色见文件头那段「配色」。
+        内容按天决定（见 :meth:`task_panel_tasks`），顺序按位置（见
+        :meth:`task_panel_groups`）：未挂 session 的一组在最前，其余每场 session
+        一组，按时间先后。每组自己摊列（屏幕够宽就 3/4 列）—— 组小的时候不至于
+        为了对齐别人的宽度而空出一大片。
+        配色见文件头那段「配色」。
         """
-        tasks = self.task_panel_tasks()
-        if not tasks:
+        groups = self.task_panel_groups()
+        if not groups:
             return None
-        cols, rows = self.task_index_layout(tasks)
-        columns = [tasks[i * rows:(i + 1) * rows] for i in range(cols)]
-        t = Table(title="Task · 任务（· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走；"
-                        "[bright_red]红[/] = 已挂 session）",
-                  box=box.SIMPLE_HEAVY, header_style="bold magenta",
-                  title_justify="left", expand=False)
-        for _ in range(cols):
-            t.add_column("number", justify="left", no_wrap=True)
-            t.add_column("task", no_wrap=True, overflow="crop")
-        selected = self.selected_task_id
-        for i in range(rows):
-            cells = []
-            for col in columns:
-                task = col[i] if i < len(col) else None
-                cells.extend(self._task_index_cells(task, selected))
-            t.add_row(*cells)
-        # 表尾一行账：这张面板里到底几条收工了 —— 光看记号容易被标题淹掉。
+        tasks = [task for _label, group in groups for task in group]
+        out = []
+        # 表头一行：图例 + 总账。分组之后每组一个标题，图例就只写一次。
         counts = {ts.STATUS_ACTIVE: 0, ts.STATUS_COMPLETED: 0, ts.STATUS_DROPPED: 0}
         for task in tasks:
             counts[ts.TaskStore.status_of(task)] = counts.get(
@@ -2037,11 +2184,37 @@ class Warden(object):
         scope = ("今天 = 没做完的 + 今天处理过的"
                  if self.sel_date >= datetime.date.today()
                  else "%s = 那天处理过的（过去就固化）" % self.sel_date.isoformat())
-        t.caption = ("%d 条：%d 进行中 · %d 完成 · %d 放弃 "
-                     "（收工的不删，只打记号 · %s）"
-                     % (len(tasks), counts[ts.STATUS_ACTIVE],
-                        counts[ts.STATUS_COMPLETED], counts[ts.STATUS_DROPPED], scope))
-        return t
+        legend = Text()
+        legend.append("Task · 任务 ", style="bold magenta")
+        legend.append("· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走   红", style="dim")
+        legend.append(" = 已挂 session", style="dim")
+        out.append(legend)
+        # 账目单独一行：图例 + 账目挤一行会在窄一点的终端上折成两截，很难看。
+        out.append(Text(
+            "%d 条：%d 进行中 · %d 完成 · %d 放弃（收工的不删，只打记号 · %s）"
+            % (len(tasks), counts[ts.STATUS_ACTIVE],
+               counts[ts.STATUS_COMPLETED], counts[ts.STATUS_DROPPED], scope),
+            style="dim"))
+        selected = self.selected_task_id
+        for label, group in groups:
+            cols, rows = self.task_index_layout(group)
+            columns = [group[i * rows:(i + 1) * rows] for i in range(cols)]
+            t = Table(box=None, show_header=False, padding=(0, 2), expand=False)
+            for _ in range(cols):
+                t.add_column("number", justify="left", no_wrap=True)
+                t.add_column("task", no_wrap=True, overflow="crop")
+            for i in range(rows):
+                cells = []
+                for col in columns:
+                    task = col[i] if i < len(col) else None
+                    cells.extend(self._task_index_cells(task, selected))
+                t.add_row(*cells)
+            # 组名单独占一行（不塞进 table.title）：rich 的 title 会被表格宽度
+            # 折行，窄组就变成「未挂 session · 」换行「2」，看着像坏了。
+            style = STYLE_MUTED if label == "未挂 session" else "magenta"
+            out.append(Text("  %s · %d" % (label, len(group)), style=style))
+            out.append(t)
+        return Group(*out) if len(out) > 1 else out[0]
 
     def _task_index_cells(self, task, selected):
         """一行里的一对（编号, 标题）。没任务时给两个空格占位。"""
@@ -3273,15 +3446,26 @@ class Warden(object):
         裸任务 ID 就是 select（``task 8`` ≡ ``task select 8``），所以最短的挂法是
         ``task 8 -a 1``。
 
-        任何子命令后面都可以跟两个后缀（都能组合）：
+        任何子命令后面都可以跟三个后缀（都能组合）：
           ``--assign <session ID>``（``-a`` 同义）= 顺手挂到那一场
           ``--note <备注>``（``-n`` 同义）= 顺手写备注（可以塞网址）
+          ``--from <session ID>``（``-s`` 同义）= 批量：那一场上的**全部**任务
+
+        ``-a`` 有两个特殊取值，替代「表格编号」：
+          ``none``    = 下架（删掉 Focusmate 那条 task，本地断绑定）→ ``task 8 -an``
+          ``current`` = 当前这一场（进行中的优先，其次最近那一场）→ ``task 8 -ac``
 
             task 8 -a 1
             task create title=写论文 --assign 3
             task create title=写论文 -n "材料在这 https://example.com/x" --assign 3
             task modify 1 due 后天 --note=下午再弄
             task select 1 -n "https://notion.so/xxx"
+            task 8 -an                  ← 从它那一场下架（≡ task 8 -a none）
+            task 8 -ac                  ← 挂到当前这一场（≡ task 8 -a current）
+            task 32 swap 21             ← 两条任务互换位置
+            task -s 5 -a 6              ← 把 #5 上的全部任务转移到 #6
+            task -s 5 -a none           ← 把 #5 上的全部任务下架
+            task -s 5                   ← 只列 #5 上现在挂着谁
 
         「挂」永远是同一套：先在 Focusmate 建 task 并复核，成功后才落本地
         （见 :meth:`cmd_task_assign`），所以 ``--assign`` 不会产生假成功的半截状态。
@@ -3296,7 +3480,14 @@ class Warden(object):
         # 所以 ``-a`` 永远只表示 ``--assign``（分流），不兼职别的意思 ——
         # 同一个字母两副面孔，是这个入口最容易踩的坑。
         assign_to, kept = self._split_assign(toks)
+        source, kept = self._split_source(kept)
         note_text, kept = self._split_note(kept)
+        if source is not None:
+            # `-s` 本身就是动作（批量），后面不该再有子命令：``task -s 5 -a 6``。
+            if kept:
+                raise ValueError("`-s/--from` 是批量后缀，后面不要再跟动作（%s）；"
+                                 "写成 `task -s 5 -a 6` 这样。" % kept[0])
+            return self._apply_bulk(source, assign_to)
         if not kept:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）")
         action = kept[0].lower()
@@ -3330,6 +3521,37 @@ class Warden(object):
             kept.append(tok)
             i += 1
         return assign_to, kept
+
+    @staticmethod
+    def _split_source(toks):
+        """把 ``--from N`` / ``--from=N`` / ``-s N`` 从参数里摘出来（批量后缀）。
+
+        ``-s`` 说的是**源 session**：它上面挂着的全部任务一起办事。和 ``-a``
+        一起用就是「把这一场上的任务搬到那一场」：
+
+            task -s 5 -a 6      把 #5 的全部任务转到 #6
+            task -s 5 -a none   把 #5 的全部任务下架
+            task -s 5           只列 #5 上现在挂着谁（什么都不动）
+        """
+        source = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            low = str(tok).lower()
+            if low in ("--from", "-s"):
+                if i + 1 >= len(toks):
+                    raise ValueError("--from 后面要跟表格里的 session ID（例如 -s 5）")
+                source = toks[i + 1]
+                i += 2
+                continue
+            if low.startswith("--from="):
+                source = tok.split("=", 1)[1]
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return source, kept
 
     @staticmethod
     def _split_note(toks):
@@ -3425,6 +3647,8 @@ class Warden(object):
                 return self.cmd_task_done([action] + rest[1:])
             if verb in ("link", "关联"):
                 return self.cmd_task_link([action] + rest[1:])
+            if verb in ("swap", "调换", "换位"):
+                return self.cmd_task_swap([action] + rest[1:])
         if action == "duplicate" or action in ("dup", "copy", "复制"):
             return self.cmd_task_duplicate(rest)
         if action == "import" or action in ("粘贴", "导入"):
@@ -3437,6 +3661,8 @@ class Warden(object):
             return self.cmd_task_done(rest)
         if action in ("link", "关联"):
             return self.cmd_task_link(rest)
+        if action in ("swap", "调换", "换位"):
+            return self.cmd_task_swap(rest)
         if action == "delete":
             return self.cmd_task_delete(rest)
         if action == "modify":
@@ -3871,21 +4097,245 @@ class Warden(object):
                 out.append(item)
         return out
 
-    def cmd_task_assign(self, args):
+    # -- 位置：挂上 / 下架 / 调换 / 全量转移 ---------------------------
+
+    @staticmethod
+    def _session_kind(token):
+        """``-a`` 的取值是不是特殊词：``"none"`` / ``"current"`` / ``""``。"""
+        low = str(token or "").strip().lower()
+        if low in TASK_SESSION_NONE:
+            return "none"
+        if low in TASK_SESSION_CURRENT:
+            return "current"
+        return ""
+
+    def current_session(self):
+        """「当前这一场」→ ``(表格编号, 行)``：进行中的优先，其次最近一场还没开始的。
+
+        需求（``task 8 -ac``）：正在干的那一场就是「当前」；一场都不在进行时，
+        取**最近一场还没开始**的（下一场马上就来，先挂上去就是为了别手忙脚乱）。
+        已经全结束、或者这一天一行都没有 —— 明说，不猜。
+        """
+        now_ms = int(time.time() * 1000)
+        live = [r for r in self.rows
+                if r.get("startMs") is not None
+                and r["startMs"] <= now_ms < (r.get("endMs") or 0)]
+        if not live:
+            upcoming = [r for r in self.rows if (r.get("startMs") or 0) > now_ms]
+            live = upcoming[:1]
+        if not live:
+            raise ValueError("现在没有正在进行的 session，也没有还没开始的一场"
+                             "（%s 只有 %d 行）；用表格编号挂吧。"
+                             % (self.sel_date.isoformat(), len(self.rows)))
+        row = live[0]
+        return self.rows.index(row) + 1, row
+
+    def _resolve_assign_target(self, token):
+        """``-a`` 的取值 → ``(编号, 行)``；``none`` 返回 ``(None, None)``（下架）。"""
+        kind = self._session_kind(token)
+        if kind == "none":
+            return None, None
+        if kind == "current":
+            return self.current_session()
+        return self.pick(token)
+
+    def _row_for_session(self, session):
+        """``task["session"]`` 那条记录 → 当前表格里的行（不在这一天就 None）。"""
+        want = ((session or {}).get("date"), (session or {}).get("start"))
+        for i, row in enumerate(self.rows, 1):
+            if (row.get("date"), row.get("startLabel")) == want:
+                return i, row
+        return None, None
+
+    def _task_detach(self, task, reason="cmd-down"):
+        """把任务从它那一场**下架**：先删 Focusmate 那条 task，再断本地绑定。
+
+        需求（``task 8 -an``）：「手动把它下下来」。顺序不能反 —— 本地先断了、
+        Focusmate 那边删失败的话，那条 task 就成了没人认领的孤儿（第二天对账
+        还以为它在等你）。所以先删、删成功（或明确报了删不掉）再断本地。
+        """
+        sess = task.get("session") or {}
+        fm = task.get("focusmate") or {}
+        if not sess and not (fm.get("task_id") or fm.get("id")):
+            self.say("任务 %d 本来就没挂 session（也没 Focusmate task），不用下架。"
+                     % task["id"], "info")
+            return task
+        note = self.fm_delete_task(task)
+        task = self.task_store.unassign(task["id"], reason=reason)
+        self.say("⏏ 任务 %d「%s」已从 %s %s 下架%s"
+                 % (task["id"], self.task_store.focusmate_title(task, 40),
+                    sess.get("date") or "（没有日期）", sess.get("start") or "",
+                    "；%s" % note if note else ""), "ok")
+        return task
+
+    def cmd_task_swap(self, args):
+        """``task <id> swap <id>`` —— 两条任务**互换位置**（位置 = 那一场 session）。
+
+        需求里的例子：一条挂在 session 1、一条赋闲 → ``task 32 swap 21`` 之后，
+        赋闲那条进 session 1，原来那条下来赋闲。两条各在一场时就是场次对调。
+
+        Focusmate 没有「把 task 挪到另一场」这个动作（只能建一条新的），所以做法是：
+        两边各自**先下架**（删掉旧场次上那条 task），再挂到对方原来的位置。
+        先下架再加挂，顺序反了会在「加挂失败」时留下两条都挂在同一场。
+
+            task 32 swap 21     ← 动作写在 ID 后面（需求里的顺序）
+            task swap 32 21     ← 一样的
+        """
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        if len(toks) < 2:
+            raise ValueError("用法：task <任务 ID> swap <任务 ID>")
+        a = self.task_store.get(toks[0])
+        b = self.task_store.get(toks[1])
+        if a["id"] == b["id"]:
+            raise ValueError("swap 要给两条不同的任务（都写成了 %d）" % a["id"])
+        sa = a.get("session") or {}
+        sb = b.get("session") or {}
+        same = (sa and sb and (sa.get("date"), sa.get("start"))
+                == (sb.get("date"), sb.get("start")))
+        if not sa and not sb:
+            self.say("任务 %d 和 %d 都还赋闲（没挂 session）—— 没有位置可换。"
+                     % (a["id"], b["id"]), "warn")
+            return [a["id"], b["id"]]
+        if same:
+            self.say("任务 %d 和 %d 都在 %s %s，位置本来就一样，不用换。"
+                     % (a["id"], b["id"], sa.get("date") or "?", sa.get("start") or "?"),
+                     "info")
+            return [a["id"], b["id"]]
+
+        def where(sess):
+            return ("%s %s" % (sess.get("date") or "?", sess.get("start") or "?")
+                    if sess else "赋闲")
+
+        self.say("互换位置：任务 %d（%s）↔ 任务 %d（%s）"
+                 % (a["id"], where(sa), b["id"], where(sb)), "cmd")
+        # 1) 两边都先下架：旧场次上那条 Focusmate task 一起删掉，账才干净
+        if sa:
+            self._task_detach(a, reason="swap")
+        if sb:
+            self._task_detach(b, reason="swap")
+        # 2) 再各自挂到**对方原来的位置**（对方赋闲的那条就留在这里不动）
+        done = []
+        for task, sess in ((b, sa), (a, sb)):
+            if not sess:
+                continue
+            idx, row = self._row_for_session(sess)
+            if row is None:
+                self.say("⚠ 任务 %d 原来的位置 %s 不在当前表格里（那天没在显示），"
+                         "所以它现在是赋闲的 —— 切到那天再 `task %d -a <编号>`。"
+                         % (task["id"], where(sess), task["id"]), "warn")
+                continue
+            try:
+                self.cmd_task_assign([str(task["id"]), str(idx)], refresh=False)
+                done.append(task["id"])
+            except Exception as e:                      # noqa: BLE001 - 一条失败不挡另一条
+                self.had_error = True
+                self.say("❌ 任务 %d 没能挂回 %s：%s" % (task["id"], where(sess), e), "error")
+        self.rebuild_rows()
+        idle_now = [t for t, sess in ((a, sb), (b, sa)) if not sess]
+        if done:
+            moved_txt = "、".join("任务 %d → %s" % (tid, where(sa if tid == b["id"] else sb))
+                                  for tid in done)
+            idle_txt = ("；赋闲的：" + "、".join("任务 %d" % t["id"] for t in idle_now)
+                        if idle_now else "")
+            self.say("✅ 位置已互换：%s%s" % (moved_txt, idle_txt), "ok")
+        return [a["id"], b["id"]]
+
+    def _apply_bulk(self, source_token, assign_to):
+        """``task -s <源> [-a <目标>]`` —— 对一场 session 上的**全部**任务办事。
+
+        需求（第 4 条）：``task -s 5 -a 6`` = 把 session 5 的全部任务转移到 6。
+        没有 ``-a`` 就只列一下现在挂着谁（只看不动，手滑不会掉东西）。
+
+        每个任务走的是和单条完全一样的路：先下架（删 Focusmate 旧 task）再挂到
+        目标场次 —— 所以「转移」之后旧场次上不会留下一条永远不会完成的幽灵 task。
+        一条失败不挡其余的，最后报总账。
+        """
+        src_idx, src_row = self.pick(source_token)
+        src_day = src_row.get("date") or self.sel_date.isoformat()
+        src_start = src_row.get("startLabel")
+        tasks = self.task_store.tasks_for_session(src_day, src_start)
+        where = "%s %s" % (src_day, src_start)
+        if not tasks:
+            self.say("session #%d（%s）上没有挂任务，没什么可办的。" % (src_idx, where), "info")
+            return False
+        if assign_to is None:
+            self.say("session #%d（%s）上挂着 %d 条（没给 -a，只看不动）："
+                     % (src_idx, where, len(tasks)), "info")
+            for task in tasks:
+                self.say("   %d %s%s"
+                         % (task["id"], self.task_store.focusmate_title(task, 40),
+                            "" if self.task_store.is_open(task) else "（已收工）"))
+            self.say("   全量转移用 `task -s %d -a <目标编号>`；全部下架用 "
+                     "`task -s %d -a none`。" % (src_idx, src_idx), "info")
+            return True
+
+        kind = self._session_kind(assign_to)
+        tgt_idx, tgt_row = self._resolve_assign_target(assign_to)
+        if tgt_row is not None and ((tgt_row.get("date") or self.sel_date.isoformat(),
+                                     tgt_row.get("startLabel")) == (src_day, src_start)):
+            self.say("源和目标都是 session #%d（%s），什么也没动。" % (src_idx, where), "info")
+            return False
+        target_where = "「下架」" if kind == "none" else "%s %s" % (
+            tgt_row.get("date") or self.sel_date.isoformat(), tgt_row.get("startLabel"))
+        self.say("批量：session #%d（%s）的 %d 条任务 → %s"
+                 % (src_idx, where, len(tasks), target_where), "cmd")
+
+        moved, failed = [], []
+        for task in tasks:
+            try:
+                self._task_detach(task, reason="bulk-move")
+                if kind == "none":
+                    moved.append(task["id"])
+                    continue
+                self.cmd_task_assign([str(task["id"]), str(tgt_idx)], refresh=False)
+                moved.append(task["id"])
+            except Exception as e:                      # noqa: BLE001 - 一条失败不挡其余
+                self.had_error = True
+                failed.append((task["id"], e))
+                self.say("❌ 任务 %d 转移失败：%s" % (task["id"], e), "error")
+        self.rebuild_rows()
+        if not self.offline:
+            try:
+                self.refresh(quiet=True)
+            except Exception:                          # noqa: BLE001 - 刷新失败不影响已做的
+                pass
+        self.say("✅ 批量完成：%d 条 → %s%s"
+                 % (len(moved), target_where,
+                    ("；%d 条没成（见上面）" % len(failed)) if failed else ""),
+                 "ok" if not failed else "warn")
+        return not failed
+
+    def cmd_task_assign(self, args, refresh=True):
         """task assign <session ID>（默认当前任务）或 task assign <任务ID> <session ID>。
+
+        ``session ID`` 还可以是 ``none``（下架）或 ``current``（当前这一场）：
+
+            task assign none            ← 把选中的任务从它那一场下架
+            task 8 assign current       ← 把任务 8 挂到当前这一场
+            task 8 -an / task 8 -ac     ← 上面两条的紧凑写法
 
         写入顺序：先在 Focusmate 给那一场建 task 并复核，成功后才落本地；
         失败不产生半截 assignment。
         """
         if not args:
-            raise ValueError("用法：task assign <session ID>（先 task select/create）")
+            raise ValueError("用法：task assign <session ID|none|current>（先 task select/create）")
         if len(args) >= 2:
             task = self.task_store.get(args[0])
             session_token = args[1]
         else:
             task = self._task_for_assign()
             session_token = args[0]
-        session_idx, row = self.pick(session_token)
+        session_idx, row = self._resolve_assign_target(session_token)
+        if self._session_kind(session_token) == "current" and row is not None:
+            self.say("「当前这一场」= 表格 #%d（%s %s %s）"
+                     % (session_idx, row.get("date") or self.sel_date.isoformat(),
+                        row.get("startLabel"), row.get("phase") or ""), "info")
+        if row is None:
+            # `-a none`：下架。它不是一个「场次」，所以不走下面那套建 task 的流程。
+            self.selected_task_id = task["id"]
+            task = self._task_detach(task, reason="cmd-assign-none")
+            self.rebuild_rows()
+            return task
         if row.get("id") is None:
             raise ValueError("session #%d 还没有 Focusmate session id（没订上/快照），"
                              "不能挂 task。先 refresh 成功一次。" % session_idx)
@@ -3937,7 +4387,7 @@ class Warden(object):
         # 表格里那一行的 task 列是 rebuild_rows 时算出来的：不重排就还是旧的
         # （用户看到的正是「assign 成功但 task 列空着」）。先本地重排，再尽量刷新。
         self.rebuild_rows()
-        if not self.offline:
+        if refresh and not self.offline:
             try:
                 self.refresh(quiet=True)
             except Exception:                       # noqa: BLE001 - 刷新失败不影响已完成的挂载
@@ -5382,6 +5832,156 @@ class Warden(object):
         self.refresh()
         return True
 
+    def cmd_refresh(self, args):
+        """``refresh [--check|-c]`` —— 重拉选中那天的 session；带 ``--check`` 就顺手对账。
+
+        ``--check`` 做的是**只读外面世界、再把不对的掰回来**（需求第 6 条）：
+
+        1. **该订没订上的 session**：执行区里契约有、API 没有的 → 让 daemon 补一轮
+           （``keep_session.py check``，仍走 daemon 自己的重试上限/退避，不越权）。
+        2. **该挂没挂上的 task**：本地记着「任务 8 挂在 11:00 那场」，但 Focusmate
+           的 ``GET /v1/tasks`` 里那条 task 没有指向那场的 attachment（手动删过、
+           或者上次只做了半截）→ 重新挂。
+        3. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
+
+        不带 ``--check`` 的 ``refresh`` 一点没变（只拉数，不碰任何东西）。
+        """
+        toks = [str(tok).lower() for tok in (args or [])]
+        want_check = any(tok in ("--check", "-c", "check", "查", "对账", "核对")
+                         for tok in toks)
+        if not want_check:
+            return self.refresh()
+        pulled = self.refresh()
+        checked = self.check_and_fix()
+        return checked and pulled is not False
+
+    def check_and_fix(self):
+        """把「该订没订上 / 该挂没挂上」都查一遍并修掉（``refresh --check`` 的实作）。"""
+        if self.offline:
+            self.say("refresh --check：离线模式下没有外部世界可查，只重画了表格。", "warn")
+            return False
+        self.say("refresh --check：对账 —— 该订的 session、该挂的 task…", "cmd")
+        fixed = 0
+        fixed += self.check_bookings()
+        fixed += self.check_task_attachments()
+        # 修完再拉一次：表格要显示的是**修完**的样子，不是修之前的
+        if fixed:
+            try:
+                self.refresh(quiet=True)
+            except Exception:                       # noqa: BLE001 - 拉不到就算了
+                pass
+        if fixed:
+            self.say("✅ 对账完成：处理了 %d 处（详细见上面几条）。" % fixed, "ok")
+            # 说完「修了」还得看一眼**修完**还剩什么 —— 补订是 daemon 的事，
+            # 它这一轮可能没补上（上限/退避/还没到点），不能报喜不报忧。
+            still = [r for r in self.rows if r.get("planned") and r.get("id") is None
+                     and r.get("zone") == "execute"]
+            if still:
+                self.say("   还有 %d 场没订上：%s —— daemon 下一轮还会试（或 force-check）。"
+                         % (len(still), "、".join(str(r.get("startLabel")) for r in still[:5])),
+                         "warn")
+        else:
+            self.say("✅ 对账完成：没有发现要修的（session 都订上了、任务都挂对了）。", "ok")
+        return True
+
+    def check_bookings(self):
+        """该订没订上的 session → 让 daemon 补一轮。返回修了几场。"""
+        missing = [r for r in self.rows
+                   if r.get("planned") and r.get("id") is None
+                   and r.get("zone") == "execute"]
+        if not missing:
+            return 0
+        names = "、".join("#%d(%s)" % (self.rows.index(r) + 1, r.get("startLabel"))
+                         for r in missing[:5])
+        self.say("⚠ %d 场该订却没订上：%s —— 叫 daemon 补一轮（check）…"
+                 % (len(missing), names), "warn")
+        self._release_browser("daemon 下单要独占同一个 Chromium profile")
+        rc, out, err = run_keep_session("check", timeout=600)
+        for line in (out or "").splitlines()[-20:]:
+            self.say(line)
+        if rc != 0:
+            self.had_error = True
+            self.say("❌ check 退出码 %d%s（计划照旧留着，daemon 下一轮还会补）"
+                     % (rc, ("：" + err) if err else ""), "error")
+            return 0
+        return len(missing)
+
+    def check_task_attachments(self):
+        """任务真的挂在那场 session 上了吗？挂漏/挂错的重新挂一遍。返回修了几条。
+
+        判据只有一条，而且来自 Focusmate 自己：``GET /v1/tasks`` 里那条 task 的
+        ``attachments`` 里有没有这一场的 session id。本地账本说「挂了」不算数 ——
+        手动在 Task Manager 删过、或上次调 API 只做了半截，账本都会照旧留着。
+        """
+        remote = self._remote_tasks()
+        if remote is None:
+            self.say("⚠ 拉不到 GET /v1/tasks（bridge 不在？），任务挂载这一项跳过。", "warn")
+            return 0
+        day = self.sel_date.isoformat()
+        bad = []
+        for task in self.task_store.list():
+            sess = task.get("session") or {}
+            if (sess.get("date") or "") != day:
+                continue
+            if not self.task_store.is_open(task):
+                continue
+            verdict = self._attachment_verdict(task, remote)
+            if verdict:
+                bad.append((task, verdict))
+        if not bad:
+            return 0
+        fixed = 0
+        for task, verdict in bad:
+            sess = task.get("session") or {}
+            self.say("⚠ 任务 %d「%s」%s（本地记着挂在 %s %s）—— 重挂…"
+                     % (task["id"], self.task_store.focusmate_title(task, 30), verdict,
+                        sess.get("date") or "?", sess.get("start") or "?"), "warn")
+            idx, row = self._row_for_session(sess)
+            if row is None or row.get("id") is None:
+                self.say("   那一场现在不在表格里（或还没订上），先 refresh --check 等它订上。",
+                         "warn")
+                continue
+            try:
+                self.cmd_task_assign([str(task["id"]), str(idx)], refresh=False)
+                fixed += 1
+            except Exception as e:                  # noqa: BLE001 - 一条失败不挡其余
+                self.had_error = True
+                self.say("   ❌ 重挂失败：%s" % e, "error")
+        self.rebuild_rows()
+        return fixed
+
+    @staticmethod
+    def _attachment_verdict(task, remote):
+        """本地说挂着、Focusmate 说不算 → 一句人话；没问题返回 ``""``。"""
+        sess = task.get("session") or {}
+        want = str(sess.get("focusmate_session_id") or "")
+        if not want:
+            # 那一场还没有 Focusmate session id（没订上/快照）—— 无从查起
+            return ""
+        fm = task.get("focusmate") or {}
+        tid = str(fm.get("task_id") or fm.get("id") or "")
+        if not tid:
+            return "没有 Focusmate task id"
+        row = remote.get(tid)
+        if row is None:
+            return "Focusmate 那边这条 task 已经不在了"
+        ids = [str(a.get("externalId") or a.get("id") or "")
+               for a in (row.get("attachments") or [])]
+        if want not in ids:
+            return "Focusmate 那条 task 没挂在这一场上"
+        return ""
+
+    def _remote_tasks(self):
+        """``GET /v1/tasks`` → ``{task_id: 行}``；拉不到返回 None（不是空 dict）。"""
+        try:
+            res = self.bridge.call("tasks", timeout=180)
+        except BridgeError as e:
+            self.say("拉 GET /v1/tasks 失败：%s" % e, "warn")
+            return None
+        rows = res.get("tasks") if isinstance(res, dict) else res
+        return {str(r.get("id")): r for r in (rows or [])
+                if isinstance(r, dict) and r.get("id") is not None}
+
     def rewrite_data_csv_from_plan(self):
         """下载层 + layout + 一次性 + 长期规则 → 重算 data.csv。
 
@@ -5721,7 +6321,10 @@ class Warden(object):
             self.say(self.view.unknown_hint(), "warn")
             return True
         try:
-            command.handler(parts[1:])
+            # 紧凑短选项（`-an` ≡ `-a none`）走 repl_kit 那一套展开：
+            # --exec / 测试用的 handle() 和交互式 dispatch 必须走同一条路，
+            # 否则「界面上能敲、脚本里不认」这种裂痕迟早会出现。
+            command.handler(command.expand(parts[1:]))
         except SystemExit:
             return False
         # 收尾在「延期」阶段会等你敲一条转移命令 —— 敲完得回头看一眼成没成

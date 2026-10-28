@@ -93,6 +93,12 @@ class FakeBridge(object):
         self.titles = {}
         # Focusmate 侧「已经完成」的 task：id → completedAt
         self.completed = {"ft-1": "2026-10-26T12:00:00Z"}
+        # Focusmate 侧「这条 task 挂在哪一场」：task id → meeting id
+        # （refresh --check 就是拿它跟本地账本对的，所以替身必须有这一份）
+        self.attached = {"ft-1": "sess-11:00"}
+        self.deleted = []
+        # snapshot 返回的场次（refresh 从这里拿「这一天到底有哪些 session」）
+        self.sessions = []
 
     def call(self, cmd, timeout=240, **kw):
         self.calls.append((cmd, kw))
@@ -100,16 +106,34 @@ class FakeBridge(object):
             self.fm_seq += 1
             tid = "ft-%d" % self.fm_seq
             self.titles[tid] = kw.get("title")
+            self.attached[tid] = kw.get("meetingId")
             return {"verified": True, "taskId": tid, "task": {"id": tid}, "via": "api"}
+        if cmd == "delete_task":
+            tid = str(kw.get("taskId") or "")
+            self.deleted.append(tid)
+            gone = self.attached.pop(tid, None) is not None
+            self.completed.pop(tid, None)
+            self.titles.pop(tid, None)
+            return {"verified": True, "taskId": tid, "deleted": {"id": tid} if gone else None}
         if cmd == "tasks":
-            return {"tasks": [{"id": k, "title": self.titles.get(k, "论文"),
-                               "completedAt": v}
-                              for k, v in self.completed.items()]}
+            rows = [{"id": k, "title": self.titles.get(k, "论文"),
+                     "completedAt": v,
+                     "attachments": ([{"type": "session", "externalId": self.attached[k]}]
+                                     if self.attached.get(k) else [])}
+                    for k, v in self.completed.items()]
+            # 挂上但还没完成的 task 也要出现在 GET /tasks 里
+            for tid, meeting in self.attached.items():
+                if tid not in self.completed:
+                    rows.append({"id": tid, "title": self.titles.get(tid, "论文"),
+                                 "completedAt": None,
+                                 "attachments": [{"type": "session", "externalId": meeting}]})
+            return {"tasks": rows}
         if cmd == "release":
             return {"released": True}
         if cmd == "snapshot":
-            return {"date": kw.get("date"), "now": int(datetime.datetime.now().timestamp() * 1000),
-                    "sessions": []}
+            return {"date": kw.get("date"),
+                    "now": int(datetime.datetime.now().timestamp() * 1000),
+                    "sessions": [dict(row) for row in self.sessions]}
         return {"verified": True}
 
     def browser_state(self):
@@ -300,14 +324,38 @@ check_true("两条任务用 | 分开且都带状态记号",
 check_true("标题长的那条被 trim 了（带 …）或本来就不长",
            "…" in row1100["task_text"] or len(row1100["task_text"]) < 40)
 
+def panel_tables(renderable):
+    """任务面板 → 里面那几张（分组的）表。
+
+    面板现在是「一行表头 + 每组一张小表」（需求：按位置分组、未挂 session 在最前），
+    所以断言要落到「组」这一层，而不是一张大表。
+    """
+    kids = getattr(renderable, "renderables", None) or [renderable]
+    return [r for r in kids if hasattr(r, "columns")]
+
+
+def panel_texts(renderable):
+    """面板里那些纯文本行（表头 + 每个组的组名）。"""
+    kids = getattr(renderable, "renderables", None) or [renderable]
+    return [str(k) for k in kids if not hasattr(k, "columns")]
+
+
+def panel_head(renderable):
+    """面板最上面那两行（图例 + 账目）。"""
+    return " ".join(panel_texts(renderable)[:2])
+
+
 contract = [v for v in w.VIEWS if v.key == "1"][0](wd)
 parts = contract.render()
 check("契约视图先给契约表格、再给任务面板（收尾面板在打断栏位里）", len(parts), 2)
-check("第二块是任务面板", "Task · 任务" in str(getattr(parts[1], "title", "")), True)
-_panel_cols = len(parts[1].columns) // 2
-check("表里是 number/task 一对一对的", len(parts[1].columns) % 2, 0)
-check("表头按对数重复",
-      [str(c.header) for c in parts[1].columns], ["number", "task"] * _panel_cols)
+check_true("第二块是任务面板", "Task · 任务" in panel_head(parts[1]))
+_panel_tables = panel_tables(parts[1])
+check_true("任务面板里至少有一张表（未挂 session 那一组）", len(_panel_tables) >= 1)
+check("每组表里是 number/task 一对一对的",
+      [len(t.columns) % 2 for t in _panel_tables], [0] * len(_panel_tables))
+check("表头按对数重复（每组都一样）",
+      sorted({tuple(str(c.header) for c in t.columns) for t in _panel_tables}),
+      sorted({tuple(["number", "task"] * (len(t.columns) // 2)) for t in _panel_tables}))
 
 print("== 任务面板：屏幕够宽就摊成 3 / 4 列（不再固定两列）==")
 # 列数只跟「终端有多宽」和「标题最长有多长」有关，所以把宽度显式喂进去。
@@ -336,9 +384,11 @@ for _t in (_many[:1],):
     pass
 wd.frame_width = lambda: 160
 _wide_cols = wd.task_index_layout(wd.task_panel_tasks() or _many, width=160)[0]
-wide_table = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+_wide_panel = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
 wd.frame_width = _real_width
-check("160 列 → 表里的 column 数 = 2 * 列数", len(wide_table.columns), 2 * _wide_cols)
+wide_table = panel_tables(_wide_panel)[0]
+check_true("160 列 → 组里的表至少摊成 2 列（每列 2 个 column）",
+           len(wide_table.columns) >= 2 and len(wide_table.columns) % 2 == 0)
 check("列数还是偶数（number/task 一对一对的）", len(wide_table.columns) % 2, 0)
 
 # 染色：已挂到 session 的 = 红，没挂的 = 深蓝
@@ -365,12 +415,12 @@ check("完成的染绿", str(num_d.style), "green")
 check("进行中的打 ·", str(title_f).startswith("·"), True)
 check("task_mark：进行中 = ·", wd.task_mark(task_free), "·")
 check("task_mark：完成 = ✓", wd.task_mark(done_task), "✓")
-index_table = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
-check_true("任务表格标题里写了记号图例", "✓ 完成" in str(index_table.title))
-check_true("表尾有一行账（几条进行中/完成/放弃）",
-           "%d 条：" % len(wd.task_panel_tasks()) in str(index_table.caption))
-check_true("表尾写清这块面板的口径（今天 = 没做完的 + 今天处理过的）",
-           "今天处理过的" in str(index_table.caption))
+index_panel = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+check_true("任务面板表头写了记号图例", "✓ 完成" in panel_head(index_panel))
+check_true("表头有一行账（几条进行中/完成/放弃）",
+           "%d 条：" % len(wd.task_panel_tasks()) in panel_head(index_panel))
+check_true("表头写清这块面板的口径（今天 = 没做完的 + 今天处理过的）",
+           "今天处理过的" in panel_head(index_panel))
 
 print("== 任务面板按天：今天 = 没做完的 + 今天处理过的；过去那天固化 ==")
 today_iso = TODAY.isoformat()
@@ -409,8 +459,8 @@ check("昨天面板固化：只剩那天处理过的", a_id in yday_ids, True)
 check("跳过的也算那天处理过（问过它、你说先放着）", d_id in yday_ids, True)
 check("昨天面板上今天还开着、昨天没碰过的不出现", b_id in yday_ids, False)
 _past = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
-check_true("过去那天的表尾写清「固化」口径", "过去就固化" in str(_past.caption))
-check_true("过去那天的表尾带日期", yday_iso in str(_past.caption))
+check_true("过去那天的表头写清「固化」口径", "过去就固化" in panel_head(_past))
+check_true("过去那天的表头带日期", yday_iso in panel_head(_past))
 
 wd.day_offset = -2
 before_ids = [t["id"] for t in wd.task_panel_tasks()]
@@ -740,6 +790,380 @@ if not row:                       # 计划里没有 16:15 → 手动补一行来
     pass
 check("daemon_slots 读得到认账记录",
       (wd.daemon_slots().get("%sT16:15" % ISO) or {}).get("match"), "covered")
+
+# ---------------------------------------------------------------- 位置：下架 / 当前 / 互换 / 全量
+print("== task <id> -an / -ac：手动下架 + 挂到当前这一场 ==")
+
+
+def plan_sessions(wd, day=None, drop=()):
+    """把 data.csv 的契约造成 bridge.snapshot 的形状（权威数据，每行都有 id）。
+
+    ``drop`` 里的开始时刻**故意不给 id** —— 模拟「契约有、API 没有」＝该订却没订上。
+    """
+    day = day or wd.sel_date
+    out = []
+    for slot in sch.day_slots(wd.entries, day):
+        h, m = map(int, slot["start"].split(":"))
+        st = dt.datetime.combine(day, dt.time(h, m))
+        en = st + dt.timedelta(minutes=int(slot["duration"]))
+        out.append({
+            "startMs": int(st.timestamp() * 1000), "endMs": int(en.timestamp() * 1000),
+            "startLabel": slot["start"], "endLabel": en.strftime("%H:%M"),
+            "durationMin": int(slot["duration"]),
+            "id": None if slot["start"] in drop else "sess-" + slot["start"],
+            "title": "", "quiet": False, "matched": True,
+        })
+    return out
+
+
+def fresh_warden():
+    """干净的 warden：任务库清空、bridge 里没有历史 attachment。"""
+    wd_ = mkwarden()
+    wd_.offline = False                     # 要有「真」数据（session id 从 bridge 来）
+    for old in wd_.task_store.list():
+        wd_.task_store.delete(old["id"])
+    wd_.bridge.completed = {}
+    wd_.bridge.attached = {}
+    wd_.bridge.titles = {}
+    wd_.bridge.deleted = []
+    wd_.reload_entries()                    # data.csv 得先读进来，plan_sessions 才有东西造
+    wd_.bridge.sessions = plan_sessions(wd_)
+    wd_.refresh()
+    assert wd_.bridge.sessions, "替身里没有场次：data.csv 没读进来？"
+    return wd_
+
+
+print("== 补全 + 提示行：-an / -ac 能被 Tab 到，提示行认得每个动作 ==")
+wd4 = fresh_warden()
+_shell = wd4.shell
+check("task 后面能 Tab 到紧凑写法",
+      [c for c in _shell.complete("task ") if c.startswith("-")],
+      ["-an", "-ac", "--assign", "-a", "--note", "-n", "--from", "-s"])
+check("敲了 -a 之后 Tab 补的是紧凑写法",
+      [c for c in _shell.complete("task -a") if c.startswith("-") and c != "-a"],
+      ["-an", "-ac"])
+check("-a 后面补「编号 + none + current」（不再混进一堆动作词）",
+      _shell.complete("task -a "), ["1", "2", "3", "none", "current"])
+check("-s 后面只补编号", _shell.complete("task -s "), ["1", "2", "3"])
+check("-an / -ac 打完了：提示说不用再跟东西",
+      "-an ≡ -a none" in _shell.hint_line("task -an"), True)
+check("提示行认得「动作写在 ID 后面」",
+      "互换位置" in _shell.hint_line("task 32 swap"), True)
+check("裸 ID 后面提示它能干什么",
+      "swap" in _shell.hint_line("task 32 ") and "下架" in _shell.hint_line("task 32 "), True)
+# 回归：repl_kit 递给 hint 的是**整行**的词（含命令名），以前 _hint_task 没摘掉
+# 「task」，于是每个动作的提示都是一句不相关的通用话（等于一直没生效）。
+check("task import 的提示说的是剪贴板", "剪贴板" in _shell.hint_line("task import"), True)
+check("task create 的提示说的是字段", "不给 id 就自动编号" in _shell.hint_line("task create"), True)
+check("task note 的提示说的是备注", "备注" in _shell.hint_line("task note"), True)
+check("task -s 的提示说的是批量", "全部任务" in _shell.hint_line("task -s 5 "), True)
+check("refresh 的提示说的是对账", "--check" in _shell.hint_line("refresh "), True)
+
+wd3 = fresh_warden()
+idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
+idx12 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "12:00"][0]
+check("干净 warden 拉到了带 id 的场次",
+      [r["id"] for r in wd3.rows if r["startLabel"] == "11:00"], ["sess-11:00"])
+
+wd3.handle("task create title=要下架的 --assign %d" % idx11)
+detached = [t for t in wd3.task_store.list() if t["fields"]["title"] == "要下架的"][0]
+fm_id = detached["focusmate"]["task_id"]
+wd3.bridge.calls = []
+check("task <id> -an 受理", wd3.handle("task %d -an" % detached["id"]), True)
+check("本地 session 断了", wd3.task_store.get(detached["id"])["session"], None)
+check("Focusmate 那条 task 被删掉（不是只改本地）", wd3.bridge.deleted[-1], fm_id)
+check("删的是它自己那条", [c for c in wd3.bridge.calls if c[0] == "delete_task"][0][1]["taskId"],
+      fm_id)
+check_true("说的是「下架」", any("下架" in m[2] for m in wd3.messages))
+check("下架之后本地不再记着 Focusmate task id",
+      (wd3.task_store.get(detached["id"]).get("focusmate") or {}).get("task_id"), None)
+
+wd3.bridge.calls = []
+check("task <id> -a none 是同一件事（长写法）", wd3.handle("task %d -a none" % detached["id"]), True)
+check("本来就没挂：不再去删 Focusmate", [c for c in wd3.bridge.calls if c[0] == "delete_task"], [])
+check_true("明说一句没挂", any("本来就没挂" in m[2] for m in wd3.messages))
+check("task assign none 也认（显式动作写法）",
+      wd3.handle("task assign %d none" % detached["id"]), True)
+
+# --- 当前这一场
+_saved_rows = wd3.rows
+_now_ms = int(dt.datetime.now().timestamp() * 1000)
+
+
+def _row(label, off_start, off_end):
+    return {"startMs": _now_ms + off_start, "endMs": _now_ms + off_end,
+            "startLabel": label, "date": ISO}
+
+
+wd3.rows = [_row("X", -600000, -100000), _row("Y", -60000, 600000),
+            _row("Z", 3600000, 7200000)]
+check("current_session 优先「进行中」", wd3.current_session()[1]["startLabel"], "Y")
+wd3.rows = [_row("X", -600000, -100000), _row("Z", 3600000, 7200000)]
+check("没有进行中就取最近一场还没开始的", wd3.current_session()[1]["startLabel"], "Z")
+wd3.rows = [_row("X", -600000, -100000)]
+try:
+    wd3.current_session()
+except ValueError as e:
+    check_true("一场都没有就说清楚", "没有正在进行的 session" in str(e))
+else:
+    check("一场都没有要抛错", False, True)
+wd3.rows = _saved_rows
+
+# 端到端：造一场「刚开始 5 分钟」的 session，`-ac` 应该挂到它上面
+_live_start = dt.datetime.now() - dt.timedelta(minutes=5)
+_live = {
+    "startMs": int(_live_start.timestamp() * 1000),
+    "endMs": int((_live_start + dt.timedelta(minutes=50)).timestamp() * 1000),
+    "startLabel": _live_start.strftime("%H:%M"),
+    "endLabel": (_live_start + dt.timedelta(minutes=50)).strftime("%H:%M"),
+    "durationMin": 50, "id": "sess-live", "title": "", "quiet": False, "matched": True,
+}
+wd3.bridge.sessions = plan_sessions(wd3) + [_live]
+wd3.refresh()
+wd3.bridge.calls = []
+check("task <id> -ac 受理", wd3.handle("task %d -ac" % detached["id"]), True)
+check("挂到了正在进行的这一场",
+      wd3.task_store.get(detached["id"])["session"]["start"],
+      _live_start.strftime("%H:%M"))
+check("bridge 收到的是这一场的 id",
+      [c for c in wd3.bridge.calls if c[0] == "add_task"][0][1]["meetingId"], "sess-live")
+check_true("说的是「当前这一场」", any("当前" in m[2] for m in wd3.messages))
+
+wd3.bridge.sessions = plan_sessions(wd3)
+wd3.refresh()
+
+print("== task 32 swap 21：两条任务互换位置 ==")
+wd3 = fresh_warden()
+idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
+idx12 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "12:00"][0]
+
+
+def mk(title, idx=None):
+    wd3.handle("task create title=%s%s" % (title, (" --assign %d" % idx) if idx else ""))
+    return [t for t in wd3.task_store.list() if t["fields"]["title"] == title][0]
+
+
+a = mk("甲", idx11)
+b = mk("乙")
+check("先是一条挂在 11:00、一条赋闲",
+      (wd3.task_store.get(a["id"])["session"]["start"],
+       wd3.task_store.get(b["id"])["session"]), ("11:00", None))
+wd3.bridge.calls = []
+check("task <id> swap <id> 受理", wd3.handle("task %d swap %d" % (a["id"], b["id"])), True)
+check("原来那条下来了（赋闲）", wd3.task_store.get(a["id"])["session"], None)
+check("赋闲那条进了 11:00",
+      wd3.task_store.get(b["id"])["session"]["start"], "11:00")
+check("旧场次上那条 Focusmate task 被删掉",
+      wd3.bridge.deleted[-1], a["focusmate"]["task_id"])
+check("新的一条挂到同一场",
+      [c for c in wd3.bridge.calls if c[0] == "add_task"][-1][1]["meetingId"], "sess-11:00")
+check_true("说明里点出「赋闲」", any("赋闲" in m[2] for m in wd3.messages))
+
+# 两条都赋闲 → 没有位置可换（handle() 只回报「受理」，所以要直接看返回值）
+c = mk("丙")
+wd3.bridge.calls = []
+check("两条都赋闲 → 返回两条 ID", wd3.cmd_task(["%d" % a["id"], "swap", "%d" % c["id"]]),
+      [a["id"], c["id"]])
+check("真的没动 bridge", wd3.bridge.calls, [])
+check_true("明说「没有位置可换」",
+           any("没有位置可换" in m[2] for m in wd3.messages))
+
+# 同一场里的两条 = 没得换
+d = mk("丁", idx11)
+wd3.bridge.calls = []
+check("同一场里的两条 → 受理", wd3.handle("task %d swap %d" % (b["id"], d["id"])), True)
+check("同一场不用换（不动 bridge）", wd3.bridge.calls, [])
+check_true("明说位置本来就一样", any("位置本来就一样" in m[2] for m in wd3.messages))
+
+# 两条各在一场 → 场次对调
+e = mk("戊", idx12)
+fm_b = wd3.task_store.get(b["id"])["focusmate"]["task_id"]
+fm_e = e["focusmate"]["task_id"]
+wd3.bridge.calls = []
+check("两条各在一场 → 受理", wd3.handle("task %d swap %d" % (b["id"], e["id"])), True)
+check("对调之后乙在 12:00", wd3.task_store.get(b["id"])["session"]["start"], "12:00")
+check("对调之后戊在 11:00", wd3.task_store.get(e["id"])["session"]["start"], "11:00")
+check("两边旧 task 都删了", sorted(wd3.bridge.deleted[-2:]), sorted([fm_b, fm_e]))
+check("两边都重新挂了一遍",
+      sorted(c[1]["meetingId"] for c in wd3.bridge.calls if c[0] == "add_task"),
+      ["sess-11:00", "sess-12:00"])
+check("两边都换了新的 Focusmate task id",
+      (wd3.task_store.get(b["id"])["focusmate"]["task_id"] != fm_b,
+       wd3.task_store.get(e["id"])["focusmate"]["task_id"] != fm_e), (True, True))
+check("swap 自己 → 受理但报错",
+      wd3.handle("task %d swap %d" % (b["id"], b["id"])), True)
+check_true("并且说清要两条不同的任务",
+           any("两条不同的任务" in m[2] for m in wd3.messages))
+
+print("== task -s 5 -a 6：把一场上的任务全量转移 ==")
+wd3 = fresh_warden()
+idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
+idx12 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "12:00"][0]
+one = mk("批量一", idx11)
+two = mk("批量二", idx11)
+three = mk("批量三", idx12)
+check("11:00 上有两条、12:00 上有一条",
+      ([t["id"] for t in wd3.task_store.tasks_for_session(ISO, "11:00")],
+       [t["id"] for t in wd3.task_store.tasks_for_session(ISO, "12:00")]),
+      ([one["id"], two["id"]], [three["id"]]))
+
+wd3.bridge.calls = []
+check("task -s N（没有 -a）：只看不动", wd3.cmd_task(["-s", "%d" % idx11]), True)
+check("一条 bridge 都没调", wd3.bridge.calls, [])
+check_true("列出了这一场上的两条",
+           any("批量一" in m[2] for m in wd3.messages)
+           and any("批量二" in m[2] for m in wd3.messages))
+check_true("并提示怎么转移", any("全量转移用" in m[2] for m in wd3.messages))
+
+wd3.bridge.calls = []
+check("task -s 5 -a 6 受理", wd3.cmd_task(["-s", "%d" % idx11, "-a", "%d" % idx12]), True)
+check("两条都到了 12:00",
+      sorted(t["id"] for t in wd3.task_store.tasks_for_session(ISO, "12:00")),
+      sorted([one["id"], two["id"], three["id"]]))
+check("11:00 空了", wd3.task_store.tasks_for_session(ISO, "11:00"), [])
+check("旧场次那两条 Focusmate task 都删了",
+      sorted(wd3.bridge.deleted[-2:]), sorted([one["focusmate"]["task_id"],
+                                               two["focusmate"]["task_id"]]))
+check("新挂的都在目标场次",
+      [c[1]["meetingId"] for c in wd3.bridge.calls if c[0] == "add_task"],
+      ["sess-12:00", "sess-12:00"])
+
+wd3.bridge.calls = []
+check("task -s 同一场 -a 同一场 → 什么也不动",
+      wd3.cmd_task(["-s", "%d" % idx12, "-a", "%d" % idx12]), False)
+check("真的没动", wd3.bridge.calls, [])
+check_true("明说源和目标是一场的", any("源和目标都是" in m[2] for m in wd3.messages))
+
+check("task -s N -a none：全部下架",
+      wd3.cmd_task(["-s", "%d" % idx12, "-a", "none"]), True)
+check("12:00 上也空了", wd3.task_store.tasks_for_session(ISO, "12:00"), [])
+check("三条都赋闲了",
+      [t["session"] for t in wd3.task_store.list() if t["id"] in (one["id"], two["id"], three["id"])],
+      [None, None, None])
+
+empty = mk("空场", idx12)
+wd3.handle("task %d -an" % empty["id"])          # 挂上又下架 → 这一场空了
+wd3.bridge.calls = []
+check("空的场次 → 明说没什么可办的",
+      wd3.cmd_task(["-s", "%d" % idx12, "-a", "%d" % idx11]), False)
+check_true("说的是没有任务", any("没有挂任务" in m[2] for m in wd3.messages))
+
+check("task -s 后面再跟动作 → 受理但报错",
+      wd3.handle("task -s %d -a %d done" % (idx11, idx12)), True)
+check_true("提示 -s 是批量后缀", any("批量后缀" in m[2] for m in wd3.messages))
+check("报错时没动任何东西", wd3.bridge.calls, [])
+
+print("== 任务面板：按位置分组，未挂 session 的在最前面 ==")
+wd3 = fresh_warden()
+idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
+idx12 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "12:00"][0]
+late = mk("晚场任务", idx12)
+early_b = mk("早场乙", idx11)
+early_a = mk("早场甲", idx11)
+idle_x = mk("赋闲甲")
+idle_y = mk("赋闲乙")
+groups = wd3.task_panel_groups()
+check("第一组永远是「未挂 session」", groups[0][0], "未挂 session")
+check("未挂那一组里就是那两条赋闲的",
+      [t["id"] for t in groups[0][1]], [idle_x["id"], idle_y["id"]])
+check("第二组是 11:00 那一场（按时间先后，不是按创建顺序）",
+      groups[1][0].startswith("11:00–11:50"), True)
+check("组名带时长", groups[1][0], "11:00–11:50 · 50min")
+check("第三组是 12:00", groups[2][0].startswith("12:00–12:50"), True)
+check("组内按任务 ID 升序（不是按挂上去的先后）",
+      [t["id"] for t in groups[1][1]], sorted([early_a["id"], early_b["id"]]))
+check("收工的任务仍回它自己那一组（不在单独的分组里）",
+      (wd3.task_store.drop(early_b["id"], reason="test") and
+       [t["id"] for t in wd3.task_panel_groups()[1][1]]),
+      sorted([early_a["id"], early_b["id"]]))
+check("面板分组和「按天取哪些任务」是同一份口径",
+      sum(len(group) for _l, group in wd3.task_panel_groups()),
+      len(wd3.task_panel_tasks()))
+
+_panel = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()[1]
+_tables = panel_tables(_panel)
+_labels = panel_texts(_panel)[2:]          # 前两行是图例 + 总账，之后每组一行组名
+check("每组一张表", len(_tables), 3)
+check("每组也各有一行组名", len(_labels), 3)
+check("组名按顺序出现（未挂 session 在最前）",
+      [_labels[0].strip().startswith("未挂 session"),
+       _labels[1].strip().startswith("11:00"),
+       _labels[2].strip().startswith("12:00")], [True, True, True])
+check("组名带这一组几条", _labels[0].strip(), "未挂 session · 2")
+check("表头仍是 number/task 一对", len(_tables[0].columns) % 2, 0)
+
+print("== refresh --check：对账（该订的 session / 该挂的 task）==")
+wd3 = fresh_warden()
+ran = []
+_orig_run_ks = w.run_keep_session
+w.run_keep_session = lambda *a, **k: (ran.append(list(a)) or (0, "check 跑完", ""))
+try:
+    idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
+    attached_task = mk("挂着的那条", idx11)
+    fm = attached_task["focusmate"]["task_id"]
+    check("先确认替身里它挂在 11:00 那场", wd3.bridge.attached.get(fm), "sess-11:00")
+
+    # (1) 一切正常 → 什么都不该修
+    wd3.bridge.calls = []
+    check("没有问题时 --check 也受理", wd3.handle("refresh --check"), True)
+    check("没有问题时不去调 check 下单", [r for r in ran], [])
+    check("没有问题时不去重挂",
+          [c for c in wd3.bridge.calls if c[0] == "add_task"], [])
+    check_true("明确报「没有发现要修的」",
+               any("没有发现要修的" in m[2] for m in wd3.messages))
+
+    # (2) 本地说挂着，Focusmate 说挂到别处了 → 重挂
+    wd3.bridge.attached[fm] = "sess-12:00"
+    wd3.bridge.calls = []
+    check("挂错场次时 --check 受理", wd3.handle("refresh --check"), True)
+    check("认出来了：Focusmate 说没挂在这一场",
+          any("没挂在这一场上" in m[2] for m in wd3.messages), True)
+    check("重挂到正确的那一场",
+          [c[1]["meetingId"] for c in wd3.bridge.calls if c[0] == "add_task"], ["sess-11:00"])
+    check("本地记的 Focusmate task id 换成新的",
+          wd3.task_store.get(attached_task["id"])["focusmate"]["task_id"] != fm, True)
+
+    # (3) Focusmate 那边那条 task 已经被人删了 → 重挂
+    fm2 = wd3.task_store.get(attached_task["id"])["focusmate"]["task_id"]
+    wd3.bridge.attached.pop(fm2, None)
+    wd3.bridge.calls = []
+    check("task 不见了时 --check 受理", wd3.handle("refresh --check"), True)
+    check_true("认出来了：那条 task 已经不在了",
+               any("已经不在了" in m[2] for m in wd3.messages))
+    check("也同样重挂了一遍",
+          [c[1]["meetingId"] for c in wd3.bridge.calls if c[0] == "add_task"], ["sess-11:00"])
+
+    # (4) 执行区里有契约、API 里没有 → 叫 daemon 补一轮
+    #     只有执行区里的「缺」才值得补（草稿区本来就还没轮它），所以把区域判据
+    #     钉成 execute：否则这条用例会随当前钟点变红。
+    ran[:] = []
+    wd3.bridge.sessions = plan_sessions(wd3, drop=("15:00",))
+    wd3.bridge.calls = []
+    _orig_zone = wd3.effective_zone
+    wd3.effective_zone = lambda zone, day: "execute"
+    try:
+        check("该订没订上时 --check 受理", wd3.handle("refresh --check"), True)
+    finally:
+        wd3.effective_zone = _orig_zone
+    check("叫 daemon 跑了一轮 check", [r[:1] for r in ran], [["check"]])
+    check_true("先说清楚哪一场没订上",
+               any("该订却没订上" in m[2] for m in wd3.messages))
+    check_true("还报了场次编号", any("#" in m[2] and "15:00" in m[2] for m in wd3.messages))
+
+    # (5) 离线：没外部世界可查，只重画
+    wd3.bridge.sessions = plan_sessions(wd3)
+    wd3.offline = True
+    check("离线时 --check 只重画（返回 False）", wd3.cmd_refresh(["--check"]), False)
+    check_true("离线时明说没有外部世界可查",
+               any("离线模式" in m[2] and "外部世界" in m[2] for m in wd3.messages))
+    wd3.offline = False
+    ran[:] = []
+    check("不带 --check 的 refresh 照样受理", wd3.handle("refresh"), True)
+    check("refresh 自己不叫 check（只拉数）", ran, [])
+finally:
+    w.run_keep_session = _orig_run_ks
+    wd3.bridge.sessions = plan_sessions(wd3)
+    wd3.refresh(quiet=True)
 
 print("== TUI 在场证明（daemon 靠它判断「人叫得回来吗」）==")
 info = wd.write_tui_state()

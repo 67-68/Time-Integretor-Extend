@@ -73,6 +73,11 @@ daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第�
 
 「提前订满」：不看「是否临近开始」，只看「还没开始且缺失」就订（现在范围是整个窗口）。
 
+**谁在调它**：daemon 自己每 5 分钟一轮；此外 TUI 里几个动作会主动触发一轮
+（`session` / `period` / `relocate` / `force-check`，以及 `refresh --check` 发现
+「执行区该订却没订上」时）。TUI 永远只是薄封装 `check`，**不重写下单逻辑、
+不替 daemon 决定重试**（`force-check` 是唯一例外，它是用户显式扳轨）。
+
 ## 计划 vs 实际（`schedule.match_slot`）
 
 **API 是事实，data.csv 是意图。** 判「这场到底落地没落地」不能只比开始分钟 ——

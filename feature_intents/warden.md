@@ -81,6 +81,11 @@ title 2 ""          清空标题
 sync [--days N]     跑 download_calendar.py populate：日历 → 覆盖 data.csv
 force-check         忽略重试上限/退避：把所有没订上的 session 各强制重订一次
 refresh / r         重新拉选中那天的 session（ID 会重编号）
+refresh --check/-c  同上，**再对账一遍**：该订没订上 / 该挂没挂上 → 能修的当场修
+task 8 -an          从它那一场下架（≡ -a none，删掉 Focusmate 那条 task）
+task 8 -ac          挂到当前这一场（≡ -a current）
+task 32 swap 21     两条任务互换位置（一条赋闲也行）
+task -s 5 -a 6      把 session #5 上的全部任务转移到 #6（-a none = 全部下架）
 start               启动 daemon（先让 bridge 放开浏览器）
 stop                停用 daemon（**要敲宣言**）
 stat [refresh]      切到「统计」视图：生涯累计 / 每天分布 / 按月 / 永不重订名单
@@ -104,6 +109,25 @@ data.csv 的契约合并重排表格（所以 ID 会重编号），**不会订�
 TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后触发一轮 `check`
 （`session` / `period` / `relocate` / `force-check`）。同理，任务视图里的
 `refresh` 只跑 `GET /v1/tasks` 同步完成时间，也不订场。
+
+### `refresh --check`：对账并修正
+
+`refresh` 本身仍然是**纯读**（只拉数）。加 `--check`（`-c`）才多走一步
+`check_and_fix()` —— 它只做两件事，而且两件都是「先看外面的世界，再掰回来」：
+
+1. **该订没订上的 session**（`check_bookings()`）：执行区里「契约有、API 没有」的行
+   → 让 daemon 补一轮 `keep_session.py check`。用普通 `check`（不是 force-check），
+   所以 daemon 自己的重试上限/退避照样生效 —— TUI 不越权替它决定「再试一次」。
+   草稿区和过去的时间**不算缺**（前者还没轮到，后者已经晚了）。
+2. **该挂没挂上的 task**（`check_task_attachments()`）：本地账本说「任务 8 挂在 11:00
+   那场」，但 `GET /v1/tasks` 里那条 task 的 `attachments` 里没有这一场的 session id
+   → 重新挂（走 `cmd_task_assign` 同一条路）。
+   判据只有 Focusmate 自己给的那一份，本地账本说「挂了」不算数：手动在 Task Manager
+   删过、或上次调 API 只做了半截，账本都会照旧留着（`_attachment_verdict()`）。
+
+修完再拉一次表格，所以屏幕上看到的是**修之后**的样子。修了几处会打总账
+（`✅ 对账完成：修了 N 处` / `没有发现要修的`）。离线模式下这一步直接跳过并明说
+——没有外部世界可查。
 
 `relocate` 和 `sync` 相反：它**不写 data.csv**，只把「某一天 + 原 HH:MM」映射到新时间
 写进 `temp/keep_session-relocations.json`。`schedule.day_slots()` 是唯一入口，所以 warden
@@ -377,6 +401,11 @@ stdout  每行： {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 
 ## 踩过的坑（都有回归测试）
 
+- **`handle()` 不展开紧凑短选项**：`-an` 的展开原本只挂在 repl_kit 的 `dispatch`
+  上，于是交互式里能敲、`--exec 'task 8 -an'` 和测试走的 `handle()` 却不认
+  （报「后面不用再跟东西」）。现在两条路都走 `Command.expand()` ——
+  框架里的一份实现，谁也别自己再写一遍。
+
 1. **请求号和 session 身份撞名**（最险的一个）。
    最初 bridge 的三个写命令用 `id` 表示「哪一场」，而信封的请求号也叫 `id`。
    Python 侧 `req.update(kw)` 会把请求号覆盖成 UUID。后果**不是报错而是卡死**：
@@ -529,6 +558,13 @@ python3 warden.py install-deps
   那几场永远补不回来。详见 `session_plan.md`。
 - 第五个视图 `设置 / 规则` + `set <id> <value>`；`edit-tomorrow` 让「明天」临时按
   草稿区处理（`Warden.effective_zone`），`tomorrow-plan` 是「明日时间安排」的规格。
+- 契约表格下面那块任务面板**按位置分组**：`未挂 session` 永远第一组，之后每场
+  session 一组（按开始时间）、组内按任务 ID 升序（详见 `task.md`）。
+- `task` 入口长出四个位置动作：`-an`（下架）/ `-ac`（当前这一场）/
+  `32 swap 21`（互换位置）/ `-s 5 -a 6`（整场转移）；紧凑写法由 repl_kit 的
+  `ShortFlag` 统一展开，补全和提示都跟着走。
+- `refresh --check`（`-c`）：重拉 + 对账（该订没订上 → 叫 daemon 补；该挂没挂上 →
+  重挂），所以「本地账本说挂上了、Focusmate 上其实没有」这种半截状态能被自己发现。
 - `session` 默认**只加这一天**（`temp/session-extras.json`），`session --permanent`
   才写成按星期几重复的长期规则（`temp/session-rules.json`）；两者都在重算
   `data.csv` 时并进去，sync 不会冲掉。
