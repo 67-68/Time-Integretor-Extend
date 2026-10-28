@@ -15,9 +15,11 @@
    「只做单向覆盖」的前提是**认得出是哪个 OmniFocus 任务**，所以只有标题时
    本地任务照建、但**不假装**自己关联上了（``has_id == False``）。
 
-   macOS 剪贴板里其实三样都有（plain / HTML / RTF），:func:`clipboard_links`
-   优先读 HTML —— `pbpaste -Prefer html` 里那条 ``<a href="omnifocus:///task/…">``
-   就是我们要的 primary key，标题就是锚文本。
+   macOS 剪贴板里其实好几样都有（plain / HTML / RTF / URL），:func:`clipboard_links`
+   四个 flavor 全读：URL flavor 就是 ``omnifocus:///task/PK`` 本体（最可靠的 id
+   来源），HTML/RTF 里有 ``<a href="omnifocus:///task/…">标题</a>``（多选时才全），
+   纯文本往往只有标题 —— 所以「⌘C 任务 → 终端 ⌘V」粘出来的东西**必然**缺 id，
+   那条路只能建任务、不能关联（见 :func:`clipboard_flavor` 上面的注释）。
 
 2. **读写调用**（子进程）
    所有真正的 osascript 都发生在 ``omnifocus_tasks.py`` 里（那边的契约是
@@ -215,31 +217,206 @@ def html_links(markup):
     return out
 
 
-def clipboard_text(prefer="html"):
-    """读 macOS 剪贴板；读不到就返回空串（不抛）。"""
-    for flag in ([prefer] if prefer else []) + ["txt"]:
-        try:
-            proc = subprocess.run(
-                ["pbpaste", "-Prefer", flag],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout
-    return ""
+def rtf_links(markup):
+    """从 RTF 里抓链接。
+
+    OmniFocus 拷任务时 RTF flavor 长这样（实测）：
+
+        {\\field{\\*\\fldinst{HYPERLINK "omnifocus:///task/PK"}}{\\fldrslt 标题}}
+
+    解析不了也不要紧 —— 兜底是把整段里出现的 ``omnifocus:///task/…`` 全抓出来
+    （标题就空了，调用方再去 OmniFocus 查）。
+    """
+    out = []
+    if not markup:
+        return out
+    seen = set()
+    pattern = re.compile(
+        r'HYPERLINK\s+"(omnifocus:///task/[^"]+)"\s*\}*\s*\{\\fldrslt\s*([^{}]*)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for href, text in pattern.findall(markup):
+        pk = _clean_id(href)
+        if not pk or pk in seen:
+            continue
+        seen.add(pk)
+        out.append({"id": pk, "url": task_url(pk), "title": _rtf_unescape(text) or None,
+                    "has_id": True, "raw": href})
+    for href in re.findall(r"omnifocus:///task/[^\s\"'\\{}<>]+", markup):
+        pk = _clean_id(href)
+        if not pk or pk in seen:
+            continue
+        seen.add(pk)
+        out.append({"id": pk, "url": task_url(pk), "title": None,
+                    "has_id": True, "raw": href})
+    return out
+
+
+def _rtf_unescape(text):
+    """RTF 里的小转义：``\\'3a`` → ``:``、``\\{`` → ``{``，多余的换行去掉。"""
+    raw = str(text or "")
+    raw = re.sub(r"\\'([0-9A-Fa-f]{2})",
+                 lambda m: bytes([int(m.group(1), 16)]).decode("cp1252", "replace"), raw)
+    raw = raw.replace("\\\\", "\\").replace("\\{", "{").replace("\\}", "}")
+    raw = re.sub(r"\\[a-zA-Z]+-?\d*\s?", "", raw)
+    raw = raw.replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+# 剪贴板 flavor 读取 -------------------------------------------------------
+#
+# ⚠️ 别用 `pbpaste -Prefer html`：这个 macOS 上 `-Prefer` **完全不起作用**，
+# 传 html / rtf / url 都原样返回纯文本（实测 2026-10-28，macOS 15.5）。
+# 而「在 OmniFocus 里 ⌘C 一条任务、到终端 ⌘V」之所以只剩标题，正是因为
+# 终端只吃 string/utf8 那个 flavor —— 链接在**粘贴那一刻**就丢了。
+# 所以读剪贴板必须用 osascript 按 flavor 点名要，返回的是 hex 包装：
+#
+#     osascript -e 'the clipboard as URL'             «data url 6F6D6E69…»
+#     osascript -e 'the clipboard as «class HTML»'    «data HTML 3C68746D…»
+#     osascript -e 'the clipboard as «class RTF »'    «data RTF 7B5C7274…»
+#     osascript -e 'clipboard info'                   有哪些 flavor（排障用）
+#
+# OmniFocus 拷一条任务时 URL flavor 就是 ``omnifocus:///task/PK`` 本身
+# （实测：URL=omnifocus:///task/i5BKXC5uNk0，纯文本只有标题），多条一起拷时
+# URL 只剩最后一个、HTML/RTF 里才是全部 —— 所以三个都读、按 id 合并，
+# 标题优先取 HTML 的锚文本。
+
+_DATA_RE = re.compile(r"«data\s+([A-Za-z0-9 ]+?)\s*([0-9A-Fa-f]+)»")
+
+
+def _osascript(script, timeout=5):
+    """跑一条 osascript；失败返回空串（读不到剪贴板不该抛异常）。"""
+    try:
+        proc = subprocess.run(["osascript", "-e", script],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _decode_data(raw):
+    """osascript 的 ``«data HTML 3C61…»`` → 字符串；不是这形状就当纯文本返回。"""
+    text = str(raw or "")
+    match = _DATA_RE.search(text)
+    if not match:
+        return text
+    try:
+        blob = bytes.fromhex(match.group(2))
+    except ValueError:
+        return ""
+    return blob.decode("utf-8", "replace")
+
+
+def clipboard_flavor(which):
+    """按 flavor 点名读剪贴板：``url`` / ``html`` / ``rtf`` / ``text``。
+
+    非 macOS 一律空串 —— 剪贴板是 macOS 才有的东西，别在别的平台上假装有。
+    """
+    if sys.platform != "darwin":
+        return ""
+    key = str(which or "").lower()
+    if key == "html":
+        return _decode_data(_osascript("the clipboard as «class HTML»"))
+    if key == "rtf":
+        return _decode_data(_osascript("the clipboard as «class RTF »"))
+    if key == "url":
+        return _decode_data(_osascript("the clipboard as URL")).strip()
+    try:
+        proc = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def clipboard_info():
+    """剪贴板里有哪些 flavor（``[("URL", 29), …]``）—— 排障 / 测试用。"""
+    raw = _osascript("clipboard info") if sys.platform == "darwin" else ""
+    out = []
+    # 形状：「名字, 字节数」一条条排下来，名字里可能带空格/逗号（``«class RTF »``）：
+    #   «class RTF », 392, «class ut16», 18, URL, 29, string, 9
+    # 所以按「最后一个是数字」把片段粘回去，而不是硬按逗号切两半。
+    pending = ""
+    for part in str(raw or "").split(","):
+        pending = (pending + "," + part) if pending else part
+        bits = pending.split()
+        if not bits or not bits[-1].isdigit():
+            continue
+        name = " ".join(bits[:-1]).replace("«class", "").replace("»", "").strip()
+        name = name.strip(",").strip()
+        if name:
+            out.append((name, int(bits[-1])))
+        pending = ""
+    return out
+
+
+def clipboard_text(prefer=None):
+    """读剪贴板纯文本（读不到返回空串）。
+
+    ``prefer="html"`` / ``"rtf"`` 时读**那个 flavor** —— 历史调用点就是这么用的，
+    但以前实际上退化成 pbpaste 拿纯文本、链接全丢，现在真的读那个 flavor。
+    """
+    key = str(prefer or "").lower()
+    if key in ("html", "rtf"):
+        return clipboard_flavor(key)
+    return clipboard_flavor("text")
 
 
 def clipboard_links():
-    """剪贴板 → 链接列表。
+    """剪贴板 → 链接列表（按 id 合并，标题优先取 HTML）。
 
-    OmniFocus「拷贝」一条任务时剪贴板里同时有 HTML（带 ``omnifocus:///task/…``）
-    和纯文本（常常只有标题）；所以**先读 HTML**，抓不到再退回纯文本解析。
+    顺序：HTML（多选时的全部 + 好标题）→ RTF（HTML 缺时兜底）→ URL flavor
+    （单条任务的链接本体，最能保证「有 id」）→ 纯文本（只有标题的粘贴）。
+    有 id 的条目按 id 去重；纯文本里「只有标题」的条目只在标题没出现过时保留
+    （调用方会明说「认不出 primary key，所以没关联」）。
     """
-    items = html_links(clipboard_text("html"))
-    if items:
-        return items
-    return parse_links(clipboard_text("txt"))
+    found = []
+    by_id = {}
+
+    def add(item):
+        if not item:
+            return
+        pk = item.get("id")
+        if not pk:
+            return
+        if pk in by_id:
+            old = by_id[pk]
+            if not old.get("title") and item.get("title"):
+                old["title"] = item["title"]
+            return
+        by_id[pk] = item
+        found.append(item)
+
+    for item in html_links(clipboard_flavor("html")):
+        add(item)
+    for item in rtf_links(clipboard_flavor("rtf")):
+        add(item)
+    url_item = parse_link(clipboard_flavor("url"))
+    if url_item and url_item.get("id"):
+        add(url_item)
+
+    for item in parse_links(clipboard_flavor("text")):
+        if item.get("id"):
+            add(item)
+            continue
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        if any((x.get("title") or "").strip() == title for x in found):
+            continue
+        found.append(item)
+
+    # 「一条有 id 没标题 + 一条只有标题」= OmniFocus 拷一条任务的典型剪贴板
+    # （URL flavor 给链接、纯文本给标题，两边其实是同一条）。这时配对是**读出来
+    # 的事实**，不是拿标题猜身份 —— 猜的是「标题属于这条链接」，而剪贴板里只有
+    # 这一条链接、这一个标题。
+    ids = [x for x in found if x.get("id")]
+    bare = [x for x in found if not x.get("id")]
+    if len(ids) == 1 and not ids[0].get("title") and len(bare) == 1:
+        ids[0]["title"] = (bare[0].get("title") or "").strip() or None
+        found.remove(bare[0])
+    return found
 
 
 # ---------------------------------------------------------------- 子进程调用

@@ -51,7 +51,10 @@ daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第�
 
 1. `schedule.window(entries, now)` 切出执行区 `due` 和已开始的 `past`。
 2. 执行区里被 warden 判过 `abandoned`（认罪放弃）的 slot：**跳过，永不重订**。
-3. 一次 `GET /v1/sessions` 拿到窗口内全部 session（只读、便宜），落盘成 `api_snapshot`。
+3. 一次 `GET /v1/sessions` 拿到窗口内全部 session（只读、便宜、**带时长**），
+   落盘成 `api_snapshot`（`sessions` 是开始时间，`details` 带 duration/id ——
+   收尾线程要用它按实际场次发问）。顺便把**计划外**的场次（API 有、data.csv 没有）
+   打到日志里：那些是你手动订的，不是错误，但要看得见。
 4. 遍历 `past`：只对账 —— API 有记 `booked`，没有记 `missed`。
    若**原来记的是 booked**（订过又消失、而且已经开过了）→ 记一笔硬罪。
 5. 遍历 `due`（按开始时间先后）：
@@ -59,7 +62,8 @@ daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第�
      （`sync` / 手改 data.csv 改计划）＝ 这是另一个目标 → 作废重来。
      只作废还没订上的（`failed` / 退避中 / 待订）；`booked` 不动（已订那场改不了时长）。
      没有这一步的话，「25min 试失败后改成 50min」会永远卡在 failed —— 改了计划等于没改。
-   - API 有 → `booked`（若之前是别的状态，纠正过来）。
+   - API 有 → `booked`（若之前是别的状态，纠正过来）。「有」的判据见下面
+     「计划 vs 实际」——**不是**只比开始分钟。
    - API 没有：
      - 若 state 以为是 `booked` → 判定为**手动取消**：**记一笔 sin**（warden 会因此锁死），
        然后照旧重订并**重置尝试计数**（守擂；机器读不了你的心）。
@@ -68,6 +72,37 @@ daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第�
      - 否则 → 下单。
 
 「提前订满」：不看「是否临近开始」，只看「还没开始且缺失」就订（现在范围是整个窗口）。
+
+## 计划 vs 实际（`schedule.match_slot`）
+
+**API 是事实，data.csv 是意图。** 判「这场到底落地没落地」不能只比开始分钟 ——
+2026-10-28 就是这么冤枉人的：
+
+```
+计划 16:15 一场 75min；你订不上 75，改成 16:00 25 + 16:30 50。
+旧逻辑：16:15 找不着 → 记一笔「booked-but-missing」（你冤枉）→ TUI 锁死要你认罪
+        → 再反复去订 16:15（与已有两场冲突，必失败，还烧浏览器）
+        → 09:30 计划、你实际 09:45 做的，账本说你没做（其实做了）
+```
+
+现在按**覆盖**判，三种都算「已落地」：`exact`（同一分钟，时长不同只标注）、
+`shifted`（起点差 ≤30 分钟、时长对得上 —— 挪了半格）、`covered`（几场拼起来
+覆盖了计划窗口，允许 ≤15 分钟缝隙、允许比计划短 5 分钟）。认账之后：
+
+- **不重订**（重订就是和已有场次打架）、**不记罪**；
+- state 里记 `match`（哪种认账）和 `actual`（「实际 16:00(25min) + 16:30(50min)」），
+  warden 的契约表据此把「缺」改成「**认账**」并标出实际场次；
+- 收尾按**实际**场次发问（见 [`postsession.md`](./postsession.md)）。
+
+## 收尾线程（session 结束 +15s 叫人）
+
+`postsession_loop()` 是 `cmd_run()` 里起的一条**独立线程**，每秒跑一次
+`postsession_tick()` + `postsession_retry()`。它不跟订场那一轮的睡眠绑在一起 ——
+一轮可能跑 20 分钟，绑在一起就会「迟到 20 分钟叫人」。
+`temp/warden-tui.json` 是 warden 启动时写的在场证明（pid / tty），
+daemon 用它判断「人叫得回来吗」：没开就 `--new`（新窗口跑 Warden.command），
+开着就按 tty 聚焦（marker 里那个 iTerm session id 早就不算数了），并且**不往
+TUI 里打字**（`--no-refresh`）。细节见 [`postsession.md`](./postsession.md)。
 
 ## 分心看门狗（session 进行时）
 
@@ -85,6 +120,10 @@ daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第�
   `start_pause` 是共用实现）。
 - 出声/通知的实现拆去了 `alert.py`（音量可调）。
 - `KEEP_SESSION_IDLE_CHECK=0` 可关；改了常量/音频要 `daemon restart`。
+- **静音时段**（`period mute T1 --permanent`）：`session_plan.mute_window_at(now)`
+  命中就**只记违规、不出声**（通知 / 拉音量 / 嘶吼全免，日志里写一行
+  「静音时段（T1 11:00–12:05）→ 不出声」）。静音是「别用声音管我」，
+  不是「别管我」：违规照样数、收尾照样催。
 
 完整规则、配置、测试见 [`idle_watchdog.md`](./idle_watchdog.md)，
 出声工具见 [`alert.md`](./alert.md)，暂停的界面见 [`warden.md`](./warden.md)。
@@ -176,6 +215,19 @@ download_calendar.py populate   ──▶ data.csv ──▶ keep_session daemon
 - 改了日历就重跑一次 `populate`，daemon 下一轮自然读到新 csv。
 - 改了 csv 格式/解析不用手动重启：daemon 会检测 `schedule.py` 等源码更新并自重启
   （见下「热重载」）。但本机制上线前就已经在跑的旧 daemon 仍需手动重启一次。
+
+## 热重载（改了源码要活着重启）
+
+`reexec_if_stale()`：这几份源码（`keep_session.py` / `main.py` / `schedule.py` /
+`alert.py`）被改过、而且**新版本能编译**，就在两轮之间 `os.execv` 成新代码（pid 不变）。
+
+⚠️ `os.execv` 的目标 argv 是显式的（`_REEXEC_ARGV = [… "_daemon_loop"]`），
+不是 `sys.argv`：daemon 是 `daemon start` double-fork 出来的**孙进程**，
+`sys.argv` 还是父进程那份（`["keep_session.py", "daemon", "start"]`）。
+拿它去 exec，新进程会再跑一遍 `daemon start`，看到 pid 文件里那个 pid
+（就是它自己）还活着 → 打一句「已在运行」→ 退出。
+**结果就是「每改一次 keep_session.py，daemon 安静地死一次」**
+（2026-10-28 实测两回，日志里那行「daemon 已在运行 (pid=…)，不重复启动」就是遗言）。
 
 ## 热重载
 

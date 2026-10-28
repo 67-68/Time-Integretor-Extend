@@ -64,15 +64,43 @@ title: "数学易错修正"                             ← 只有标题（**没
 第四种只有标题，认不出身份 —— 那就**不假装**关联上了（`has_id == False`）。
 拿标题去猜一条 OmniFocus 任务比不关联更糟：猜错就是改错东西。
 
-`omnifocus.clipboard_links()` 读剪贴板时**先读 HTML**（`pbpaste -Prefer html`），
-因为 OmniFocus 给的 HTML 里就有一条 `<a href="omnifocus:///task/…">标题</a>`；
-HTML 抓不到才退回纯文本。
+### 剪贴板：为什么粘贴会丢链接，怎么才能不丢
+
+**⌘C 一条任务 → 终端里 ⌘V，粘出来只有标题。** 终端只接受剪贴板里
+`string` / `utf8` 那个 flavor，`omnifocus:///task/PK` 在**粘贴那一刻**就丢了。
+所以「把粘贴的内容交给 import」这条路注定没有 primary key。
+
+而且 `pbpaste -Prefer html` **在这台 macOS 上完全不起作用**（实测 macOS 15.5：
+传 `html` / `rtf` / `url` 都原样返回纯文本）—— 老实现其实一直在读纯文本，
+链接从来没读到过。要拿链接只能**按 flavor 点名**用 osascript 读，返回的是
+hex 包装：
+
+```bash
+osascript -e 'the clipboard as URL'             # «data url 6F6D6E69…»  ← 链接本体
+osascript -e 'the clipboard as «class HTML»'    # «data HTML 3C68746D…»  ← 多选+标题
+osascript -e 'the clipboard as «class RTF »'    # «data RTF 7B5C7274…»
+osascript -e 'clipboard info'                   # 有哪些 flavor（排障）
+pbpaste                                          # 纯文本（常常只有标题）
+```
+
+`omnifocus.clipboard_links()` 四个 flavor 全读、按 id 合并、标题优先取 HTML 锚文本：
+
+| flavor | 里面是什么 | 用途 |
+|---|---|---|
+| `URL` | `omnifocus:///task/PK` | 最可靠的 id 来源（单条任务就是它） |
+| `HTML` | `<a href="omnifocus:///task/PK">标题</a>` | 多选时的全部 + 好标题 |
+| `RTF` | `{\field{\*\fldinst{HYPERLINK "omnifocus:///task/PK"}}{\fldrslt 标题}}` | 同上，兜底 |
+| 纯文本 | 常常只有标题 | 只有「一条有 id 没标题 + 一条只有标题」时才配对成一条 |
 
 ```bash
 python3 omnifocus.py parse '[数学易错修正](omnifocus:///task/kc-4VLAE_1L)'
 python3 omnifocus.py links        # 直接看剪贴板里认出了什么
 python3 omnifocus.py get kc-4VLAE_1L
 ```
+
+TUI 里的用法：`task import -a`（读剪贴板导入并自动关联）、`task 5 link -a`
+（读剪贴板关联到已有任务）。不带 `-a` 但粘进来一段只有标题的文字时，会去剪贴板
+对一下**同名**链接（标题完全相同才认，不是猜），对不上就明确说「没有关联」。
 
 ### 子进程而不是 import
 

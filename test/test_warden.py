@@ -75,6 +75,22 @@ ks.EXPECTED_FILE = os.path.join(os.path.dirname(ks.STATE_FILE),
                                 "keep_session-expected.json")
 ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
+
+# 兜底：本文件里任何一条**意外**走到「真·一轮」的路径都要立刻炸，而不是
+# 去连 api.focusmate.com（真下过单的东西，测试绝不该碰）。日志也一样要关进
+# 临时目录 —— 以前漏了，用例的日志混进真 temp/keep_session.log 里，看日志
+# 排障时会以为 daemon 半夜自己干了什么。
+ks.LOG_FILE = os.path.join(TMP, "keep_session.log")
+ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
+
+
+def _no_network(*a, **kw):
+    raise RuntimeError("测试里不许真连 Focusmate API（这一轮本该被替身拦住）")
+
+
+ks.fetch_session_details = _no_network
+ks.fetch_sessions = _no_network
+
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
 ks.IDLE_STATE_FILE = os.path.join(TMP, "idle-state.json")
 ks.IDLE_MODE_FILE = os.path.join(TMP, "mode.json")

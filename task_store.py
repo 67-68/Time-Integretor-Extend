@@ -820,6 +820,41 @@ class TaskStore(object):
         self.save(store)
         return found
 
+    def forget_focusmate(self, task_id, reason="deleted", keep_previous=True):
+        """Focusmate 那条 task 已经删掉了 → 本地别再记着它。
+
+        任务**转移**走之后，旧场次上那条 Focusmate task 会被删（bridge 的
+        ``delete_task``）。删完还留着 ``focusmate.task_id`` 的话，下一次
+        ``reconcile`` 会以为「这条在 Focusmate 里还在、而且没完成」，一直等它。
+
+        旧 id 挪进 ``previous``（归档/查账还要用），当前那格清空。
+        """
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if task["id"] == int(task_id):
+                found = task
+                break
+        if found is None:
+            raise ValueError("没有任务 %s" % task_id)
+        fm = found.get("focusmate") or {}
+        old_id = fm.get("task_id") or fm.get("id")
+        if keep_previous and old_id:
+            fm.setdefault("previous", []).append({
+                "task_id": old_id,
+                "session": dict(found.get("session") or {}) or None,
+                "deleted_at": _now(),
+                "reason": reason,
+            })
+        for key in ("task_id", "id", "completed_at", "attached_at", "via", "title"):
+            fm.pop(key, None)
+        fm["deleted_at"] = _now()
+        fm["deleted_reason"] = reason
+        found["focusmate"] = fm
+        found["updated_at"] = _now()
+        self.save(store)
+        return found
+
     # -- 每周重复 -----------------------------------------------------
     def set_repeat(self, task_id, weekday, start, duration=None):
         """把任务标成每周重复：``weekday`` 0-6（或 mon..sun），``start`` HH:MM。

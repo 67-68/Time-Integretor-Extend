@@ -93,6 +93,77 @@ check("HTML 剪贴板抓 href + 锚文本",
       [(i["id"], i["title"]) for i in of.html_links(html)], [("kc-9", "数学 & 易错")])
 
 
+print("== omnifocus 剪贴板：按 flavor 读（⌘V 到终端只剩标题）==")
+check("osascript 的 «data url …» 解出链接",
+      of._decode_data("«data url 6F6D6E69666F6375733A2F2F2F7461736B2F6935424B584335754E6B30»"),
+      "omnifocus:///task/i5BKXC5uNk0")
+check("html flavor 解出来就是 HTML",
+      of._decode_data("«data HTML 3C623Ee6B189«»") if False else
+      of._decode_data("«data HTML 3C623EE6B1893C2F623E»"), "<b>汉</b>")
+check("不是 data 包装就当纯文本", of._decode_data("TI: Swap"), "TI: Swap")
+check("空输入不炸", (of._decode_data(""), of._decode_data(None)), ("", ""))
+
+rtf = ('{\\rtf1\\ansi{\\field{\\*\\fldinst{HYPERLINK '
+       '"omnifocus:///task/kc-4VLAE_1L"}}{\\fldrslt 数学易错修正}}}')
+rtf_items = of.rtf_links(rtf)
+check("RTF 里抓出链接", [(i["id"], i["title"]) for i in rtf_items],
+      [("kc-4VLAE_1L", "数学易错修正")])
+check("RTF 兜底：整段里扫链接",
+      [i["id"] for i in of.rtf_links("x omnifocus:///task/abc y")], ["abc"])
+
+# 各 flavor 全部喂给 clipboard_links（真的按 flavor 读，不是 pbpaste 一刀切）
+_real_flavor = of.clipboard_flavor
+of.clipboard_flavor = lambda which: {
+    "url": "omnifocus:///task/i5BKXC5uNk0",
+    "html": '<a href="omnifocus:///task/i5BKXC5uNk0">TI: Swap</a>',
+    "rtf": rtf.replace("kc-4VLAE_1L", "i5BKXC5uNk0").replace("数学易错修正", "TI: Swap"),
+    "text": "TI: Swap\n",
+}.get(which, "")
+items = of.clipboard_links()
+check("三个 flavor 说的是同一条 → 合并成一条", len(items), 1)
+check("id 来自 URL flavor", items[0]["id"], "i5BKXC5uNk0")
+check("标题来自 HTML 锚文本", items[0]["title"], "TI: Swap")
+
+# 多选拷好几条：HTML 里有全部（URL flavor 只剩最后一个）
+of.clipboard_flavor = lambda which: {
+    "url": "omnifocus:///task/b",
+    "html": ('<a href="omnifocus:///task/a">甲</a>'
+             '<a href="omnifocus:///task/b">乙</a>'),
+    "rtf": "",
+    "text": "甲" + chr(10) + "乙" + chr(10),
+}.get(which, "")
+items = of.clipboard_links()
+check("多选拷贝 → 两条都在（URL flavor 只剩最后一条也补得上）",
+      [(i["id"], i["title"]) for i in items], [("a", "甲"), ("b", "乙")])
+
+# 只有 URL + 纯文本标题（OmniFocus 拷一条任务的真实剪贴板）
+of.clipboard_flavor = lambda which: {
+    "url": "omnifocus:///task/i5BKXC5uNk0",
+    "html": "",
+    "rtf": "",
+    "text": "TI: Swap\n",
+}.get(which, "")
+items = of.clipboard_links()
+check("URL + 纯文本标题会配对成一条", len(items), 1)
+check("配对之后既有 id 又有标题",
+      (items[0]["id"], items[0]["title"]), ("i5BKXC5uNk0", "TI: Swap"))
+
+# 只有标题：不假装有 id
+of.clipboard_flavor = lambda which: {"text": "只有个标题\n"}.get(which, "")
+items = of.clipboard_links()
+check("只有标题 → 没有 id（宁可少关联）",
+      [(i.get("id"), i.get("title")) for i in items], [(None, "只有个标题")])
+
+check("非 macOS 读不到剪贴板就返回空（不抛）",
+      of.clipboard_flavor("url") if sys.platform == "darwin" else "", "")
+_real_osascript = of._osascript
+of._osascript = lambda script, timeout=5: "«class RTF », 392, URL, 29, string, 9"
+check("clipboard info 解析得出 flavor 和大小", of.clipboard_info(),
+      [("RTF", 392), ("URL", 29), ("string", 9)])
+of._osascript = _real_osascript
+of.clipboard_flavor = _real_flavor
+
+
 # ---------------------------------------------------------------- omni 客户端
 
 print("== omnifocus.Client：退出码 → 异常 ==")
@@ -290,6 +361,21 @@ check("A：复制品也在库里、指向同一条",
       store.get(copy["id"])["omnifocus"]["id"], "pk1")
 check("A：收尾结束", review.closed, True)
 
+print("== 转移之后 Focusmate 那条 task 要删掉 ==")
+deleted = []
+store, review, ids = mk_review(hooks=dict(hooks_base(),
+      delete_focusmate_task=lambda task: deleted.append(task["id"]) or "Focusmate task ft-1 已删除"))
+store.attach_focusmate(ids[0], {"task_id": "ft-1"})
+review.handle("a")
+store.duplicate(ids[0], session=NEXT)          # 真的把复制品挂到下一场（＝转移发生了）
+review.after_dispatch("task %d duplicate -a 1" % ids[0])
+check("转移成立时叫了「删 Focusmate task」", deleted, [ids[0]])
+check_true("收尾里说了已删除",
+           any("已删除" in text for _kind, text in review.notes))
+check("旧任务还是放弃 + 标签", store.get(ids[0])["status"], ts.STATUS_DROPPED)
+store2, review2, ids2 = mk_review(hooks=hooks_base())
+check("没有 delete hook 也不炸（收尾照走）", review2.handle("b")["action"], "close")
+
 # 跳过 / 退出 / 认不出的选项
 store, review, ids = mk_review(titles=("写论文", "复习"), hooks=hooks_base())
 check("认不出的选项不推进", review.handle("zzz"), {"action": "handled"})
@@ -308,7 +394,18 @@ check("空行只是提示", review.handle("x"), {"action": "handled"})
 print("== keep_session.postsession_tick：入队 + 拉 warden ==")
 import keep_session as ks  # noqa: E402
 
+# ⚠️ 立刻钉死：后面任何一段（包括本文件里后来才写的用例）都可能碰 daemon 的
+# 状态文件。以前是到「warden 侧」才钉，于是前面那几段写的是仓库里**真的**
+# temp/keep_session-state.json（实测把真 state 清空过一次）。
 CSV = os.path.join(TMP, "data.csv")
+ks.STATE_FILE = os.path.join(TMP, "state.json")
+ks.LOCK_FILE = os.path.join(TMP, "keep_session.lock")
+ks.EXPECTED_FILE = os.path.join(TMP, "expected.json")
+ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
+ks.SINS_FILE = os.path.join(TMP, "sins.json")
+ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
+ks.LOG_FILE = os.path.join(TMP, "keep_session.log")
+ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
 with open(CSV, "w", encoding="utf-8") as f:
     f.write("2026-10-27,11:00,50\n")
 import schedule as sch  # noqa: E402
@@ -335,6 +432,172 @@ check("收完之后也不会再催",
 psv.clear()
 
 
+print("== 收尾按「实际场次」发问（计划 75 被拆成 25+50）==")
+real = [{"start": datetime.datetime(2026, 10, 27, 16, 0), "duration": 25, "id": "a"},
+        {"start": datetime.datetime(2026, 10, 27, 16, 30), "duration": 50, "id": "b"}]
+by_day = psv.slots_from_details(real)
+check("按天分组", list(by_day), [datetime.date(2026, 10, 27)])
+check("实际时长进来（不再拿计划占位）",
+      [(s["start"], s["duration"]) for s in by_day[datetime.date(2026, 10, 27)]],
+      [("16:00", 25), ("16:30", 50)])
+check("标了 actual", all(s["actual"] for s in by_day[datetime.date(2026, 10, 27)]),
+      True)
+
+with open(CSV, "w", encoding="utf-8") as f:
+    f.write("2026-10-27,16:15,75\n")
+plan_only = psv.slots_around(sch.load_entries()[0],
+                             now=datetime.datetime(2026, 10, 27, 12, 0), days_back=0)
+check("不给 actual 就用计划", [(x["start"], int(x["duration"]))
+                                for _d, xs in plan_only for x in xs], [("16:15", 75)])
+with_actual = psv.slots_around(sch.load_entries()[0],
+                               now=datetime.datetime(2026, 10, 27, 12, 0),
+                               days_back=0, actual=real)
+check("(entries, warnings) 整个传进来也认（以前会静悄悄变空）",
+      psv.slots_around(sch.load_entries(), now=datetime.datetime(2026, 10, 27, 12, 0),
+                       days_back=0),
+      plan_only)
+check("给了 actual 就用实际",
+      [(x["start"], x["duration"]) for _d, xs in with_actual for x in xs],
+      [("16:00", 25), ("16:30", 50)])
+early = psv.ended_sessions(with_actual, now=datetime.datetime(2026, 10, 27, 16, 25, 20))
+check("第一段结束 15 秒后就该问（不是等到计划的 17:30）",
+      [r["key"] for r in early], ["2026-10-27T16:00"])
+late = psv.ended_sessions(with_actual, now=datetime.datetime(2026, 10, 27, 17, 20, 20))
+check("第二段结束 15 秒后再问一次（第一段还在 3 小时内，一起等着）",
+      [r["key"] for r in late], ["2026-10-27T16:00", "2026-10-27T16:30"])
+plan_early = psv.ended_sessions(plan_only, now=datetime.datetime(2026, 10, 27, 16, 25, 20))
+check("（对照）按计划那边这时候什么都不问", plan_early, [])
+
+print("== keep_session：收尾线程按 state.json 里的实际快照算 ==")
+fresh = [{"start": (datetime.datetime.now() + datetime.timedelta(minutes=5)).isoformat(
+              timespec="seconds"), "duration": 25, "id": "x"}]
+ks.save_state({"date": datetime.date.today().isoformat(), "slots": {},
+               "api_snapshot": {"at": datetime.datetime.now().isoformat(timespec="seconds"),
+                                "horizon": None, "sessions": [], "details": fresh}})
+got = ks.fresh_snapshot_details()
+check("新鲜快照读得出来", [r["duration"] for r in got], [25])
+ks.save_state({"date": datetime.date.today().isoformat(), "slots": {},
+               "api_snapshot": {"at": (datetime.datetime.now()
+                                       - datetime.timedelta(hours=3)).isoformat(timespec="seconds"),
+                                "horizon": None, "sessions": [], "details": fresh}})
+check("过期快照当没有（退回计划，别拿旧数据当事实）",
+      ks.fresh_snapshot_details(), None)
+
+print("== 叫人：TUI 活着 / 没开 分得清 ==")
+TUI = os.path.join(TMP, "warden-tui.json")
+ks.TUI_STATE_FILE = TUI
+check("没有状态文件 → 没开", ks.tui_alive(), (False, {}))
+with open(TUI, "w", encoding="utf-8") as f:
+    json.dump({"pid": os.getpid(), "tty": "/dev/ttys999"}, f)
+alive, st = ks.tui_alive()
+check("自己这个 pid 活着 → 开着的", (alive, st.get("tty")), (True, "/dev/ttys999"))
+with open(TUI, "w", encoding="utf-8") as f:
+    json.dump({"pid": 999999, "tty": "/dev/ttys999"}, f)
+check("pid 没了 → 没开（marker 里的 session 早就不跑 warden 了）",
+      ks.tui_alive()[0], False)
+
+# summon_warden 的三种参数组合（不真跑 osascript）
+calls = []
+
+
+class _Proc(object):
+    def __init__(self, out="focused ABC"):
+        self.returncode = 0
+        self.stdout = out
+        self.stderr = ""
+
+
+_real_run = ks.subprocess.run
+_real_exists = os.path.exists
+ks.subprocess.run = lambda cmd, **kw: (calls.append(list(cmd)), _Proc())[1]
+ks.os.path.exists = lambda p: True if p == ks.SUMMON_SCRIPT else _real_exists(p)
+with open(TUI, "w", encoding="utf-8") as f:
+    json.dump({"pid": os.getpid(), "tty": "/dev/ttys003"}, f)
+check("TUI 开着 → 聚焦 + 按 tty 找 + 不打 refresh",
+      (ks.summon_warden(), calls[-1][2:]),
+      (True, ["--no-refresh", "--tty", "/dev/ttys003"]))
+os.remove(TUI)
+check("TUI 没开 → --new（新窗口跑 Warden.command）",
+      (ks.summon_warden(), calls[-1][2:]), (True, ["--new", "--no-refresh"]))
+check("显式要 refresh 就给（默认不给）",
+      (ks.summon_warden(refresh=True), calls[-1][2:]),
+      (True, ["--new"]))
+check("dry-run 不调 osascript", (ks.summon_warden(dry_run=True), len(calls)), (True, 3))
+
+# osascript 被 TCC 挡住（-10004 权限违例）→ 走 open -a app bundle
+SUMMON_LOGS = []
+_real_ks_log = ks.log
+ks.log = lambda msg, echo=True, to_file=True: SUMMON_LOGS.append(str(msg))
+opened = []
+_real_isdir = os.path.isdir
+ks.os.path.isdir = lambda p: True if p == ks.SUMMON_APP else _real_isdir(p)
+
+
+class _Proc2(object):
+    def __init__(self, rc=0, out=""):
+        self.returncode = rc
+        self.stdout = out
+        self.stderr = ""
+
+
+def fake_run(cmd, **kw):
+    args = list(cmd)
+    calls.append(args)
+    if args and args[0] == "open":
+        opened.append(args)
+        return _Proc2(0, "")
+    # osascript 那条：退出码 0，但 AppleScript 的 fail() 把错误写进了 stdout
+    return _Proc2(0, "error -10004: “iTerm”遇到一个错误：发生权限违例。")
+
+
+ks.subprocess.run = fake_run
+check("osascript 报权限违例时算失败，并改用 app（先按名字找装好的那个）",
+      (ks.summon_warden(), opened[-1]), (True, ["open", "-a", "Warden"]))
+
+
+def fake_run_all_broken(cmd, **kw):
+    args = list(cmd)
+    calls.append(args)
+    if args and args[0] == "open":
+        return _Proc2(1, "")            # open 也失败
+    return _Proc2(0, "权限违例")
+
+
+ks.subprocess.run = fake_run_all_broken
+check("两条路都走不通 → 返回失败（不假装成功）", ks.summon_warden(), False)
+ks.os.path.isdir = lambda p: False
+check("app 也起不来 → 失败（不假装成功）", ks.summon_warden(), False)
+check_true("日志里给了 build.sh / 授权 的修法",
+           any("build.sh" in m for m in SUMMON_LOGS))
+check_true("日志里点名了 app 那条路也试过",
+           any("open -a" in m for m in SUMMON_LOGS))
+ks.log = _real_ks_log
+ks.os.path.isdir = _real_isdir
+ks.subprocess.run = _real_run
+ks.os.path.exists = _real_exists
+
+print("== 补叫：叫了但人没来 → 隔一会儿再叫 ==")
+psv.clear()
+psv.mark_pending({"key": "2026-10-27T11:00", "date": "2026-10-27", "start": "11:00",
+                  "end": "11:50", "duration": 50},
+                 now=datetime.datetime(2026, 10, 27, 11, 50, 16))
+retries = []
+check("TUI 没开、刚叫过 → 这一秒不再叫",
+      ks.postsession_retry(now=datetime.datetime(2026, 10, 27, 11, 50, 30),
+                           summon=lambda **kw: retries.append("x")), [])
+check("过了一分钟还没人 → 再叫一次",
+      len(ks.postsession_retry(now=datetime.datetime(2026, 10, 27, 11, 52, 0),
+                               summon=lambda **kw: retries.append("x"))), 1)
+check("叫了", retries, ["x"])
+psv.clear()
+
+print("== 收尾线程起来了（1 秒一次，不等订场那一轮）==")
+check_true("start_postsession_thread 返回活线程",
+           ks.start_postsession_thread(dry_run=True).is_alive())
+ks._STOP["flag"] = True
+ks._STOP["flag"] = False
+
+
 # ---------------------------------------------------------------- warden 侧
 
 print("== warden：状态标记 / 截止时间 / 写回 ==")
@@ -353,6 +616,22 @@ ks.LOCK_FILE = os.path.join(TMP, "keep_session.lock")
 ks.EXPECTED_FILE = os.path.join(TMP, "expected.json")
 ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
+
+# 兜底：本文件里任何一条**意外**走到「真·一轮」的路径都要立刻炸，而不是
+# 去连 api.focusmate.com（真下过单的东西，测试绝不该碰）。日志也一样要关进
+# 临时目录 —— 以前漏了，用例的日志混进真 temp/keep_session.log 里，看日志
+# 排障时会以为 daemon 半夜自己干了什么。
+ks.LOG_FILE = os.path.join(TMP, "keep_session.log")
+ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
+
+
+def _no_network(*a, **kw):
+    raise RuntimeError("测试里不许真连 Focusmate API（这一轮本该被替身拦住）")
+
+
+ks.fetch_session_details = _no_network
+ks.fetch_sessions = _no_network
+
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
 ks.IDLE_STATE_FILE = os.path.join(TMP, "idle.json")
 ks.IDLE_MODE_FILE = os.path.join(TMP, "mode.json")

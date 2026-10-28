@@ -5,15 +5,25 @@
 --
 --   1. read the iTerm session id recorded in app/.warden-window
 --   2. look for that id across every iTerm window -> tab -> session
---   3. found     -> activate iTerm + select that window/tab/session
---                   + optionally type "refresh" into it (the TUI treats it
---                   as if you typed it, which refreshes whatever it shows)
---   4. not found (first run / you closed the window / iTerm restarted) -> create a
+--   3. (optional) if given `--tty /dev/ttysNNN`, look for that tty instead/in
+--      addition: the marker id dies whenever iTerm restarts or the tab is moved,
+--      but a tty keeps pointing at the same running shell.  A tty hit also
+--      **rewrites the marker**, so the next summon is fast again.
+--   4. found     -> activate iTerm + select that window/tab/session
+--                   (+ type "refresh" only when explicitly asked with --refresh)
+--   5. not found (first run / you closed the window / iTerm restarted) -> create a
 --      new window running app/Warden.command and record the new id
 --
 -- Why record the id instead of matching the window title: the TUI rewrites its own
 -- title, and titles are not unique.  A session id is a UUID handed out by iTerm.
 -- Losing the marker file costs you one extra window, never a broken launch.
+--
+-- Why "refresh" is **not** typed by default any more: it used to be the way to tell
+-- the TUI "look again".  But typing into a session that no longer runs Warden (you
+-- quit with `q`, it crashed, iTerm reopened that tab at a shell prompt) just types
+-- `refresh` into your shell, and typing while a review question is pending feeds
+-- the text to the review.  Warden polls the review queue by itself every frame, so
+-- the default is now focus-only.
 --
 -- The target terminal is iTerm2.  Its scripting name is "iTerm" (CFBundleName is
 -- "iTerm2", but the scripting dictionary registers as "iTerm").
@@ -22,7 +32,9 @@
 --   osascript app/warden-summon.applescript              # summon
 --   osascript app/warden-summon.applescript --dry-run    # say what it would do, touch nothing
 --   osascript app/warden-summon.applescript --new        # ignore the recorded window
---   osascript app/warden-summon.applescript --no-refresh # focus only
+--   osascript app/warden-summon.applescript --no-refresh # focus only (default now)
+--   osascript app/warden-summon.applescript --refresh    # also type "refresh"
+--   osascript app/warden-summon.applescript --tty /dev/ttys003   # find by tty
 --   osascript app/warden-summon.applescript --log        # tail the log
 --
 -- Troubleshooting: every step appends a line to the log.  Start there.
@@ -66,22 +78,36 @@ end quit
 -- ---------------------------------------------------------------- arguments
 
 on optsDefault()
-    return {dryRun:false, forceNew:false, doRefresh:true, logOnly:false}
+    -- doRefresh defaults to FALSE: see the header (typing "refresh" into a plain
+    -- shell, or into a pending review question, does more harm than good).
+    return {dryRun:false, forceNew:false, doRefresh:false, logOnly:false, ttyPath:""}
 end optsDefault
 
 on parseArgs(argv)
     set opts to my optsDefault()
-    repeat with a in argv
-        set flag to (a as text)
+    set n to count of argv
+    set i to 1
+    repeat while i <= n
+        set flag to (item i of argv as text)
         if flag is "--dry-run" then
             set dryRun of opts to true
         else if flag is "--new" then
             set forceNew of opts to true
         else if flag is "--no-refresh" then
             set doRefresh of opts to false
+        else if flag is "--refresh" then
+            set doRefresh of opts to true
         else if flag is "--log" then
             set logOnly of opts to true
+        else if flag is "--tty" then
+            if i < n then
+                set i to i + 1
+                set ttyPath of opts to (item i of argv as text)
+            end if
+        else if flag starts with "--tty=" then
+            set ttyPath of opts to text 7 thru -1 of flag
         end if
+        set i to i + 1
     end repeat
     return opts
 end parseArgs
@@ -93,6 +119,7 @@ on summon(opts)
     set dryRun to dryRun of opts
     set forceNew to forceNew of opts
     set wantRefresh to doRefresh of opts
+    set wantTty to ttyPath of opts
 
     set repo to my resolveRepo()
     set markerPath to repo & "/app/" & MARKER_NAME
@@ -107,7 +134,7 @@ on summon(opts)
     end if
 
     my logLine("")
-    my logLine("=== summon  dry-run=" & dryRun & " forceNew=" & forceNew & " refresh=" & wantRefresh)
+    my logLine("=== summon  dry-run=" & dryRun & " forceNew=" & forceNew & " refresh=" & wantRefresh & " tty=" & wantTty)
 
     set priorId to my readMarker(markerPath)
     my logLine("repo=" & repo & "  marker=" & markerPath & "  priorId=" & priorId)
@@ -156,6 +183,40 @@ on summon(opts)
         on error e number n
             my logLine("window search failed (treating as no hit) " & n & ": " & e)
         end try
+    end if
+    -- Second chance: match by tty.  The recorded session id dies when iTerm
+    -- restarts or the tab is moved, while the tty keeps pointing at the same
+    -- running shell.  A tty hit also repairs the marker.
+    if hitId is "" and (not forceNew) and wantTty is not "" then
+        try
+            tell application "iTerm"
+                repeat with wi from 1 to (count of windows)
+                    set w to window wi
+                    repeat with ti from 1 to (count of tabs of w)
+                        set t to tab ti of w
+                        repeat with si from 1 to (count of sessions of t)
+                            set s to session si of t
+                            try
+                                if (tty of s) is wantTty then
+                                    set hitW to wi
+                                    set hitT to ti
+                                    set hitS to si
+                                    set hitId to (id of s)
+                                end if
+                            on error
+                                -- old iTerm builds may not expose `tty`; skip quietly
+                            end try
+                        end repeat
+                    end repeat
+                end repeat
+            end tell
+        on error e number n
+            my logLine("tty search failed (treating as no hit) " & n & ": " & e)
+        end try
+        if hitId is not "" then
+            my writeMarker(markerPath, hitId)
+            my logLine("tty hit -> marker repaired to " & hitId)
+        end if
     end if
     my logLine("hit = " & hitId & "  (window " & hitW & " tab " & hitT & ")")
 

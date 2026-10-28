@@ -282,7 +282,43 @@ check("dry-run 不发通知", NOTIFIES, [])
 check("dry-run 不放声音", PLAYS, [])
 check("dry-run 也落盘计数", ks.load_idle_state().get("strikes"), 1)
 
+print("== 静音时段：违规照记，但不出声 ==")
+reset()
+MUTES = os.path.join(TMP, "session-mutes.json")
+os.environ["TI_SESSION_MUTES"] = MUTES
+write_csv(["# t", "%s,09:50,50" % WD])
+if os.path.exists(MUTES):
+    os.remove(MUTES)
+ks.sp.mute_period(NOW.date(), {"id": "T1", "start": "09:00", "end": "11:00"})
+check("静音窗生效（10:00 在 09:00–11:00 里）", ks.sp.is_muted_at(NOW), True)
+ks.idle_tick(now=NOW, idle_seconds=5)                 # 建立基线
+check("静音时段第 1 次违规照样记",
+      ks.idle_tick(now=NOW, idle_seconds=61), 1)
+check("静音时段不发通知", NOTIFIES, [])
+check("静音时段不放声音", PLAYS, [])
+check_true("日志里说明是静音时段",
+           any("静音时段" in m for m in LOGS))
+# 到第 3 次也不许出声（普通模式 3 次 = 拉低音量 + 嘶吼）
+ks.idle_tick(now=NOW, idle_seconds=121)
+ks.idle_tick(now=NOW, idle_seconds=181)
+check("第 3 次违规也不放歌", PLAYS, [])
+check("但违规次数照记", ks.load_idle_state().get("strikes"), 3)
+
+# 撤掉静音之后，同样第 3 次就会真的响
+reset()
+write_csv(["# t", "%s,09:50,50" % WD])
+ks.sp.unmute_period(NOW.date(), "T1")
+check("撤销后不再静音", ks.sp.is_muted_at(NOW), False)
+ks.idle_tick(now=NOW, idle_seconds=5)
+for sec in (61, 121, 181):
+    ks.idle_tick(now=NOW, idle_seconds=sec)
+check("不静音了 → 真的放歌", len(PLAYS), 1)
+check_true("放的是赵小六", "赵小六" in str(PLAYS[0][0]))
+check_true("静音时段没发过的通知，这儿补上",
+           any("违规" in str(m) for m in NOTIFIES))
+
 print("== 总开关 ==")
+reset()                       # 上一段故意响过，通知列表先清空（这段要验「一条都不发」）
 ks.IDLE_CHECK = False
 check("关掉后 idle_tick 不做事", ks.idle_tick(now=NOW, idle_seconds=999), None)
 check("关掉后不发通知", NOTIFIES, [])

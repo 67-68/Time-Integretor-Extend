@@ -302,7 +302,7 @@ def due_candidates(store, now=None, within_minutes=0, include_no_due=False):
 
 
 def unreviewed_sessions(store, entries, now=None, delay=DELAY_SEC,
-                        lookback=LOOKBACK_SEC, done_keys=()):
+                        lookback=LOOKBACK_SEC, done_keys=(), actual=None):
     """已经结束、还没收尾、而且**确实还有没做完的任务**的场次（从早到晚）。
 
     为什么 warden 自己也要算一遍：daemon 只负责「准点叫人」，它写的是
@@ -317,7 +317,7 @@ def unreviewed_sessions(store, entries, now=None, delay=DELAY_SEC,
     now = now or datetime.datetime.now()
     done = {str(k) for k in (done_keys or ())}
     out = []
-    for rec in ended_sessions(slots_around(entries, now=now, days_back=1),
+    for rec in ended_sessions(slots_around(entries, now=now, days_back=1, actual=actual),
                               now=now, delay=delay, lookback=lookback):
         if rec["key"] in done:
             continue
@@ -336,15 +336,67 @@ def unreviewed_sessions(store, entries, now=None, delay=DELAY_SEC,
     return out
 
 
-def slots_around(entries, now=None, days_back=1, days_fwd=0):
-    """data.csv 规则 → ``[(date, slots)]``，覆盖昨天今天（跨午夜那点边角也算）。"""
+def slots_from_details(details):
+    """API 的**实际** session → ``{date: [slot, ...]}``（slot 带 ``actual: True``）。
+
+    为什么要这个：收尾该问哪几场，答案在**实际订到的场次**里，不在计划里。
+    2026-10-28 的教训 —— 计划 16:15 一场 75min，实际是 16:00 25 + 16:30 50：
+    按计划问，只会在 17:30 问一次；按实际问，16:25 和 17:20 各问一次，
+    任务转移才落得下来。
+    """
+    by_day = {}
+    for rec in details or []:
+        if not isinstance(rec, dict):
+            continue
+        start = rec.get("start")
+        if isinstance(start, str):
+            try:
+                start = datetime.datetime.fromisoformat(start)
+            except ValueError:
+                continue
+        if not isinstance(start, datetime.datetime):
+            continue
+        dur = rec.get("duration")
+        try:
+            dur = int(dur) if dur is not None else 0
+        except (TypeError, ValueError):
+            dur = 0
+        by_day.setdefault(start.date(), []).append({
+            "start": start.strftime("%H:%M"),
+            # hour / minute 是 schedule.day_slots 的形状，_slot_window 要用
+            "hour": start.hour,
+            "minute": start.minute,
+            "duration": dur,
+            "actual": True,
+            "focusmate_session_id": rec.get("id"),
+        })
+    for day in by_day:
+        by_day[day].sort(key=lambda r: r["start"])
+    return by_day
+
+
+def slots_around(entries, now=None, days_back=1, days_fwd=0, actual=None):
+    """``[(date, slots)]``，覆盖昨天今天（跨午夜那点边角也算）。
+
+    ``actual``：``[{"start": datetime, "duration": 分钟}, …]``（API 里的实际场次）。
+    给了就用**实际**的替换那一天的计划 —— 「实际订到的才算这场 session」。
+    没给（拉不到 API / 那天在窗口外）就退回计划，绝不因为缺数据就不催。
+    """
     import schedule as sch
 
     now = now or datetime.datetime.now()
     today = now.date()
+    # 容忍 ``schedule.load_entries()`` 的整个返回值 ``(entries, warnings)`` ——
+    # 传错了不该静悄悄返回空（以前就是这样：一场都不催，还看不出来）。
+    if isinstance(entries, tuple) and len(entries) == 2:
+        entries = entries[0]
+    real = slots_from_details(actual) if actual else {}
     out = []
     for offset in range(-int(days_back), int(days_fwd) + 1):
         day = today + datetime.timedelta(days=offset)
+        if day in real:
+            out.append((day, real[day]))
+            continue
         try:
             out.append((day, sch.day_slots(entries, day)))
         except Exception:                      # noqa: BLE001 - 排布坏了不该让 daemon 挂
@@ -385,6 +437,7 @@ class Review(object):
         drop_omnifocus(task)                    OmniFocus 放弃这条（返回一句人话）
         complete_omnifocus(task, minutes)       OmniFocus 完成 + 写回截止时间
         complete_focusmate(task)                Focusmate 那边勾完成
+        delete_focusmate_task(task)             删掉 Focusmate 那条 task（转移之后）
         assign_focusmate(task, session)         把任务挂到下一场（Focusmate + 本地）
         next_session(task)                      下一场 session（dict）或 None
         due_of(task)                            这条任务的截止时间（session 终点）
@@ -771,13 +824,22 @@ class Review(object):
         return out[-1] if out else None
 
     def _finish_transfer(self, task, how):
-        """延期成立：旧任务放弃 + 本地标签「未完成转移」。OmniFocus 不动。"""
+        """延期成立：旧任务放弃 + 本地标签「未完成转移」+ 删掉 Focusmate 那条 task。
+
+        Focusmate 那条 task 必须删（用户点名的「任务转移之后 focusmate 任务删除」）：
+        它挂在**旧那一场**上，任务已经转走了，它既不会完成、也不该继续躺在
+        Task Manager 里。删失败只报告，不挡住转移本身（账本先落下来）。
+        OmniFocus 那边照旧一个字节都不动。
+        """
         tag = ts.TRANSFER_TAG
         self.mark_processed(task, "transfer")
+        note = self._hook("delete_focusmate_task", task)
         self.store.drop(task["id"], reason="transferred", tag=tag)
         self.say("⤼ 任务 %s「%s」已转移（%s）：旧记录标放弃 + 标签「%s」；"
                  "OmniFocus 那条任务一个字节都没动。"
                  % (task["id"], self.title_of(task), how, tag), "ok")
+        if note:
+            self.say("   %s" % note, "ok" if "已删除" in str(note) else "info")
         self.stage = self.ASK
         self.pending_task = None
         self.index += 1

@@ -210,6 +210,23 @@ with contextlib.redirect_stdout(buf):
     ts.main(["--file", TASKS, "--archive", ARCHIVE, "archive", "--json"])
 check("--json 原样打出整个文件", '"records"' in buf.getvalue(), True)
 
+print("== 转移之后：本地把 Focusmate task 忘掉（旧 id 进 previous）==")
+import tempfile as _tf
+store2 = ts.TaskStore(os.path.join(_tf.mkdtemp(), "t.json"),
+                      os.path.join(_tf.mkdtemp(), "a.json"))
+t = store2.create({"title": "写论文"})
+store2.assign(t["id"], {"date": "2026-10-27", "start": "11:00", "duration": 50})
+store2.attach_focusmate(t["id"], {"task_id": "ft-9"})
+check("先记着 task_id", store2.get(t["id"])["focusmate"]["task_id"], "ft-9")
+store2.forget_focusmate(t["id"], reason="transfer")
+fm = store2.get(t["id"])["focusmate"]
+check("当前那格清空", fm.get("task_id"), None)
+check("旧 id 进 previous（归档还要用）",
+      [p["task_id"] for p in fm.get("previous") or []], ["ft-9"])
+check("记下了为什么删", (fm.get("deleted_reason"), bool(fm.get("deleted_at"))),
+      ("transfer", True))
+check("任务本身还在（没被删）", store2.get(t["id"])["fields"]["title"], "写论文")
+
 print("== 坏 JSON 不炸 ==")
 with open(TASKS, "w", encoding="utf-8") as f:
     f.write("{not json")

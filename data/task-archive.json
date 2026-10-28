@@ -176,6 +176,100 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-10-28T09:50:39",
+      "task_id": 19,
+      "fields": {
+        "title": "sat数学bluebook6",
+        "due": "2026-10-28T00:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-27",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": "50",
+        "focusmate_session_id": "29442be3-0e04-4429-bd05-e985ee9d2446"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 40,
+      "status_at": "2026-10-28T09:50:39",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "2adf16e2-835c-4431-89b3-3c46418579bd",
+        "title": "sat数学bluebook6",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-10-28T10:40:37",
+      "task_id": 21,
+      "fields": {
+        "title": "创建任务",
+        "due": "2026-10-28T10:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 2,
+        "date": "2026-10-28",
+        "start": "09:45",
+        "end": "10:35",
+        "duration": 50,
+        "focusmate_session_id": "d1180ebb-1b12-4dbb-9a7f-1bce16bbc2b5"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 30,
+      "status_at": "2026-10-28T10:40:37",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "fbcd9b81-cf4c-410e-9f4d-130291cbedc5",
+        "title": "创建任务",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-10-28T16:15:51",
+      "task_id": 17,
+      "fields": {
+        "title": "物理lastyear",
+        "due": "2026-10-28T16:15:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-10-28",
+        "start": "15:00",
+        "end": "16:15",
+        "duration": 75,
+        "focusmate_session_id": "2981ed35-4539-47b4-818a-fceb92f18abb",
+        "previous_due": "2026-10-28T10:35:00"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 25,
+      "status_at": "2026-10-28T16:15:51",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "ba4bab52-19fa-4251-a7ea-92ef49c49901",
+        "title": "物理lastyear",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

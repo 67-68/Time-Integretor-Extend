@@ -50,6 +50,22 @@ ks.EXPECTED_FILE = os.path.join(os.path.dirname(ks.STATE_FILE),
                                 "keep_session-expected.json")
 ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
 ks.SINS_FILE = os.path.join(TMP, "sins.json")
+
+# 兜底：本文件里任何一条**意外**走到「真·一轮」的路径都要立刻炸，而不是
+# 去连 api.focusmate.com（真下过单的东西，测试绝不该碰）。日志也一样要关进
+# 临时目录 —— 以前漏了，用例的日志混进真 temp/keep_session.log 里，看日志
+# 排障时会以为 daemon 半夜自己干了什么。
+ks.LOG_FILE = os.path.join(TMP, "keep_session.log")
+ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
+
+
+def _no_network(*a, **kw):
+    raise RuntimeError("测试里不许真连 Focusmate API（这一轮本该被替身拦住）")
+
+
+ks.fetch_session_details = _no_network
+ks.fetch_sessions = _no_network
+
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
 ks.IDLE_STATE_FILE = os.path.join(TMP, "idle.json")
 ks.IDLE_MODE_FILE = os.path.join(TMP, "mode.json")
@@ -534,6 +550,202 @@ check("旧场次已记进 previous_session/focusmate",
 for t in list(wd.task_store.list()):
     wd.handle("task delete %d" % t["id"])
 check("task delete", wd.task_store.list(), [])
+
+
+# ---------------------------------------------------------------- 剪贴板导入
+
+print("== task import -a：直接读剪贴板（⌘V 到终端会丢链接）==")
+CLIP = [{"id": "i5BKXC5uNk0", "url": "omnifocus:///task/i5BKXC5uNk0",
+         "title": "TI: Swap", "has_id": True, "raw": "omnifocus:///task/i5BKXC5uNk0"}]
+_real_clip = w.of.clipboard_links
+w.of.clipboard_links = lambda: [dict(x) for x in CLIP]
+wd.messages = []
+check("task import -a 受理", wd.handle("task import -a"), True)
+made = wd.task_store.get(wd.selected_task_id)
+check("从剪贴板读到了 OmniFocus primary key",
+      (made.get("omnifocus") or {}).get("id"), "i5BKXC5uNk0")
+check("标题也来自剪贴板", made["fields"]["title"], "TI: Swap")
+check_true("消息里说明链接是从剪贴板读的",
+           any("链接从剪贴板读的" in m[2] for m in wd.messages))
+
+wd.messages = []
+check("再加一条（-a 可以叠在别的参数前面）", wd.handle("task import --clip"), True)
+check("两条都关联上了",
+      len([t for t in wd.task_store.list()
+           if (t.get("omnifocus") or {}).get("id") == "i5BKXC5uNk0"]), 2)
+
+# 粘贴「只有标题」：去剪贴板里对同名的那条，对上了就关联（不是拿标题猜）
+w.of.clipboard_links = lambda: [dict(CLIP[0])]
+wd.messages = []
+check("粘贴只有标题也受理", wd.handle("task import TI: Swap"), True)
+linked = wd.task_store.get(wd.selected_task_id)
+check("同名 → 认下剪贴板里的链接", (linked.get("omnifocus") or {}).get("id"),
+      "i5BKXC5uNk0")
+# 对不上就明说没关联
+w.of.clipboard_links = lambda: [{"id": "other", "title": "别的任务", "has_id": True}]
+wd.messages = []
+check("标题对不上也照样建", wd.handle("task import 谁也不是"), True)
+loose = wd.task_store.get(wd.selected_task_id)
+check("对不上 → 不关联", loose.get("omnifocus"), None)
+check_true("并且明说没关联", any("没有关联" in m[2] for m in wd.messages))
+check_true("给出补救办法（link -a）",
+           any("link -a" in m[2] for m in wd.messages))
+
+wd.messages = []
+w.of.clipboard_links = lambda: []
+check("剪贴板空 → 报错但 TUI 不死", wd.handle("task import -a"), True)
+check_true("错误说清剪贴板里没有链接",
+           any("剪贴板里没有 OmniFocus 链接" in m[2] for m in wd.messages))
+
+print("== task <id> link -a ==")
+w.of.clipboard_links = lambda: [dict(CLIP[0])]
+tgt = wd.task_store.create({"title": "先建后关联"})
+check("link -a 受理", wd.handle("task %d link -a" % tgt["id"]), True)
+check("关联上了", (wd.task_store.get(tgt["id"]).get("omnifocus") or {}).get("id"),
+      "i5BKXC5uNk0")
+w.of.clipboard_links = _real_clip
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
+
+
+# ---------------------------------------------------------------- 静音时段
+
+print("== period mute T1 --permanent：写意图 … ==")
+os.environ["TI_SESSION_MUTES"] = os.path.join(TMP, "mutes.json")
+MUTES = os.environ["TI_SESSION_MUTES"]
+if os.path.exists(MUTES):
+    os.remove(MUTES)
+wd.messages = []
+check("period mute T1 受理", wd.handle("period mute T1"), True)
+check("写到「只这一天」的表里", [(m.get("period"), m.get("date"))
+                               for m in sp.load_mutes()["mutes"]],
+      [("T1", ISO)])
+check("静音窗是那个时段的时间窗",
+      [(m["start"], m["end"]) for m in sp.load_mutes()["mutes"]], [("11:00", "13:00")])
+check_true("消息说清这段钟点什么行为", any("看门狗不出声" in m[2] for m in wd.messages))
+
+wd.messages = []
+check("period mute T1 --permanent 受理", wd.handle("period mute T1 --permanent"), True)
+check("写进按星期几重复的表",
+      [m.get("weekday") for m in sp.load_mutes()["mutes"] if m.get("weekday")],
+      [sch.weekday_of_day(TODAY)])
+check_true("消息说「每个周X」", any("每个" in m[2] and "静音了" in m[2] for m in wd.messages))
+check("今天这个时段的 id 被认成静音",
+      "T1" in sp.muted_period_ids(TODAY), True)
+check("别的时段没事", "T2" in sp.muted_period_ids(TODAY), False)
+
+print("== …然后这一场自动 quiet on ==")
+wd.api_rows = []
+plan_rows = [r for r in wd.rows if r.get("planned")] or []
+for slot in sch.day_slots(wd.entries, wd.sel_date):
+    h, m = map(int, slot["start"].split(":"))
+    st = dt.datetime.combine(wd.sel_date, dt.time(h, m))
+    en = st + dt.timedelta(minutes=int(slot["duration"]))
+    wd.api_rows.append({
+        "startMs": int(st.timestamp() * 1000), "endMs": int(en.timestamp() * 1000),
+        "startLabel": slot["start"], "endLabel": en.strftime("%H:%M"),
+        "durationMin": int(slot["duration"]), "id": "sess-" + slot["start"],
+        "title": "", "quiet": False, "matched": False,
+        "phase": wd.phase_of(int(st.timestamp() * 1000), int(en.timestamp() * 1000),
+                             int(dt.datetime.now().timestamp() * 1000)),
+    })
+wd.rows_source = "bridge"
+wd.rebuild_rows()
+t1_rows = [r for r in wd.rows if r.get("period_id") == "T1"]
+check("T1 的行都标了「时段静音」", [r.get("period_muted") for r in t1_rows],
+      [True, True])
+check("T2 的行没标", [r.get("period_muted") for r in wd.rows
+                      if r.get("period_id") == "T2"], [False])
+targets = wd.mute_targets()
+check("要静音的就是这两场", [r["startLabel"] for r in targets], ["11:00", "12:00"])
+wd.offline = False
+wd.bridge.calls[:] = []
+wd.messages = []
+applied = wd.apply_mutes()
+check("bridge 收到两次 mute quiet=True",
+      [(c[0], c[1].get("quiet"), c[1].get("meetingId")) for c in wd.bridge.calls
+       if c[0] == "mute"],
+      [("mute", True, "sess-11:00"), ("mute", True, "sess-12:00")])
+check("两场都确认了", [ok for _l, ok, _d in applied], [True, True])
+check_true("消息说「已静音」", any("已静音" in m[2] for m in wd.messages))
+# 已经是 ON 的不再重复动
+for r in wd.rows:
+    if r.get("period_id") == "T1":
+        r["quiet"] = True
+wd.bridge.calls[:] = []
+check("已经 ON 的不会再动一次", wd.apply_mutes(), [])
+wd.offline = True
+
+buf = io.StringIO()
+wd.console = Console(file=buf, width=240, force_terminal=False)
+wd.paint()
+plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", buf.getvalue())
+check_true("表格里能看出「时段静音」", "静" in plain)
+
+print("== period unmute T1 ==")
+wd.messages = []
+check("period unmute T1 --permanent 受理",
+      wd.handle("period unmute T1 --permanent"), True)
+check("按星期几那条被删掉",
+      [m for m in sp.load_mutes()["mutes"] if m.get("weekday")], [])
+check_true("消息说「已解除静音」", any("已解除静音" in m[2] for m in wd.messages))
+
+print("== 分心看门狗：静音窗里不出声（daemon 侧，同一个表）==")
+win = sp.mute_window_at(dt.datetime.combine(TODAY, dt.time(11, 30)))
+check("11:30 在 T1 的静音窗里", win.get("period"), "T1")
+check("13:30 不在", sp.mute_window_at(dt.datetime.combine(TODAY, dt.time(13, 30))), None)
+
+
+# ---------------------------------------------------------------- 计划 vs 实际
+
+print("== 计划 16:15 75min，实际 16:00 25 + 16:30 50 ==")
+start = dt.datetime.combine(TODAY, dt.time(16, 15))
+actual = [{"start": dt.datetime.combine(TODAY, dt.time(16, 0)), "duration": 25},
+          {"start": dt.datetime.combine(TODAY, dt.time(16, 30)), "duration": 50}]
+m = sch.match_slot(actual, start, 75)
+check("判成 covered", m["kind"], "covered")
+check_true("note 里写出实际两场", "16:00" in m["note"] and "16:30" in m["note"])
+check("实际分钟数 = 75", m["actual_minutes"], 75)
+check("同样两场对 50min 的计划也认账（16:30 那场就是它，只是挪了 15 分钟）",
+      sch.match_slot(actual, dt.datetime.combine(TODAY, dt.time(16, 15)), 50)["kind"],
+      "shifted")
+check("挪了半格（09:30→09:45，同为 50min）",
+      sch.match_slot([{"start": dt.datetime.combine(TODAY, dt.time(9, 45)),
+                       "duration": 50}],
+                     dt.datetime.combine(TODAY, dt.time(9, 30)), 50)["kind"], "shifted")
+check("彻底没有 → none", sch.match_slot([], start, 75)["kind"], "none")
+check("计划外场次能列出来",
+      [r["start"].strftime("%H:%M") for r in sch.unmatched_actual(
+          actual, [{"start": "16:15"}, {"start": "19:00"}])], ["16:00", "16:30"])
+
+print("== daemon 认账之后，表格说「认账」不说「缺」==")
+st = ks.load_state()
+st["slots"] = dict(st.get("slots") or {})
+st["slots"]["%sT16:15" % ISO] = {"status": "booked", "duration": "75", "attempts": 0,
+                                "match": "covered",
+                                "actual": "实际 16:00(25min) + 16:30(50min)（计划 16:15 75min）"}
+ks.save_state(st)
+wd._snapshot_cache.pop("__daemon_slots__", None)
+wd.api_rows = []
+wd.rows_source = "bridge"
+wd.rebuild_rows()
+row = [r for r in wd.rows if r["startLabel"] == "16:15"]
+if not row:                       # 计划里没有 16:15 → 手动补一行来验显示逻辑
+    pass
+check("daemon_slots 读得到认账记录",
+      (wd.daemon_slots().get("%sT16:15" % ISO) or {}).get("match"), "covered")
+
+print("== TUI 在场证明（daemon 靠它判断「人叫得回来吗」）==")
+info = wd.write_tui_state()
+check("写了 pid", info["pid"], os.getpid())
+check_true("有 tty 字段（跑在管道时可能为空串）", "tty" in info)
+import json as _json
+on_disk = _json.load(open(ks.TUI_STATE_FILE, encoding="utf-8"))
+check("文件里也是这个 pid", on_disk["pid"], os.getpid())
+alive, seen = ks.tui_alive()
+check("daemon 侧认得出 TUI 活着", alive, True)
+wd.clear_tui_state()
+check("退场时擦掉", os.path.exists(ks.TUI_STATE_FILE), False)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print()

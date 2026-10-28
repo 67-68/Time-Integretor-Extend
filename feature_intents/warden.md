@@ -71,6 +71,11 @@ relocate N -15      临时把 #N 提前 15 分钟（只改选中这一天的计�
 relocate N +15      临时把 #N 推后 15 分钟；同一天只能推一次，且不能跨天
 mute 3              把 #3 静音（不写 on/off 就是取反）
 mute 3 on|off       显式开/关
+period mute T1      这个时段（今天）静音：quiet 自动开 + daemon 看门狗不出声
+period mute T1 --permanent   以后**每个这个星期几**的 T1 都静音
+period unmute T1 [--permanent] / period mute T1 off   撤销
+task import -a      从剪贴板读 omnifocus:///task/PK 导入任务并自动关联（⌘V 会丢链接）
+task 5 link -a      从剪贴板读链接，关联到已有任务
 title 2 "Math Past Paper"
 title 2 ""          清空标题
 sync [--days N]     跑 download_calendar.py populate：日历 → 覆盖 data.csv
@@ -221,6 +226,38 @@ prompt_toolkit 每敲**一个**字就重画一次 chrome（`on_text_changed` →
 结果：**每次敲键 27ms → 0.1ms**，只剩每秒一次 ~20ms 的整帧重画（`tick=1.0` 本来就要画）。
 注意：别往看板上放**秒以下**的时间（倒计时毫秒、spinner），那会让帧键每秒都对不上、
 缓存等于白做 —— 真需要就放进 `status_line()`（它不在缓存里，逐帧现算）。
+
+## 静音时段（`period mute`）
+
+「这个时段以后都静音」是**排班意图**，不是单场开关，所以它落在
+`temp/session-mutes.json`（按星期几 / 按日期重复），由 `session_plan` 负责判定。
+warden 这边只做两件事：
+
+1. `period mute T1 [--permanent]` 写表，然后**立刻**把今天这个窗口里还没静音的场次
+   设成 quiet（`apply_mutes()`，走 bridge，API 复核）；
+2. 每帧（节流 5 秒）后台补一次（`_maybe_apply_mutes()`）—— 新订上的场次会自己安静下来，
+   同一场 5 分钟内只试一次，bridge 挂了也不会每帧开浏览器。
+
+表格「静音」列：`ON` = 已静音；`静…` = 时段要求静音但还没设上；`·` = 不静音。
+daemon 侧的「不出声」见 [`session_mute.md`](./session_mute.md)（同一个表，同一个判定）。
+
+## 计划 vs 实际（表格里为什么会出现「认账」）
+
+daemon 会把「计划与实际不一样、但实际确实做了」的场次记成认账（拆分 / 挪了半格，
+见 [`keep_session.md`](./keep_session.md)）。契约表读 `state.json` 的 `slots`，
+把这种行的状态从「缺」改成「**认账**」，并在标题后标出实际场次
+（`· 实际 16:00(25min) + 16:30(50min)（计划 16:15 75min）`）。
+「缺」会让人去重订一场和现有场次打架的 session，所以这两个字必须分清楚。
+
+收尾也按**实际**场次走（`actual_slots()` → `postsession.unreviewed_sessions(actual=…)`），
+手动 `review` 一样能问到计划外的场次。
+
+## 在场证明（`temp/warden-tui.json`）
+
+TUI 启动时写 `{pid, tty, started_at}`，退出时只擦自己那条。daemon 的「叫人」用它判断
+「warden 到底开着没」：没开就新窗口跑 `Warden.command`，开着就按 **tty** 聚焦
+（marker 里那个 iTerm session id 在 iTerm 重启 / 拖窗口之后就死了，tty 不会）。
+没有这份文件的时候只能靠 marker 猜，于是会出现「日志写着 focused、其实谁都没来」。
 
 ## 收尾（session 结束 +15s）
 

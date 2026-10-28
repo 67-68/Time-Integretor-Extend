@@ -28,6 +28,10 @@ def load(name, filename):
     return mod
 
 
+def check_true(label, got):
+    check(label, bool(got), True)
+
+
 def check(label, got, want):
     ok = got == want
     if not ok:
@@ -61,7 +65,12 @@ BOOKED = []
 ks.fm.book_once = lambda start_iso, duration: (BOOKED.append((start_iso, str(duration))),
                                                {"success": True, "session": {"id": "stub"}})[1]
 API = []                                      # API 里默认什么都没有
-ks.fetch_sessions = lambda now, until: list(API)
+# daemon 现在读的是**带时长**的 API 结果（计划 vs 实际要对得上，见
+# schedule.match_slot）；API 列表里可以塞 {"start":…, "duration":…} 或裸 datetime。
+ks.fetch_session_details = lambda now, until: [
+    {"start": x, "duration": None, "id": None} if isinstance(x, datetime.datetime) else x
+    for x in API]
+ks.fetch_sessions = lambda now, until: [r["start"] for r in ks.fetch_session_details(now, until)]
 ks.verify_slot_booked = lambda start, **kw: (True, "")   # 复核永远通过
 
 
@@ -124,6 +133,100 @@ check("下单用的是新时长 50", BOOKED[-1][1], "50")
 check("状态回到 booked", rec().get("status"), "booked")
 check("记录里是新时长", rec().get("duration"), "50")
 check("日志说明原因", any("计划时长 25 → 50" in m for m in LOGS), True)
+
+# ---------------------------------------------------------------- 计划 vs 实际
+
+print("== 计划 75min，实际 25+50：认账，不重订、不记罪 ==")
+clear()
+write_csv(["# t", "%s,%s,75" % (WD, HHMM)])
+API.extend([
+    {"start": _start - datetime.timedelta(minutes=15), "duration": 25, "id": "a"},
+    {"start": _start + datetime.timedelta(minutes=15), "duration": 50, "id": "b"},
+])
+ks.run_once()
+check("认账了 → 一场都没订", BOOKED, [])
+check("状态是 booked", rec().get("status"), "booked")
+check("记下了它是「覆盖」认账", rec().get("match"), "covered")
+check_true("actual 那句人话写进去了", "25" in (rec().get("actual") or ""))
+check("没记罪（冤枉过一次，别再冤枉）", ks.load_sins().get("sins", []), [])
+check_true("日志里说清是认账", any("认账" in m for m in LOGS))
+check_true("日志里报出计划外的两场",
+           any("计划外" in m and "16:" not in m for m in LOGS))
+
+print("== 计划 09:30 / 实际 09:45 同样算落地（挪了半格）==")
+clear()
+_start2 = _start + datetime.timedelta(minutes=20)      # 避开上面那场的时刻
+_start2 = _start2.replace(minute=(_start2.minute // 15) * 15, second=0, microsecond=0)
+HHMM2 = _start2.strftime("%H:%M")
+WD2 = sch.weekday_of_day(_start2.date())
+KEY2 = sch.key_of(_start2.date(), HHMM2)
+write_csv(["# t", "%s,%s,50" % (WD2, HHMM2)])
+API.append({"start": _start2 + datetime.timedelta(minutes=15), "duration": 50, "id": "c"})
+ks.run_once()
+slots = ks.load_state()["slots"]
+check("判成 shifted", (slots.get(KEY2) or {}).get("match"), "shifted")
+check("一场都没订", BOOKED, [])
+check("没记罪", ks.load_sins().get("sins", []), [])
+
+print("== 真的没有：还是该订就订、改记罪就记罪 ==")
+clear()
+write_csv(["# t", "%s,%s,75" % (WD, HHMM)])
+ks.run_once()
+check("没有实际场次 → 照常下单", len(BOOKED), 1)
+
+print("== 已经过去的场次：实际覆盖了就别记「没做」==")
+clear()
+API.extend([
+    {"start": _start - datetime.timedelta(hours=3), "duration": 25, "id": "p1"},
+    {"start": _start - datetime.timedelta(hours=3) + datetime.timedelta(minutes=30),
+     "duration": 50, "id": "p2"},
+])
+past_start = _start - datetime.timedelta(hours=3) + datetime.timedelta(minutes=15)
+past_key = sch.key_of(past_start.date(), past_start.strftime("%H:%M"))
+write_csv(["# t", "%s,%s,75" % (sch.weekday_of_day(past_start.date()),
+                                past_start.strftime("%H:%M"))])
+_now = datetime.datetime.now()
+_orig_now = None
+ks.WINDOW_HOURS = 24
+ks.run_once()
+# 那场已经开始了 → 进 past 分支（只对账）
+slots = ks.load_state()["slots"]
+check("过去的场次被认账成 booked", (slots.get(past_key) or {}).get("status"), "booked")
+check("没记「没做」的罪", ks.load_sins().get("sins", []), [])
+
+
+# ---------------------------------------------------------------- 热重载
+
+print("== 热重载不能把 daemon 弄死（exec 的目标 argv 必须是自己）==")
+execed = []
+_real_execv = getattr(ks.os, "execv", None)
+
+
+def fake_execv(path, argv):
+    execed.append((path, list(argv)))
+    raise OSError("测试里不真的 exec")
+
+
+ks.os.execv = fake_execv
+_real_source_mtimes = ks._SOURCE_MTIMES
+_real_stale = ks.stale_sources
+ks._SOURCE_MTIMES = {"dummy.py": 0}
+ks.stale_sources = lambda: ["keep_session.py"]
+ks._REEXEC_ARGV = None
+ks.reexec_if_stale()
+check("默认（前台 run / 手动 check）沿用 sys.argv",
+      execed[-1][1][1:], list(ks.sys.argv))
+ks._REEXEC_ARGV = [ks.PYTHON_BIN, os.path.join(ROOT, "keep_session.py"), "_daemon_loop",
+                   "--dry-run"]
+ks.reexec_if_stale()
+check("daemon 里 exec 回 _daemon_loop（不是父进程的 'daemon start'）",
+      execed[-1][1][2:], ["_daemon_loop", "--dry-run"])
+check_true("绝不会 exec 成 'daemon start'", "daemon" not in execed[-1][1])
+ks._REEXEC_ARGV = None
+ks.os.execv = _real_execv
+ks._SOURCE_MTIMES = _real_source_mtimes
+ks.stale_sources = _real_stale
+
 
 # ---------------------------------------------------------------- 退避中 + 时长改了
 

@@ -31,6 +31,10 @@ def check(label, got, want):
     print("%s %s" % ("ok  " if ok else "FAIL", label))
 
 
+def check_true(label, got):
+    check(label, bool(got), True)
+
+
 def check_raises(label, fn, exc=ValueError):
     try:
         fn()
@@ -810,6 +814,29 @@ if sys.platform == "darwin" and os.path.exists("/usr/bin/osascript"):
     check("set 包装还原的 JS 一致", proc.stdout.decode("utf-8").rstrip("\n"), expected_js)
 else:
     print("skip set 包装探针（不是 macOS）")
+
+# ---------------------------------------------------------------- 叫人的脚本
+
+if sys.platform == "darwin":
+    print("== app/warden-summon.applescript：能编译 + 认得新参数 ==")
+    import tempfile as _tempfile
+    cand = os.path.join(_tempfile.mkdtemp(prefix="summon-"), "summon.scpt")
+    proc = subprocess.run(["/usr/bin/osacompile", "-o", cand,
+                           os.path.join(ROOT, "app", "warden-summon.applescript")],
+                          capture_output=True)
+    check("编译通过", proc.returncode, 0)
+    # --dry-run 不会碰 iTerm，可以真跑：它只会说「会干什么」
+    out = subprocess.run(["/usr/bin/osascript",
+                          os.path.join(ROOT, "app", "warden-summon.applescript"),
+                          "--dry-run", "--tty", "/dev/ttys999", "--no-refresh"],
+                         capture_output=True, text=True)
+    check("dry-run 退出 0", out.returncode, 0)
+    check_true("dry-run 说了会干什么", bool((out.stdout or "").strip()))
+    check("--tty 会被记进日志（解析没丢参数）",
+          "tty=/dev/ttys999" in open(os.path.join(ROOT, "temp", "warden-summon.log"),
+                                     encoding="utf-8").read(), True)
+else:
+    print("skip summon 探针（不是 macOS）")
 
 print()
 if fails:

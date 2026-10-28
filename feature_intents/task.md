@@ -64,6 +64,9 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
 - **`duplicate_of`**：这条是从哪条复制来的。收尾里「延期到底成立没成立」
   就是靠它判的（同一条 OmniFocus 任务的多条本地记录）。
 - **`actual_minutes`**：「缺漏完成补充」手填的实际耗时，归档里也有一份。
+- **`focusmate`**：Focusmate 侧那条 task 的账。`task_id` 是当前挂着的，
+  `previous` 是历史（改挂到别场、或者**转移之后被删掉**的旧 id 都留在这儿），
+  删掉时写 `deleted_at` / `deleted_reason`（见 `forget_focusmate()`）。
 - **`history`**：「这条任务在哪一天的 session 里被处理过」。收尾/查账的每个动作
   （放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / **跳过**）都留一笔，
   `(day, start)` 相同只留最后一条，最多 `HISTORY_KEEP` 条。
@@ -93,7 +96,8 @@ TUI（任务视图 / 任意视图都认 `task`）：
 | `task <id> done [分钟]` | 完成：本地完成 + 归档 + Focusmate 勾上 + **OmniFocus 完成并写回截止时间** |
 | `task <id> drop [--local]` | 放弃：本地放弃；默认**OmniFocus 也放弃**，`--local` 只改本地 |
 | `task <id> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
-| `task import [粘贴文本]` | 从粘贴或**剪贴板**导入任务并自动关联 OmniFocus，可一次多行 |
+| `task import [-a] [粘贴文本]` | 从**剪贴板**（`-a`，推荐）或粘贴导入任务并自动关联 OmniFocus，可一次多行 |
+| `task <id> link -a` | 从剪贴板读 `omnifocus:///task/PK` 关联到已有任务 |
 
 `--assign N` 是**任何** task 子命令都认的后缀（`_split_assign()` 在 `cmd_task()` 入口
 统一摘掉），所以这些写法都成立：
@@ -105,6 +109,33 @@ task create title=复习 --repeat mon@22:15 --assign 3
 task modify 1 due 后天 --assign 3
 task select 1 --assign 3        # 等价于 task assign 1 3（也等价于 task 1 -a 3）
 ```
+
+### `task import -a`：为什么必须有 `-a`
+
+在 OmniFocus 里 ⌘C 一条任务、再到终端 ⌘V，**粘出来只有标题**：终端只接受
+剪贴板里 `string` / `utf8` 那个 flavor，`omnifocus:///task/PK` 在粘贴那一刻就丢了。
+所以「把粘贴的内容交给 `task import`」这条路注定没有 primary key（只能建任务、
+不能关联）。`-a`（`--auto` / `--clip` / `--clipboard` 同义）绕开粘贴这一层，
+**按 flavor 直接读剪贴板**：
+
+```text
+osascript -e 'the clipboard as URL'            → «data url 6F6D…»  ← OmniFocus 链接本体
+osascript -e 'the clipboard as «class HTML»'   → «data …»          ← 多选时的全部 + 标题
+osascript -e 'the clipboard as «class RTF »'   → «data …»          ← 同上，兜底
+pbpaste                                        → 纯文本（常常只有标题）
+```
+
+四个 flavor 都读、按 id 合并、标题优先取 HTML 锚文本；只有「一条有 id 没标题 +
+一条只有标题」时才把两者配成一条（那是同一次 ⌘C 的两半，不是猜身份）。
+`pbpaste -Prefer html` 在这台 macOS 上**完全不起作用**（实测 macOS 15.5，传
+html/rtf/url 都原样返回纯文本），所以老实现其实一直在读纯文本 —— 链接从来没读到过。
+
+没带 `-a` 但粘进来一段只有标题的文字时，会去剪贴板对一下**同名**的那条链接
+（标题完全相同才认），对不上就建任务并明确说「没有关联」，同时给出补救办法
+（`task <id> link -a`）。`-a` 与 `--assign N` 可以叠：`task import -a --assign 3`。
+
+> 注意 `-a` 有两个含义，按**动作**分流：`task 8 -a 3` 里 `-a` 是 `--assign 3`
+> （老语义不变），`task import -a` / `task 8 link -a` 里 `-a` 是「读剪贴板」。
 
 **裸 ID 就是 `select`**（`_dispatch_task()` 里 `action.isdigit()` 那一段）：
 `task 8` ≡ `task select 8`，所以 `-a` / `-n` 这两个后缀挂在裸 ID 上也成立。

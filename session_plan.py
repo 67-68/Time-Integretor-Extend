@@ -803,6 +803,227 @@ def period_first_starts(download):
     return out
 
 
+# ---------------------------------------------------------------- 静音时段
+#
+# 「`period mute T1 --permanent` = 以后每个这个星期几的 T1 都静音」。
+#
+# 为什么不复用 Focusmate 的 quiet：那是**单场**开关，得一场一场点；而「这个时段
+# 我就是要静音」是**排班意图**，和 `session --permanent` 是一类东西 —— 所以它
+# 和长期规则一样，落在一张按星期几 / 按日期重复的表里（temp/session-mutes.json）。
+#
+# 记录里存**时间窗**（start/end）而不只是时段 ID：静音要能在没有日历下载层、
+# 没有 data.csv 的地方判 —— daemon 的分心看门狗就属于这种，它只想知道
+# 「现在这个钟点该不该出声」。
+#
+#   {"period": "T1", "weekday": "tue", "start": "11:00", "end": "12:05",
+#    "permanent": true, "created_at": "..."}
+#   {"period": "T1", "date": "2026-10-28", "start": "11:00", ...}   ← 只这一天
+
+MUTES_FILE = os.path.join(TEMP, "session-mutes.json")
+
+
+def mutes_path(path=None):
+    return path or os.environ.get("TI_SESSION_MUTES") or MUTES_FILE
+
+
+def empty_mutes():
+    return {"version": 1, "mutes": []}
+
+
+def _weekday_label(value):
+    """0-6 / 'mon' / '周一' → 'mon'；认不出返回 None。"""
+    if isinstance(value, int) and 0 <= value <= 6:
+        return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][value]
+    text = str(value or "").strip().lower()
+    if text[:3] in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
+        return text[:3]
+    cn = {"一": "mon", "二": "tue", "三": "wed", "四": "thu",
+          "五": "fri", "六": "sat", "日": "sun", "天": "sun"}
+    for key, label in cn.items():
+        if key in text:
+            return label
+    return None
+
+
+def _day_iso(day):
+    return day.isoformat() if hasattr(day, "isoformat") else str(day)
+
+
+def load_mutes(path=None):
+    """读静音表（坏了就当空表 —— 静音这种辅助设置不值得让谁崩掉）。"""
+    try:
+        with open(mutes_path(path), encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return empty_mutes()
+    if isinstance(raw, list):
+        raw = {"version": 1, "mutes": raw}
+    if not isinstance(raw, dict):
+        return empty_mutes()
+    out = []
+    for item in (raw.get("mutes") if isinstance(raw.get("mutes"), list) else []):
+        if not isinstance(item, dict):
+            continue
+        start = parse_hhmm(item.get("start"))
+        end = parse_hhmm(item.get("end"))
+        if start is None or end is None:
+            continue
+        rec = {
+            "period": str(item.get("period") or "").strip().upper(),
+            "start": fmt_hhmm(*start),
+            "end": fmt_hhmm(*end),
+            "permanent": bool(item.get("permanent")),
+        }
+        weekday = _weekday_label(item.get("weekday"))
+        date = str(item.get("date") or "").strip()
+        if weekday:
+            rec["weekday"] = weekday
+        if date:
+            rec["date"] = date
+        if not weekday and not date:
+            continue
+        if item.get("created_at"):
+            rec["created_at"] = str(item["created_at"])
+        out.append(rec)
+    raw = dict(raw)
+    raw["version"] = 1
+    raw["mutes"] = out
+    return raw
+
+
+def save_mutes(data, path=None):
+    _atomic_json(mutes_path(path), data)
+    return mutes_path(path)
+
+
+def mute_period(day, period, permanent=False, path=None):
+    """把某一天的某个时段设成静音（``permanent`` = 以后每个这个星期几都静音）。
+
+    ``period`` 是 :func:`periods_for_date` 的元素（要 ``id`` / ``start`` / ``end``）。
+    同一目标重复设置就覆盖时间窗（排班可能被改过），不报错 —— 「我要它静音」
+    这个意图没变。
+    """
+    if not isinstance(period, dict):
+        raise ValueError("要传时段 dict（periods_for_date 的元素）")
+    pid = str(period.get("id") or "").strip().upper()
+    if not pid:
+        raise ValueError("这个时段没有 id，没法设静音")
+    start, end = parse_hhmm(period.get("start")), parse_hhmm(period.get("end"))
+    if start is None or end is None:
+        raise ValueError("时段 %s 的时间窗不完整（%r–%r）"
+                         % (pid, period.get("start"), period.get("end")))
+    rec = {
+        "period": pid,
+        "start": fmt_hhmm(*start),
+        "end": fmt_hhmm(*end),
+        "permanent": bool(permanent),
+        "created_at": _now(),
+    }
+    if permanent:
+        weekday = _weekday_label(day.weekday() if hasattr(day, "weekday") else day)
+        if weekday is None:
+            raise ValueError("认不出 %r 是星期几" % (day,))
+        rec["weekday"] = weekday
+    else:
+        rec["date"] = _day_iso(day)
+
+    data = load_mutes(path)
+    keep = []
+    for old in data["mutes"]:
+        if permanent:
+            same = old.get("period") == pid and old.get("weekday") == rec.get("weekday")
+        else:
+            same = old.get("period") == pid and old.get("date") == rec.get("date")
+        if not same:
+            keep.append(old)
+    keep.append(rec)
+    keep.sort(key=lambda r: (r.get("weekday") or "", r.get("date") or "", r.get("start") or ""))
+    data["mutes"] = keep
+    save_mutes(data, path)
+    return rec
+
+
+def unmute_period(day, period_id, permanent=False, path=None):
+    """撤销静音。返回被删掉的记录列表。"""
+    pid = str(period_id or "").strip().upper()
+    data = load_mutes(path)
+    if permanent:
+        weekday = _weekday_label(day.weekday() if hasattr(day, "weekday") else day)
+        gone = [r for r in data["mutes"]
+                if r.get("period") == pid and r.get("weekday") == weekday]
+    else:
+        iso = _day_iso(day)
+        gone = [r for r in data["mutes"]
+                if r.get("period") == pid and r.get("date") == iso]
+    if gone:
+        data["mutes"] = [r for r in data["mutes"] if r not in gone]
+        save_mutes(data, path)
+    return gone
+
+
+def mutes_for_day(day, data=None):
+    """某一天生效的静音记录（按星期几重复的 + 只这一天的）。"""
+    data = data if isinstance(data, dict) else load_mutes(data)
+    iso = _day_iso(day)
+    weekday = _weekday_label(day.weekday() if hasattr(day, "weekday") else day)
+    out = []
+    for rec in data.get("mutes") or []:
+        if rec.get("date") == iso or (rec.get("weekday") and rec.get("weekday") == weekday):
+            out.append(rec)
+    return out
+
+
+def muted_period_ids(day, data=None):
+    """某一天要静音的时段 ID 集合（契约表格子用）。"""
+    return {r["period"] for r in mutes_for_day(day, data) if r.get("period")}
+
+
+def _crosses_midnight(rec):
+    """这条静音记录的窗是不是跨午夜（``23:30–00:30``）。"""
+    a, b = parse_hhmm(rec.get("start")), parse_hhmm(rec.get("end"))
+    if a is None or b is None:
+        return False
+    return _minutes(*b) <= _minutes(*a)
+
+
+def mute_window_at(moment, data=None):
+    """``moment`` 落在哪个静音窗里 → 那条记录；没有就是 None。
+
+    daemon 的分心看门狗用它：静音时段里就**不出声**（但照旧记日志）。
+    只用到点/分；跨午夜（end < start）按 +24h 算。
+    """
+    if moment is None:
+        return None
+    data = data if isinstance(data, dict) else load_mutes(data)
+    minute = moment.hour * 60 + moment.minute
+    # 今天生效的窗 + **昨天**那条跨午夜的窗（23:30–00:30 这种）
+    yesterday = moment.date() - datetime.timedelta(days=1)
+    windows = [(rec, False) for rec in mutes_for_day(moment.date(), data)]
+    # 昨天那条只算**跨午夜**的（23:30–00:30）；不跨的昨天就是昨天的事
+    windows += [(rec, True) for rec in mutes_for_day(yesterday, data)
+                if _crosses_midnight(rec)]
+    for rec, from_yesterday in windows:
+        a, b = parse_hhmm(rec.get("start")), parse_hhmm(rec.get("end"))
+        if a is None or b is None:
+            continue
+        lo, hi = _minutes(*a), _minutes(*b)
+        if hi <= lo:
+            hi += 24 * 60
+        cand = minute
+        if cand < lo:
+            cand += 24 * 60
+        if from_yesterday and cand < 24 * 60:
+            continue                  # 昨天那条只覆盖「今天 00:00 之后」那一段
+        if lo <= cand < hi:
+            return rec
+    return None
+
+
+def is_muted_at(moment, data=None):
+    """``moment`` 是不是在静音时段里（daemon / 收尾 / 提醒都问这一个）。"""
+    return mute_window_at(moment, data) is not None
+
+
 # ---------------------------------------------------------------- CLI（给人看 / 调试）
 def cmd_show(argv=None):
     import sys

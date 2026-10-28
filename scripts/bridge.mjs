@@ -24,6 +24,8 @@
  *     mute     startMs meetingId? quiet       开/关 quiet mode
  *     cancel   startMs meetingId? source?     取消（**破坏性**，调用方负责把关）
  *     tasks                             列 Task Manager 的 task（含 completedAt）
+ *     delete_task  taskId              删一条 task（GET 复核真没了）——
+ *                                      任务转移走之后，旧场次上那条 task 用它清掉
  *     complete_task taskId             把一条 task 勾完成（API 候选 + GET 复核
  *                                      completedAt）；收尾「缺漏完成补充」用它
  *     add_task startMs title? notes? via? 给某场 session 挂 Focusmate task
@@ -566,6 +568,47 @@ const handlers = {
       err.attempts = attempts;
       throw err;
     }
+  },
+
+  async delete_task(req) {
+    // 删一条 Focusmate task（Task Manager 的实体，不是 session）。
+    // 用途：任务**转移**走之后，旧那一场 session 上挂着的那条 task 就没意义了
+    // —— 它既不会完成、也不该继续出现在 Task Manager 里。收尾 A/E 两步会调它。
+    const taskId = String(req.taskId || "");
+    if (!taskId) throw new Error("delete_task 要 taskId（Focusmate task 的 id）");
+    let before = null;
+    try {
+      const all = await listTasksRaw();
+      before = all.find((t) => String(t.id) === taskId) || null;
+    } catch (e) {
+      // 列不出来也继续删：删完还会复核
+    }
+    const r = await callApi("DELETE", "/tasks/" + encodeURIComponent(taskId), {});
+    if (![200, 201, 202, 204, 404].includes(r.status)) {
+      throw new Error(
+        "删除 task 失败：HTTP " + r.status + " " + String(r.text || "").slice(0, 300)
+      );
+    }
+    // 删掉的东西必须以「GET /tasks 里没有它」为准 —— 接口回 200 不等于真没了。
+    let still = null;
+    for (let i = 0; i < 3; i++) {
+      await sleep(i === 0 ? 300 : 800);
+      let all = [];
+      try {
+        all = await listTasksRaw();
+      } catch (e) {
+        continue;
+      }
+      still = all.find((t) => String(t.id) === taskId) || null;
+      if (!still) break;
+    }
+    return {
+      verified: !still,
+      taskId,
+      alreadyGone: !before && !still,
+      deleted: before ? normalizeTask(before) : null,
+      stillThere: still ? normalizeTask(still) : null,
+    };
   },
 
   async cancel(req) {

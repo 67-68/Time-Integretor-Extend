@@ -91,6 +91,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -100,6 +101,7 @@ sys.path.insert(0, HERE)
 
 import main as fm  # noqa: E402  复用 resolve_target / mcp_call / book_once / TOKEN
 import schedule as sch  # noqa: E402  data.csv 的解析/编辑：唯一实现（TUI 也 import 它）
+import session_plan as sp  # noqa: E402  静音时段（period mute）—— daemon 只读它
 import postsession as psv  # noqa: E402  收尾：谁该收、什么时候收（纯逻辑 + 状态文件）
 
 LOOP_INTERVAL = 300            # daemon 每轮间隔（秒）
@@ -186,6 +188,17 @@ def stale_sources():
     return stale
 
 
+#: 热重载时该用什么 argv 重新 exec 自己。
+#:
+#: daemon 是 `keep_session.py daemon start` **double-fork 出来的孙进程**，但它的
+#: ``sys.argv`` 还是父进程那份（`["keep_session.py", "daemon", "start"]`）——
+#: 于是热重载 exec 回去之后，新进程老老实实又跑了一遍 `daemon start`，
+#: 看到 pid 文件里的 pid（就是它自己）还活着 → 打一句「已在运行」→ 退出。
+#: 结果：**你每改一次 keep_session.py，daemon 就安静地死一次**
+#: （实测 2026-10-28 16:37 / 16:51 两次）。所以 exec 的目标要显式指定。
+_REEXEC_ARGV = None
+
+
 def reexec_if_stale():
     """源码更新 → 用新代码替换当前进程（os.execv）。返回是否已重启。"""
     stale = stale_sources()
@@ -197,8 +210,9 @@ def reexec_if_stale():
             stream.flush()
         except Exception:
             pass
+    argv = list(_REEXEC_ARGV) if _REEXEC_ARGV else [sys.executable] + list(sys.argv)
     try:
-        os.execv(sys.executable, [sys.executable] + list(sys.argv))
+        os.execv(sys.executable, argv)
     except OSError as e:
         log("自重启失败（继续用旧代码跑）：%s" % e)
         for path in RELOAD_SOURCES:
@@ -217,6 +231,20 @@ IDLE_POLL_SEC = 5                # daemon 隔多久看一眼空闲时间（秒�
 POSTSESSION_DELAY = psv.DELAY_SEC     # session 结束多久之后拉 warden 收尾（秒）
 POSTSESSION_ENABLED = True            # 设置项 postsession=off 时这里也不拉
 SUMMON_SCRIPT = os.path.join(HERE, "app", "warden-summon.applescript")
+#: 唤起失败的**第二条路**：走 app bundle（`open -a`），不是 AppleScript。
+#:
+#: 为什么需要它：daemon 是 double-fork + setsid 出来的**孤儿进程**，它的
+#: responsible process 不是你的终端。从这种进程里跑 osascript 控制 iTerm，
+#: macOS 会直接拒绝（实测报 `-10004 … 发生权限违例`，连弹框都不弹）——
+#: 于是「准时叫人」变成「准时写一行错误日志」。而 `open -a` 走 LaunchServices，
+#: 不需要 Apple Events；Warden.app 自己再以**它自己**的 TCC 身份去跑那段
+#: AppleScript（那份权限早就给过了），就成了。
+SUMMON_APP = os.path.join(HERE, "app", "Warden.app")
+#: warden TUI 启动时写下的自身信息（pid / tty）。「叫人了，但人不在」这件事
+#: 只有这份文件能回答：marker 里那个 iTerm session id 可能早就不跑 warden 了
+#: （你 `q` 退出、或 warden 崩了），那时「聚焦 + 打一行 refresh」只会把
+#: refresh 敲进 shell —— 看起来像叫了，其实谁都没来。
+TUI_STATE_FILE = os.path.join(HERE, "temp", "warden-tui.json")
 IDLE_MAX_STRIKES = 3             # 兜底值；真正惩罚次数用模式里的 max_strikes
 IDLE_ALERT_AUDIO = os.path.join(HERE, "data", "audio", "赵小六嘶吼.mp3")
 IDLE_ALERT_VOLUME = 10           # 「把音量拉到 10%」
@@ -858,12 +886,28 @@ def play_alert(path=None, volume=IDLE_ALERT_VOLUME):
     return alert.play(path, volume=100, system_volume=volume, wait=False) == 0
 
 
+def muted_window(now=None):
+    """现在这个钟点是不是静音时段（``period mute T1 --permanent``）→ 那条记录或 None。
+
+    静音的口径只有一条：**这一段钟点别出声**。违规照样数、日志照样记、
+    收尾照样催 —— 静音不是「不管我」，是「别用声音管我」。
+    """
+    try:
+        return sp.mute_window_at(now or datetime.datetime.now())
+    except Exception:                     # noqa: BLE001 - 静音表坏了不该让看门狗停摆
+        return None
+
+
 def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
     """session 进行中的一次分心检查（daemon 每 IDLE_POLL_SEC 调一次）。
 
     返回本场累计违规次数；看门狗没上班（不在 session / 读不到空闲时间）返回 None，
     暂停中返回当前累计值。idle_seconds / mode 可注入 —— 测试不用真去问 ioreg 或
     改文件。
+
+    **静音时段**（``period mute T1 --permanent`` 设的窗）里：照记违规、只记日志，
+    不发通知、不拉音量、不播放嘶吼。同一段逻辑还让 ``notify`` / ``play_alert``
+    变成了局部函数 —— 出声的地方只有这两处，能一眼看全。
     """
     if not IDLE_CHECK:
         return None
@@ -872,6 +916,24 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
         idle_seconds = hid_idle_seconds()
     if idle_seconds is None:
         return None                      # 读不到空闲时间：不误判
+
+    mute = muted_window(now)
+
+    def say_quietly(what):
+        log("  [idle] 静音时段（%s %s–%s）→ %s不响"
+            % (mute.get("period") or "?", mute.get("start"), mute.get("end"), what))
+
+    def notify_(*args, **kwargs):
+        if mute:
+            say_quietly("该发通知「%s」" % (args[0] if args else ""))
+            return False
+        return notify(*args, **kwargs)
+
+    def alert_(*args, **kwargs):
+        if mute:
+            say_quietly("该播放 %s" % os.path.basename(args[0] if args else IDLE_ALERT_AUDIO))
+            return False
+        return play_alert(*args, **kwargs)
 
     st = load_idle_state()
     prev_idle = st.get("last_idle_seconds")
@@ -957,7 +1019,7 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
         if dry_run:
             log("  [idle][dry-run] 会发预警，但不记违规")
         else:
-            notify("Focusmate 分心预警",
+            notify_("Focusmate 分心预警",
                    "（%s模式）你已经连续 %s 没碰键盘/触控板了；再 %s 就会记"
                    "一次违规。预警不算违规次数，到下一个违规周期前会再提醒。"
                    % (cfg["name"], fmt_idle_seconds(idle_seconds), lead))
@@ -977,18 +1039,18 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
                 % (max_strikes, os.path.basename(IDLE_ALERT_AUDIO)))
             continue
         if strikes < max_strikes:
-            notify("Focusmate 分心警告",
+            notify_("Focusmate 分心警告",
                    "（%s模式）连续 %s 没碰键盘/触控板 = 违规。当前违规次数：%d/%d —— "
                    "到第 %d 次会有不好的事情发生。"
                    % (cfg["name"], fmt_idle_seconds(idle_seconds), strikes,
                       max_strikes, max_strikes))
         else:
-            notify("Focusmate 分心警告",
+            notify_("Focusmate 分心警告",
                    "（%s模式）连续 %s 没碰键盘/触控板。违规次数：%d/%d —— "
                    "说好的不好的事情，现在就来。"
                    % (cfg["name"], fmt_idle_seconds(idle_seconds), strikes,
                       max_strikes))
-            play_alert(IDLE_ALERT_AUDIO, IDLE_ALERT_VOLUME)
+            alert_(IDLE_ALERT_AUDIO, IDLE_ALERT_VOLUME)
     save_idle_state(st)
     return strikes
 
@@ -1005,11 +1067,48 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
 # 所以这里是唯一能保证「准时」的地方。
 
 
-def summon_warden(dry_run=False, extra=()):
+def load_tui_state(path=None):
+    """warden TUI 启动时写下的 ``{"pid", "tty", "started_at"}``（读不到就是空 dict）。"""
+    try:
+        with open(path or TUI_STATE_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def tui_alive(state=None):
+    """warden 的 TUI 现在是不是真的开着 → ``(bool, 状态 dict)``。
+
+    判据只有 pid 活没活。**不许**去查 iTerm 的 session id：那个 id 只证明
+    「这个终端还在」，不证明「里面还跑着 warden」—— 你 `q` 退出之后它就是
+    一个普通的 shell，往里面写 `refresh` 只会得到 `command not found`。
+    """
+    st = state if isinstance(state, dict) else load_tui_state()
+    try:
+        pid = int(st.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    return (pid > 0 and pid_alive(pid), st)
+
+
+def summon_warden(dry_run=False, extra=(), force_new=False, refresh=False,
+                  state=None):
     """把 warden 拉到前台（app/warden-summon.applescript 是唯一实现）。
 
-    「找到就聚焦、找不到就新建窗口」那些语义全在 AppleScript 里，这里不重复实现。
-    失败只记日志：叫人失败不该影响订场。
+    「找到就聚焦、找不到就新建窗口」那些语义全在 AppleScript 里，这里补三件
+    它会不知道的事：
+
+    1. **TUI 到底开没开**（:func:`tui_alive`）。没开就 ``--new``：直接新窗口跑
+       ``app/Warden.command``。否则会出现「聚焦成功、什么都没发生」——marker 里
+       那个 session 早就不跑 warden 了，往 shell 里打 refresh 等于没叫。
+    2. **往哪个 tty 上找**。TUI 活着就把它的 tty 传过去，AppleScript 会**先在
+       所有窗口/标签里按 tty 找**，找到就重新认领（顺手修好 marker）——
+       iTerm 重启过、窗口被拖到别的窗口里之后，marker 里的 session id 是死的，
+       但 tty 是活的。
+    3. **不打 refresh**。默认 ``--no-refresh``：warden 自己每帧看收尾队列，
+       不需要谁往它的输入行里塞字。塞字有代价 —— 你正在打命令时会被打断，
+       收尾问答时那句话会被当成答案。
     """
     if dry_run:
         log("  [postsession] dry-run：会跑 osascript %s" % SUMMON_SCRIPT)
@@ -1017,7 +1116,15 @@ def summon_warden(dry_run=False, extra=()):
     if not os.path.exists(SUMMON_SCRIPT):
         log("  [postsession] 找不到 %s，跳过唤起" % SUMMON_SCRIPT)
         return False
-    cmd = ["osascript", SUMMON_SCRIPT] + [str(x) for x in extra]
+    alive, st = tui_alive(state)
+    args = [str(x) for x in extra]
+    if force_new or not alive:
+        args.append("--new")
+    if not refresh:
+        args.append("--no-refresh")
+    if alive and st.get("tty"):
+        args.extend(["--tty", str(st["tty"])])
+    cmd = ["osascript", SUMMON_SCRIPT] + args
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
@@ -1025,11 +1132,92 @@ def summon_warden(dry_run=False, extra=()):
         return False
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
-    if proc.returncode != 0:
-        log("  [postsession] 唤起 warden 退出 %d：%s" % (proc.returncode, err or out))
-        return False
-    log("  [postsession] 已唤起 warden：%s" % (out or "ok"))
+    # osascript 的「成功」也可能是 AppleScript 里的 fail() 兜底（它把错误吞进
+    # stdout，退出码仍是 0），所以这两个字样也当失败，好走下面那条路。
+    broken = ("error " in out.lower() or "权限违例" in out
+              or "not granted" in out.lower())
+    if proc.returncode != 0 or broken:
+        log("  [postsession] 唤起 warden 失败（osascript 退出 %d）：%s"
+            % (proc.returncode, (err or out) or "无输出"))
+        return summon_via_app(alive=alive, why=(err or out)[:120])
+    log("  [postsession] 已唤起 warden（TUI %s，tty %s）：%s"
+        % ("开着" if alive else "没开", st.get("tty") or "?", out or "ok"))
     return True
+
+
+#: `open -a` 的两个候选：先按**名字**（LaunchServices 找装好的，通常是
+#: /Applications/Warden.app），再按仓库里那份绝对路径。用相对路径 `open -a app/…`
+#: 是不行的（`open` 会把它当 app 名字去 LaunchServices 里查，然后报「找不到」）。
+SUMMON_APP_NAMES = ("Warden",)
+
+
+def summon_via_app(alive=None, why=""):
+    """第二条路：``open -a Warden``（不需要 Apple Events）。
+
+    AppleScript 那条路在**孤儿 daemon** 里会被 TCC 挡（实测 `-10004 权限违例`，
+    连弹框都不弹）。`open -a` 走 LaunchServices，谁跑都行；Warden.app 起来之后
+    用它**自己**的身份去跑同一段 AppleScript（「控制 iTerm」那份授权是给 app 的）。
+    """
+    targets = list(SUMMON_APP_NAMES)
+    if os.path.isdir(SUMMON_APP):
+        targets.append(SUMMON_APP)
+    tried = []
+    for target in targets:
+        try:
+            proc = subprocess.run(["open", "-a", target], capture_output=True,
+                                  text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            tried.append("%s: %s" % (target, e))
+            continue
+        if proc.returncode == 0:
+            log("  [postsession] 已用 app（open -a %s）唤起 warden"
+                "（osascript 那条路不行：%s）" % (target, why or "未知"))
+            return True
+        tried.append("%s: %s" % (target, (proc.stderr or "").strip() or
+                                 ("退出 %d" % proc.returncode)))
+    log("  [postsession] app 唤起也不行（%s）；一次性修法：cd %s && ./app/build.sh "
+        "&& ./app/install-app.sh，或者去 系统设置 → 隐私与安全性 → 自动化 里"
+        "允许 Warden/iTerm 控制 iTerm" % ("；".join(tried) or "没有可用的 app", HERE))
+    return False
+
+
+#: API 快照多久算新鲜（秒）。收尾线程每秒跑，不能每次都去问 API；
+#: 每轮订场都会重写这份快照（默认 5 分钟一轮）。
+SNAPSHOT_FRESH_SEC = 20 * 60
+
+
+def fresh_snapshot_details(now=None):
+    """state.json 里那份带时长的 API 快照（太旧就当没有）。
+
+    返回 ``[{"start": datetime, "duration": 分钟}]``；没有 / 过期返回 ``None``。
+    """
+    now = now or datetime.datetime.now()
+    try:
+        snap = (load_state().get("api_snapshot") or {})
+    except Exception:                      # noqa: BLE001
+        return None
+    at = snap.get("at")
+    try:
+        got = datetime.datetime.fromisoformat(str(at))
+    except (TypeError, ValueError):
+        return None
+    if abs((now - got).total_seconds()) > SNAPSHOT_FRESH_SEC:
+        return None
+    out = []
+    for rec in snap.get("details") or []:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            start = datetime.datetime.fromisoformat(str(rec.get("start")))
+        except (TypeError, ValueError):
+            continue
+        dur = rec.get("duration")
+        try:
+            dur = int(dur) if dur is not None else 0
+        except (TypeError, ValueError):
+            dur = 0
+        out.append({"start": start, "duration": dur, "id": rec.get("id")})
+    return out or None
 
 
 def postsession_enabled():
@@ -1057,7 +1245,11 @@ def postsession_tick(dry_run=False, now=None, delay=None, summon=None):
     delay = POSTSESSION_DELAY if delay is None else delay
     try:
         entries, _warnings = load_entries()
-        slots = psv.slots_around(entries, now=now, days_back=1)
+        # 收尾按**实际**场次发问（计划 75 被拆成 25+50 时，该在两场的终点各问一次）。
+        # 快照是每轮订场时写的，超过 SNAPSHOT_FRESH_SEC 就当它过期，退回计划 ——
+        # 反正是「闹钟」，宁可多问一场，也不要因为没数据就漏问。
+        slots = psv.slots_around(entries, now=now, days_back=1,
+                                 actual=fresh_snapshot_details(now))
         due = psv.ended_sessions(slots, now=now, delay=delay)
     except Exception as e:                 # noqa: BLE001 - data.csv 坏了也不该让 daemon 挂
         log("  [postsession] 算不出该收尾的场次：%s" % e)
@@ -1080,18 +1272,125 @@ def postsession_tick(dry_run=False, now=None, delay=None, summon=None):
             % (rec["key"], int(delay)))
         fired.append(rec)
     if fired and not dry_run:
-        (summon or summon_warden)(dry_run=dry_run)
+        ok = (summon or summon_warden)(dry_run=dry_run)
+        if not ok:
+            log("  [postsession] ⚠ 没叫起来（%d 场还在队列里）—— %ds 后重试"
+                % (len(fired), int(SUMMON_RETRY_SEC)))
+        _note_summoned(now)
     return fired
+
+
+#: 叫了但没叫起来（TUI 没开 / TCC 拒绝 / 脚本报错）时，隔多久再叫一次
+SUMMON_RETRY_SEC = 60
+#: 同一场最多补叫几次（再不行就等 warden 自己起来收，队列不会丢）
+SUMMON_MAX_TRIES = 5
+
+
+def _note_summoned(now):
+    """在队列里记一笔「刚叫过」（重试用得着，纯诊断信息）。"""
+    try:
+        state = psv.load_state()
+        changed = False
+        for rec in state["pending"].values():
+            rec["summoned_at"] = now.isoformat(timespec="seconds")
+            rec["summon_tries"] = int(rec.get("summon_tries") or 0) + 1
+            changed = True
+        if changed:
+            psv.save_state(state)
+    except Exception:                      # noqa: BLE001 - 记号丢了不算事
+        pass
+
+
+def postsession_retry(now=None, dry_run=False, summon=None):
+    """补叫：队列里还有 pending、但 warden 的 TUI 没在跑 → 隔一会儿再叫一次。
+
+    「准时叫人」有一半在**叫完之后**：叫了但没人来（你 `q` 退出了 warden、
+    或者 iTerm 被关了），队列会一直躺在那里。这里补的就是这一半 ——
+    最多 ``SUMMON_MAX_TRIES`` 次，之后安静等着（warden 一打开就会自己接走，
+    见 ``postsession.pending_sessions``）。
+    """
+    if not postsession_enabled():
+        return []
+    now = now or datetime.datetime.now()
+    try:
+        pending = psv.pending_sessions()
+    except Exception:                      # noqa: BLE001
+        return []
+    if not pending:
+        return []
+    alive, _st = tui_alive()
+    if alive:
+        return []                          # 人已经在了，别烦他
+    retried = []
+    for rec in pending:
+        tries = int(rec.get("summon_tries") or 0)
+        if tries >= SUMMON_MAX_TRIES:
+            continue
+        last = rec.get("summoned_at") or rec.get("queued_at")
+        try:
+            got = datetime.datetime.fromisoformat(str(last))
+        except (TypeError, ValueError):
+            got = None
+        if got and (now - got).total_seconds() < SUMMON_RETRY_SEC:
+            continue
+        retried.append(rec)
+    if not retried:
+        return []
+    if dry_run:
+        log("  [postsession] dry-run：会补叫 warden（%d 场还等着）" % len(retried))
+        return retried
+    log("  [postsession] 还有 %d 场等着收尾，但 warden 没开着 → 再叫一次"
+        % len(retried))
+    (summon or summon_warden)(dry_run=dry_run)
+    _note_summoned(now)
+    return retried
+
+
+def postsession_loop(dry_run=False, interval=1.0):
+    """收尾的**独立线程**：每秒看一眼，和「一轮订场」完全解耦。
+
+    为什么必须是线程：``postsession_tick`` 以前只在两轮之间的睡眠里跑，
+    而一轮（订场 + 浏览器自动化 + 重试）动不动就 5~20 分钟 —— 于是「结束 15 秒
+    内叫人」实际变成「结束 25~50 分钟后叫人」（日志里 10:11 结束的那场 10:55
+    才叫，就是这原因）。收尾是**时间敏感**的，不能排在订场后面。
+    """
+    log("收尾线程已启动：每 %.0fs 看一眼「刚结束满 %ds」的场次"
+        % (interval, POSTSESSION_DELAY))
+    while not _STOP["flag"]:
+        try:
+            postsession_tick(dry_run=dry_run)
+        except Exception as e:             # noqa: BLE001 - 线程不许死
+            log("  [postsession] 检查出错（下一秒再试）：%s" % e)
+        try:
+            postsession_retry(dry_run=dry_run)
+        except Exception as e:             # noqa: BLE001
+            log("  [postsession] 补叫出错（下一秒再试）：%s" % e)
+        for _ in range(max(1, int(interval * 10))):
+            if _STOP["flag"]:
+                break
+            time.sleep(0.1)
+    log("收尾线程已退出")
+
+
+def start_postsession_thread(dry_run=False, interval=1.0):
+    thread = threading.Thread(target=postsession_loop, args=(dry_run, interval),
+                              name="postsession", daemon=True)
+    thread.start()
+    return thread
 
 
 # ---------------------------------------------------------------- 只读 API
 
 
-def fetch_sessions(now, until):
-    """一次 API 调用，返回 [now 当天 00:00, until] 之间所有 session（**本地 naive** 时间）。
+def fetch_session_details(now, until):
+    """一次 API 调用，返回 [今天 00:00, until] 的所有 session **含时长**。
 
-    窗口跨天（今天+明天），所以不能再"只捞今天"——一次捞够，反正只读接口很便宜。
-    出错就抛异常，由调用方决定这一轮怎么办。
+    为什么必须带时长：**计划 vs 实际**的比对要靠它（见 :func:`schedule.match_slot`）。
+    只给开始时间的话，「计划 16:15 一场 75min、实际 16:00 25 + 16:30 50」这种
+    手动拆分会被判成「没订上」（真实冤案，2026-10-28）。
+
+    返回 ``[{"start": naive datetime, "duration": 分钟, "id": …, "title": …}]``。
+    窗口跨天（今天+明天），一次捞够，反正只读接口很便宜。出错就抛异常。
     """
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     url = "https://api.focusmate.com/v1/sessions?start=%s&end=%s" % (
@@ -1110,8 +1409,33 @@ def fetch_sessions(now, until):
             got = datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
         except ValueError:
             continue
-        out.append(got.astimezone().replace(tzinfo=None, second=0, microsecond=0))
+        local = got.astimezone().replace(tzinfo=None, second=0, microsecond=0)
+        dur = None
+        for key in ("duration", "durationMs", "duration_minutes"):
+            if s.get(key) is None:
+                continue
+            try:
+                val = float(s[key])
+            except (TypeError, ValueError):
+                continue
+            # /v1/sessions 的 duration 是**毫秒**；数字小到不像毫秒时按分钟收
+            dur = int(round(val / 60000.0)) if val > 1000 else int(round(val))
+            break
+        out.append({"start": local, "duration": dur,
+                    "id": s.get("sessionId") or s.get("id"),
+                    "title": s.get("title") or ""})
+    out.sort(key=lambda r: r["start"])
     return out
+
+
+def fetch_sessions(now, until):
+    """``fetch_session_details`` 的「只要开始时间」版本（老调用点用）。"""
+    return [r["start"] for r in fetch_session_details(now, until)]
+
+
+def match_planned(details, start, duration):
+    """计划的一场在 API 实际结果里对应什么（薄封装，见 ``schedule.match_slot``）。"""
+    return sch.match_slot(details or [], start, duration)
 
 
 def has_session_at(sessions, start_dt):
@@ -1243,9 +1567,11 @@ def _run_once_locked(dry_run=False, force=False):
 
     # 一次 API 拿到窗口内全部 session（即使 due 为空也要拿，供 status/TUI 展示）
     sessions = None
+    details = None
     if not dry_run:
         try:
-            sessions = fetch_sessions(now, horizon)
+            details = fetch_session_details(now, horizon)
+            sessions = [r["start"] for r in details]
             log("  窗口内 API 里已有 %d 场 session" % len(sessions))
         except Exception as e:
             log("  API 列 session 失败: %s（本轮跳过，下轮再试）" % e)
@@ -1254,8 +1580,28 @@ def _run_once_locked(dry_run=False, force=False):
             "at": now.isoformat(timespec="seconds"),
             "horizon": horizon.isoformat(timespec="seconds"),
             "sessions": [s.isoformat() for s in sessions],
+            # 带时长的快照：收尾线程要用它按**实际**场次发问（计划 75 被拆成
+            # 25+50 时，收尾该在两场的终点各问一次，而不是计划终点问一次）
+            "details": [{"start": r["start"].isoformat(timespec="seconds"),
+                         "duration": r["duration"], "id": r["id"]} for r in details],
         }
         changed = True
+
+        # 计划外的场次（API 有、data.csv 没有）：不是错误，但要能看见 ——
+        # 「这场我做完了、没人问我」就是从这里漏出去的。
+        try:
+            plan_slots = []
+            for i in range(int(WINDOW_HOURS // 24) + 2):
+                day = now.date() + datetime.timedelta(days=i)
+                plan_slots.extend(sch.day_slots(entries, day))
+            extra = sch.unmatched_actual(details, plan_slots)
+        except Exception:                  # noqa: BLE001 - 只是提示，别影响主流程
+            extra = []
+        if extra:
+            log("  计划外 %d 场（API 有、data.csv 没有）：%s"
+                % (len(extra), "、".join("%s%s" % (
+                    r["start"].strftime("%H:%M"),
+                    ("(%dmin)" % r["duration"]) if r["duration"] else "") for r in extra[:8])))
 
     # 已经开始的：不补订，只把"到底有没有"记进 state（让 status / TUI 能看出来）
     for day, slot, start in past:
@@ -1263,11 +1609,18 @@ def _run_once_locked(dry_run=False, force=False):
         rec = state["slots"].get(key) or {}
         if dry_run or sessions is None:
             continue
-        if has_session_at(sessions, start):
-            if rec.get("status") != "booked":
+        match = match_planned(details, start, slot["duration"])
+        if match["kind"] != "none":
+            note = match.get("note") or None
+            if (rec.get("status") != "booked" or rec.get("match") != match["kind"]
+                    or rec.get("actual") != note):
                 state["slots"][key] = {"status": "booked", "duration": slot["duration"],
-                                       "attempts": rec.get("attempts", 0), "past": True}
+                                       "attempts": rec.get("attempts", 0), "past": True,
+                                       "match": match["kind"], "actual": note}
                 changed = True
+                if note:
+                    # 只在**结论变了**的时候说一次；每轮都念一遍会把日志淹掉
+                    log("  [已过] %s 认账：%s" % (key, note))
         else:
             if rec.get("status") != "missed":
                 log("  [已过] %s (%smin) 没有这场 session，已经来不及补订了" % (key, slot["duration"]))
@@ -1306,14 +1659,31 @@ def _run_once_locked(dry_run=False, force=False):
             rec, status = {}, None
             changed = True
 
-        present = has_session_at(sessions, start)
+        match = match_planned(details, start, slot["duration"])
+        present = match["kind"] != "none"
+        if present and match["kind"] != "exact":
+            # 计划与实际不一样，但**实际确实做了**（拆分 / 挪了半格）：
+            # 认账 —— 不重订（重订就是和已有场次打架）、也不记罪。
+            note = match.get("note") or match["kind"]
+            if rec.get("match") != match["kind"] or rec.get("actual") != note:
+                log("  %s 认账：%s" % (key, note))
+            state["slots"][key] = {"status": "booked", "duration": slot["duration"],
+                                   "attempts": rec.get("attempts", 0),
+                                   "match": match["kind"], "actual": note}
+            changed = True
+            continue
 
         if present:
-            # API 有 → 确认 booked；若是从 failed/取消 恢复，也一并纠正
+            # 同一分钟，API 有 → 确认 booked；若是从 failed/取消 恢复，也一并纠正
             if status != "booked":
                 log("  %s 已存在（API 确认），标记 booked" % key)
                 state["slots"][key] = {"status": "booked", "duration": slot["duration"],
-                                       "attempts": rec.get("attempts", 0)}
+                                       "attempts": rec.get("attempts", 0),
+                                       "match": "exact",
+                                       "actual": match.get("note") or None}
+                changed = True
+            elif match.get("note"):
+                state["slots"][key] = dict(rec, match="exact", actual=match["note"])
                 changed = True
             continue
 
@@ -1480,6 +1850,10 @@ def cmd_run(dry_run=False):
         log("  分心看门狗已武装：模式 %s；惩罚时把音量拉到 %d%% 并播放 %s"
             % (mode_txt, IDLE_ALERT_VOLUME,
                os.path.basename(IDLE_ALERT_AUDIO)))
+    # 收尾（session 结束 +15s 叫人）**不再**挂在两轮之间的睡眠里：那一轮可能跑
+    # 20 分钟，叫人就会迟到同样的时间。改成独立线程，永远 1 秒一次（见
+    # postsession_loop）。
+    start_postsession_thread(dry_run=dry_run)
     while not _STOP["flag"]:
         reexec_if_stale()
         run_once(dry_run=dry_run)
@@ -1496,12 +1870,6 @@ def cmd_run(dry_run=False):
                     idle_tick(dry_run=dry_run)
                 except Exception as e:
                     log("  [idle] 检查出错（忽略，下轮再试）：%s" % e)
-            # 收尾：每秒看一眼「刚结束满 15 秒」的场次（用户要求准时 15s）。
-            # 睡觉醒来跳过的那些按 LOOKBACK 补，不会漏。
-            try:
-                postsession_tick(dry_run=dry_run)
-            except Exception as e:
-                log("  [postsession] 检查出错（忽略，下一秒再试）：%s" % e)
             time.sleep(min(1, LOOP_INTERVAL - slept))
             slept += 1
     log("run 已退出")
@@ -1570,6 +1938,11 @@ def cmd_daemon_start(dry_run=False):
         f.write(str(os.getpid()))
     os.chdir(HERE)
     os.environ.update(DAEMON_ENV)
+    # 热重载必须回到**这个**子命令，而不是父进程的 "daemon start"（见 _REEXEC_ARGV）
+    global _REEXEC_ARGV
+    _REEXEC_ARGV = [PYTHON_BIN, os.path.join(HERE, "keep_session.py"), "_daemon_loop"]
+    if dry_run:
+        _REEXEC_ARGV.append("--dry-run")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)

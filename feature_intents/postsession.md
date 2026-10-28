@@ -15,7 +15,8 @@ session 结束的那一刻，是唯一还清楚「刚才那 50 分钟到底干�
 
 ```
 keep_session.py（daemon，一直在跑）
-   │  两轮之间的睡眠里每秒醒一次 → postsession_tick()
+   │  收尾线程里每秒醒一次 → postsession_tick()
+   │  （**独立线程**，不等「订场那一轮」跑完 —— 见下面「为什么必须是线程」）
    │  判据：结束时刻 + 15s ≤ now < 结束时刻 + 15s + 3h
    │  （机器睡了俩小时醒来会补一次，但不会翻三天前的旧账）
    ├─→ temp/keep_session-postsession.json   pending{} 里加一条
@@ -32,9 +33,42 @@ warden.py ──────────────┘
 - **准点在 daemon**：warden 是人开的 TUI，可能压根没在看这一场；
   daemon 才是一直在跑的那个。所以「15 秒」由 `postsession_tick()` 保证，
   warden 只负责「被叫起来之后把话说清楚」。
+- **为什么必须是线程**：`postsession_tick()` 以前挂在 `run_once()` 之间的睡眠里，
+  而一轮（浏览器开单 + 复核 + 退避重试）动不动 5~20 分钟 —— 于是「结束 15 秒内
+  叫人」实际变成「结束后 25~50 分钟才叫人」（真日志：10:11 结束的那场 10:55 才叫）。
+  收尾是时间敏感的事，不能排在订场后面，所以它自己一个线程（`postsession_loop`）。
+- **叫人的两条路**：先 `osascript app/warden-summon.applescript`（能聚焦到具体
+  iTerm 窗口）；这条在**孤儿 daemon** 里会被 TCC 顶回来（实测 `-10004 权限违例`），
+  那就退到 `open -a Warden`（LaunchServices，不需要 Apple Events，由 app 用自己
+  的身份去跑同一段脚本）。两条都失败才认输，日志里写清「怎么修」。
+- **叫了没人来会补叫**：队列里还有 pending、而 `temp/warden-tui.json` 说 TUI 没开
+  （你 `q` 退出过、或 iTerm 被关了）→ 每 60 秒再叫一次，最多 5 次
+  （`postsession_retry`）。之后安静等着 —— warden 一打开就会自己把 pending 接走。
+- **不往 TUI 里打字**：`summon` 默认 `--no-refresh`。以前它会往那个 iTerm session
+  里敲一行 `refresh`；可那个 session 早就不跑 warden 了（你在 shell 里），
+  于是 `refresh` 变成一条 shell 报错；收尾问答进行中时那句话还会被当成答案。
+  warden 自己每帧看队列，不需要谁往它嘴里塞字。
 - **状态文件是唯一交接**：`temp/keep_session-postsession.json`
   （`pending` = 该收还没收，`done` = 收完了；两边都读同一个文件）。
 - **反复催**：同一场只在 `pending` 里出现一次；收完挪进 `done`，之后永不重催。
+
+## 收尾按「实际」还是「计划」发问？—— 按实际
+
+`postsession_tick()` 用 **API 里的实际场次**当槽位（`slots_from_details`），
+拿不到 / 快照超过 20 分钟才退回 data.csv 的计划。
+
+2026-10-28 的教训：计划 16:15 一场 75min，实际订的是 16:00 25 + 16:30 50。
+按计划问，只会在 17:30 问一次（前一段干完时没人问）；按实际问，16:25 和 17:20
+各问一次，任务转移才落得下来。同理，**计划外**的场次（你手动加的）也会被问到。
+
+## 转移之后：把 Focusmate 那条 task 删掉
+
+转移（A 延期 / E 快捷推后）的意思是「这一场不干了」：旧记录标放弃 + 标签
+「未完成转移」、复制品挂到下一场。可 Focusmate 那边那条 task 还挂在**旧场次**
+上 —— 它既不会完成，又一直躺在 Task Manager 里，第二天对账还会以为它在等你。
+所以 `_finish_transfer()` 会调 bridge 的 `delete_task`（`DELETE /v1/tasks/{id}`，
+再 `GET /v1/tasks` 复核「真的没了」），删完把本地 `focusmate.task_id` 挪进
+`previous`（`task_store.forget_focusmate()`）。删失败只报告，不挡转移本身。
 
 ## 五个选项（用户原话 → 动作）
 

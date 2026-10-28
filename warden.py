@@ -37,7 +37,13 @@
    - **截止时间**：任务挂到一场 session 上时自动 = 那场的终点；完成的时候
      把「完成 + 截止时间」一条命令写回 OmniFocus（见 docs/omnifocus.md）。
    - `task <id> duplicate [-a N]` 复制一条（同一条 OmniFocus 任务、新的本地 ID），
-     `task import [粘贴]` 从剪贴板/粘贴里认出 `omnifocus:///task/PK` 并自动关联。
+     `task import -a` 直接**按 flavor 读剪贴板**认 `omnifocus:///task/PK`
+     （⌘C 任务再 ⌘V 到终端只剩标题 —— 终端只吃纯文本 flavor，链接在粘贴那一刻
+     就丢了；`-a` 绕开粘贴这一层，`the clipboard as URL` 里就是链接本体）。
+6. **静音时段**：`period mute T1 [--permanent]` = 这个时段（或以后每个这个星期几）
+   静音 —— Focusmate quiet 自动开、daemon 的分心看门狗不出声（违规照记、收尾照催）。
+   表在 `temp/session-mutes.json`，判定在 `session_plan.mute_window_at()`，
+   见 [`feature_intents/session_mute.md`](feature_intents/session_mute.md)。
 5. **设置**：`settings_store.SETTINGS` 里注册的全部设置项（id / 当前值 / 默认值 /
    解释），`set <id> <value>` 修改，不写 value = 恢复默认。现有四项：
    `edit-tomorrow`（今天可以先安排明天，过了凌晨回到 24 小时窗口）、
@@ -675,6 +681,41 @@ def _hint_cancel(parts):
     return repl_kit.Hint("参数", ("<n>",), note="执行区要敲宣言")
 
 
+def mute_window_for(day, hhmm):
+    """``("11:15", 这一天)`` 落在哪条静音窗里 → 记录；不在就是 None。
+
+    口径只认 ``period mute``（:mod:`session_plan` 里那张表），别处不要自己算 ——
+    表格的「静音」列、daemon 的分心看门狗、自动 quiet 都问这一个函数。
+    """
+    got = sp.parse_hhmm(hhmm)
+    if got is None:
+        return None
+    try:
+        moment = datetime.datetime.combine(day, datetime.time(got[0], got[1]))
+        return sp.mute_window_at(moment, data=mute_data())
+    except Exception:                       # noqa: BLE001 - 静音表坏了不该没表格
+        return None
+
+
+_MUTE_CACHE = {"at": 0.0, "data": None}
+
+
+def mute_data(force=False):
+    """静音表（2 秒缓存）。表格每一行都要问它，别每行读一次盘。"""
+    now = time.time()
+    if not force and _MUTE_CACHE["data"] is not None and now - _MUTE_CACHE["at"] < 2.0:
+        return _MUTE_CACHE["data"]
+    _MUTE_CACHE["data"] = sp.load_mutes()
+    _MUTE_CACHE["at"] = now
+    return _MUTE_CACHE["data"]
+
+
+def forget_mute_cache():
+    """改过静音表之后清一下（``period mute`` 立刻生效，不用等 2 秒）。"""
+    _MUTE_CACHE["data"] = None
+    _MUTE_CACHE["at"] = 0.0
+
+
 def _hint_sync(parts):
     return repl_kit.Hint("选项", ("--days",), note="日历 → data.csv")
 
@@ -687,9 +728,13 @@ def _hint_stat(parts):
 
 
 def _hint_period(parts):
+    if parts and str(parts[0]).lower() in ("mute", "unmute", "静音", "解除静音", "取消静音"):
+        return repl_kit.Hint("参数", ("T1", "--permanent", "--off"),
+                             note="静音这个时段（--permanent = 以后每个这个星期几都静音）")
     if len(parts) >= 2:
         return repl_kit.Hint("时长", ("25", "50", "75"), note="可连续给多个；超时就报错")
-    return repl_kit.Hint("参数", ("T1", "50", "50"), note="按 25/50/75 排这个时段")
+    return repl_kit.Hint("参数", ("T1", "50", "50", "mute T1"), note="按 25/50/75 排这个时段；"
+                             "period mute T1 --permanent = 这个时段以后都静音")
 
 
 def _hint_set(parts):
@@ -701,10 +746,16 @@ def _hint_set(parts):
 
 def _hint_task(parts):
     if not parts:
-        return repl_kit.Hint("动作", ("create", "delete", "modify", "note", "assign",
-                                      "select", "repeat", "sync", "archive"),
+        return repl_kit.Hint("动作", ("create", "import", "delete", "modify", "note",
+                                      "assign", "select", "repeat", "sync", "archive"),
                              note="字段随便写，不校验 · 备注可以塞网址")
     action = parts[0].lower() if len(parts) else ""
+    if action in ("import", "粘贴", "导入"):
+        return repl_kit.Hint("参数", ("-a", "[标题](omnifocus:///task/PK)", "--assign N"),
+                             note="-a = 直接读剪贴板（⌘V 到终端会丢链接，这条不会）")
+    if action in ("link", "关联"):
+        return repl_kit.Hint("参数", ("-a", "omnifocus:///task/PK", "PK"),
+                             note="-a = 从剪贴板读链接")
     if action == "create":
         return repl_kit.Hint("参数", ("[id]", "key=value...", "--repeat 周几@HH:MM",
                                       "--assign N", "--note 备注"),
@@ -724,8 +775,8 @@ def _hint_task(parts):
     if action == "assign":
         return repl_kit.Hint("参数", ("<session ID>",),
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
-    return repl_kit.Hint("参数", ("create", "delete", "modify", "note", "assign",
-                                  "select", "repeat", "sync", "archive"),
+    return repl_kit.Hint("参数", ("create", "import", "delete", "modify", "note",
+                                  "assign", "select", "repeat", "sync", "archive"),
                          note="任何动作都能带 --assign N / --note 备注")
 
 
@@ -800,9 +851,9 @@ class View(object):
                  hint=_hint_actions("on", "off", note="不写就是取反")),
             _cmd("task", w.cmd_task,
                  "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
-                 usage="task <create|delete|modify|note|assign|select|repeat|sync|archive> ... [--assign N]",
-                 options=("create", "delete", "modify", "note", "assign", "select", "repeat",
-                          "sync", "archive", "--assign", "--note", "--repeat"),
+                 usage="task <create|import|delete|modify|note|assign|select|repeat|sync|archive> ... [--assign N]",
+                 options=("create", "import", "delete", "modify", "note", "assign", "select",
+                          "repeat", "sync", "archive", "--assign", "--note", "--repeat", "-a"),
                  hint=_hint_task),
         ]
 
@@ -899,8 +950,9 @@ class ContractView(View):
                  options=("--permanent", "25", "50", "75"),
                  hint=_hint_session),
             _cmd("period", w.cmd_period_layout,
-                 "改一个时段的 session 排布：period T1 50 50",
-                 usage="period <T1> [25|50|75 ...]", options=("25", "50", "75"),
+                 "改一个时段的排布（period T1 50 50）或静音它（period mute T1）",
+                 usage="period <T1> [25|50|75 ...] | period mute|unmute <T1> [--permanent]",
+                 options=("25", "50", "75", "mute", "unmute", "--permanent"),
                  hint=_hint_period),
             _cmd("relocate", w.cmd_relocate, "临时把 #N 提前/推后：relocate N ±MM",
                  usage="relocate <n> ±MM",
@@ -1655,6 +1707,11 @@ class Warden(object):
         self.review = None
         self.review_check = None
         self.review_at = 0.0
+        # 静音时段（period mute）自动落地：mutes_at 是节流时间戳，
+        # mute_tries 记「这一场刚才试过、几分钟内别再试」，mute_worker 是后台线程。
+        self.mutes_at = 0.0
+        self.mute_tries = {}
+        self.mute_worker = None
         # 「现在」是几点：None = 跟着墙上时钟走。测试/回放可以钉死它，
         # 否则「3 小时内才自动催」这条规则会让用例在钟点变了之后莫名其妙地红。
         self.review_now = None
@@ -1822,6 +1879,13 @@ class Warden(object):
             row["period"] = None
             row["period_id"] = None
             row["period_first"] = False
+        # 「这一行在不在静音时段里」——口径只有一个：`period mute T1 [--permanent]`
+        # 写下的时间窗。quiet 是**结果**（Focusmate 那边设上了没），period_muted
+        # 是**意图**；两个都摆出来，才知道是「本来就该静音」还是「该静音没设上」。
+        window = mute_window_for(day, row.get("startLabel"))
+        row["period_muted"] = bool(window)
+        if window:
+            row["mute_window"] = dict(window)
         tasks = self.tasks_for_session(day, row.get("startLabel"), row.get("durationMin"))
         if tasks:
             row["task"] = tasks[0]                # 兼容：只关心一条的地方仍然能用
@@ -2340,6 +2404,17 @@ class Warden(object):
             rows.append(row)
 
         rows.sort(key=lambda r: r["startMs"])
+        # daemon 的「认账」结论（state.json 里 slots[key] 的 match / actual）：
+        # 计划 16:15 没有同一分钟的 session，但实际被 16:00 25 + 16:30 50 覆盖了。
+        # 这是**已经付过钱**的事实，表格必须照着它显示，不能再报「缺」。
+        state_slots = self.daemon_slots()
+        for row in rows:
+            rec = state_slots.get("%sT%s" % (row.get("date"), row.get("startLabel"))) or {}
+            if rec.get("match") and rec.get("match") != "exact":
+                row["adopted"] = True
+                row["actual_note"] = rec.get("actual") or rec.get("match")
+            elif rec.get("match") == "exact" and rec.get("actual"):
+                row["actual_note"] = rec.get("actual")
         for row in rows:
             try:
                 self.attach_period_info(row, datetime.date.fromisoformat(row["date"]))
@@ -2392,6 +2467,38 @@ class Warden(object):
                           "没有标题/静音/伙伴/契约行" % why)
         self.rows_at = time.time()
         self.rebuild_rows(now_ms)
+
+    def daemon_slots(self):
+        """daemon 写下的 ``state.json`` 里的 ``slots``（带 2 秒缓存，画表格会问它）。"""
+        now = time.time()
+        cached = self._snapshot_cache.get("__daemon_slots__")
+        if cached and now - cached[0] < 2.0:
+            return cached[1]
+        try:
+            slots = (ks.load_state() or {}).get("slots") or {}
+        except Exception:                       # noqa: BLE001 - 读不到就当没有
+            slots = {}
+        self._snapshot_cache["__daemon_slots__"] = (now, slots)
+        return slots
+
+    def actual_slots(self):
+        """这一天的**实际** session（bridge 真数据）→ 收尾/对账要的形状。
+
+        返回 ``[{"start": datetime, "duration": 分钟}]`` 或 None（离线 / 快照）。
+        收尾按它发问，才不会把「计划 75min」当成一场去问。
+        """
+        if not self.authoritative:
+            return None
+        out = []
+        for row in self.rows:
+            if row.get("id") is None:
+                continue
+            try:
+                start = datetime.datetime.fromtimestamp(row["startMs"] / 1000.0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            out.append({"start": start, "duration": row.get("durationMin")})
+        return out or None
 
     def effective_zone(self, zone, day):
         """``edit-tomorrow`` 设置：开着时，明天（以及之后）按草稿区算。
@@ -2592,8 +2699,11 @@ class Warden(object):
                 # 快照里没有 session id —— 订没订看不出来，别假装知道
                 st.append(r["phase"], style=STYLE_MUTED)
                 st.append(" 快照", style=STYLE_MUTED)
-            elif r.get("planned") and not r.get("id"):
-                st.append("缺", style="bold yellow")
+            elif r.get("planned") and not r.get("id") and r.get("adopted"):
+                # 计划这一行在 API 里没有「同一分钟」的场次，但 daemon 认账了
+                # （实际是别的场次覆盖了它：拆分 / 挪了半格）。别再说「缺」——
+                # 「缺」会让你去重订一场和现有场次打架的 session。
+                st.append("认账", style="bold green")
             elif not r.get("planned"):
                 st.append("计划外", style="bold magenta")
             else:
@@ -2604,6 +2714,10 @@ class Warden(object):
                 qtxt = "[%s]?[/]" % STYLE_MUTED
             elif quiet:
                 qtxt = "[bold yellow]ON[/]"
+            elif r.get("period_muted"):
+                # 时段要求静音、但 Focusmate 那边还没设上（正在补 / 补失败）——
+                # 不能显示成「·」，那等于假装这一行不在静音时段里。
+                qtxt = "[yellow]静…[/]"
             else:
                 qtxt = "[%s]·[/]" % STYLE_MUTED
             dur = r.get("durationMin")
@@ -2614,6 +2728,8 @@ class Warden(object):
             if r.get("matched"):
                 # 注意：Text.append **不解析 markup**，所以要给 style 而不是塞 "[cyan]…[/]"
                 label.append("  · 已匹配", style="cyan")
+            if r.get("actual_note"):
+                label.append("  · %s" % r["actual_note"], style="yellow")
             period = r.get("period") or {}
             first = bool(r.get("period_first"))
             pid = period.get("id") if first else ""
@@ -2800,6 +2916,10 @@ class Warden(object):
         try:
             self._maybe_start_review()
         except Exception:                          # noqa: BLE001 - 收尾坏了也不能没帧
+            pass
+        try:
+            self._maybe_apply_mutes()
+        except Exception:                          # noqa: BLE001 - 静音坏了也不能没帧
             pass
         now = time.time()
         if not force and self.warnings_at and now - self.warnings_at < max_age:
@@ -3165,7 +3285,14 @@ class Warden(object):
         toks = [str(a) for a in args]
         if not toks:
             raise ValueError("用法：task create/delete/modify/note/assign/select/repeat/sync/archive ...")
-        assign_to, kept = self._split_assign(toks)
+        # `-a` 有两个含义，按**动作**分流（都要，不能二选一）：
+        #   task 8 -a 3          → -a = --assign 3（老语义）
+        #   task import -a       → -a = 读剪贴板（用户要的「直接读剪贴板」）
+        #   task 8 link -a       → 同上
+        # 所以 import / link 不把 -a 当 --assign 摘走，留给子命令自己解释。
+        verbs = {t.lower() for t in toks if not t.startswith("-")}
+        short_assign = not (verbs & {"import", "粘贴", "导入", "link", "关联"})
+        assign_to, kept = self._split_assign(toks, dash_a=short_assign)
         note_text, kept = self._split_note(kept)
         if not kept:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）")
@@ -3179,15 +3306,19 @@ class Warden(object):
         return result
 
     @staticmethod
-    def _split_assign(toks):
-        """把 ``--assign N`` / ``--assign=N`` / ``-a N`` 从参数里摘出来。"""
+    def _split_assign(toks, dash_a=True):
+        """把 ``--assign N`` / ``--assign=N`` / ``-a N`` 从参数里摘出来。
+
+        ``dash_a=False`` 时只认 ``--assign``（``-a`` 留给子命令，例如
+        ``task import -a`` 的「读剪贴板」）。
+        """
         assign_to = None
         kept = []
         i = 0
         while i < len(toks):
             tok = toks[i]
             low = tok.lower()
-            if low in ("--assign", "-a"):
+            if low == "--assign" or (dash_a and low == "-a"):
                 if i + 1 >= len(toks):
                     raise ValueError("--assign 后面要跟表格里的 session ID（例如 --assign 3）")
                 assign_to = toks[i + 1]
@@ -3591,55 +3722,107 @@ class Warden(object):
         return task
 
     def cmd_task_link(self, args):
-        """``task <id> link <OmniFocus 链接|primary key>`` —— 把本地任务关联到 OmniFocus。
+        """``task <id> link [-a | <OmniFocus 链接|primary key>]`` —— 关联到 OmniFocus。
 
         链接从 OmniFocus 里「拷贝任务」拿到就行，几种粘贴形状都认：
 
             task 5 link omnifocus:///task/kc-4VLAE_1L
             task 5 link "[数学易错修正](omnifocus:///task/kc-4VLAE_1L)"
             task 5 link kc-4VLAE_1L
+            task 5 link -a          ← 直接读剪贴板（⌘V 会丢链接，见 task import）
 
         只有标题（``title: "数学易错修正"``）那种粘贴**认不出 primary key**，
         会明确拒绝 —— 拿标题去猜一条任务，猜错比没有更糟。
         """
-        toks = [str(a) for a in args]
-        if len(toks) < 2:
-            raise ValueError("用法：task <任务 ID> link <omnifocus:///task/PK | PK>")
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        auto = any(t.lower() in ("-a", "--auto", "--clip", "--clipboard", "剪贴板")
+                   for t in toks)
+        toks = [t for t in toks
+                if t.lower() not in ("-a", "--auto", "--clip", "--clipboard", "剪贴板")]
+        if not toks:
+            raise ValueError("用法：task <任务 ID> link <omnifocus:///task/PK | PK | -a>")
         task_id = toks[0]
-        text = " ".join(toks[1:])
-        info = of.parse_link(text)
+        if auto:
+            items = [item for item in of.clipboard_links() if item.get("id")]
+            if not items:
+                raise ValueError("剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本都读了）。"
+                                 "在 OmniFocus 里 ⌘C 那条任务再来。")
+            if len(items) > 1:
+                raise ValueError("剪贴板里有 %d 条 OmniFocus 链接：%s —— 只拷一条再来，"
+                                 "或者把要的那条的链接直接写出来。"
+                                 % (len(items), "、".join(i["id"] for i in items[:5])))
+            info = items[0]
+        else:
+            if len(toks) < 2:
+                raise ValueError("用法：task <任务 ID> link <omnifocus:///task/PK | PK | -a>")
+            text = " ".join(toks[1:])
+            info = of.parse_link(text)
         if not info or not info.get("id"):
             raise ValueError("认不出 OmniFocus 任务 primary key：%r（要 omnifocus:///task/… "
-                             "或裸 PK；只有标题的那种粘贴认不出来）" % text)
+                             "或裸 PK；只有标题的那种粘贴认不出来）" % (" ".join(toks[1:]),))
         task = self.task_store.link_omnifocus(task_id, info["id"], title=info.get("title"))
-        self.say("🔗 任务 %d 已关联 OmniFocus %s%s"
+        self.say("🔗 任务 %d 已关联 OmniFocus %s%s%s"
                  % (task["id"], info["id"],
-                    ("「%s」" % info["title"]) if info.get("title") else ""), "ok")
+                    ("「%s」" % info["title"]) if info.get("title") else "",
+                    "（链接从剪贴板读的）" if auto else ""), "ok")
         return task
 
     def cmd_task_import(self, args):
-        """``task import [粘贴文本|链接] [--assign N]`` —— 从粘贴/剪贴板导入一条任务。
+        """``task import [-a] [粘贴文本|链接] [--assign N]`` —— 从剪贴板/粘贴导入任务。
 
         需求（第 4 条）：在 OmniFocus 里复制一条任务（剪贴板里自带 primary key 的
         链接），然后在这里 import —— 本地任务**自动关联**到那条 OmniFocus 任务。
 
-        不写参数就读 macOS 剪贴板：先读 HTML（OmniFocus 给的是
-        ``<a href="omnifocus:///task/PK">标题</a>``），读不到再退回纯文本。
-        可以一次粘好几行，一行一条。
+        **为什么要有 ``-a``**：从 OmniFocus ⌘C 再往终端里 ⌘V，粘出来的**只有标题**
+        —— 终端只接受纯文本那个剪贴板 flavor，链接在粘贴那一刻就没了。所以
+        「把粘贴的内容交给 task import」这条路注定没有 id。``-a``（``--auto`` /
+        ``--clipboard``）就是绕过粘贴：**直接按 flavor 去读剪贴板**，把
+        ``the clipboard as URL`` 里的 ``omnifocus:///task/PK`` 捞出来。
 
-        只有标题、没有 primary key 的粘贴也照样建任务，但**明确说一句**「没关联上」
-        —— 宁可少关联，也不拿标题猜身份。
+        三种用法：
+
+            task import -a                 读剪贴板（推荐的用法）
+            task import                    同上（不写参数就是读剪贴板）
+            task import [标题](omnifocus:///task/PK)   手动给链接
+
+        不带 ``-a`` 但粘进来一段**只有标题**的文字时，会去剪贴板里对一下：标题
+        完全一致的那条链接就认下来（那是同一次 ⌘C 的两半，不是猜）；对不上就
+        建任务但**明确说一句**没关联 —— 宁可少关联，也不拿标题猜身份。
         """
-        toks = [str(a).strip() for a in args if str(a).strip()]
+        toks = []
+        auto = False
+        assign_to = None
+        raw = [str(a).strip() for a in args]
+        i = 0
+        while i < len(raw):
+            tok = raw[i]
+            low = tok.lower()
+            if low in ("-a", "--auto", "--clip", "--clipboard", "剪贴板", "auto"):
+                auto = True
+            elif low in ("--assign", "-s", "assign") and i + 1 < len(raw):
+                assign_to = raw[i + 1]
+                i += 1
+            elif tok.startswith("--assign="):
+                assign_to = tok.split("=", 1)[1]
+            elif tok:
+                toks.append(tok)
+            i += 1
+
+        pasted = " ".join(toks).strip()
+        clip = of.clipboard_links() if (auto or not pasted) else []
         items = []
-        if toks:
-            text = " ".join(toks)
-            items = of.parse_links(text) or [of.parse_link(text)]
-        else:
-            items = of.clipboard_links()
+        if auto or not pasted:
+            items = [dict(item, from_clipboard=True) for item in clip]
             if not items:
-                raise ValueError("剪贴板里没有 OmniFocus 链接；也可以直接写 "
-                                 "`task import [标题](omnifocus:///task/PK)`")
+                raise ValueError(
+                    "剪贴板里没有 OmniFocus 链接（试过 URL / HTML / RTF / 纯文本四个 flavor）。"
+                    "在 OmniFocus 里 ⌘C 一条任务再回来敲 `task import -a`；"
+                    "也可以手写 `task import [标题](omnifocus:///task/PK)`。")
+        else:
+            items = of.parse_links(pasted) or [of.parse_link(pasted)]
+            if not any(item and item.get("id") for item in items):
+                items = self._task_import_match_clipboard(items, clip or of.clipboard_links())
+
         made = []
         for item in items:
             if not item:
@@ -3652,14 +3835,50 @@ class Warden(object):
             task = self.task_store.create({"title": title}, omnifocus=omnifocus)
             made.append(task)
             if item.get("id"):
-                self.say("✅ 导入任务 %d「%s」→ OmniFocus %s"
-                         % (task["id"], title, item["id"]), "ok")
+                self.say("✅ 导入任务 %d「%s」→ OmniFocus %s%s"
+                         % (task["id"], title, item["id"],
+                            "（链接从剪贴板读的）" if item.get("from_clipboard") else ""),
+                         "ok")
             else:
                 self.say("✅ 导入任务 %d「%s」（只有标题：认不出 OmniFocus primary key，"
                          "所以**没有关联**）" % (task["id"], title), "warn")
+                self.say("   要连上那条 OmniFocus 任务：回到 OmniFocus ⌘C 它，"
+                         "再敲 `task %d link -a`。" % task["id"], "info")
         if made:
             self.selected_task_id = made[-1]["id"]
+        if made and assign_to:
+            self.cmd_task_assign([str(made[-1]["id"]), assign_to])
         return made[-1] if made else None
+
+    @staticmethod
+    def _task_import_match_clipboard(items, clip_items):
+        """粘贴的「只有标题」→ 去剪贴板里找同名的那条，认下它的 id。
+
+        只在**标题完全一致**（去掉首尾空白/合并空格后）时才认：这是同一次 ⌘C
+        的两半，不是拿标题猜身份。认不出来就原样返回，由调用方明说「没关联」。
+        """
+        def norm(text):
+            return " ".join(str(text or "").split()).strip().lower()
+
+        wanted = [norm((it or {}).get("title")) for it in items if it]
+        by_title = {}
+        for cand in clip_items or []:
+            key = norm(cand.get("title"))
+            if key and cand.get("id"):
+                by_title.setdefault(key, cand)
+        out = []
+        for item, key in zip([it for it in items if it], wanted):
+            hit = by_title.get(key)
+            if hit and not item.get("id"):
+                merged = dict(item)
+                merged["id"] = hit["id"]
+                merged["url"] = hit.get("url")
+                merged["title"] = item.get("title") or hit.get("title")
+                merged["from_clipboard"] = True
+                out.append(merged)
+            else:
+                out.append(item)
+        return out
 
     def cmd_task_assign(self, args):
         """task assign <session ID>（默认当前任务）或 task assign <任务ID> <session ID>。
@@ -3944,6 +4163,38 @@ class Warden(object):
             pass
         return "Focusmate 已勾完成"
 
+    def fm_delete_task(self, task):
+        """Focusmate：删掉这条任务在 Task Manager 里那条 task（收尾「转移」时用）。
+
+        需求：「任务转移之后 focusmate 任务删除」。转移的语义是**这一场不干了**
+        —— 旧任务标放弃、复制品挂到下一场。可 Focusmate 那边那条 task 还挂在
+        旧场次上：既不会完成，又一直躺在 Task Manager 里，第二天对账还会以为
+        它在等你。删掉它，账才干净（OmniFocus 那条照旧一个字节都不动）。
+
+        返回一句人话（收尾面板会显示），删不掉也**不挡**转移本身。
+        """
+        fm = task.get("focusmate") or {}
+        task_id = fm.get("task_id") or fm.get("id")
+        if not task_id:
+            return "（这条没有 Focusmate task，不用删）"
+        if self.offline:
+            return "离线模式：没去删 Focusmate task %s" % str(task_id)[:8]
+        try:
+            res = self.bridge.call("delete_task", timeout=180, taskId=task_id)
+        except BridgeError as e:
+            self.had_error = True
+            return "Focusmate task 删除失败：%s" % e
+        if not res.get("verified"):
+            self.had_error = True
+            still = (res.get("stillThere") or {}).get("title") or ""
+            return "Focusmate 说删了，但复核还在%s（去 Task Manager 手动删一下）" % (
+                ("：" + still) if still else "")
+        try:
+            self.task_store.forget_focusmate(task["id"], reason="transfer")
+        except ValueError:
+            pass
+        return "Focusmate task %s 已删除" % str(task_id)[:8]
+
     def sync_omnifocus_status(self):
         """读一遍 OmniFocus 的完成状态，返回 ``{本地任务 id: OmniFocus 行}``。
 
@@ -4108,6 +4359,7 @@ class Warden(object):
             "say": lambda text, kind="info": self.say(text, kind),
             "drop_omnifocus": lambda task: self.omni_drop(task),
             "complete_focusmate": lambda task: self.fm_complete(task),
+            "delete_focusmate_task": lambda task: self.fm_delete_task(task),
             "complete_omnifocus": lambda task, minutes=None: self.omni_complete(task),
             "next_session": lambda task: self.next_session_after(task),
             "assign_focusmate": lambda task, sess: self.assign_task_to(task, sess),
@@ -4277,7 +4529,8 @@ class Warden(object):
             # 手动收尾往回看一整天（自动催只看 3 小时，见 postsession.LOOKBACK_SEC）：
             # 「上午那场我忘了收」正是这条命令存在的理由。
             sessions = psv.ended_sessions(
-                psv.slots_around(self.reload_entries(), days_back=1),
+                psv.slots_around(self.reload_entries(), days_back=1,
+                                 actual=self.actual_slots()),
                 lookback=36 * 3600)
             entry = psv.pick(sessions, wanted)
         if entry is None:
@@ -4354,7 +4607,8 @@ class Warden(object):
             done_keys = set()
         try:
             rows = psv.unreviewed_sessions(self.task_store, entries,
-                                           done_keys=done_keys, now=self.review_now)
+                                           done_keys=done_keys, now=self.review_now,
+                                           actual=self.actual_slots())
         except Exception:                          # noqa: BLE001
             return None, False
         if not rows:
@@ -4764,6 +5018,180 @@ class Warden(object):
             self._forget_layout_state(cancelled)
         return True
 
+    # -- 静音时段（period mute） --------------------------------------
+
+    def mute_targets(self, rows=None):
+        """「该静音、但 Focusmate 那边 quiet 还不是 ON」的行。
+
+        判据只有一个：这行的起点落在 ``period mute`` 写下的时间窗里
+        （``row["period_muted"]``，见 :func:`mute_window_for`）。
+        没有 id 的行动不了（快照 / 还没订上），跳过。
+        """
+        out = []
+        for row in (self.rows if rows is None else rows):
+            if not row.get("period_muted"):
+                continue
+            if row.get("quiet"):
+                continue
+            if row.get("id") is None:
+                continue
+            out.append(row)
+        return out
+
+    def apply_mutes(self, rows=None, quiet_spinner=True):
+        """把「时段静音」落到 Focusmate（quiet on）。返回 ``[(标签, ok, 说明)]``。
+
+        幂等：已经是 ON 的行不在 :meth:`mute_targets` 里，所以重复调用只是查一次。
+        这是**意图 → 结果**的那一步：`period mute` 只写本地那张表，真正让这一场
+        安静下来的是这里（Focusmate 的 quiet 是单场开关）。
+        """
+        if self.offline:
+            return []
+        targets = self.mute_targets() if rows is None else list(rows)
+        out = []
+        for row in targets:
+            label = "%s–%s" % (row.get("startLabel"), row.get("endLabel") or "?")
+            status = self.console.status("[yellow]把 %s 设成静音…[/]" % label, spinner="dots")
+            try:
+                if quiet_spinner:
+                    status.__enter__()
+                try:
+                    res = self.bridge.call("mute", startMs=row["startMs"],
+                                           meetingId=row["id"], quiet=True)
+                finally:
+                    if quiet_spinner:
+                        status.__exit__(None, None, None)
+            except (BridgeError, KeyError) as e:
+                self.had_error = True
+                out.append((label, False, str(e)))
+                self.say("❌ %s 静音失败：%s" % (label, e), "error")
+                continue
+            ok = bool(res.get("verified"))
+            if ok:
+                out.append((label, True, ""))
+                self.say("🔇 %s 已静音（时段要求，Focusmate quiet = ON）" % label, "ok")
+            else:
+                self.had_error = True
+                out.append((label, False, "复核不一致：%s" % (res.get("quiet"),)))
+                self.say("❌ %s 静音后复核不一致：quiet = %s"
+                         % (label, res.get("quiet")), "error")
+        if out:
+            self.invalidate()
+        return out
+
+    def _maybe_apply_mutes(self):
+        """每帧看一眼：有「时段要求静音但还没设上」的场次 → 后台补上。
+
+        节流两层：整体 5 秒一次（`mutes_at`），同一场 5 分钟内只试一次
+        （`mute_tries`，避免 bridge 连着失败时每帧都去开浏览器）。
+        """
+        if self.offline or self.review is not None:
+            return
+        now = time.time()
+        if now - self.mutes_at < 5.0:
+            return
+        self.mutes_at = now
+        cooldown = 300.0
+        targets = []
+        for row in self.mute_targets():
+            key = (row.get("date"), row.get("startLabel"))
+            if now - self.mute_tries.get(key, 0.0) < cooldown:
+                continue
+            self.mute_tries[key] = now
+            targets.append(row)
+        if not targets:
+            return
+        if self.mute_worker is not None and self.mute_worker.is_alive():
+            return
+        self.mute_worker = threading.Thread(target=self._mute_worker, args=(targets,),
+                                           daemon=True)
+        self.mute_worker.start()
+
+    def _mute_worker(self, targets):
+        try:
+            self.apply_mutes(rows=targets, quiet_spinner=False)
+        except Exception as e:                   # noqa: BLE001
+            self.say("自动静音出错（下次再试）：%s: %s" % (type(e).__name__, e), "warn")
+
+    def cmd_period_mute(self, args):
+        """``period mute T1 [--permanent]`` / ``period unmute T1 [--permanent]``。
+
+        需求原话：「我希望可以设置静音时段，比如说 ``period mute t1 --permanent``
+        就是设置之后这里都静音。在设置完成之后，这个时段内部的 session 自动切换为
+        静音模式」。
+
+        这条命令只写**意图**（``temp/session-mutes.json``）：这个时段（按星期几
+        重复，或者只今天）里的钟点都算静音窗口。落地有两件事，都是自动的：
+
+        1. 这一场 Focusmate 的 quiet 打开 —— 立刻做一遍，之后每帧补
+           （:meth:`_maybe_apply_mutes`，重复的场次不会反复动）；
+        2. daemon 的分心看门狗在这段钟点里**不出声**（通知 / 拉音量 / 嘶吼全免），
+           违规照记、日志照写 —— 静音是「别用声音管我」，不是「别管我」。
+
+        ``--permanent`` 写星期几（以后每个这个星期几都静音）；不写就只静音这一天。
+        """
+        toks = [str(a).strip() for a in args if str(a).strip()]
+        want_on = True
+        permanent = False
+        period_id = None
+        if toks and toks[0].lower() in ("unmute", "解除静音", "取消静音", "off", "关"):
+            want_on = False
+            toks = toks[1:]
+        if toks and toks[0].lower() in ("mute", "静音", "on", "开"):
+            toks = toks[1:]
+        for tok in toks:
+            low = tok.lower()
+            if low in ("--permanent", "-p", "--perm", "permanent"):
+                permanent = True
+            elif low in ("off", "unmute", "关", "解除静音", "取消静音"):
+                want_on = False
+            elif low in ("on", "mute", "开", "静音"):
+                want_on = True
+            elif re.match(r"^[Tt]\d+$", tok):
+                period_id = tok.upper()
+            else:
+                raise ValueError("认不出参数 %r。用法：period mute T1 [--permanent] / "
+                                 "period unmute T1 [--permanent]" % (tok,))
+        day = self.sel_date
+        periods = self.periods_for_day(day)
+        if period_id is None:
+            ids = "、".join(p.get("id", "?") for p in periods) or "无"
+            raise ValueError("要哪个时段？%s 的时段：%s（例：period mute T1 --permanent）"
+                             % (day.isoformat(), ids))
+        period = next((p for p in periods if p.get("id") == period_id), None)
+        if period is None:
+            ids = "、".join(p.get("id", "?") for p in periods) or "无"
+            raise ValueError("没有时段 %s（%s 的时段：%s）"
+                             % (period_id, day.isoformat(), ids))
+
+        scope = (("每个%s的 " % sch.cn_weekday_of_day(day)) if permanent
+                 else ("%s 的 " % day.isoformat()))
+        if not want_on:
+            gone = sp.unmute_period(day, period_id, permanent=permanent)
+            if not gone:
+                self.say("ℹ️ %s%s 本来就没设静音（%s）"
+                         % (scope, period_id, "按星期几" if permanent else "按日期"), "info")
+            else:
+                self.say("🔊 已解除静音：%s%s（%s–%s）"
+                         % (scope, period_id, gone[0].get("start"), gone[0].get("end")), "ok")
+            forget_mute_cache()
+            self.rebuild_rows()
+            return True
+
+        rec = sp.mute_period(day, period, permanent=permanent)
+        forget_mute_cache()
+        self.say("🔇 %s%s 静音了：%s–%s（%s）"
+                 % (scope, period_id, rec["start"], rec["end"],
+                    "写进按星期几重复的表" if permanent else "只这一天"), "ok")
+        self.say("   这段钟点里：Focusmate quiet 自动开、daemon 的分心看门狗不出声；"
+                 "违规照记、收尾照催。撤销：period unmute %s%s"
+                 % (period_id, " --permanent" if permanent else ""), "info")
+        self.rebuild_rows()
+        applied = self.apply_mutes()
+        if applied:
+            self.refresh(quiet=True)
+        return True
+
     def cmd_period_layout(self, args):
         """period T1 50 50 / session T1 50 50 —— 改一个时段的 session 排布。
 
@@ -4783,7 +5211,11 @@ class Warden(object):
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
-            raise ValueError("用法：period T1 50 50（时段 ID 看表格第一列）")
+            raise ValueError("用法：period T1 50 50（时段 ID 看表格第一列）"
+                             " / period mute T1 [--permanent]")
+        # `period mute T1 --permanent` 走静音那条路（同一个命令名词，两个动作）
+        if toks[0].lower() in ("mute", "unmute", "静音", "解除静音", "取消静音"):
+            return self.cmd_period_mute(toks)
         period_id = toks[0]
         if not re.match(r"^[Tt]\d+$", period_id):
             raise ValueError("时段 ID 要像 T1 / T2；你给的是 %r" % period_id)
@@ -5311,7 +5743,51 @@ class Warden(object):
             border_style="bold red", box=box.HEAVY,
         )
 
+    def write_tui_state(self):
+        """把「我在这里」写给 daemon（``temp/warden-tui.json``）。
+
+        内容只有三样：**pid**（活着没活着）、**tty**（在哪个终端上找得到这个
+        TUI）、**started_at**。daemon 结束一场 session 之后要「把人叫回来」，
+        它必须能回答一个问题：*warden 现在到底开着没*。
+
+        以前它不回答，于是 summon 只会「聚焦那个 iTerm session 并打一行 refresh」
+        —— 你 `q` 退出过 warden 之后，那个 session 就是个 shell，refresh 打进去
+        等于没叫（日志里还写着 focused，看着像成功）。
+        """
+        path = ks.TUI_STATE_FILE
+        info = {"pid": os.getpid(),
+                "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "cwd": HERE}
+        try:
+            info["tty"] = os.ttyname(0)
+        except (OSError, ValueError, AttributeError):
+            info["tty"] = ""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(info, f, ensure_ascii=False)
+                f.write("\n")
+        except OSError:
+            pass                     # 写不了就退化成老行为，别挡住 TUI
+        self.tui_state = info
+        return info
+
+    def clear_tui_state(self):
+        """退出时把「我在这里」擦掉（只擦自己那条，孤儿进程别误删别人的）。"""
+        try:
+            with open(ks.TUI_STATE_FILE, encoding="utf-8") as f:
+                if int(json.load(f).get("pid") or 0) != os.getpid():
+                    return
+        except (OSError, ValueError, TypeError):
+            return
+        try:
+            os.unlink(ks.TUI_STATE_FILE)
+        except OSError:
+            pass
+
     def run(self, exec_lines=None):
+        if not exec_lines:
+            self.write_tui_state()
         self.emit("[dim]起 bridge、拉 session…[/]")
         try:
             self.refresh()
@@ -5349,6 +5825,7 @@ class Warden(object):
         try:
             self.shell.run()
         finally:
+            self.clear_tui_state()
             self.emit("[dim]收工。[/]")
         return 0 if not self.had_error else 1
 

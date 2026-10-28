@@ -502,6 +502,180 @@ def window(entries, now, hours=WINDOW_HOURS):
     return {"horizon": horizon, "due": due, "past": past}
 
 
+# ---------------------------------------------------------------- 计划 vs 实际
+#
+# **API 是事实，data.csv 是意图。** 这两者今天经常对不上，而且每一对不上都
+# 会变成冤案（真实踩过 2026-10-28）：
+#
+#   计划 16:15 一场 75min；你订不上 75，改成 16:00 25min + 16:30 50min。
+#   daemon 只认「同一分钟开始」→ 判 16:15 缺失 → 记一笔「booked-but-missing」
+#   （你冤枉）→ 锁死 TUI 要你认罪 → 再反复去订 16:15（和已有两场冲突，必失败）。
+#   同时 09:30 那场计划、你实际做的是 09:45：账本说你没做，其实你做了。
+#
+# 所以「这场到底落地没落地」不能只比开始分钟，要比**覆盖**：
+#   1. exact    同一分钟（±MATCH_START_TOL）—— 时长不同也认，只是标注出来；
+#   2. covered  计划窗口被若干场**拼起来**覆盖（25+50 = 75，允许 <=15min 缝隙、
+#               允许比计划短 ADOPT_SHORT_MIN 分钟）—— 手动拆分替代，认账；
+#   3. shifted  起点挪了但还在 ADOPT_SHIFT_MIN 内、时长对得上 —— 手动挪了半格。
+# 三种都算「已落地」：不重订、不记罪，只把**实际**时长/场次记下来给收尾和
+# 截止时间用（`note` 就是给人看的那句「实际 25+50」）。
+
+MATCH_START_TOL = 60        # 秒：同一分钟就算同一场
+ADOPT_SHIFT_MIN = 30        # 分钟：起点最多差这么多还算「同一场，只是挪了」
+ADOPT_GAP_MIN = 15          # 分钟：拼接覆盖时允许的最大缝隙
+ADOPT_SHORT_MIN = 5         # 分钟：覆盖时长允许比计划短多少
+
+
+def _actual_pairs(actual):
+    """把 ``actual`` 统一成 ``[(datetime, duration_or_None)]``（容忍裸 datetime）。"""
+    out = []
+    for item in actual or []:
+        if isinstance(item, dict):
+            start = item.get("start") or item.get("start_dt")
+            if not isinstance(start, datetime.datetime):
+                continue
+            dur = item.get("duration")
+            try:
+                dur = int(dur) if dur is not None else None
+            except (TypeError, ValueError):
+                dur = None
+            out.append((start, dur))
+        elif isinstance(item, datetime.datetime):
+            out.append((item, None))
+    out.sort(key=lambda p: p[0])
+    return out
+
+
+def _fmt_actual(pairs):
+    """``[(16:00, 25), (16:30, 50)]`` → ``16:00(25) + 16:30(50)``。"""
+    bits = []
+    for start, dur in pairs:
+        bits.append("%s(%s)" % (start.strftime("%H:%M"), ("%dmin" % dur) if dur else "?"))
+    return " + ".join(bits)
+
+
+def match_slot(actual, start, duration, tol_sec=MATCH_START_TOL,
+               shift_min=ADOPT_SHIFT_MIN, gap_min=ADOPT_GAP_MIN,
+               short_min=ADOPT_SHORT_MIN):
+    """计划的一场 (start, duration) 在 API 实际结果里对应什么 → dict。
+
+    返回 ``{"kind", "sessions", "note", "planned", "actual_minutes"}``，
+    ``kind`` ∈ ``exact`` / ``covered`` / ``shifted`` / ``none``。
+    ``note`` 只在「实际和计划不一样」时非空（直接拿去打日志 / 显示）。
+    """
+    pairs = _actual_pairs(actual)
+    try:
+        duration = int(duration)
+    except (TypeError, ValueError):
+        duration = 0
+    planned_end = start + datetime.timedelta(minutes=duration)
+    base = {"planned": {"start": start.strftime("%H:%M"), "duration": duration},
+            "sessions": [], "note": "", "actual_minutes": None}
+
+    # 1) 同一分钟：后面的时长差异只是「标注」，不是「没订上」
+    for got, dur in pairs:
+        if abs((got - start).total_seconds()) <= tol_sec:
+            note = ""
+            if dur and duration and dur != duration:
+                note = "实际 %dmin（计划 %dmin）" % (dur, duration)
+            out = dict(base)
+            out.update({"kind": "exact", "sessions": [{"start": got, "duration": dur}],
+                        "note": note, "actual_minutes": dur or duration})
+            return out
+
+    # 2) 挪了半格：起点差在 ±shift_min 内、时长对得上 —— 「同一场，时间挪了」
+    #    （放在覆盖前面：09:30 计划 / 09:45 实际 这种，说成「覆盖」会误导读日志的人）
+    shifted = []
+    for got, dur in pairs:
+        delta = abs((got - start).total_seconds()) / 60.0
+        if delta > shift_min:
+            continue
+        shifted.append((got, dur))
+    for got, dur in shifted:
+        if dur is not None and duration and abs(dur - duration) > 0:
+            continue
+        out = dict(base)
+        out.update({"kind": "shifted",
+                    "sessions": [{"start": got, "duration": dur}],
+                    "note": "实际 %s%s（计划 %s）" % (
+                        got.strftime("%H:%M"), (" %dmin" % dur) if dur else "",
+                        start.strftime("%H:%M")),
+                    "actual_minutes": dur or duration})
+        return out
+
+    # 3) 拼接覆盖：25 + 50 顶掉一场 75（允许 <=gap_min 的缝隙、允许短 short_min）
+    window = []
+    for got, dur in pairs:
+        if got + datetime.timedelta(minutes=(dur or 0)) <= start:
+            continue
+        if got >= planned_end:
+            continue
+        if dur is None:
+            # 不知道时长：按「到计划终点」估（保守：只会让它更容易被判覆盖）
+            dur = max(0, int((planned_end - got).total_seconds() // 60))
+        window.append((got, int(dur)))
+    if window:
+        cover = start
+        used = []
+        for got, dur in sorted(window):
+            if got > cover + datetime.timedelta(minutes=gap_min):
+                break
+            cover = max(cover, got + datetime.timedelta(minutes=dur))
+            used.append((got, dur))
+        total = sum(d for _s, d in used)
+        need = duration - short_min
+        # 两种都算「干了这么多活」：覆盖到窗口终点，或者几场加起来够了
+        if used and (cover >= planned_end - datetime.timedelta(minutes=short_min)
+                     or total >= need):
+            covered_min = max(total, int((cover - start).total_seconds() // 60))
+            note = ""
+            if len(used) > 1 or abs(total - duration) > short_min:
+                note = "实际 %s（计划 %s %dmin）" % (
+                    _fmt_actual(used), start.strftime("%H:%M"), duration)
+            out = dict(base)
+            out.update({"kind": "covered",
+                        "sessions": [{"start": a, "duration": b} for a, b in used],
+                        "note": note, "actual_minutes": covered_min})
+            return out
+
+    # 4) 兜底：起点在 ±shift_min 内、时长对不上（例如计划 75 实际只有一场 25）
+    #    —— 也算落地（别重复下单，那是冲突的根源），只是把差异说清楚。
+    for got, dur in shifted:
+        out = dict(base)
+        out.update({"kind": "shifted",
+                    "sessions": [{"start": got, "duration": dur}],
+                    "note": "实际 %s%s（计划 %s %dmin）" % (
+                        got.strftime("%H:%M"), (" %dmin" % dur) if dur else "",
+                        start.strftime("%H:%M"), duration),
+                    "actual_minutes": dur or duration})
+        return out
+
+    out = dict(base)
+    out["kind"] = "none"
+    return out
+
+
+def unmatched_actual(actual, plan_slots, tol_sec=MATCH_START_TOL):
+    """API 里有、计划里没有的场次（「计划外」）—— 只看开始分钟。
+
+    ``plan_slots`` 是 ``[{"start": "HH:MM", ...}, ...]``；``actual`` 见
+    :func:`match_slot`。这些场次不是错误：你手动订的、或者你把 csv 那行删了。
+    收尾和契约表要**能看见**它们，否则「这场做完了，但没人问我」。
+    """
+    starts = []
+    for slot in plan_slots or []:
+        got = parse_hhmm(slot.get("start") if isinstance(slot, dict) else slot)
+        if got:
+            starts.append(got[0] * 60 + got[1])
+    out = []
+    for got, dur in _actual_pairs(actual):
+        minute = got.hour * 60 + got.minute
+        if any(abs(minute - s) * 60 <= tol_sec for s in starts):
+            continue
+        out.append({"start": got, "duration": dur})
+    return out
+
+
 # ---------------------------------------------------------------- 编辑（TUI 用）
 
 

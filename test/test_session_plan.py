@@ -152,6 +152,62 @@ check("过期的一次性 session 会被清掉",
       sp._drop_old_extras({"dates": {"2000-01-01": [{"start": "09:00"}]}},
                           datetime.date(2026, 10, 26))["dates"], {})
 
+# ---------------------------------------------------------------- 静音时段
+
+print("== period mute：按星期几重复 / 只这一天 ==")
+MP = os.path.join(tempfile.mkdtemp(prefix="mutes-test-"), "session-mutes.json")
+os.environ["TI_SESSION_MUTES"] = MP
+DAY = datetime.date(2026, 10, 28)          # 周三
+P1 = {"id": "T1", "start": "11:00", "end": "12:05"}
+
+check("空表", sp.load_mutes()["mutes"], [])
+rec = sp.mute_period(DAY, P1, permanent=True)
+check("--permanent 记的是星期几", rec.get("weekday"), sp._weekday_label(DAY.weekday()))
+check("不记日期", "date" in rec, False)
+check("时间窗来自时段", (rec["start"], rec["end"]), ("11:00", "12:05"))
+check("写进文件", len(sp.load_mutes()["mutes"]), 1)
+check("下一个同星期几也静音",
+      [m["period"] for m in sp.mutes_for_day(datetime.date(2026, 11, 4))], ["T1"])
+check("别的星期几不受影响",
+      sp.mutes_for_day(datetime.date(2026, 11, 3)), [])
+check("11:30 落在窗里", sp.is_muted_at(datetime.datetime(2026, 11, 4, 11, 30)), True)
+check("12:05 之后不在窗里", sp.is_muted_at(datetime.datetime(2026, 11, 4, 12, 5)), False)
+check("窗外的钟点没事", sp.is_muted_at(datetime.datetime(2026, 11, 4, 9, 0)), False)
+
+check("再设一次同目标：覆盖不叠加", len(sp.load_mutes()["mutes"]), 1)
+rec2 = sp.mute_period(DAY, {"id": "T1", "start": "11:00", "end": "13:00"}, permanent=True)
+check("时间窗被更新", (rec2["start"], rec2["end"]), ("11:00", "13:00"))
+check("还是一条", len(sp.load_mutes()["mutes"]), 1)
+
+makeup = sp.mute_period(DAY, {"id": "T2", "start": "15:00", "end": "16:00"})
+check("只这一天记的是日期", makeup.get("date"), "2026-10-28")
+check("只这一天不记星期几", "weekday" in makeup, False)
+check("今天两个静音窗", sorted(sp.muted_period_ids(DAY)), ["T1", "T2"])
+check("明天只有按星期几那条",
+      sorted(sp.muted_period_ids(datetime.date(2026, 10, 29))), [])
+check("按日期那条只对那一天生效",
+      sp.is_muted_at(datetime.datetime(2026, 10, 29, 15, 30)), False)
+check("那一天本身生效",
+      sp.is_muted_at(datetime.datetime(2026, 10, 28, 15, 30)), True)
+
+gone = sp.unmute_period(DAY, "T1", permanent=True)
+check("撤销按星期几那条", [g["period"] for g in gone], ["T1"])
+check("T2 还在", [m["period"] for m in sp.load_mutes()["mutes"]], ["T2"])
+check("撤销不存在的不报错", sp.unmute_period(DAY, "T9", permanent=True), [])
+
+print("== 静音窗跨午夜 / 坏数据 ==")
+sp.save_mutes({"version": 1, "mutes": [
+    {"period": "T9", "weekday": "wed", "start": "23:30", "end": "00:30"},
+    {"period": "T8", "weekday": "wed", "start": "乱写", "end": "01:00"},
+    "我不是 dict",
+]})
+check("坏记录被丢掉", [m["period"] for m in sp.load_mutes()["mutes"]], ["T9"])
+check("23:45 在跨午夜的窗里",
+      sp.is_muted_at(datetime.datetime(2026, 10, 28, 23, 45)), True)
+check("00:15 也在（跨到第二天）",
+      sp.is_muted_at(datetime.datetime(2026, 10, 29, 0, 15)), True)
+check("01:00 不在", sp.is_muted_at(datetime.datetime(2026, 10, 29, 1, 0)), False)
+
 print()
 if fails:
     print("%d 项失败：" % len(fails))
