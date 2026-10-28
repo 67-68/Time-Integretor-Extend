@@ -71,11 +71,11 @@ relocate N -15      临时把 #N 提前 15 分钟（只改选中这一天的计�
 relocate N +15      临时把 #N 推后 15 分钟；同一天只能推一次，且不能跨天
 mute 3              把 #3 静音（不写 on/off 就是取反）
 mute 3 on|off       显式开/关
-period mute T1      这个时段（今天）静音：quiet 自动开 + daemon 看门狗不出声
-period mute T1 --permanent   以后**每个这个星期几**的 T1 都静音
+period mute T1      这个时段（今天）的 session 自动开 Focusmate quiet（静音只指这个）
+period mute T1 --permanent   以后**每个这个星期几**的 T1 都这样
 period unmute T1 [--permanent] / period mute T1 off   撤销
-task import -a      从剪贴板读 omnifocus:///task/PK 导入任务并自动关联（⌘V 会丢链接）
-task 5 link -a      从剪贴板读链接，关联到已有任务
+task import         读剪贴板导入任务并自动关联 OmniFocus（⌘V 会丢链接，所以自己读）
+task 5 link         不给链接 = 读剪贴板里那条 omnifocus:///task/PK
 title 2 "Math Past Paper"
 title 2 ""          清空标题
 sync [--days N]     跑 download_calendar.py populate：日历 → 覆盖 data.csv
@@ -239,7 +239,10 @@ warden 这边只做两件事：
    同一场 5 分钟内只试一次，bridge 挂了也不会每帧开浏览器。
 
 表格「静音」列：`ON` = 已静音；`静…` = 时段要求静音但还没设上；`·` = 不静音。
-daemon 侧的「不出声」见 [`session_mute.md`](./session_mute.md)（同一个表，同一个判定）。
+
+**范围只有 Focusmate 那一场**：daemon 的通知 / 拉音量 / 嘶吼一概照旧
+（用户原话：「daemon 应该在静音时段发通知，拉音量和放嘶吼，静音只是指 focusmate
+session」）。同一个表、同一个判定，见 [`session_mute.md`](./session_mute.md)。
 
 ## 计划 vs 实际（表格里为什么会出现「认账」）
 

@@ -120,10 +120,10 @@ TUI 里打字**（`--no-refresh`）。细节见 [`postsession.md`](./postsession
   `start_pause` 是共用实现）。
 - 出声/通知的实现拆去了 `alert.py`（音量可调）。
 - `KEEP_SESSION_IDLE_CHECK=0` 可关；改了常量/音频要 `daemon restart`。
-- **静音时段**（`period mute T1 --permanent`）：`session_plan.mute_window_at(now)`
-  命中就**只记违规、不出声**（通知 / 拉音量 / 嘶吼全免，日志里写一行
-  「静音时段（T1 11:00–12:05）→ 不出声」）。静音是「别用声音管我」，
-  不是「别管我」：违规照样数、收尾照样催。
+- **静音时段与本模块无关**：`period mute T1 --permanent` 只改 Focusmate 那一场的
+  quiet mode（见 [`session_mute.md`](./session_mute.md)）。看门狗**照旧**通知、
+  拉音量、放嘶吼 —— 用户明确过「daemon 应该在静音时段发通知，拉音量和放嘶吼，
+  静音只是指 focusmate session」。所以这个文件里一行都不读静音表。
 
 完整规则、配置、测试见 [`idle_watchdog.md`](./idle_watchdog.md)，
 出声工具见 [`alert.md`](./alert.md)，暂停的界面见 [`warden.md`](./warden.md)。

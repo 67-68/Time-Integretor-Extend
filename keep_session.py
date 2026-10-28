@@ -101,7 +101,6 @@ sys.path.insert(0, HERE)
 
 import main as fm  # noqa: E402  复用 resolve_target / mcp_call / book_once / TOKEN
 import schedule as sch  # noqa: E402  data.csv 的解析/编辑：唯一实现（TUI 也 import 它）
-import session_plan as sp  # noqa: E402  静音时段（period mute）—— daemon 只读它
 import postsession as psv  # noqa: E402  收尾：谁该收、什么时候收（纯逻辑 + 状态文件）
 
 LOOP_INTERVAL = 300            # daemon 每轮间隔（秒）
@@ -886,18 +885,6 @@ def play_alert(path=None, volume=IDLE_ALERT_VOLUME):
     return alert.play(path, volume=100, system_volume=volume, wait=False) == 0
 
 
-def muted_window(now=None):
-    """现在这个钟点是不是静音时段（``period mute T1 --permanent``）→ 那条记录或 None。
-
-    静音的口径只有一条：**这一段钟点别出声**。违规照样数、日志照样记、
-    收尾照样催 —— 静音不是「不管我」，是「别用声音管我」。
-    """
-    try:
-        return sp.mute_window_at(now or datetime.datetime.now())
-    except Exception:                     # noqa: BLE001 - 静音表坏了不该让看门狗停摆
-        return None
-
-
 def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
     """session 进行中的一次分心检查（daemon 每 IDLE_POLL_SEC 调一次）。
 
@@ -905,9 +892,9 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
     暂停中返回当前累计值。idle_seconds / mode 可注入 —— 测试不用真去问 ioreg 或
     改文件。
 
-    **静音时段**（``period mute T1 --permanent`` 设的窗）里：照记违规、只记日志，
-    不发通知、不拉音量、不播放嘶吼。同一段逻辑还让 ``notify`` / ``play_alert``
-    变成了局部函数 —— 出声的地方只有这两处，能一眼看全。
+    **静音时段（``period mute``）跟这里没有任何关系**：静音只作用于 Focusmate
+    那一场（quiet mode），本地看门狗照旧通知 / 拉音量 / 放嘶吼 —— 用户的原话是
+    「daemon 应该在静音时段发通知，拉音量和放嘶吼，静音只是指 focusmate session」。
     """
     if not IDLE_CHECK:
         return None
@@ -916,24 +903,6 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
         idle_seconds = hid_idle_seconds()
     if idle_seconds is None:
         return None                      # 读不到空闲时间：不误判
-
-    mute = muted_window(now)
-
-    def say_quietly(what):
-        log("  [idle] 静音时段（%s %s–%s）→ %s不响"
-            % (mute.get("period") or "?", mute.get("start"), mute.get("end"), what))
-
-    def notify_(*args, **kwargs):
-        if mute:
-            say_quietly("该发通知「%s」" % (args[0] if args else ""))
-            return False
-        return notify(*args, **kwargs)
-
-    def alert_(*args, **kwargs):
-        if mute:
-            say_quietly("该播放 %s" % os.path.basename(args[0] if args else IDLE_ALERT_AUDIO))
-            return False
-        return play_alert(*args, **kwargs)
 
     st = load_idle_state()
     prev_idle = st.get("last_idle_seconds")
@@ -1019,7 +988,7 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
         if dry_run:
             log("  [idle][dry-run] 会发预警，但不记违规")
         else:
-            notify_("Focusmate 分心预警",
+            notify("Focusmate 分心预警",
                    "（%s模式）你已经连续 %s 没碰键盘/触控板了；再 %s 就会记"
                    "一次违规。预警不算违规次数，到下一个违规周期前会再提醒。"
                    % (cfg["name"], fmt_idle_seconds(idle_seconds), lead))
@@ -1039,18 +1008,18 @@ def idle_tick(dry_run=False, now=None, idle_seconds=None, mode=None):
                 % (max_strikes, os.path.basename(IDLE_ALERT_AUDIO)))
             continue
         if strikes < max_strikes:
-            notify_("Focusmate 分心警告",
+            notify("Focusmate 分心警告",
                    "（%s模式）连续 %s 没碰键盘/触控板 = 违规。当前违规次数：%d/%d —— "
                    "到第 %d 次会有不好的事情发生。"
                    % (cfg["name"], fmt_idle_seconds(idle_seconds), strikes,
                       max_strikes, max_strikes))
         else:
-            notify_("Focusmate 分心警告",
+            notify("Focusmate 分心警告",
                    "（%s模式）连续 %s 没碰键盘/触控板。违规次数：%d/%d —— "
                    "说好的不好的事情，现在就来。"
                    % (cfg["name"], fmt_idle_seconds(idle_seconds), strikes,
                       max_strikes))
-            alert_(IDLE_ALERT_AUDIO, IDLE_ALERT_VOLUME)
+            play_alert(IDLE_ALERT_AUDIO, IDLE_ALERT_VOLUME)
     save_idle_state(st)
     return strikes
 

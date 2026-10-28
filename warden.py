@@ -37,12 +37,15 @@
    - **截止时间**：任务挂到一场 session 上时自动 = 那场的终点；完成的时候
      把「完成 + 截止时间」一条命令写回 OmniFocus（见 docs/omnifocus.md）。
    - `task <id> duplicate [-a N]` 复制一条（同一条 OmniFocus 任务、新的本地 ID），
-     `task import -a` 直接**按 flavor 读剪贴板**认 `omnifocus:///task/PK`
+     `task import`（不给参数）直接**按 flavor 读剪贴板**认 `omnifocus:///task/PK`
      （⌘C 任务再 ⌘V 到终端只剩标题 —— 终端只吃纯文本 flavor，链接在粘贴那一刻
-     就丢了；`-a` 绕开粘贴这一层，`the clipboard as URL` 里就是链接本体）。
+     就丢了；import 自己绕开粘贴这一层，`the clipboard as URL` 里就是链接本体）。
+     分工固定：**动作归子命令**（import/link 自己读剪贴板），**后缀归分流**
+     （`-a N` = `--assign N`，顺手挂到表格 #N）。
 6. **静音时段**：`period mute T1 [--permanent]` = 这个时段（或以后每个这个星期几）
-   静音 —— Focusmate quiet 自动开、daemon 的分心看门狗不出声（违规照记、收尾照催）。
-   表在 `temp/session-mutes.json`，判定在 `session_plan.mute_window_at()`，
+   的 session 自动打开 **Focusmate quiet**（「静音」只指这个）。本地看门狗/通知/
+   嘶吼一概照旧 —— daemon 里根本不读这张表。表在 `temp/session-mutes.json`，
+   判定在 `session_plan.mute_window_at()`，
    见 [`feature_intents/session_mute.md`](feature_intents/session_mute.md)。
 5. **设置**：`settings_store.SETTINGS` 里注册的全部设置项（id / 当前值 / 默认值 /
    解释），`set <id> <value>` 修改，不写 value = 恢复默认。现有四项：
@@ -685,7 +688,8 @@ def mute_window_for(day, hhmm):
     """``("11:15", 这一天)`` 落在哪条静音窗里 → 记录；不在就是 None。
 
     口径只认 ``period mute``（:mod:`session_plan` 里那张表），别处不要自己算 ——
-    表格的「静音」列、daemon 的分心看门狗、自动 quiet 都问这一个函数。
+    表格的「静音」列和自动 quiet 都问这一个函数。
+    （daemon 的分心看门狗**不**问它：静音只改 Focusmate 那一场，本地该响还响。）
     """
     got = sp.parse_hhmm(hhmm)
     if got is None:
@@ -751,11 +755,11 @@ def _hint_task(parts):
                              note="字段随便写，不校验 · 备注可以塞网址")
     action = parts[0].lower() if len(parts) else ""
     if action in ("import", "粘贴", "导入"):
-        return repl_kit.Hint("参数", ("-a", "[标题](omnifocus:///task/PK)", "--assign N"),
-                             note="-a = 直接读剪贴板（⌘V 到终端会丢链接，这条不会）")
+        return repl_kit.Hint("参数", ("（不写）", "[标题](omnifocus:///task/PK)", "-a 3"),
+                             note="不写参数 = 读剪贴板（⌘V 到终端只剩标题，这条不会丢链接）")
     if action in ("link", "关联"):
-        return repl_kit.Hint("参数", ("-a", "omnifocus:///task/PK", "PK"),
-                             note="-a = 从剪贴板读链接")
+        return repl_kit.Hint("参数", ("（不写）", "omnifocus:///task/PK", "PK"),
+                             note="不给链接 = 读剪贴板")
     if action == "create":
         return repl_kit.Hint("参数", ("[id]", "key=value...", "--repeat 周几@HH:MM",
                                       "--assign N", "--note 备注"),
@@ -853,7 +857,7 @@ class View(object):
                  "任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
                  usage="task <create|import|delete|modify|note|assign|select|repeat|sync|archive> ... [--assign N]",
                  options=("create", "import", "delete", "modify", "note", "assign", "select",
-                          "repeat", "sync", "archive", "--assign", "--note", "--repeat", "-a"),
+                          "repeat", "sync", "archive", "--assign", "--note", "--repeat"),
                  hint=_hint_task),
         ]
 
@@ -3285,14 +3289,13 @@ class Warden(object):
         toks = [str(a) for a in args]
         if not toks:
             raise ValueError("用法：task create/delete/modify/note/assign/select/repeat/sync/archive ...")
-        # `-a` 有两个含义，按**动作**分流（都要，不能二选一）：
-        #   task 8 -a 3          → -a = --assign 3（老语义）
-        #   task import -a       → -a = 读剪贴板（用户要的「直接读剪贴板」）
-        #   task 8 link -a       → 同上
-        # 所以 import / link 不把 -a 当 --assign 摘走，留给子命令自己解释。
-        verbs = {t.lower() for t in toks if not t.startswith("-")}
-        short_assign = not (verbs & {"import", "粘贴", "导入", "link", "关联"})
-        assign_to, kept = self._split_assign(toks, dash_a=short_assign)
+        # 分工固定成一条规矩：**动作归子命令，后缀归分流**。
+        #   task import          → 动作：读剪贴板（不需要任何 flag）
+        #   task import -a 3     → 后缀：顺手分流/挂到表格 #3
+        #   task 5 link          → 动作：读剪贴板里的链接
+        # 所以 ``-a`` 永远只表示 ``--assign``（分流），不兼职别的意思 ——
+        # 同一个字母两副面孔，是这个入口最容易踩的坑。
+        assign_to, kept = self._split_assign(toks)
         note_text, kept = self._split_note(kept)
         if not kept:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）")
@@ -3306,19 +3309,15 @@ class Warden(object):
         return result
 
     @staticmethod
-    def _split_assign(toks, dash_a=True):
-        """把 ``--assign N`` / ``--assign=N`` / ``-a N`` 从参数里摘出来。
-
-        ``dash_a=False`` 时只认 ``--assign``（``-a`` 留给子命令，例如
-        ``task import -a`` 的「读剪贴板」）。
-        """
+    def _split_assign(toks):
+        """把 ``--assign N`` / ``--assign=N`` / ``-a N`` 从参数里摘出来（分流后缀）。"""
         assign_to = None
         kept = []
         i = 0
         while i < len(toks):
             tok = toks[i]
             low = tok.lower()
-            if low == "--assign" or (dash_a and low == "-a"):
+            if low in ("--assign", "-a"):
                 if i + 1 >= len(toks):
                     raise ValueError("--assign 后面要跟表格里的 session ID（例如 --assign 3）")
                 assign_to = toks[i + 1]
@@ -3722,106 +3721,97 @@ class Warden(object):
         return task
 
     def cmd_task_link(self, args):
-        """``task <id> link [-a | <OmniFocus 链接|primary key>]`` —— 关联到 OmniFocus。
+        """``task <id> link [链接|PK]`` —— 把本地任务关联到 OmniFocus。
 
-        链接从 OmniFocus 里「拷贝任务」拿到就行，几种粘贴形状都认：
+        **不给链接就是读剪贴板**（和 `task import` 同一条规矩：动作归子命令）。
+        OmniFocus 里 ⌘C 那条任务，回来敲 `task 5 link` 就完事。
 
+            task 5 link                 ← 读剪贴板（只认里面唯一的那条链接）
             task 5 link omnifocus:///task/kc-4VLAE_1L
             task 5 link "[数学易错修正](omnifocus:///task/kc-4VLAE_1L)"
             task 5 link kc-4VLAE_1L
-            task 5 link -a          ← 直接读剪贴板（⌘V 会丢链接，见 task import）
 
         只有标题（``title: "数学易错修正"``）那种粘贴**认不出 primary key**，
         会明确拒绝 —— 拿标题去猜一条任务，猜错比没有更糟。
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
-        auto = any(t.lower() in ("-a", "--auto", "--clip", "--clipboard", "剪贴板")
-                   for t in toks)
-        toks = [t for t in toks
-                if t.lower() not in ("-a", "--auto", "--clip", "--clipboard", "剪贴板")]
         if not toks:
-            raise ValueError("用法：task <任务 ID> link <omnifocus:///task/PK | PK | -a>")
+            raise ValueError("用法：task <任务 ID> link [omnifocus:///task/PK | PK]")
         task_id = toks[0]
+        rest = toks[1:]
+        auto = not rest
         if auto:
             items = [item for item in of.clipboard_links() if item.get("id")]
             if not items:
-                raise ValueError("剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本都读了）。"
-                                 "在 OmniFocus 里 ⌘C 那条任务再来。")
+                raise ValueError("剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本 "
+                                 "都读了）。在 OmniFocus 里 ⌘C 那条任务再来。")
             if len(items) > 1:
                 raise ValueError("剪贴板里有 %d 条 OmniFocus 链接：%s —— 只拷一条再来，"
                                  "或者把要的那条的链接直接写出来。"
                                  % (len(items), "、".join(i["id"] for i in items[:5])))
             info = items[0]
         else:
-            if len(toks) < 2:
-                raise ValueError("用法：task <任务 ID> link <omnifocus:///task/PK | PK | -a>")
-            text = " ".join(toks[1:])
-            info = of.parse_link(text)
+            info = of.parse_link(" ".join(rest))
         if not info or not info.get("id"):
             raise ValueError("认不出 OmniFocus 任务 primary key：%r（要 omnifocus:///task/… "
-                             "或裸 PK；只有标题的那种粘贴认不出来）" % (" ".join(toks[1:]),))
+                             "或裸 PK；只有标题的那种粘贴认不出来）" % (" ".join(rest),))
         task = self.task_store.link_omnifocus(task_id, info["id"], title=info.get("title"))
         self.say("🔗 任务 %d 已关联 OmniFocus %s%s%s"
                  % (task["id"], info["id"],
                     ("「%s」" % info["title"]) if info.get("title") else "",
-                    "（链接从剪贴板读的）" if auto else ""), "ok")
+                    "（链接是从剪贴板读的）" if auto else ""), "ok")
         return task
 
     def cmd_task_import(self, args):
-        """``task import [-a] [粘贴文本|链接] [--assign N]`` —— 从剪贴板/粘贴导入任务。
+        """``task import [--assign N] [粘贴文本|链接]`` —— 从**剪贴板**导入任务。
 
         需求（第 4 条）：在 OmniFocus 里复制一条任务（剪贴板里自带 primary key 的
-        链接），然后在这里 import —— 本地任务**自动关联**到那条 OmniFocus 任务。
+        链接），然后 import —— 本地任务**自动关联**到那条 OmniFocus 任务。
 
-        **为什么要有 ``-a``**：从 OmniFocus ⌘C 再往终端里 ⌘V，粘出来的**只有标题**
-        —— 终端只接受纯文本那个剪贴板 flavor，链接在粘贴那一刻就没了。所以
-        「把粘贴的内容交给 task import」这条路注定没有 id。``-a``（``--auto`` /
-        ``--clipboard``）就是绕过粘贴：**直接按 flavor 去读剪贴板**，把
-        ``the clipboard as URL`` 里的 ``omnifocus:///task/PK`` 捞出来。
+        **动作归子命令，后缀归分流**：
 
-        三种用法：
+            task import                 ← 读剪贴板（默认动作，不需要 flag）
+            task import -a 3            ← 同上，顺手分流/挂到表格 #3
+            task import [标题](omnifocus:///task/PK)   ← 手动给链接
 
-            task import -a                 读剪贴板（推荐的用法）
-            task import                    同上（不写参数就是读剪贴板）
-            task import [标题](omnifocus:///task/PK)   手动给链接
+        为什么不靠粘贴：从 OmniFocus ⌘C 再往终端 ⌘V，粘出来的**只有标题** ——
+        终端只接受纯文本那个 flavor，链接在粘贴那一刻就没了。所以 import 自己按
+        flavor 去读剪贴板：`the clipboard as URL` / `«class HTML»` / `«class RTF »` /
+        纯文本，四个都读、按 id 合并（见 ``omnifocus.clipboard_links``）。
 
-        不带 ``-a`` 但粘进来一段**只有标题**的文字时，会去剪贴板里对一下：标题
-        完全一致的那条链接就认下来（那是同一次 ⌘C 的两半，不是猜）；对不上就
-        建任务但**明确说一句**没关联 —— 宁可少关联，也不拿标题猜身份。
+        不带参数就是读剪贴板；粘进来一段**只有标题**的文字时，会去剪贴板里对一下
+        标题完全一致的那条链接（那是同一次 ⌘C 的两半，不是拿标题猜身份），对不上
+        就建任务但**明确说一句**没关联 —— 宁可少关联，也不拿标题猜身份。
         """
         toks = []
-        auto = False
         assign_to = None
         raw = [str(a).strip() for a in args]
         i = 0
         while i < len(raw):
-            tok = raw[i]
-            low = tok.lower()
-            if low in ("-a", "--auto", "--clip", "--clipboard", "剪贴板", "auto"):
-                auto = True
-            elif low in ("--assign", "-s", "assign") and i + 1 < len(raw):
+            tok, low = raw[i], str(raw[i]).lower()
+            if low in ("--assign", "-a") and i + 1 < len(raw):
                 assign_to = raw[i + 1]
-                i += 1
-            elif tok.startswith("--assign="):
+                i += 2
+                continue
+            if low.startswith("--assign="):
                 assign_to = tok.split("=", 1)[1]
             elif tok:
                 toks.append(tok)
             i += 1
 
         pasted = " ".join(toks).strip()
-        clip = of.clipboard_links() if (auto or not pasted) else []
-        items = []
-        if auto or not pasted:
-            items = [dict(item, from_clipboard=True) for item in clip]
+        if not pasted:
+            items = [dict(item, from_clipboard=True) for item in of.clipboard_links()]
             if not items:
                 raise ValueError(
-                    "剪贴板里没有 OmniFocus 链接（试过 URL / HTML / RTF / 纯文本四个 flavor）。"
-                    "在 OmniFocus 里 ⌘C 一条任务再回来敲 `task import -a`；"
+                    "剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本四个 flavor "
+                    "都试过了）。在 OmniFocus 里 ⌘C 一条任务再回来敲 `task import`；"
                     "也可以手写 `task import [标题](omnifocus:///task/PK)`。")
         else:
             items = of.parse_links(pasted) or [of.parse_link(pasted)]
             if not any(item and item.get("id") for item in items):
-                items = self._task_import_match_clipboard(items, clip or of.clipboard_links())
+                # 粘进来的只有标题 → 去剪贴板对同名的那条（同一次 ⌘C 的两半）
+                items = self._task_import_match_clipboard(items, of.clipboard_links())
 
         made = []
         for item in items:
@@ -3837,13 +3827,14 @@ class Warden(object):
             if item.get("id"):
                 self.say("✅ 导入任务 %d「%s」→ OmniFocus %s%s"
                          % (task["id"], title, item["id"],
-                            "（链接从剪贴板读的）" if item.get("from_clipboard") else ""),
+                            "（链接是从剪贴板读的）" if item.get("from_clipboard") else ""),
                          "ok")
             else:
                 self.say("✅ 导入任务 %d「%s」（只有标题：认不出 OmniFocus primary key，"
                          "所以**没有关联**）" % (task["id"], title), "warn")
-                self.say("   要连上那条 OmniFocus 任务：回到 OmniFocus ⌘C 它，"
-                         "再敲 `task %d link -a`。" % task["id"], "info")
+                self.say("   要连上那条 OmniFocus 任务：回 OmniFocus ⌘C 它，"
+                         "再敲 `task %d link`（不带参数就是读剪贴板）。"
+                         % task["id"], "info")
         if made:
             self.selected_task_id = made[-1]["id"]
         if made and assign_to:
@@ -5120,13 +5111,17 @@ class Warden(object):
         就是设置之后这里都静音。在设置完成之后，这个时段内部的 session 自动切换为
         静音模式」。
 
-        这条命令只写**意图**（``temp/session-mutes.json``）：这个时段（按星期几
-        重复，或者只今天）里的钟点都算静音窗口。落地有两件事，都是自动的：
+        **「静音」= Focusmate session 的 quiet mode，仅此而已**（用户明确过：
+        daemon 在静音时段照旧发通知、拉音量、放嘶吼）。所以这条命令只写**意图**
+        （``temp/session-mutes.json``：这个时段按星期几重复，或者只今天），
+        然后把它落到 Focusmate 那一场上：
 
-        1. 这一场 Focusmate 的 quiet 打开 —— 立刻做一遍，之后每帧补
-           （:meth:`_maybe_apply_mutes`，重复的场次不会反复动）；
-        2. daemon 的分心看门狗在这段钟点里**不出声**（通知 / 拉音量 / 嘶吼全免），
-           违规照记、日志照写 —— 静音是「别用声音管我」，不是「别管我」。
+        1. 命令本身立刻设一遍（今天的、还在这个窗口里的场次）；
+        2. 之后每帧后台补（:meth:`_maybe_apply_mutes`）—— 新订上的场次自己安静下来，
+           已经是 ON 的不会反复动。
+
+        本地行为一概不变：分心看门狗照旧通知/拉音量/放嘶吼（``keep_session`` 里
+        根本没有读静音表的地方）。
 
         ``--permanent`` 写星期几（以后每个这个星期几都静音）；不写就只静音这一天。
         """
@@ -5183,8 +5178,9 @@ class Warden(object):
         self.say("🔇 %s%s 静音了：%s–%s（%s）"
                  % (scope, period_id, rec["start"], rec["end"],
                     "写进按星期几重复的表" if permanent else "只这一天"), "ok")
-        self.say("   这段钟点里：Focusmate quiet 自动开、daemon 的分心看门狗不出声；"
-                 "违规照记、收尾照催。撤销：period unmute %s%s"
+        self.say("   这段钟点里的 session 会自动打开 Focusmate quiet（那才是「静音」"
+                 "的本体）；本地看门狗/通知照旧 —— 静音只作用于 Focusmate 那一场。"
+                 "撤销：period unmute %s%s"
                  % (period_id, " --permanent" if permanent else ""), "info")
         self.rebuild_rows()
         applied = self.apply_mutes()

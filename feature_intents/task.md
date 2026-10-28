@@ -96,8 +96,8 @@ TUI（任务视图 / 任意视图都认 `task`）：
 | `task <id> done [分钟]` | 完成：本地完成 + 归档 + Focusmate 勾上 + **OmniFocus 完成并写回截止时间** |
 | `task <id> drop [--local]` | 放弃：本地放弃；默认**OmniFocus 也放弃**，`--local` 只改本地 |
 | `task <id> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
-| `task import [-a] [粘贴文本]` | 从**剪贴板**（`-a`，推荐）或粘贴导入任务并自动关联 OmniFocus，可一次多行 |
-| `task <id> link -a` | 从剪贴板读 `omnifocus:///task/PK` 关联到已有任务 |
+| `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus，可一次多行 |
+| `task <id> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
 
 `--assign N` 是**任何** task 子命令都认的后缀（`_split_assign()` 在 `cmd_task()` 入口
 统一摘掉），所以这些写法都成立：
@@ -110,13 +110,24 @@ task modify 1 due 后天 --assign 3
 task select 1 --assign 3        # 等价于 task assign 1 3（也等价于 task 1 -a 3）
 ```
 
-### `task import -a`：为什么必须有 `-a`
+### 分工：动作归子命令，后缀归分流
 
-在 OmniFocus 里 ⌘C 一条任务、再到终端 ⌘V，**粘出来只有标题**：终端只接受
-剪贴板里 `string` / `utf8` 那个 flavor，`omnifocus:///task/PK` 在粘贴那一刻就丢了。
-所以「把粘贴的内容交给 `task import`」这条路注定没有 primary key（只能建任务、
-不能关联）。`-a`（`--auto` / `--clip` / `--clipboard` 同义）绕开粘贴这一层，
-**按 flavor 直接读剪贴板**：
+`task` 这个入口只有一条规矩，记住了就不会乱：
+
+| 形态 | 谁负责 | 例子 |
+|---|---|---|
+| **动作**（第一个词） | 子命令自己 | `task import` = 读剪贴板；`task 5 link` = 读剪贴板里的链接 |
+| **后缀**（`-a N` / `--assign N` / `-n`） | `cmd_task()` 统一摘掉 | `task import -a 3` = 读完顺手分流/挂到表格 #3 |
+
+所以 `import` / `link` **不需要任何 flag 就已经在读剪贴板了**，`-a` 永远只表示
+「分流到哪一场」（`--assign` 的简写），不兼职第二个意思。
+
+### 为什么 `task import` 必须自己读剪贴板
+
+在 OmniFocus 里 ⌘C 一条任务、再到终端 ⌘V，**粘出来只有标题**：终端只接受剪贴板里
+`string` / `utf8` 那个 flavor，`omnifocus:///task/PK` 在**粘贴那一刻**就丢了。
+所以「把粘贴的内容交给 import」这条路注定没有 primary key（只能建任务、不能关联）。
+要拿到链接只能绕开粘贴这一层，按 flavor 直接读：
 
 ```text
 osascript -e 'the clipboard as URL'            → «data url 6F6D…»  ← OmniFocus 链接本体
@@ -130,12 +141,9 @@ pbpaste                                        → 纯文本（常常只有标�
 `pbpaste -Prefer html` 在这台 macOS 上**完全不起作用**（实测 macOS 15.5，传
 html/rtf/url 都原样返回纯文本），所以老实现其实一直在读纯文本 —— 链接从来没读到过。
 
-没带 `-a` 但粘进来一段只有标题的文字时，会去剪贴板对一下**同名**的那条链接
-（标题完全相同才认），对不上就建任务并明确说「没有关联」，同时给出补救办法
-（`task <id> link -a`）。`-a` 与 `--assign N` 可以叠：`task import -a --assign 3`。
-
-> 注意 `-a` 有两个含义，按**动作**分流：`task 8 -a 3` 里 `-a` 是 `--assign 3`
-> （老语义不变），`task import -a` / `task 8 link -a` 里 `-a` 是「读剪贴板」。
+没给参数就直接读剪贴板；给了参数但粘进来一段**只有标题**的文字时，会去剪贴板对一下
+**同名**的那条链接（标题完全相同才认），对不上就建任务并明确说「没有关联」，同时
+给出补救办法（`task <id> link`，同样不用参数）。
 
 **裸 ID 就是 `select`**（`_dispatch_task()` 里 `action.isdigit()` 那一段）：
 `task 8` ≡ `task select 8`，所以 `-a` / `-n` 这两个后缀挂在裸 ID 上也成立。

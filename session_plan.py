@@ -989,7 +989,9 @@ def _crosses_midnight(rec):
 def mute_window_at(moment, data=None):
     """``moment`` 落在哪个静音窗里 → 那条记录；没有就是 None。
 
-    daemon 的分心看门狗用它：静音时段里就**不出声**（但照旧记日志）。
+    用途只有一个：把落在窗里的 session 的 **Focusmate quiet** 打开（warden 那边
+    每帧补一次，见 `_maybe_apply_mutes`）。daemon 的分心看门狗**不**读它 ——
+    「静音」只指 Focusmate 的 session，本地通知/音量/嘶吼照旧（用户明确过）。
     只用到点/分；跨午夜（end < start）按 +24h 算。
     """
     if moment is None:
@@ -1020,7 +1022,7 @@ def mute_window_at(moment, data=None):
 
 
 def is_muted_at(moment, data=None):
-    """``moment`` 是不是在静音时段里（daemon / 收尾 / 提醒都问这一个）。"""
+    """``moment`` 是不是在静音时段里（排障 / 测试用；daemon 不读）。"""
     return mute_window_at(moment, data) is not None
 
 

@@ -64,6 +64,10 @@ daemon 在新 session 第一次上班时会把这个「下一场默认」绑到�
 - **读不到时钟也不会崩**：`idle_tick` 在 `cmd_run` 里被 try/except 包住，
   出错只记日志、下轮再试。
 - `dry_run` 下只记数 + 打日志，不通知、不出声（方便调试）。
+- **`period mute`（静音时段）和看门狗无关**：那个只改 Focusmate 那一场的 quiet mode。
+  看门狗在静音时段里照样通知、照样拉音量、照样放嘶吼 —— 用户明确过
+  「daemon 应该在静音时段发通知，拉音量和放嘶吼，静音只是指 focusmate session」。
+  （`test_idle_watchdog.py` 里有一组用例钉着这件事。）
 
 ## 空闲时间从哪来
 

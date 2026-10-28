@@ -3,8 +3,12 @@
 ## 一句话
 
 `period mute T1 --permanent` = **这个时段以后都静音**；设置之后，落在那个窗口里
-的 session 自动切到静音：Focusmate 的 quiet 打开，daemon 的分心看门狗不出声。
-违规照记、收尾照催 —— 静音是「别用声音管我」，不是「别管我」。
+的 session 自动切到**静音模式（Focusmate 的 quiet mode）**。
+
+⚠️ 「静音」的范围**只有 Focusmate 那一场**。用户明确过：*「daemon 应该在静音时段
+发通知，拉音量和放嘶吼，静音只是指 focusmate session」*。所以本地一概不变 ——
+分心看门狗照旧通知、照旧拉音量到 10%、照旧播放 `赵小六嘶吼.mp3`；
+`keep_session.py` 里**没有任何一行**读这张静音表（有测试钉着：`hasattr(ks, "muted_window") == False`）。
 
 ## 为什么不是复用 Focusmate 的 quiet
 
@@ -34,8 +38,8 @@ Focusmate 的 quiet 是**单场**开关：得一场一场点，而且明天新�
 
 | 函数 | 谁在用 |
 |---|---|
-| `sp.mute_window_at(moment)` | daemon 看门狗、warden 表格、`warden.py:mute_window_for` |
-| `sp.is_muted_at(moment)` | `keep_session.idle_tick` |
+| `sp.mute_window_at(moment)` | warden 表格（`warden.py:mute_window_for`）、自动 quiet |
+| `sp.is_muted_at(moment)` | 排障 / 测试用（daemon **不**用它） |
 | `sp.muted_period_ids(day)` | 契约表 / 状态行 |
 | `sp.mutes_for_day(day)` | 上面几个的底层 |
 
@@ -48,10 +52,10 @@ Focusmate 的 quiet 是**单场**开关：得一场一场点，而且明天新�
    ON」的行 → 后台线程调 bridge `mute quiet=True`，`GET /api/session` 复核。
    同一场 5 分钟内只试一次（`mute_tries`），失败不会每帧开浏览器。
    `period mute` 命令本身也会立刻落地一次。
-2. **本地不出声**：`keep_session.idle_tick` 里，静音窗内不发通知、不拉音量、
-   不播放嘶吼；日志写一行「静音时段（T1 11:00–12:05）→ 该播放…不响」。
-3. **表格显示**：契约表的「静音」列 —— `ON` = Focusmate 已静音；`静…` = 时段要求
+2. **表格显示**：契约表的「静音」列 —— `ON` = Focusmate 已静音；`静…` = 时段要求
    静音但还没设上；`·` = 不静音。
+3. **本地什么都不改**：通知、音量、嘶吼、收尾催办全和平时一样。
+   （曾经在 `idle_tick` 里做过「静音时段闭嘴」，用户明确否掉了 —— 那不是他要的意思。）
 
 ## 命令
 
@@ -66,7 +70,7 @@ period unmute T1 --permanent # 撤销按星期几那条
 
 - `test/test_session_plan.py`：「静音时段」整段 —— 按星期几 / 按日期、覆盖不叠加、
   跨午夜、坏记录被丢掉。
-- `test/test_idle_watchdog.py`：「静音时段：违规照记，但不出声」—— 三次违规也不放歌，
-  撤销之后立刻恢复出声。
+- `test/test_idle_watchdog.py`：「静音时段（period mute）**不**管这里」—— 静音窗里
+  第 1 次违规照样发通知、第 3 次照样拉音量放嘶吼，并且钉住「看门狗里没有静音分支」。
 - `test/test_task_ui.py`：`period mute T1 --permanent` 写表、表格标 `静`、
   `apply_mutes()` 只对「该静音且没静音」的行调 bridge、已经 ON 的不重复动。

@@ -554,25 +554,29 @@ check("task delete", wd.task_store.list(), [])
 
 # ---------------------------------------------------------------- 剪贴板导入
 
-print("== task import -a：直接读剪贴板（⌘V 到终端会丢链接）==")
+print("== task import：读剪贴板是**动作**，-a 只是分流后缀（⌘V 到终端会丢链接）==")
 CLIP = [{"id": "i5BKXC5uNk0", "url": "omnifocus:///task/i5BKXC5uNk0",
          "title": "TI: Swap", "has_id": True, "raw": "omnifocus:///task/i5BKXC5uNk0"}]
 _real_clip = w.of.clipboard_links
 w.of.clipboard_links = lambda: [dict(x) for x in CLIP]
 wd.messages = []
-check("task import -a 受理", wd.handle("task import -a"), True)
+check("task import（不带参数）就受理", wd.handle("task import"), True)
 made = wd.task_store.get(wd.selected_task_id)
 check("从剪贴板读到了 OmniFocus primary key",
       (made.get("omnifocus") or {}).get("id"), "i5BKXC5uNk0")
 check("标题也来自剪贴板", made["fields"]["title"], "TI: Swap")
 check_true("消息里说明链接是从剪贴板读的",
-           any("链接从剪贴板读的" in m[2] for m in wd.messages))
+           any("链接是从剪贴板读的" in m[2] for m in wd.messages))
 
 wd.messages = []
-check("再加一条（-a 可以叠在别的参数前面）", wd.handle("task import --clip"), True)
+check("task import -a 3：动作 + 分流一起写（-a 是 --assign）",
+      wd.handle("task import -a 1"), True)
 check("两条都关联上了",
       len([t for t in wd.task_store.list()
            if (t.get("omnifocus") or {}).get("id") == "i5BKXC5uNk0"]), 2)
+check("新导入的那条顺手分流到了 #1（表格第一场）",
+      (wd.task_store.get(wd.selected_task_id).get("session") or {}).get("start"),
+      wd.rows[0]["startLabel"])
 
 # 粘贴「只有标题」：去剪贴板里对同名的那条，对上了就关联（不是拿标题猜）
 w.of.clipboard_links = lambda: [dict(CLIP[0])]
@@ -588,19 +592,20 @@ check("标题对不上也照样建", wd.handle("task import 谁也不是"), True
 loose = wd.task_store.get(wd.selected_task_id)
 check("对不上 → 不关联", loose.get("omnifocus"), None)
 check_true("并且明说没关联", any("没有关联" in m[2] for m in wd.messages))
-check_true("给出补救办法（link -a）",
-           any("link -a" in m[2] for m in wd.messages))
+check_true("给出补救办法（link 不带参数 = 读剪贴板）",
+           any("link`（不带参数" in m[2] or "`task" in m[2] and "link" in m[2]
+               for m in wd.messages))
 
 wd.messages = []
 w.of.clipboard_links = lambda: []
-check("剪贴板空 → 报错但 TUI 不死", wd.handle("task import -a"), True)
+check("剪贴板空 → 报错但 TUI 不死", wd.handle("task import"), True)
 check_true("错误说清剪贴板里没有链接",
            any("剪贴板里没有 OmniFocus 链接" in m[2] for m in wd.messages))
 
-print("== task <id> link -a ==")
+print("== task <id> link（不给链接 = 读剪贴板）==")
 w.of.clipboard_links = lambda: [dict(CLIP[0])]
 tgt = wd.task_store.create({"title": "先建后关联"})
-check("link -a 受理", wd.handle("task %d link -a" % tgt["id"]), True)
+check("link 不带链接也受理", wd.handle("task %d link" % tgt["id"]), True)
 check("关联上了", (wd.task_store.get(tgt["id"]).get("omnifocus") or {}).get("id"),
       "i5BKXC5uNk0")
 w.of.clipboard_links = _real_clip
@@ -622,7 +627,8 @@ check("写到「只这一天」的表里", [(m.get("period"), m.get("date"))
       [("T1", ISO)])
 check("静音窗是那个时段的时间窗",
       [(m["start"], m["end"]) for m in sp.load_mutes()["mutes"]], [("11:00", "13:00")])
-check_true("消息说清这段钟点什么行为", any("看门狗不出声" in m[2] for m in wd.messages))
+check_true("消息说清「静音」到底指什么（Focusmate quiet，不是本地闭嘴）",
+           any("Focusmate quiet" in m[2] and "本地看门狗" in m[2] for m in wd.messages))
 
 wd.messages = []
 check("period mute T1 --permanent 受理", wd.handle("period mute T1 --permanent"), True)
