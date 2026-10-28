@@ -177,16 +177,18 @@ wd.handle("set edit-tomorrow on")
 
 # ---------------------------------------------------------------- 状态框
 
-print("== 状态框：契约（data.csv 周几）+ 警告，一个 ASCII 框 ==")
+print("== 状态框：契约（data.csv 周几）+ 警告，一个平滑边框的框 ==")
 write_csv(["# test schedule", "%s,21:00,25" % WD])
 wd = mkwarden()
 wd.reload_entries()
 wd.refresh_warnings(force=True)
 box = wd.shell.status_box()
 text = box.text()
-check_true("有 ASCII 边框", text.splitlines()[0].startswith("+-- 状态"))
-check_true("只有横竖和角（没有 box-drawing 字符）",
-           set("".join(text.splitlines())) >= set("+-|"))
+check_true("有平滑边框（重线 ━ + 竖线 ┃）", text.splitlines()[0].startswith("┏━━ 状态"))
+check_true("横竖和四个角都是 box-drawing 重线",
+           set("".join(text.splitlines())) >= set("━┃┏┓┗┛"))
+check("框线那行没有 ASCII 的 + - | 残留",
+      [ch for ch in "+-|" if ch in text.splitlines()[0]], [])
 check_true("框里有契约那行", "契约" in text and "data.csv" in text)
 check_true("框里有警告", "!" in text or "x" in text)
 check_true("框里有怎么修的提示", "→" in text)
@@ -209,7 +211,7 @@ wd = mkwarden()
 wd.reload_entries()
 out = render(wd)
 check("契约视图不再出现「永不重订名单（N 条）」", "永不重订名单" not in out, True)
-check("但状态框还在", "+-- 状态" in out, True)
+check("但状态框还在", "┏━━ 状态" in out, True)
 
 # ---------------------------------------------------------------- edit-tomorrow
 

@@ -764,6 +764,88 @@ check_true("begin_review 直接进收尾", wd.review is not None)
 check("空行只是提示，不推进", wd.intercept(""), True)
 check("q 结束收尾", (wd.intercept("q"), wd.review), (True, None))
 
+print("== 收尾面板挂在 repl_kit 的「打断栏位」里 ==")
+psv.clear()
+wd.review = None
+wd.say = w.__dict__["Warden"].say.__get__(wd)          # 把 say 还原成真的
+t4 = store.create({"title": "栏位里的这条"})
+store.assign(t4["id"], entry)
+wd.begin_review(entry, sync=False)
+check_true("在收尾", wd.review is not None)
+
+# 1) 视图自己不再画它（换视图、表格变长都不该把它挤走）
+contract_parts = [v for v in wd.view_impls if v.name == "契约"][0].render()
+check("契约视图的 render 里没有收尾面板了",
+      [p for p in contract_parts if "收尾" in str(getattr(p, "title", ""))], [])
+task_parts = [v for v in wd.view_impls if v.name == "任务"][0].render()
+check("任务视图的 render 里也没有",
+      [p for p in task_parts if "收尾" in str(getattr(p, "title", ""))], [])
+
+# 2) 栏位里（repl_kit.interrogate）有这块东西
+block = wd.shell.interrogate()
+check_true("打断栏位里有收尾面板", block is not None)
+check_true("栏位里认得出是收尾", "收尾" in str(wd.shell.interrogate_text()))
+
+# 3) 位置：看板下面、提示行上面（走不带裁屏的 _basic_chrome，免得终端太矮把顶部裁掉）
+_parts = wd.shell.frame_parts()
+check("帧里最后一块就是栏位（它在看板最下面）",
+      "收尾" in str(getattr(_parts[-1], "title", "")), True)
+_console = wd.console
+_out = io.StringIO()
+wd.console = Console(file=_out, width=160, force_terminal=False)
+wd.shell._basic_chrome()
+wd.console = _console
+_chrome = _out.getvalue()
+_tbl = _chrome.index("The Contract Table")
+_blk = _chrome.index("收尾", _tbl)
+_hint = _chrome.index("session", _blk)
+check("栏位在看板之后、提示行之前", _tbl < _blk < _hint, True)
+
+# 4) 切视图不掉
+wd.go_to_view(w.TaskView)
+check_true("切到任务视图，栏位里还有", wd.shell.interrogate() is not None)
+wd.go_to_view(w.StatsView)
+check_true("切到统计视图，栏位里还有", wd.shell.interrogate() is not None)
+wd.go_to_view(w.ContractView)
+
+# 5) 收完就空，且不占行
+wd.intercept("q")
+check("收尾结束", wd.review, None)
+check("栏位空了（一问完就不占地方）", wd.shell.interrogate(), None)
+
+# 6) --status / --exec 那条路（paint）也画在同一位置
+buf = io.StringIO()
+wd.console = Console(file=buf, width=160, force_terminal=False)
+wd.begin_review(entry, sync=False)
+wd.paint()
+out = buf.getvalue()
+check_true("paint 里也有收尾面板", "收尾" in out)
+_tbl2 = out.index("The Contract Table")
+check("paint 里栏位在契约表格之后",
+      _tbl2 < out.index("收尾", _tbl2), True)
+
+# 7) 画帧缓存不能把「问题变了」当成「画面没变」：栏位内容变了必须重排版
+wd.review = None
+psv.clear()
+for _old_task in store.list():                # 清场：只留下面这两条
+    store.delete(_old_task["id"])
+t5 = store.create({"title": "栏位里的第一条"})
+store.assign(t5["id"], entry)
+t6 = store.create({"title": "栏位里的第二条"})
+store.assign(t6["id"], entry)
+wd.begin_review(entry, sync=False)
+check("这场问两条", wd.review.total(), 2)
+wd.shell._frame_clock = lambda: 5000          # 钉住时钟：看「同一秒里」会不会端出旧画面
+_f1 = wd.shell.frame_text()
+check_true("第一帧画的是第一条", "栏位里的第一条" in _f1)
+check("同一秒、没变化 → 复用同一帧", wd.shell.frame_text() is _f1, True)
+check("跳过一条（问题变了）", wd.intercept("s"), True)
+_f2 = wd.shell.frame_text()
+check_true("换到下一条之后重排版了", _f2 != _f1)
+check_true("新的一帧画的是第二条", "栏位里的第二条" in _f2)
+del wd.shell._frame_clock
+wd.review = None
+
 print()
 if fails:
     print("%d 项失败：" % len(fails))

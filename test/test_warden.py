@@ -63,6 +63,11 @@ sch.TEMP = TMP
 os.environ["TI_SESSION_EXTRAS"] = os.path.join(TMP, "session-extras.json")
 os.environ["TI_SESSION_RULES"] = os.path.join(TMP, "session-rules.json")
 os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
+# 任务库也必须关进临时目录：这里以前漏了，于是用例读的是仓库里**真的**
+# data/tasks.json —— 任务一多，契约表就变宽，`已匹配` 会被压成 `已匹`，用例跟着红；
+# 更糟的是重复任务会在 refresh 里被 materialize，那是会**写**真库的。
+os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
+os.environ["TI_TASK_ARCHIVE"] = os.path.join(TMP, "task-archive.json")
 ks.STATE_FILE = os.path.join(TMP, "state.json")
 # 改排布会取 daemon 那一轮的 round lock、并写「我取消的」挂号单 —— 别落到真目录里
 ks.LOCK_FILE = os.path.join(os.path.dirname(ks.STATE_FILE), "keep_session.lock")
@@ -843,7 +848,9 @@ trimmed = shell.frame_text()
 lines = trimmed.splitlines()
 check("裁到终端预算内（14 行 - 提示 - 输入）", len(lines) <= 12, True)
 check("从顶部裁：The Warden 标题滚走", "The Warden" not in plain(trimmed), True)
-check("底部视图栏留下", "视图 1 契约" in plain(trimmed), True)
+check("视图栏不在看板里（所以裁屏裁不掉它）", "视图 1 契约" in plain(trimmed), False)
+check("视图栏改由框架的 footer 画，永远在",
+      "视图 1 契约" in plain(shell.footer_text()), True)
 shell._terminal_rows = lambda: 80
 check("终端够高时不裁", len(shell.frame_text().splitlines()), len(full.splitlines()))
 
@@ -1030,7 +1037,7 @@ out = buf.getvalue()
 check("平常视图不逐行列永不重订名单", "2026-01-09 09:00" not in out, True)
 check("那一行已经换成警告（状态框里不再提永不重订名单）",
       "永不重订名单" not in out, True)
-check("契约视图最上面是 ASCII「状态」框", "+-- 状态" in out, True)
+check("契约视图最上面是「状态」框（平滑重线边框）", "┏━━ 状态" in out, True)
 check("状态框里有契约执行情况", "契约" in out and "data.csv" in out, True)
 check("状态框里有警告", "→" in out, True)
 

@@ -30,6 +30,9 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
                   "writeback": {"completed": "..."}},
     "duplicate_of": null,                // 从哪条复制来的
     "actual_minutes": null,              // 「缺漏完成补充」手填的实际耗时
+    "history": [                         // 哪一天的哪一场「处理」过它（见下）
+      {"day": "2026-10-27", "start": "11:00", "action": "skip", "at": "..."}
+    ],
     "session": {"date": "2026-10-26", "start": "11:00", "end": "11:50",
                 "duration": 50, "focusmate_session_id": "..."},
     "focusmate": {"task_id": "...", "session_id": "...", "completed_at": "..."}
@@ -61,6 +64,13 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
 - **`duplicate_of`**：这条是从哪条复制来的。收尾里「延期到底成立没成立」
   就是靠它判的（同一条 OmniFocus 任务的多条本地记录）。
 - **`actual_minutes`**：「缺漏完成补充」手填的实际耗时，归档里也有一份。
+- **`history`**：「这条任务在哪一天的 session 里被处理过」。收尾/查账的每个动作
+  （放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / **跳过**）都留一笔，
+  `(day, start)` 相同只留最后一条，最多 `HISTORY_KEEP` 条。
+  契约视图下面那块**任务面板按天取值**就靠它：今天 = 没做完的 + 今天处理过的，
+  过去那天固化 = 只剩当时处理过的。读写入口是 `mark_processed()` / `processed_on()`；
+  老数据没有痕迹时 `processed_on()` 用 `status_at`（或 `focusmate.completed_at`）
+  兜底，否则升级当天「过去几天」会整片空白。
 
 ## 命令
 

@@ -201,7 +201,7 @@ check("--assign=N 这种写法也认",
 # 需求：任务被分配到一场 session 上，截止时间**自动**变成那场的终点
 # （12:00 + 50min = 12:50）。手写的那条不丢，留在 session.previous_due 里。
 check("assign 之后截止时间 = 这场 session 的终点",
-      wd.task_store.get(new_id)["fields"]["due"], "2026-10-27T12:50:00")
+      wd.task_store.get(new_id)["fields"]["due"], "%sT12:50:00" % ISO)
 check("原来手写的 due 留档在 session.previous_due",
       wd.task_store.get(new_id)["session"].get("previous_due"), "后天")
 check("又挂了一次（同一场重挂是会走 bridge 的）",
@@ -286,11 +286,44 @@ check_true("标题长的那条被 trim 了（带 …）或本来就不长",
 
 contract = [v for v in w.VIEWS if v.key == "1"][0](wd)
 parts = contract.render()
-check("契约视图先给契约表格、再给任务表格", len(parts), 2)
-check("第二块是任务表格", "Task · 任务" in str(getattr(parts[1], "title", "")), True)
-check("两列模式：4 个 column", len(parts[1].columns), 4)
-check("表头是 number / task 各两遍",
-      [str(c.header) for c in parts[1].columns], ["number", "task", "number", "task"])
+check("契约视图先给契约表格、再给任务面板（收尾面板在打断栏位里）", len(parts), 2)
+check("第二块是任务面板", "Task · 任务" in str(getattr(parts[1], "title", "")), True)
+_panel_cols = len(parts[1].columns) // 2
+check("表里是 number/task 一对一对的", len(parts[1].columns) % 2, 0)
+check("表头按对数重复",
+      [str(c.header) for c in parts[1].columns], ["number", "task"] * _panel_cols)
+
+print("== 任务面板：屏幕够宽就摊成 3 / 4 列（不再固定两列）==")
+# 列数只跟「终端有多宽」和「标题最长有多长」有关，所以把宽度显式喂进去。
+# 造 20 条同形任务：id 两位数，标题 12 个汉字（显示宽 24 列 → 一对 28 列）。
+_many = [{"id": i, "fields": {"title": "任务标题任务标题任务标题"}} for i in range(1, 21)]
+check("窄屏 60 列：只能 2 列", wd.task_index_layout(_many, width=60), (2, 10))
+check("80 列还是 2 列", wd.task_index_layout(_many, width=80)[0], 2)
+check("110 列：3 列", wd.task_index_layout(_many, width=110)[0], 3)
+check("110 列每列 7 条（20 / 3）", wd.task_index_layout(_many, width=110), (3, 7))
+check("160 列：4 列", wd.task_index_layout(_many, width=160)[0], 4)
+check("再宽也不会超过 4 列", wd.task_index_layout(_many, width=1000)[0], 4)
+check("宽屏每列 5 条（20 / 4）", wd.task_index_layout(_many, width=160), (4, 5))
+check("任务少的时候不硬凑（3 条 → 3 列 1 行，没有空列）",
+      wd.task_index_layout(_many[:3], width=1000), (3, 1))
+check("1 条任务 = 1 列", wd.task_index_layout(_many[:1], width=1000), (1, 1))
+check("22 条 / 4 列 = 6 行，最后一列不满也不多开一列",
+      wd.task_index_layout(_many + [{"id": 21, "fields": {}}, {"id": 22, "fields": {}}],
+                           width=160), (4, 6))
+# 每列几条往下读：20 条 4 列 → 第 2 列从编号 6 开始（不是第 3 条）
+_cols, _rows = wd.task_index_layout(_many, width=160)
+check("编号从上往下读，不是从左往右读", (_rows, _many[_rows]["id"]), (5, 6))
+
+# 真的画出来：160 列的终端里，表里是 2*cols 个 column
+_real_width = wd.frame_width
+for _t in (_many[:1],):
+    pass
+wd.frame_width = lambda: 160
+_wide_cols = wd.task_index_layout(wd.task_panel_tasks() or _many, width=160)[0]
+wide_table = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+wd.frame_width = _real_width
+check("160 列 → 表里的 column 数 = 2 * 列数", len(wide_table.columns), 2 * _wide_cols)
+check("列数还是偶数（number/task 一对一对的）", len(wide_table.columns) % 2, 0)
 
 # 染色：已挂到 session 的 = 红，没挂的 = 深蓝
 # （不能用任务 5 了 —— 它已经被 task sync 标成完成，那一行是绿的）
@@ -302,9 +335,11 @@ task_free = [t for t in wd.task_store.list() if not t.get("session")][0]
 num_a, title_a = wd._task_index_cells(task_assigned, None)
 num_f, title_f = wd._task_index_cells(task_free, None)
 check("已 assign 的编号+标题染红",
-      (str(num_a.style), str(title_a.style)), ("bold red", "bold red"))
-check("没 assign 的保持深蓝",
-      (str(num_f.style), str(title_f.style)), ("dark_blue", "dark_blue"))
+      (str(num_a.style), str(title_a.style)), (w.STYLE_ASSIGNED, w.STYLE_ASSIGNED))
+check("没 assign 的是亮蓝（深色背景上 dark_blue 等于隐形，用户反馈过）",
+      (str(num_f.style), str(title_f.style)), (w.STYLE_ACTIVE, w.STYLE_ACTIVE))
+check("已完成染绿", str(wd._task_index_cells(wd.task_store.get(5), None)[1].style),
+      w.STYLE_DONE)
 check("编号列显示任务 ID", str(num_a), str(task_assigned["id"]))
 # 状态记号：完成 ✓ / 进行中 ·（表格里「什么都没有」曾经分不清是哪种）
 done_task = wd.task_store.get(5)
@@ -317,7 +352,64 @@ check("task_mark：完成 = ✓", wd.task_mark(done_task), "✓")
 index_table = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
 check_true("任务表格标题里写了记号图例", "✓ 完成" in str(index_table.title))
 check_true("表尾有一行账（几条进行中/完成/放弃）",
-           "%d 条：" % len(wd.task_store.list()) in str(index_table.caption))
+           "%d 条：" % len(wd.task_panel_tasks()) in str(index_table.caption))
+check_true("表尾写清这块面板的口径（今天 = 没做完的 + 今天处理过的）",
+           "今天处理过的" in str(index_table.caption))
+
+print("== 任务面板按天：今天 = 没做完的 + 今天处理过的；过去那天固化 ==")
+today_iso = TODAY.isoformat()
+yday_iso = (TODAY - datetime.timedelta(days=1)).isoformat()
+before_iso = (TODAY - datetime.timedelta(days=2)).isoformat()
+
+
+def _new_task(title):
+    wd.handle("task create title=%s" % title)
+    return max(t["id"] for t in wd.task_store.list())
+
+
+# A：昨天那场收尾里放弃了（有痕迹 + 状态时间都在昨天）
+a_id = _new_task("昨天放弃的那条")
+wd.task_store.mark_processed(a_id, yday_iso, "09:30", "drop")
+wd.task_store.drop(a_id, reason="review-drop", at="%sT09:40:00" % yday_iso)
+# B：现在还开着，谁也没碰过
+b_id = _new_task("还开着的")
+# C：前天完成的老账，**没有**处理痕迹（模拟升级前就收工的数据）
+c_id = _new_task("前天完成的老账")
+wd.task_store.set_status(c_id, ts.STATUS_COMPLETED, at="%sT10:00:00" % before_iso)
+# D：昨天被「跳过」的任务，现在还开着
+d_id = _new_task("昨天被跳过的")
+wd.task_store.mark_processed(d_id, yday_iso, "15:00", "skip")
+
+wd.day_offset = 0
+today_ids = [t["id"] for t in wd.task_panel_tasks()]
+check("今天面板里有没做完的", b_id in today_ids, True)
+check("今天面板里有「昨天问过、还开着」的（它还没做完）", d_id in today_ids, True)
+check("今天面板里没有昨天放弃的那条（今天没它的事）", a_id in today_ids, False)
+check("今天面板里没有更早完成的老账", c_id in today_ids, False)
+
+wd.day_offset = -1
+yday_ids = [t["id"] for t in wd.task_panel_tasks()]
+check("昨天面板固化：只剩那天处理过的", a_id in yday_ids, True)
+check("跳过的也算那天处理过（问过它、你说先放着）", d_id in yday_ids, True)
+check("昨天面板上今天还开着、昨天没碰过的不出现", b_id in yday_ids, False)
+_past = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+check_true("过去那天的表尾写清「固化」口径", "过去就固化" in str(_past.caption))
+check_true("过去那天的表尾带日期", yday_iso in str(_past.caption))
+
+wd.day_offset = -2
+before_ids = [t["id"] for t in wd.task_panel_tasks()]
+check("前天面板里有前天完成的那条（老数据靠 status_at 兜底）", c_id in before_ids, True)
+check("前天面板里没有昨天的事", a_id in before_ids, False)
+
+recs = wd.task_store.processed_on(wd.task_store.get(c_id), before_iso)
+check("兜底痕迹标了 derived", [r["derived"] for r in recs], [True])
+recs = wd.task_store.processed_on(wd.task_store.get(a_id), yday_iso)
+check("显式痕迹没有 derived 标记", [r["derived"] for r in recs], [False])
+check("同一天同一场只留一条痕迹（后一次覆盖前一次）",
+      len(wd.task_store.mark_processed(a_id, yday_iso, "09:30", "drop")["history"]),
+      len([r for r in wd.task_store.get(a_id)["history"] if r["day"] == yday_iso]))
+
+wd.day_offset = 0
 
 print("== 备注：task note / note= 收敛成 notes ==")
 wd.handle("task note 5 材料在这 https://example.com/set3")

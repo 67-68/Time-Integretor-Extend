@@ -431,6 +431,25 @@ class Review(object):
         except ValueError:
             self.tasks = [t for t in self.tasks if self._still_there(t)]
 
+    def mark_processed(self, task, action):
+        """给任务留一笔「这一天的这一场处理过它」。
+
+        任务面板按天固化（今天 = 没做完的 + 今天处理过的；过去那天只剩当时处理过的），
+        标记写在 ``task_store`` 那边（``mark_processed``）。这里把「哪一天、哪一场」
+        从 ``self.session`` 里取出来；``inspect-due`` 没有场次，就记成今天。
+        """
+        if not task or not task.get("id"):
+            return
+        sess = self.session or {}
+        start = "" if self.due_mode() else str(sess.get("start") or "")
+        day = sess.get("date") or str(sess.get("day") or "")
+        if not day:
+            day = (self.now or datetime.datetime.now()).date().isoformat()
+        try:
+            self.store.mark_processed(task["id"], day, start, action, at=self.now)
+        except (ValueError, TypeError, AttributeError):
+            pass                     # 痕迹只是界面用的；记不上也别挡住收尾
+
     @staticmethod
     def _still_there(task):
         return bool(task and task.get("id"))
@@ -642,6 +661,8 @@ class Review(object):
         if task is None:
             return {"action": "handled"}
         self.skipped.append(task.get("id"))
+        # 跳过也算「这一场处理过它」：过去那天的面板上要看得见「问过、你说先跳过」。
+        self.mark_processed(task, "skip")
         self.say("跳过任务 %s（它还是「进行中」，下一场收尾会再问你）。"
                  % task.get("id"), "warn")
         self.index += 1
@@ -652,6 +673,7 @@ class Review(object):
     def _drop(self, task, why="review-drop"):
         """放弃：本地放弃 + OmniFocus 也放弃。"""
         note = self._hook("drop_omnifocus", task)
+        self.mark_processed(task, "drop")
         self.store.set_status(task["id"], ts.STATUS_DROPPED, reason=why)
         self.say("✗ 任务 %s「%s」已放弃%s"
                  % (task["id"], self.title_of(task), ("；" + note) if note else ""), "ok")
@@ -660,6 +682,7 @@ class Review(object):
     def _reconsider(self, task):
         """重议：复制一条（同一条 OmniFocus 任务），旧的就地放弃。"""
         copy = self.store.duplicate(task["id"])
+        self.mark_processed(task, "reconsider")
         self.store.set_status(task["id"], ts.STATUS_DROPPED, reason="reconsider")
         self.say("⤼ 任务 %s「%s」改成 #%s 重议（同一条 OmniFocus %s）；旧的已放弃。"
                  % (task["id"], self.title_of(task), copy["id"],
@@ -675,6 +698,7 @@ class Review(object):
             return {"action": "handled"}
         copy = self.store.duplicate(task["id"])
         note = self._hook("assign_focusmate", copy, nxt)
+        self.mark_processed(task, "postpone")
         self.store.drop(task["id"], reason="postponed", tag=ts.TRANSFER_TAG)
         label = "%s %s" % (nxt.get("date"), nxt.get("start"))
         self.say("⤼ 任务 %s「%s」推到 %s（新任务 #%s%s）；旧的已放弃 + 「%s」。"
@@ -685,6 +709,7 @@ class Review(object):
     def _complete_manually(self, task, minutes):
         """缺漏完成补充：本地完成 + Focusmate 勾上 + OmniFocus 完成（写回截止时间）。"""
         due = self._hook("due_of", task)
+        self.mark_processed(task, "backfill")
         self.store.complete(task["id"], minutes=minutes, reason="review-manual")
         fresh = self.store.get(task["id"])
         self.store.archive_local(fresh, reason="review-manual")
@@ -748,6 +773,7 @@ class Review(object):
     def _finish_transfer(self, task, how):
         """延期成立：旧任务放弃 + 本地标签「未完成转移」。OmniFocus 不动。"""
         tag = ts.TRANSFER_TAG
+        self.mark_processed(task, "transfer")
         self.store.drop(task["id"], reason="transferred", tag=tag)
         self.say("⤼ 任务 %s「%s」已转移（%s）：旧记录标放弃 + 标签「%s」；"
                  "OmniFocus 那条任务一个字节都没动。"

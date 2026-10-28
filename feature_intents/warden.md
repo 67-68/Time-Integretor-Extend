@@ -130,7 +130,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
-| 1 | 契约（默认） | **状态框（ASCII）+ The Contract Table** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
+| 1 | 契约（默认） | **状态框（平滑边框）+ The Contract Table + 任务面板** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
 | 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` |
@@ -224,7 +224,12 @@ prompt_toolkit 每敲**一个**字就重画一次 chrome（`on_text_changed` →
 
 ## 收尾（session 结束 +15s）
 
-契约视图和任务视图里，**表格最上面**会多一块黄色面板：
+收尾（和 `inspect-due` 查账）共用一块黄色面板。它**不是某个视图的内部件**，而是
+`repl_kit` 的**打断栏位**（`ReplShell(interrogate=...)`，框架文档在隔壁仓库
+`paper_researcher/repl_kit/README.md` 的「The interrogate slot」）。
+它压在**整块看板下面、状态栏上面**（顺序：看板 → 收尾面板 → 视图栏 → 提示行 → 状态行
+→ 输入行）。所以换视图它不会消失、表格再长也挤不掉它、终端太矮裁屏也是从顶部裁。
+一问完栏位立刻消失，不占一行。
 
 ```
 ⏱ 收尾 · 2026-10-27 11:00–11:50
@@ -418,16 +423,18 @@ python3 warden.py install-deps
 
 ### 状态框
 
-契约视图最上面那块是**状态框**：一个只用 `+ - |` 画的 ASCII 框，标题「状态」：
+契约视图最上面那块是**状态框**：一个平滑重线边框的块（`━━ ┃ ┏┓┗┛`，和表格那套
+字形同一套；挑字体/老终端可以整体换成 `+ - |`——`StatusBox(border=ASCII_BORDER)`），
+标题「状态」：
 
 ```
-+-- 状态 ----------------------------------------------------------+
-| 契约（data.csv 周一）：计划 3 场 · 已落地 3 场 ✅ 一场不缺        |
-| 来源：时段排布 8 · 一次性 1 · 长期规则 2   （session = …）        |
-| /Users/.../data.csv                                             |
-| ! 今天的 session 里没有「明日时间安排」这类每周重复任务            |
-|     → task create title=明日时间安排 --repeat mon@22:15           |
-+------------------------------------------------------------------+
+┏━━ 状态 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ 契约（data.csv 周一）：计划 3 场 · 已落地 3 场 ✅ 一场不缺        ┃
+┃ 来源：时段排布 8 · 一次性 1 · 长期规则 2   （session = …）        ┃
+┃ /Users/.../data.csv                                             ┃
+┃ ! 今天的 session 里没有「明日时间安排」这类每周重复任务            ┃
+┃     → task create title=明日时间安排 --repeat mon@22:15           ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 ```
 
 - 上半是 `ContractView.status_box()` 给的行（契约执行情况 / 来源 / 临时挪动 / 文件路径）；
@@ -488,10 +495,16 @@ python3 warden.py install-deps
 - **契约视图的 task 列改成「编号: 标题」**：`2: 写论文 | 5: 复习错题`，每条标题
   单独裁到 `TASK_CELL_TITLE_MAX`（18）个字再拼，别让第一条把第二条挤出屏幕；
   标题优先取 `title`/`name` 字段（`focusmate_title`），不是整条 `1. … 2. …` 摘要。
-- **契约表格下面多了一块「任务表格」**（`Warden.render_task_index()`）：两列布局
-  （`number | task | number | task`，左半 + 右半），已 assign 到 session 的任务
-  number 和 title 染**红**，没挂的保持**深蓝**；当前选中的任务再加 reverse。
-  布局顺序 = 契约表格 → 任务表格 → Recent（Recent 仍由 `frame()` 接在后面）。
+- **契约表格下面多了一块「任务面板」**（`Warden.render_task_index()`）：
+  编号 + 标题成对并排，**列数跟着屏幕宽度走**（2 列是底线，宽屏自动摊成 3 / 4 列，
+  `TASK_INDEX_MAX_COLS`；编号从上往下读，不空列）。配色分工：已挂 session = 亮红、
+  没挂 = 亮蓝、完成 = 绿、收工（放弃/转移）= 亮灰。
+  布局顺序 = 契约表格 → 任务面板 → Recent（Recent 仍由 `frame()` 接在后面）。
+- **任务面板按天取值**（`Warden.task_panel_tasks()`）：今天（以及以后）= **所有没做完的**
+  \+ **今天被处理过的**；**过去那天固化** = 只剩「那一天的 session 里被处理过的」。
+  「被处理过」不挑结果：放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / 跳过都算一笔，
+  痕迹落在任务的 `history`（`TaskStore.mark_processed`，键是 day + start + action）。
+  老数据没有痕迹，按 `status_at`／Focusmate 的 `completedAt` 兜底（`processed_on`）。
 - `task create ... --repeat 周几@HH:MM` / `task repeat <id> ...`：每周重复任务，
   只落在「同一星期几 + 同一时刻 + 同一时长」的那场 session 上（拆分后那一周不落，
   设置不变）；`task sync` 负责真的挂到 Focusmate。

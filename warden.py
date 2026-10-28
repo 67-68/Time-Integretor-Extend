@@ -53,10 +53,15 @@
 （`inspect-due 60` = 未来 60 分钟内到期的也算，`--all` = 不按截止时间筛）
 拉进同一套状态机过一遍。过期任务还会出现在状态框的警告里，提示敲这条命令。
 
-**状态框**（契约视图最上面那一块 ASCII 框）：上面是「契约（data.csv 周几）」的
+**收尾面板长在哪儿**：不是某个视图的内部件，而是 `repl_kit` 的**打断栏位**
+（`ReplShell(interrogate=...)`）—— 压在整块看板下面、状态栏上面。换视图、表格变长、
+终端太矮被裁屏，都冲不掉它；一问完栏位立刻消失，不占一行。
+
+**状态框**（契约视图最上面那一块）：上面是「契约（data.csv 周几）」的
 执行情况，下面是警告（`repl_kit.WarningBoard`）—— data.csv 解析问题、layout 坏了、
 今天没有落上每周重复任务…… 警告由框架画、由 warden 每帧重算；`warn off` 只藏警告，
-`warn on` 回来。
+`warn on` 回来。边框是平滑重线（`┏━━ 状态 ━━┓ ┃ ┗━━┛`），和表格里那套线是同一套
+字形；老终端想退回 `+ - |`，把 `repl_kit.DEFAULT_BORDER` 换成 `ASCII_BORDER` 即可。
 
 视图可扩展：继承 `View` + `@register_view` 即可；每个视图用 `commands()` 声明自己
 认哪些命令、用 `idle_hint()` 声明空闲提示、用 `status_box()` 声明「状态」框里自己那几行，
@@ -72,9 +77,14 @@
 这里只提供三样东西：`frame()`（当前视图的看板）、`View.status_line()`（那行数字）、
 `intercept()`（派发前的一道闸，罪案区就挂在这儿）。消息区屏幕上只显示最近 3 条。
 
-看板比终端高时，`WardenShell` 会从**顶部**裁，保证最下面的消息 / 视图栏 / 提示行 /
-状态行 / 输入行永远在屏幕上（矮终端里顶部本来就装不下）。补全菜单浮在看板上，
-不再在输入行下面预留 8 行空白。
+看板比终端高时，`WardenShell` 会从**顶部**裁，保证最下面的消息 / 提示行 /
+状态行 / 输入行永远在屏幕上（矮终端里顶部本来就装不下）。视图栏和收尾面板
+**不在**被裁的那一块里：前者是框架的 `footer`，后者是 `interrogate` 栏位。
+补全菜单浮在看板上，不再在输入行下面预留 8 行空白。
+
+界面的三条「永远看得见」的东西，从下往上是：提示行（命令/参数）→ 状态行（秒级数字）
+→ 视图栏（你在第几个视图）→ 收尾/查账面板。它们的顺序由 `repl_kit` 的 chrome 统一拼，
+warden 只提供内容。
 
 命令输出（帮助面板 / 宣言闸门 / `>>>` 回显）直接 print 就行：它们发生在两次提示符
 之间，擦除和重画归 prompt_toolkit。
@@ -246,6 +256,22 @@ MESSAGE_KEEP = 12
 # 每条标题单独裁到 TASK_CELL_TITLE_MAX 个字（后面的内容 trim 掉），
 # 别让第一条把第二条挤出屏幕（列的 overflow="crop" 只能整体截断）。
 TASK_CELL_TITLE_MAX = 18
+
+# 契约表格下面那块任务面板：2 列是底线，屏幕够宽就摊成 3 列、4 列（编号从上往下读）。
+TASK_INDEX_MAX_COLS = 4
+
+# ---------------------------------------------------------------- 配色
+# 终端背景**一定是深色**的（用户反馈："有些字根本看不见"）。所以这里只有三条规矩：
+#   1. 不用暗色系：dark_blue / blue 在深色背景上等于隐形。
+#   2. **数据不用 dim**：dim 是给说明、图例、单位这些「看漏了也不耽误事」的东西的；
+#      任务标题、时间、状态这些要读的字一律给实色（灰也得是 grey62 这种亮灰）。
+#   3. 颜色要有分工，同一个颜色别兼两份意思：
+#      红 = 今天真要做的（已挂 session）· 蓝 = 还没挂 · 绿 = 完成 · 黄 = 警告 · 灰 = 收工的。
+STYLE_MUTED = "grey62"            # 亮灰：次要但**要读得清**（收工的任务、占位的破折号）
+STYLE_ASSIGNED = "bold bright_red"     # 已挂 session：今天得干的那条
+STYLE_ACTIVE = "bold bright_blue"      # 还没挂 session
+STYLE_DONE = "green"
+STYLE_DROPPED = STYLE_MUTED
 
 # 帧式重画：把上一帧从终端上抹掉，而不是 Console.clear() 整屏清。
 # 上移 n 行（`\x1b[<n>A`）+ 回行首 + 清到屏幕末尾（`\r\x1b[J`）。
@@ -727,7 +753,7 @@ class View(object):
         return None
 
     def status_box(self):
-        """「状态」框（ASCII 边框）里本视图自己的那几行；None = 这个视图不要框。
+        """「状态」框里本视图自己的那几行；None = 这个视图不要框。
 
         警告由框架追加（repl_kit 的 WarningBoard），这里只管业务状态。
         """
@@ -842,11 +868,9 @@ class ContractView(View):
         return self.w.render_status_rows()
 
     def render(self):
-        out = []
-        review = self.w.review_panel()
-        if review is not None:
-            out.append(review)
-        out.append(self.w.render_table())
+        # 收尾面板不在这儿画：它是 repl_kit 的「打断栏位」（见 render_interrogate），
+        # 换视图 / 表格变长都不该把它挤走。
+        out = [self.w.render_table()]
         if self.w.rows_note:
             out.append(Text("  " + self.w.rows_note, style="dim"))
         # 契约表格下面那块任务表格（Recent 由框架接在后面）
@@ -1298,7 +1322,7 @@ class TaskView(View):
             t.add_column(str(k), no_wrap=True, overflow="crop")
         if not keys:
             t.add_column("内容", no_wrap=True, overflow="crop")
-        status_style = {ts.STATUS_COMPLETED: "green", ts.STATUS_DROPPED: "dim"}
+        status_style = {ts.STATUS_COMPLETED: STYLE_DONE, ts.STATUS_DROPPED: STYLE_DROPPED}
         for task in tasks:
             status = w.task_store.status_of(task)
             style = "bold reverse" if task.get("id") == selected else ""
@@ -1328,22 +1352,19 @@ class TaskView(View):
             status_txt = "%s %s" % (w.task_mark(task) or "·", status)
             tags = task.get("tags") or []
             t.add_row(str(task["id"]),
-                      Text(status_txt, style=status_style.get(status, "white")),
-                      Text(rep_txt, style="magenta" if rep else "dim"),
+                      Text(status_txt, style=status_style.get(status, "")),
+                      Text(rep_txt, style="magenta" if rep else STYLE_MUTED),
                       Text(sess_txt, style=style),
-                      Text(due_txt, style="dim" if due else style),
+                      Text(due_txt, style=STYLE_MUTED if due else style),
                       Text(fm_txt, style=style),
-                      Text(omni_txt, style="cyan" if omni_id else "dim"),
+                      Text(omni_txt, style="cyan" if omni_id else STYLE_MUTED),
                       Text(done, style=style),
                       Text(" · ".join(tags) if tags else "—",
-                           style="yellow" if tags else "dim"),
+                           style="yellow" if tags else STYLE_MUTED),
                       *[Text(v, style=style) for v in vals])
 
-        out = []
-        review = w.review_panel()
-        if review is not None:
-            out.append(review)
-        out.append(t)
+        # 收尾面板在 repl_kit 的打断栏位里（见 render_interrogate），不在这儿。
+        out = [t]
         arch = w.task_store.load_archive().get("records") or []
         at = Table.grid(padding=(0, 1))
         at.add_column(style="dim", no_wrap=True)
@@ -1521,6 +1542,10 @@ class WardenShell(repl_kit.ReplShell):
                 self._ansi_memo = (dashboard, tuple(chunks))
         else:
             chunks = []
+        # 底部状态栏（视图栏）：框架把它排在打断栏位下面、提示行上面 —— 这里照抄。
+        footer = self.footer_text()
+        if footer:
+            chunks.extend(self._dashboard_chunks(footer))
         hint = self.hint_line(text)
         if hint:
             chunks.append((self.pt_hint_class, hint + "\n"))
@@ -1661,6 +1686,11 @@ class Warden(object):
             status_title="状态",
             # 每帧画框之前先重算警告：框和看板永远是同一时刻的事实
             warnings_refresh=self.refresh_warnings,
+            # 打断栏位（repl_kit 的 interrogate）：收尾/查账那句问话挂在这里 ——
+            # 它压在整块看板**下面**、提示行上面，翻页/裁屏都冲不掉它。
+            interrogate=self.render_interrogate,
+            # 底部状态栏（repl_kit 的 footer）：视图栏在打断栏位**下面**、提示行上面。
+            footer=self.render_view_bar,
         )
         # 看板自己就是最下面那块内容；补全菜单浮在它上面，不再在输入行
         # 下面留 8 行空白（留了就会把看板/提示挤出屏幕）。
@@ -1689,6 +1719,22 @@ class Warden(object):
             except Exception:                          # noqa: BLE001 - 画面旧一秒也别崩
                 pass
 
+    def review_signature(self):
+        """打断栏位里那块的「一句话身份」：内容一变，画帧缓存就得作废。
+
+        `id(self.review)` 只认得「换了一场」，认不出「问到下一条了」——
+        所以还要 stage / index / pending / 已经说了几句话。全部 O(1)：
+        这个函数每画一帧都要调一次，**不许**在里面读盘或遍历任务。
+        """
+        review = self.review
+        if review is None:
+            return (id(self.review_check), bool(self.review_check))
+        return (
+            id(review), review.stage, review.index, review.closed,
+            len(review.notes), len(review.skipped),
+            (review.pending_task or {}).get("id"),
+        )
+
     def frame_signature(self):
         """画帧缓存要看的那些「便宜的事实」（贵的东西留在 key 之外）。
 
@@ -1702,7 +1748,8 @@ class Warden(object):
             self.rows_note or "", self.rows_source or "",
             self.bridge_note or "", bool(self.had_error),
             self.csv_fp, len(self.entries),
-            id(self.review), id(self.review_check),
+            self.review_signature(),
+            self.sel_date.isoformat(), self.day_offset,
             id(getattr(self, "stat", None)),
         )
 
@@ -1821,62 +1868,127 @@ class Warden(object):
             parts.append("%s%d: %s" % (prefix, task.get("id"), title))
         return " | ".join(parts)
 
-    def render_task_index(self):
-        """契约视图里那块「任务表格」：两列（编号+任务 各两对）。
+    def frame_width(self):
+        """这一帧能占多少列（= 终端宽度，和 repl_kit 排「状态」框用的是同一个数）。
 
-        需求：已 assign 到某个 session 的任务，编号和标题染红；其他保持深蓝。
-        分成左右两栏是为了让任务一多也不会把契约表格挤没。
+        抽成一个方法是为了测试能钉住它：「几列并排」「哪几行被裁」这种断言不能
+        跟着「现在窗口开多大」乱跳。
         """
-        tasks = self.task_store.list()
+        width = getattr(self.console, "width", None)
+        try:
+            cols = shutil.get_terminal_size((80, 24)).columns
+        except Exception:                             # noqa: BLE001
+            cols = width if isinstance(width, int) else 80
+        if not isinstance(cols, int) or cols < 24:
+            cols = width if isinstance(width, int) and width >= 24 else 80
+        return cols
+
+    def task_panel_tasks(self):
+        """这一天任务面板里该出现哪些任务 —— 用户定的两条规矩。
+
+        * **今天（以及以后）**：所有没做完的 + 今天被处理过的。
+        * **过去那天**：固化，只剩「那一天的 session 里被处理过的」。
+
+        「被处理过」不挑结果：放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / 跳过
+        都算一笔，痕迹记在 ``task["history"]``（``TaskStore.mark_processed``）。
+        跳过也要记：那一天你问过它、你说先放着 —— 这是那一天发生过的事。
+        """
+        day = self.sel_date
+        is_today_or_later = day >= datetime.date.today()
+        open_tasks = []
+        touched = []
+        for task in self.task_store.list():
+            records = self.task_store.processed_on(task, day.isoformat())
+            if self.task_store.is_open(task):
+                # 没做完的一律挂在「今天」的面板上；过去那天只有「问过但没收掉」才留
+                if is_today_or_later or records:
+                    open_tasks.append(task)
+            elif records:
+                touched.append(task)
+        return open_tasks + touched
+
+    def task_index_title(self, task):
+        """任务面板里那一格的字：记号 + （🔁）+ 裁过的标题。"""
+        title = self.task_store.focusmate_title(task, max_len=TASK_CELL_TITLE_MAX)
+        prefix = self.task_mark(task)
+        if task.get("repeat"):
+            prefix += "🔁"
+        return prefix + title
+
+    def task_index_layout(self, tasks, width=None):
+        """``(几列, 每列几条)``：屏幕够宽就摊成 3 列、4 列，装不下回来 2 列。
+
+        需求：不该永远只有两列 —— 宽屏上白白浪费半屏，任务一多还得翻。
+        一「对」的宽度 = 编号列 + 1 空格 + 标题列，两对之间 rich 再给 2 列 padding。
+        """
+        if not tasks:
+            return 1, 0
+        width = width or self.frame_width()
+        num_w = max(len(str(t.get("id"))) for t in tasks)
+        title_w = max(repl_kit.display_width(self.task_index_title(t)) for t in tasks)
+        pair_w = num_w + 1 + title_w
+        cols = 1
+        for n in range(min(TASK_INDEX_MAX_COLS, len(tasks)), 1, -1):
+            if n * pair_w + (n - 1) * 2 <= width - 2:
+                cols = n
+                break
+        rows = (len(tasks) + cols - 1) // cols
+        cols = (len(tasks) + rows - 1) // rows        # 有余数时别留空列
+        return cols, rows
+
+    def render_task_index(self):
+        """契约视图里那块「任务面板」：编号+任务 并排，列数看屏幕宽度。
+
+        内容按天决定（见 :meth:`task_panel_tasks`）：今天 = 没做完的 + 今天处理过的，
+        过去那天 = 只有那天处理过的。配色见文件头那段「配色」。
+        """
+        tasks = self.task_panel_tasks()
         if not tasks:
             return None
-        half = (len(tasks) + 1) // 2
-        left = tasks[:half]
-        right = tasks[half:]
+        cols, rows = self.task_index_layout(tasks)
+        columns = [tasks[i * rows:(i + 1) * rows] for i in range(cols)]
         t = Table(title="Task · 任务（· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走；"
-                        "[red]红[/] = 已挂 session）",
+                        "[bright_red]红[/] = 已挂 session）",
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
                   title_justify="left", expand=False)
-        t.add_column("number", justify="left", no_wrap=True)
-        t.add_column("task", no_wrap=True, overflow="crop")
-        t.add_column("number", justify="left", no_wrap=True)
-        t.add_column("task", no_wrap=True, overflow="crop")
+        for _ in range(cols):
+            t.add_column("number", justify="left", no_wrap=True)
+            t.add_column("task", no_wrap=True, overflow="crop")
         selected = self.selected_task_id
-        for i in range(len(left)):
+        for i in range(rows):
             cells = []
-            for col in (left, right):
+            for col in columns:
                 task = col[i] if i < len(col) else None
                 cells.extend(self._task_index_cells(task, selected))
             t.add_row(*cells)
-        # 表尾一行账：这张表里到底几条收工了 —— 光看记号容易被标题淹掉。
+        # 表尾一行账：这张面板里到底几条收工了 —— 光看记号容易被标题淹掉。
         counts = {ts.STATUS_ACTIVE: 0, ts.STATUS_COMPLETED: 0, ts.STATUS_DROPPED: 0}
         for task in tasks:
             counts[ts.TaskStore.status_of(task)] = counts.get(
                 ts.TaskStore.status_of(task), 0) + 1
+        scope = ("今天 = 没做完的 + 今天处理过的"
+                 if self.sel_date >= datetime.date.today()
+                 else "%s = 那天处理过的（过去就固化）" % self.sel_date.isoformat())
         t.caption = ("%d 条：%d 进行中 · %d 完成 · %d 放弃 "
-                     "（收工的不删，只打记号）"
+                     "（收工的不删，只打记号 · %s）"
                      % (len(tasks), counts[ts.STATUS_ACTIVE],
-                        counts[ts.STATUS_COMPLETED], counts[ts.STATUS_DROPPED]))
+                        counts[ts.STATUS_COMPLETED], counts[ts.STATUS_DROPPED], scope))
         return t
 
     def _task_index_cells(self, task, selected):
         """一行里的一对（编号, 标题）。没任务时给两个空格占位。"""
         if task is None:
             return [Text(""), Text("")]
-        assigned = bool(task.get("session"))
-        style = "bold red" if assigned else "dark_blue"
-        if ts.TaskStore.status_of(task) == ts.STATUS_DROPPED:
-            style = "dim strikethrough"
-        if ts.TaskStore.status_of(task) == ts.STATUS_COMPLETED:
-            style = "green"
+        status = ts.TaskStore.status_of(task)
+        style = STYLE_ASSIGNED if task.get("session") else STYLE_ACTIVE
+        if status == ts.STATUS_DROPPED:
+            style = STYLE_DROPPED
+        if status == ts.STATUS_COMPLETED:
+            style = STYLE_DONE
         if task.get("id") == selected:
             style += " reverse"
-        title = self.task_store.focusmate_title(task, max_len=TASK_CELL_TITLE_MAX)
-        prefix = self.task_mark(task)
-        if task.get("repeat"):
-            prefix += "🔁"
         return [Text(str(task.get("id")), style=style),
-                Text(prefix + title, style=style)]
+                Text(self.task_index_title(task), style=style)]
 
     def plan_rows_for(self, day):
         return sch.day_slots(self.entries, day)
@@ -1922,7 +2034,8 @@ class Warden(object):
             parts.extend(body if isinstance(body, (list, tuple)) else [body])
         if self.messages:
             parts.append(self.render_messages())
-        parts.append(self.render_view_bar())
+        # 视图栏**不**放这儿：它是 repl_kit 的 footer（见 shell_kwargs）。
+        # 看板是会被裁掉顶部的那一块，而「你在第几个视图」任何时候都得看得见。
         return Group(*parts)
 
     def paint(self, prompt_row=True):
@@ -1935,6 +2048,12 @@ class Warden(object):
         if box is not None:
             self.console.print(box.renderable())
         self.console.print(self.frame())
+        # 打断栏位（收尾/查账那句问话）：和交互模式同一位置 —— 看板下面、状态行上面
+        block = self.shell.interrogate()
+        if block is not None:
+            self.console.print(block.renderable())
+        # 底部状态栏（视图栏）：栏位下面、状态行上面 —— 和交互模式同一顺序
+        self.console.print(self.render_view_bar())
         st = self.live_status()
         if st is not None:
             self.console.print(Text(st))
@@ -2331,11 +2450,11 @@ class Warden(object):
     def _day_cell(self):
         day = self.sel_date
         off = self.day_offset
-        kinds = {0: ("今天", "bold"), -1: ("昨天", "dim"), 1: ("明天", "bold")}
+        kinds = {0: ("今天", "bold"), -1: ("昨天", STYLE_MUTED), 1: ("明天", "bold")}
         name, style = kinds.get(off, ("%+d 天" % off, ""))
         zone = self.day_zone()
         zone_txt = {
-            "past": ("过去 · 只能看", "dim"),
+            "past": ("过去 · 只能看", STYLE_MUTED),
             "locked": ("执行区 · 已吃进 API，取消要敲宣言", "bold red"),
             "draft": ("草稿区 · 100% 自由，随便改", "bold green"),
             "mixed": ("执行区 + 草稿区混合（按行看）」", "bold yellow"),
@@ -2346,7 +2465,7 @@ class Warden(object):
         cell.append(zone_txt[0], style=zone_txt[1])
         if off > 0 and self.settings.get_bool("edit-tomorrow"):
             cell.append("\n（edit-tomorrow 开着：未来的日子先按草稿区，凌晨后回到 24h 规则）",
-                        style="dim green")
+                        style="green")
         return cell
 
     def _window_cell(self):
@@ -2460,32 +2579,33 @@ class Warden(object):
                 live_idx = i + 1
                 break
         zone_tag = {"locked": ("锁", "bold red"), "draft": ("草", "bold green"),
-                    "past": ("过", "dim")}
+                    "past": ("过", STYLE_MUTED)}
         for i, r in enumerate(self.rows):
             idx = i + 1
-            style = "dim" if r["phase"] == "已结束" else ""
+            # 数据（标题/时间/状态）不用 dim：dim 是给说明和单位的，压在数据上就看不清了
+            style = STYLE_MUTED if r["phase"] == "已结束" else ""
             st = Text()
             tag, tag_style = zone_tag.get(r.get("zone"), ("", ""))
             if tag:
                 st.append(tag + " ", style=tag_style)
             if not self.authoritative:
                 # 快照里没有 session id —— 订没订看不出来，别假装知道
-                st.append(r["phase"], style="dim")
-                st.append(" 快照", style="dim")
+                st.append(r["phase"], style=STYLE_MUTED)
+                st.append(" 快照", style=STYLE_MUTED)
             elif r.get("planned") and not r.get("id"):
                 st.append("缺", style="bold yellow")
             elif not r.get("planned"):
                 st.append("计划外", style="bold magenta")
             else:
                 st.append(r["phase"], style={"进行中": "bold green", "未开始": "white",
-                                             "已结束": "dim"}[r["phase"]])
+                                             "已结束": STYLE_MUTED}[r["phase"]])
             quiet = r.get("quiet")
             if quiet is None:
-                qtxt = "[dim]?[/]"
+                qtxt = "[%s]?[/]" % STYLE_MUTED
             elif quiet:
                 qtxt = "[bold yellow]ON[/]"
             else:
-                qtxt = "[dim]·[/]"
+                qtxt = "[%s]·[/]" % STYLE_MUTED
             dur = r.get("durationMin")
             label = Text()
             if idx == live_idx:
@@ -2502,7 +2622,7 @@ class Warden(object):
             ptype = (period.get("type") or period.get("calendar") or "") if first else ""
             pname = (period.get("name") or period.get("title") or "") if first else ""
             task_text = r.get("task_text") or ""
-            task_cell = Text(task_text, style="bold green" if task_text else "dim")
+            task_cell = Text(task_text, style="bold green" if task_text else STYLE_MUTED)
             t.add_row(
                 Text(pid or "", style="bold magenta"),
                 Text(pspan, style="cyan"),
@@ -2513,7 +2633,7 @@ class Warden(object):
                 ("%dmin" % dur) if dur else "?",
                 st,
                 qtxt,
-                Text(r.get("contract") or "—", style="dim"),
+                Text(r.get("contract") or "—", style=STYLE_MUTED),
                 label,
                 task_cell,
             )
@@ -2523,7 +2643,7 @@ class Warden(object):
         """「状态」框的正文：契约执行情况 + 一次性/长期规则 + 临时挪动 + 文件位置。
 
         用户要求：这一行（原来这里挂的「永不重订名单（N 条）」）换成警告，
-        并且「契约（data.csv 周几）」和警告一起装进同一个 ASCII「状态」框。
+        并且「契约（data.csv 周几）」和警告一起装进同一个「状态」框（平滑重线边框）。
         永不重订名单本体只在「统计」视图里逐行列。
         """
         rows = []
@@ -4241,8 +4361,17 @@ class Warden(object):
             return None, False
         return rows[-1], True
 
+    def render_interrogate(self):
+        """repl_kit 的「打断栏位」里画什么 —— 收尾/查账那句问话。
+
+        以前这块面板是塞在契约视图/任务视图自己的 render 里的：视图一换就没了、
+        表格一长就被挤出屏幕，而它恰恰是屏幕上最该看见的东西。现在它归框架的那个
+        栏位管（压在整块看板下面、提示行上面），切视图、滚表格都不影响。
+        """
+        return self.review_panel()
+
     def review_panel(self):
-        """收尾面板（契约 / 任务视图里画在表格下面）。"""
+        """收尾 / 查账面板的正文（由 :meth:`render_interrogate` 挂进栏位）。"""
         if self.review is not None:
             body = Text()
             for text, style in self.review.lines():

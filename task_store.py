@@ -39,7 +39,14 @@ DEFAULT_ARCHIVE_FILE = os.path.join(DATA_DIR, "task-archive.json")
 
 # 这些键是本地簿记，不属于用户字段。用户仍然可以随便写别的字段。
 RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate", "repeat",
-            "status", "status_at", "tags", "omnifocus", "duplicate_of", "actual_minutes"}
+            "status", "status_at", "tags", "omnifocus", "duplicate_of", "actual_minutes",
+            "history"}
+
+#: 「这条任务在哪一天的 session 里被处理过」的痕迹（见 :meth:`TaskStore.mark_processed`）。
+#: 任务是按天固化的：今天的任务面板 = 所有没做完的 + 今天处理过的；过去那天只剩
+#: 「当时处理过的」。所以每次收尾动了一条任务，都要在这一栏里留一笔。
+HISTORY_KEY = "history"
+HISTORY_KEEP = 40
 
 # 任务状态。**「完成」只表示本地这条记录收工了**，不等于 OmniFocus 那边也完成了：
 # 两边是「单向覆盖」（warden → OmniFocus），同步动作由调用方决定、并且要留痕。
@@ -153,6 +160,11 @@ def _coerce_task(raw, fallback_id=None):
         task["actual_minutes"] = int(minutes) if minutes is not None else None
     except (TypeError, ValueError):
         task["actual_minutes"] = None
+    history = _coerce_history(task.get(HISTORY_KEY))
+    if history:
+        task[HISTORY_KEY] = history
+    else:
+        task.pop(HISTORY_KEY, None)
     task.setdefault("created_at", _now())
     task.setdefault("updated_at", task["created_at"])
     return task
@@ -167,6 +179,35 @@ def _coerce_tags(raw):
         text = str(item or "").strip()
         if text and text not in out:
             out.append(text)
+    return out
+
+
+def _day_text(value):
+    """``date`` / ``datetime`` / ``"2026-10-28"`` / ``"2026-10-28T11:00"`` → ``"2026-10-28"``。"""
+    if isinstance(value, datetime.datetime):
+        return value.date().isoformat()
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    text = str(value or "").strip()
+    return text[:10] if len(text) >= 10 else text
+
+
+def _coerce_history(raw):
+    """处理痕迹：只留形状对的记录，按发生顺序排。"""
+    out = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        day = _day_text(item.get("day"))
+        if not day:
+            continue
+        out.append({
+            "day": day,
+            "start": str(item.get("start") or ""),
+            "action": str(item.get("action") or ""),
+            "at": str(item.get("at") or ""),
+        })
+    out.sort(key=lambda r: (r["day"], r["at"]))
     return out
 
 
@@ -590,6 +631,60 @@ class TaskStore(object):
     @staticmethod
     def is_done(task):
         return TaskStore.status_of(task) in (STATUS_COMPLETED, STATUS_DROPPED)
+
+    # -- 「这一天处理过哪些任务」 ---------------------------------------
+
+    def mark_processed(self, task_id, day, start=None, action="", at=None):
+        """留一笔「这条任务在这一天的 session 里被处理过」。
+
+        任务面板是按天固化的（今天的面板 = 没做完的 + 今天处理过的；过去那天只剩
+        「当时处理过的」），所以每一次收尾动作都要打这个戳 —— 放弃 / 完成 / 补录 /
+        重议 / 推后 / 转移走 / 跳过**都算**，用户的原话是「无论结果是没做完迁移、
+        放弃还是什么」。
+
+        同一个 ``(day, start)`` 只留最后一条：同一场里先按了 A 延期没成、后来按 B
+        放弃，结果以最后一次为准。
+        """
+        day = _day_text(day)
+        if not day:
+            raise ValueError("处理痕迹要一个日期（YYYY-MM-DD）")
+        if isinstance(at, datetime.datetime):
+            at = at.isoformat(timespec="seconds")
+        record = {"day": day, "start": str(start or ""), "action": str(action or ""),
+                  "at": str(at or _now())}
+
+        def apply(task):
+            history = [r for r in _coerce_history(task.get(HISTORY_KEY))
+                       if (r["day"], r["start"]) != (record["day"], record["start"])]
+            history.append(record)
+            task[HISTORY_KEY] = history[-HISTORY_KEEP:]
+        return self._mutate(task_id, apply)
+
+    @staticmethod
+    def processed_on(task, day):
+        """``[{"day","start","action","derived"}]``：这一天里这条任务被处理的记录。
+
+        显式痕迹优先。老数据没有痕迹（升级前收尾过的场次），就按状态时间推一把：
+        ``status_at``（或 Focusmate 的 completedAt）落在这一天 → 算这天处理的。
+        不这么兜底，升级当天的「过去那几天」面板会整片空白。
+        """
+        day = _day_text(day)
+        task = task or {}
+        found = [dict(r, derived=False) for r in _coerce_history(task.get(HISTORY_KEY))
+                 if r["day"] == day]
+        if found:
+            return found
+        if TaskStore.status_of(task) == STATUS_ACTIVE:
+            return []
+        stamp = (task.get("status_at")
+                 or (task.get("focusmate") or {}).get("completed_at") or "")
+        if _day_text(stamp) != day:
+            return []
+        sess = task.get("session") or {}
+        return [{"day": day,
+                 "start": str(sess.get("start") or "") if _day_text(
+                     sess.get("date")) == day else "",
+                 "action": TaskStore.status_of(task), "at": str(stamp), "derived": True}]
 
     def by_status(self, *statuses):
         want = set(statuses or STATUSES)
