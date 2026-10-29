@@ -745,10 +745,10 @@ check("进行中打 ·（不能是空串，否则表格里分不清）",
 # 完成 + 关联 OmniFocus → 写回（完成 + 截止时间）
 task2 = store.create({"title": "复习数学"})
 store.assign(task2["id"], {"date": "2026-10-27", "start": "12:00", "duration": 50})
-wd.cmd_task_link([str(task2["id"]), "[复习数学](omnifocus:///task/pk1)"])
+wd.cmd_task_link(["id:%d" % task2["id"], "[复习数学](omnifocus:///task/pk1)"])
 check("link 之后本地记下了 primary key",
       store.get(task2["id"])["omnifocus"]["id"], "pk1")
-wd.handle("task %d done 35" % task2["id"])
+wd.handle("task id:%d done 35" % task2["id"])
 check("done：本地完成", store.get(task2["id"])["status"], ts.STATUS_COMPLETED)
 check("done：OmniFocus 写回（complete + due）", omni.writes,
       [("complete", "pk1", "2026-10-27T12:50:00")])
@@ -760,25 +760,25 @@ check("已经写回过的不会重复写", omni.writes, [])
 
 # drop 会把 OmniFocus 也放弃；--local 不会
 task3 = store.create({"title": "不要了"})
-wd.cmd_task_link([str(task3["id"]), "omnifocus:///task/pk2"])
+wd.cmd_task_link(["id:%d" % task3["id"], "omnifocus:///task/pk2"])
 omni.writes = []
-wd.handle("task %d drop --local" % task3["id"])
+wd.handle("task id:%d drop --local" % task3["id"])
 check("--local 只改本地", omni.writes, [])
 check("--local 也真的放弃了", store.get(task3["id"])["status"], ts.STATUS_DROPPED)
 task4 = store.create({"title": "也不要了"})
-wd.cmd_task_link([str(task4["id"]), "omnifocus:///task/pk3"])
+wd.cmd_task_link(["id:%d" % task4["id"], "omnifocus:///task/pk3"])
 omni.writes = []
-wd.handle("task %d drop" % task4["id"])
+wd.handle("task id:%d drop" % task4["id"])
 check("drop 会连带 OmniFocus", omni.writes, [("drop", "pk3", None)])
 
 # task N duplicate -a M
 task5 = store.create({"title": "复制的源头"})
-wd.cmd_task_link([str(task5["id"]), "omnifocus:///task/pk5"])
+wd.cmd_task_link(["id:%d" % task5["id"], "omnifocus:///task/pk5"])
 wd.rebuild_rows()
 wd.rows = [{"startLabel": "12:00", "id": "sess-2", "startMs": 1793088000000,
             "date": "2026-10-27", "endLabel": "12:50", "durationMin": 50,
             "task_text": ""}]
-wd.handle("task %d duplicate -a 1" % task5["id"])
+wd.handle("task id:%d duplicate -a 1" % task5["id"])
 copy = [t for t in store.list() if t.get("duplicate_of") == task5["id"]][0]
 check("duplicate：新任务挂到了那一场", copy["session"]["start"], "12:00")
 check("duplicate：OmniFocus 还是同一条", copy["omnifocus"]["id"], "pk5")

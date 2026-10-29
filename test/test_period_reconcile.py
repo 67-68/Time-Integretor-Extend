@@ -234,7 +234,8 @@ check("旧 Focusmate task 记进 previous（完成时间还能归档）",
       [x["task_id"] for x in prev.get("previous") or []], ["fmt-12:00"])
 check("previous 里记着为什么清", prev["previous"][0]["reason"], "layout-changed")
 check_true("消息里说了清掉哪条绑定",
-           any("清掉任务 %d" % t2["id"] in m[2] for m in wd.messages))
+           any("清掉任务" in m[2] and wd.task_store.focusmate_title(t2, 20) in m[2]
+               for m in wd.messages))
 
 print("== 改排布：连保留的那场也动了 → 全清 ==")
 wd.messages = []

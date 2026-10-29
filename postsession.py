@@ -571,11 +571,28 @@ class Review(object):
             return "大概花了多少分钟？（填个整数就行，例如 35）"
         return "A 延期 · B 放弃 · C 重议 · D 缺漏完成 · E 快捷推后 · s 跳过 · q 结束收尾"
 
+    def label_of(self, task):
+        """给用户看的任务编号：warden 那边给的是**面板序号**（``#3``）。
+
+        收尾面板和别处的编号必须是一个东西 —— 面板上写着 #3，这里就不能说「任务 15」。
+        warden 通过 ``label`` 钩子把 :meth:`Warden.task_label` 递进来；没有钩子
+        （纯逻辑测试里）就老实写内部 id。
+        """
+        hook = self.hooks.get("label")
+        if hook is not None:
+            try:
+                text = hook(task)
+                if text:
+                    return text
+            except Exception:                     # noqa: BLE001 - 编号算不出来别炸收尾
+                pass
+        return "%s" % ((task or {}).get("id") or "?")
+
     def _task_label(self):
         task = self.pending_task or self.current()
         if not task:
             return "?"
-        return "%s" % task.get("id")
+        return self.label_of(task)
 
     def lines(self):
         """面板正文：[(文本, 样式)] —— 由 warden 塞进 rich Panel。"""
@@ -588,7 +605,8 @@ class Review(object):
         omni = task.get("omnifocus") or {}
         fm = task.get("focusmate") or {}
         sess = task.get("session") or {}
-        out.append(("任务 %s：%s" % (task["id"], self.title_of(task)), "bold yellow"))
+        out.append(("任务 %s：%s" % (self.label_of(task), self.title_of(task)),
+                    "bold yellow"))
         bits = []
         due = effective_due(task)
         due_text = ((task.get("fields") or {}).get("due")
@@ -686,7 +704,8 @@ class Review(object):
             self.pending_task = task
             self.stage = self.TRANSFER
             self.say("延期：请把任务 %s「%s」转移走 —— %s"
-                     % (task["id"], self.title_of(task), self.stage_hint()), "cmd")
+                     % (self.label_of(task), self.title_of(task), self.stage_hint()),
+                     "cmd")
             return {"action": "handled"}
         if choice == "b":
             return self._drop(task, why="review-drop")
@@ -696,7 +715,7 @@ class Review(object):
             self.pending_task = task
             self.stage = self.MINUTES
             self.say("缺漏完成补充：任务 %s「%s」大概花了多少分钟？"
-                     % (task["id"], self.title_of(task)), "cmd")
+                     % (self.label_of(task), self.title_of(task)), "cmd")
             return {"action": "handled"}
         if choice == "e":
             return self._postpone(task)
@@ -726,7 +745,7 @@ class Review(object):
         # 跳过也算「这一场处理过它」：过去那天的面板上要看得见「问过、你说先跳过」。
         self.mark_processed(task, "skip")
         self.say("跳过任务 %s（它还是「进行中」，下一场收尾会再问你）。"
-                 % task.get("id"), "warn")
+                 % self.label_of(task), "warn")
         self.index += 1
         if self.current() is None:
             return self._close()
@@ -738,7 +757,8 @@ class Review(object):
         self.mark_processed(task, "drop")
         self.store.set_status(task["id"], ts.STATUS_DROPPED, reason=why)
         self.say("✗ 任务 %s「%s」已放弃%s"
-                 % (task["id"], self.title_of(task), ("；" + note) if note else ""), "ok")
+                 % (self.label_of(task), self.title_of(task),
+                    ("；" + note) if note else ""), "ok")
         return self._advance()
 
     def _reconsider(self, task):
@@ -747,7 +767,7 @@ class Review(object):
         self.mark_processed(task, "reconsider")
         self.store.set_status(task["id"], ts.STATUS_DROPPED, reason="reconsider")
         self.say("⤼ 任务 %s「%s」改成 #%s 重议（同一条 OmniFocus %s）；旧的已放弃。"
-                 % (task["id"], self.title_of(task), copy["id"],
+                 % (self.label_of(task), self.title_of(task), copy["id"],
                     (task.get("omnifocus") or {}).get("id") or "（未关联）"), "ok")
         return self._advance()
 
@@ -764,7 +784,7 @@ class Review(object):
         self.store.drop(task["id"], reason="postponed", tag=ts.TRANSFER_TAG)
         label = "%s %s" % (nxt.get("date"), nxt.get("start"))
         self.say("⤼ 任务 %s「%s」推到 %s（新任务 #%s%s）；旧的已放弃 + 「%s」。"
-                 % (task["id"], self.title_of(task), label, copy["id"],
+                 % (self.label_of(task), self.title_of(task), label, copy["id"],
                     ("；" + note) if note else "", ts.TRANSFER_TAG), "ok")
         return self._advance()
 
@@ -779,7 +799,7 @@ class Review(object):
         note_of = self._hook("complete_omnifocus", task, minutes)
         extra = "；".join(x for x in (note_fm, note_of) if x)
         self.say("✓ 任务 %s「%s」补录完成：%d 分钟%s%s"
-                 % (task["id"], self.title_of(task), minutes,
+                 % (self.label_of(task), self.title_of(task), minutes,
                     ("，截止 %s" % due) if due else "",
                     ("；" + extra) if extra else ""), "ok")
         return self._advance()
@@ -846,7 +866,7 @@ class Review(object):
         self.store.drop(task["id"], reason="transferred", tag=tag)
         self.say("⤼ 任务 %s「%s」已转移（%s）：旧记录标放弃 + 标签「%s」；"
                  "OmniFocus 那条任务一个字节都没动。"
-                 % (task["id"], self.title_of(task), how, tag), "ok")
+                 % (self.label_of(task), self.title_of(task), how, tag), "ok")
         if note:
             self.say("   %s" % note, "ok" if "已删除" in str(note) else "info")
         self.stage = self.ASK

@@ -75,32 +75,53 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
   老数据没有痕迹时 `processed_on()` 用 `status_at`（或 `focusmate.completed_at`）
   兜底，否则升级当天「过去几天」会整片空白。
 
+## 序号 = 面板上的第几条（不是内部 id）
+
+需求：「任务重置他们的序号，根据当前任务的数量从 1 到最多」。
+
+所以命令里的数字是**序号**：这条任务在**契约视图那块任务面板上排第几**（1 起、
+连续、不跳号）。口径就是 `task_panel_order()`，所以「面板上写着 3」和「`task 3` 指的
+是同一条」永远成立 —— 这也正是它必须跟着面板重排的原因（删一条、收工一条，后面的
+就往前顶，屏幕上永远不留空号）。
+
+- 序号**不是**内部的 `id`。内部 id 是一条任务从生到死不变的那个数（`task list` 里
+  「id」那一列）。两套数各管一件事：**序号给手敲用**（跟眼睛看到的一致），id 给
+  账本和归档用。
+- 序号缓存在 `task_number_index()` 里，键是「库文件 mtime + 哪一天」：库一写、天一
+  切，缓存自己作废，不会给出旧号。
+- 面板上**没有**的任务（别的天处理过的、归档里的）用显式写法 `id:15` 指定内部 id。
+  另外「数字超过面板上界」时也会按内部 id 认，并明说一句（`（17 超过面板的 #1–#12，
+  按内部 id 认：…）`）—— 免得对着 `task list` 敲了半天没反应。
+- 面板上找不到、内部 id 也没有 → 报清楚面板现在有 #1…#几（不猜、不静默）。
+- 契约表格 task 列、任务面板编号列、收尾面板的「任务 #3」、Recent 里的每一句
+  —— 全部用同一个 `task_label()`，所以屏幕上不会同时出现两套编号。
+
 ## 命令
 
-TUI（任务视图 / 任意视图都认 `task`）：
+TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面板上的第几条：
 
 | 命令 | 作用 |
 |---|---|
 | `task create [id] [key=value ...]` | 创建；给了数字 id 就用它，否则自动编号。没有 `=` 的 token 拼成 `title` |
-| `task delete <id>` | 删除 |
-| `task modify <id> <field> <新值>` | 改任意字段 |
-| `task select <id>` | 选中任务（`task assign <session>` 的默认目标） |
-| `task <id>` | ← 和 `task select <id>` **完全等价**（裸 ID 就是 select） |
-| `task assign [<任务ID>] <session ID>` | 先挂 Focusmate，成功后落本地；成功即刻重排表格（task 列马上有内容） |
-| `task repeat <id> <周几@HH:MM\|off>` | 设置 / 取消每周重复 |
+| `task delete <序号>` | 删除 |
+| `task modify <序号> <field> <新值>` | 改任意字段 |
+| `task select <序号>` | 选中任务（`task assign <session>` 的默认目标） |
+| `task <序号>` | ← 和 `task select <序号>` **完全等价**（裸序号就是 select） |
+| `task assign [<序号>] <session ID>` | 先挂 Focusmate，成功后落本地；成功即刻重排表格（task 列马上有内容） |
+| `task repeat <序号> <周几@HH:MM\|off>` | 设置 / 取消每周重复 |
 | `task create ... --repeat 周几@HH:MM` | 一步建「每周重复任务」 |
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
 | `task archive [N]` | 看归档：按完成日期分组、最近 N 条（默认 5） |
 | `task <任何动作> ... --assign <N>` | 跑完顺手把产出的任务挂到表格 #N（`-a` / `--assign=N` 同义） |
-| `task <id> duplicate [-a N]` | 复制一条（字段 + 本地标签 + **同一条 OmniFocus**），可顺手挂到 #N |
-| `task <id> done [分钟]` | 完成：本地完成 + 归档 + Focusmate 勾上 + **OmniFocus 完成并写回截止时间** |
-| `task <id> drop [--local]` | 放弃：本地放弃；默认**OmniFocus 也放弃**，`--local` 只改本地 |
-| `task <id> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
+| `task <序号> duplicate [-a N]` | 复制一条（字段 + 本地标签 + **同一条 OmniFocus**），可顺手挂到 #N |
+| `task <序号> done [分钟]` | 完成：本地完成 + 归档 + Focusmate 勾上 + **OmniFocus 完成并写回截止时间** |
+| `task <序号> drop [--local]` | 放弃：本地放弃；默认**OmniFocus 也放弃**，`--local` 只改本地 |
+| `task <序号> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
 | `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus，可一次多行 |
-| `task <id> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
-| `task <id> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |
-| `task <id> -a current`（`-ac`） | 挂到**当前这一场**（进行中优先，其次最近一场） |
-| `task 32 swap 21` | 两条任务**互换位置**（一条赋闲也行） |
+| `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
+| `task <序号> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |
+| `task <序号> -a current`（`-ac`） | 挂到**当前这一场**（进行中优先，其次最近一场） |
+| `task 3 swap 5` | 两条任务**互换位置**（一条赋闲也行） |
 | `task -s 5 -a 6` | 把 session #5 上的**全部**任务转移到 #6 |
 | `task -s 5 -a none` | 把 session #5 上的全部任务下架 |
 | `task -s 5` | 只列 #5 上现在挂着谁（只看不动） |
@@ -110,11 +131,11 @@ TUI（任务视图 / 任意视图都认 `task`）：
 统一摘掉），所以这些写法都成立：
 
 ```text
-task 8 -a 1                     # 最省事：选中任务 8 + 挂到表格 #1
+task 3 -a 1                     # 最省事：选中面板第 3 条 + 挂到表格 #1
 task create title=写论文 --assign 3
 task create title=复习 --repeat mon@22:15 --assign 3
-task modify 1 due 后天 --assign 3
-task select 1 --assign 3        # 等价于 task assign 1 3（也等价于 task 1 -a 3）
+task modify 4 due 后天 --assign 3
+task select 4 --assign 3        # 等价于 task assign 4 3（也等价于 task 4 -a 3）
 ```
 
 ### 分工：动作归子命令，后缀归分流
@@ -174,7 +195,7 @@ TASK_SHORT_FLAGS = (
 
 「位置」只有一种定义：**那一场 session**（或者赋闲）。
 
-**`task 32 swap 21`**（`cmd_task_swap()`）—— 两条任务互换位置：
+**`task 3 swap 5`**（`cmd_task_swap()`）—— 两条任务互换位置（数字是面板序号）：
 
 - 一条在 #1、一条赋闲 → 赋闲那条进 #1，原来那条下来赋闲；
 - 两条各在一场 → 场次对调；
@@ -214,11 +235,12 @@ html/rtf/url 都原样返回纯文本），所以老实现其实一直在读纯�
 
 没给参数就直接读剪贴板；给了参数但粘进来一段**只有标题**的文字时，会去剪贴板对一下
 **同名**的那条链接（标题完全相同才认），对不上就建任务并明确说「没有关联」，同时
-给出补救办法（`task <id> link`，同样不用参数）。
+给出补救办法（`task <序号> link`，同样不用参数）。
 
-**裸 ID 就是 `select`**（`_dispatch_task()` 里 `action.isdigit()` 那一段）：
-`task 8` ≡ `task select 8`，所以 `-a` / `-n` 这两个后缀挂在裸 ID 上也成立。
-裸 ID 后面**再跟别的东西**（`task 8 3`）不算「选中再挂」—— 那会被判成用法错误，
+**裸序号就是 `select`**（`_dispatch_task()` 里那段 `numeric`）：`task 3` ≡
+`task select 3`，所以 `-a` / `-n` 这两个后缀挂在裸序号上也成立。`id:15` 走同一条路，
+只是它明说「按内部 id」（面板上没有的任务用）。
+裸序号后面**再跟别的东西**（`task 3 5`）不算「选中再挂」—— 那会被判成用法错误，
 提示你用 `-a`：挂 session 和挂 task 是两回事，不靠位置猜。
 
 它复用的是 `cmd_task_assign()` 那一条路径（先 Focusmate 复核、成功才落本地），
@@ -353,6 +375,8 @@ Task · 任务（· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走；红 = 
 24 条：6 进行中 · 7 完成 · 11 放弃（收工的不删，只打记号 · 今天 = …）
 ```
 
+0. **编号就是序号**：面板上写的 `1, 2, 3 …` 是按这个顺序数下来的（连续、不跳号），
+   命令里敲的也是它 —— 见上面「序号 = 面板上的第几条」。
 1. **状态段**（第一维，`TASK_PANEL_BANDS`）：进行中 → 完成 → 放弃。
    待办归待办、收工归收工，不再出现 `15(待办) / 33(放弃) / 38(放弃)` 这样混着的一行。
 2. **位置**（段内）：未挂 session 的最前，之后按场次时间聚成段，同一场那几条挨在一起。

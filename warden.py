@@ -734,6 +734,13 @@ def task_completer(w, prior):
     取值 —— 不给它们，``-an`` / ``-ac`` 就等于只存在于文档里。
     """
     words = [str(part).lower() for part in prior]
+    if len(words) <= 1:
+        # `task ` 后面最常敲的就是「第几条」—— 直接补的是面板序号（1..N），
+        # 不是内部 id（那两套数不是一回事，补错了会让人敲到别的任务上）。
+        try:
+            return [str(i) for i in range(1, len(w.task_panel_order()) + 1)]
+        except Exception:                            # noqa: BLE001 - 补不出来就算了
+            return []
     if words and words[-1] in ("--assign", "-a", "-an", "-ac"):
         return [str(i) for i in range(1, len(w.rows) + 1)] + ["none", "current"]
     if words and words[-1] in ("--from", "-s"):
@@ -842,11 +849,12 @@ def _hint_task(parts):
     # `task 32 swap 21`：动作写在 ID 后面。提示行拿到的是「已经敲完的词」，
     # 所以 `task 32 ` 这时候 parts 只有 ["32"] —— 提示该给「这个 ID 能干什么」。
     head = list(words)
-    if head and head[0].isdigit():
+    if head and (head[0].isdigit() or head[0].startswith("id:")):
         if len(head) == 1:
-            return repl_kit.Hint("动作", ("swap", "duplicate", "drop", "done", "link", "-a <编号>"),
-                                 note="swap 21 = 和 21 换位置 · -a none 下架 · "
-                                      "-a current 挂到当前这一场")
+            return repl_kit.Hint("动作", ("swap", "duplicate", "drop", "done", "link",
+                                          "-a <编号>"),
+                                 note="数字是面板序号（swap 5 = 和第 5 条换位置）"
+                                      " · -a none 下架 · -a current 挂到当前这一场")
         head = head[1:]
     action = head[0] if head else ""
     if action in ("import", "粘贴", "导入"):
@@ -862,15 +870,15 @@ def _hint_task(parts):
     if action in ("archive", "history", "归档"):
         return repl_kit.Hint("参数", ("<N>",), note="不给就列最近 5 条")
     if action in ("repeat", "recurring"):
-        return repl_kit.Hint("参数", ("<任务 ID>", "周几@HH:MM|off"),
+        return repl_kit.Hint("参数", ("<序号>", "周几@HH:MM|off"),
                              note="每周那一天、那一场自动挂上")
     if action in ("note", "notes", "备注"):
-        return repl_kit.Hint("参数", ("<任务 ID>", "<备注文本 / 网址>"),
+        return repl_kit.Hint("参数", ("<序号>", "<备注文本 / 网址>"),
                              note="备注会跟着完成归档一起显示（网址可点）")
     if action in ("delete", "select"):
-        return repl_kit.Hint("参数", ("<任务 ID>",))
+        return repl_kit.Hint("参数", ("<序号>",), note="面板上第几条；面板外的用 id:N")
     if action in ("swap", "调换", "换位"):
-        return repl_kit.Hint("参数", ("<任务 ID>", "<任务 ID>"),
+        return repl_kit.Hint("参数", ("<序号>", "<序号>"),
                              note="两条任务互换位置（一条赋闲也行）：task 32 swap 21")
     if action == "modify":
         return repl_kit.Hint("参数", ("<任务 ID>", "<字段>", "<新值>"), note="字段不校验")
@@ -1370,13 +1378,13 @@ class TaskView(View):
     命令统一以 ``task`` 开头（需求里的语法）：::
 
         task create [id] [field=value ...] [--repeat 周几@HH:MM] [--assign N]
-        task delete <id>
-        task modify <id> <field> <新值>
-        task note <id> <备注文本|网址>      # 备注：完成之后照着去对应地方干活
+        task delete <序号>
+        task modify <序号> <field> <新值>
+        task note <序号> <备注文本|网址>    # 备注：完成之后照着去对应地方干活
         task assign <session ID>            # 默认当前选中的任务
-        task assign <任务 ID> <session ID>  # 显式指定
-        task select <id>
-        task <id>                           # ↑ 同义：裸 ID 就是 select
+        task assign <序号> <session ID>     # 显式指定
+        task select <序号>
+        task <序号>                         # ↑ 同义：裸序号就是 select
         task <id> -a <session ID>           # 选中 + 挂上去（最省事）
         task <id> -an                       # 从它那一场下架（≡ -a none）
         task <id> -ac                       # 挂到当前这一场（≡ -a current）
@@ -1387,8 +1395,14 @@ class TaskView(View):
         task sync                           # GET /v1/tasks → 把 completedAt 归档
         task archive [N]                    # 看归档（data/task-archive.json）
 
+    **编号有两套，别混**：
+      * **序号** = 契约视图那块任务面板上的第几条（1 起、连续、refresh/收工后重排）。
+        命令里直接写它：``task 3 -an`` 就是「面板第 3 条下架」。
+      * **内部 id** = 任务库里那个不变的 id（`task list` 里那一列）。面板上没有的任务
+        （别的天处理过的、归档里的）用 ``id:15`` 显式指定。
+
     任何子命令都能带 ``--assign N``（表格里的 session ID）：命令跑完顺手挂上去，
-    例如 ``task create title=写论文 --assign 3``、``task 8 -a 1``。
+    例如 ``task create title=写论文 --assign 3``、``task 3 -a 1``。
     ``-a`` 还有两个特殊取值：``none``（下架：删掉 Focusmate 那条 task，本地断绑定）
     和 ``current``（当前这一场，进行中的优先）；紧凑写法 ``-an`` / ``-ac`` 由
     repl_kit 的短选项表统一展开，补全和提示都跟着走。
@@ -1408,10 +1422,10 @@ class TaskView(View):
 
     def idle_hint(self):
         return repl_kit.Hint(
-            "命令", ("task create", "task 8 -a 1", "task 8 -an", "task 8 -ac",
-                     "task 32 swap 21", "task -s 5 -a 6", "inspect-due", "review"),
-            note="字段不校验 · task 8 ≡ task select 8 · -an 下架 / -ac 当前这一场"
-                 " · Tab 切视图",
+            "命令", ("task create", "task 3 -a 1", "task 3 -an", "task 3 -ac",
+                     "task 3 swap 5", "task -s 5 -a 6", "inspect-due", "review"),
+            note="数字 = 面板上的序号（1 起连续）· task 3 ≡ task select 3"
+                 " · -an 下架 / -ac 当前这一场 · 面板外的用 id:N · Tab 切视图",
         )
 
     def status_line(self):
@@ -1420,9 +1434,9 @@ class TaskView(View):
     def unknown_hint(self):
         return ("「任务」视图认 task create/delete/modify/assign/select/duplicate/"
                 "drop/done/link/import/sync/swap、review、inspect-due"
-                "（也可以直接写任务 ID，如 task 8 -a 1 / task 8 -an / "
-                "task 32 swap 21 / task -s 5 -a 6）；"
-                "Shift+Tab 切回去再干别的。")
+                "（也可以直接写序号，如 task 3 -a 1 / task 3 -an / "
+                "task 3 swap 5 / task -s 5 -a 6；序号 = 面板上的第几条，"
+                "面板外的任务用 id:N）；Shift+Tab 切回去再干别的。")
 
     def commands(self):
         w = self.w
@@ -1470,9 +1484,12 @@ class TaskView(View):
             for k in (t.get("fields") or {}):
                 if k not in keys and k not in hidden:
                     keys.append(k)
-        t = Table(title="Task · 本地 JSON 任务库", box=box.SIMPLE_HEAVY,
-                  header_style="bold magenta", title_justify="left", expand=False)
-        t.add_column("ID", justify="right", style="bold", no_wrap=True)
+        t = Table(title="Task · 本地 JSON 任务库（序号 = 契约视图面板上的第几条；"
+                        "不在面板上的用 `id:N` 指定）",
+                  box=box.SIMPLE_HEAVY, header_style="bold magenta",
+                  title_justify="left", expand=False)
+        t.add_column("序号", justify="right", style="bold", no_wrap=True)
+        t.add_column("id", justify="right", style=STYLE_MUTED, no_wrap=True)
         t.add_column("状态", no_wrap=True)
         t.add_column("重复", no_wrap=True)
         t.add_column("session", no_wrap=True)
@@ -1514,7 +1531,8 @@ class TaskView(View):
                        if rep else "—")
             status_txt = "%s %s" % (w.task_mark(task) or "·", status)
             tags = task.get("tags") or []
-            t.add_row(str(task["id"]),
+            t.add_row(str(w.task_no(task) or "—"),
+                      str(task["id"]),
                       Text(status_txt, style=status_style.get(status, "")),
                       Text(rep_txt, style="magenta" if rep else STYLE_MUTED),
                       Text(sess_txt, style=style),
@@ -2040,7 +2058,9 @@ class Warden(object):
             prefix = self.task_mark(task)
             if task.get("repeat"):
                 prefix += "🔁"
-            parts.append("%s%d: %s" % (prefix, task.get("id"), title))
+            no = self.task_no(task)
+            parts.append("%s%d: %s" % (prefix, no, title) if no else
+                         "%s%s" % (prefix, title))
         return " | ".join(parts)
 
     def frame_width(self):
@@ -2067,18 +2087,25 @@ class Warden(object):
         「被处理过」不挑结果：放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / 跳过
         都算一笔，痕迹记在 ``task["history"]``（``TaskStore.mark_processed``）。
         跳过也要记：那一天你问过它、你说先放着 —— 这是那一天发生过的事。
+
+        还有一条兜底：**挂在这一天某场 session 上的任务一律进面板**。契约表格那一格
+        写着它，面板上却没有它的序号 —— 那两处就对不上了（用户按面板序号敲命令，
+        看到的却是「这一条没号」）。
         """
         day = day or self.sel_date
+        iso = day.isoformat()
         is_today_or_later = day >= datetime.date.today()
         open_tasks = []
         touched = []
         for task in self.task_store.list():
-            records = self.task_store.processed_on(task, day.isoformat())
+            records = self.task_store.processed_on(task, iso)
+            sess = task.get("session") or {}
+            attached_today = (sess.get("date") or "") == iso
             if self.task_store.is_open(task):
                 # 没做完的一律挂在「今天」的面板上；过去那天只有「问过但没收掉」才留
-                if is_today_or_later or records:
+                if is_today_or_later or records or attached_today:
                     open_tasks.append(task)
-            elif records:
+            elif records or attached_today:
                 touched.append(task)
         return open_tasks + touched
 
@@ -2111,6 +2138,87 @@ class Warden(object):
                     task.get("id") or 0)
 
         return sorted(self.task_panel_tasks(day), key=key)
+
+    # -- 任务序号（面板上的第几条）--------------------------------------
+
+    def task_number_index(self, day=None):
+        """当前面板的「序号 → 任务」+ 反查表 ``{内部 id: 序号}``。
+
+        需求：「任务重置他们的序号，根据当前任务的数量从 1 到最多」。所以序号**不是**
+        内部 id，而是这条任务在面板上是**第几条**（1 起、连续、不跳号）。口径就是
+        :meth:`task_panel_order`（先状态分段、段内按位置），所以「序号」和「你看到的
+        那块面板」永远是同一份东西 —— 见 1 就是那一行里的第 1 条。
+
+        每读一次库就重算一趟太浪费（画一帧要问好几次），所以按「库文件 mtime + 哪一天」
+        存一份：库一写（增删、状态变了）、天一切，缓存自己就作废。
+        """
+        day = day or self.sel_date
+        try:
+            info = os.stat(self.task_store.path)
+            stamp = (day.isoformat(), info.st_mtime_ns, info.st_size)
+        except OSError:
+            stamp = (day.isoformat(), 0, 0)
+        memo = getattr(self, "_number_memo", None)
+        if memo is not None and memo[0] == stamp:
+            return memo[1], memo[2]
+        tasks = self.task_panel_order(day)
+        by_no = {}
+        no_of = {}
+        for i, task in enumerate(tasks, 1):
+            by_no[i] = task
+            no_of[task.get("id")] = i
+        self._number_memo = (stamp, by_no, no_of)
+        return by_no, no_of
+
+    def task_no(self, task, day=None):
+        """这条任务在**当前面板**上是第几条（不在面板上 → None）。"""
+        if not isinstance(task, dict):
+            return None
+        return self.task_number_index(day)[1].get(task.get("id"))
+
+    def task_label(self, task, day=None):
+        """给用户看的编号：面板上是 ``#3``；不在面板上就老实写内部 id。
+
+        面板上**没有**这条（别的天的收工记录、归档里的）就别编个号给它 —— 编号一
+        编，用户敲下去要么打偏要么报错，不如直接写 ``id 15``。
+        """
+        no = self.task_no(task, day)
+        if no:
+            return "#%d" % no
+        ident = task.get("id") if isinstance(task, dict) else task
+        return "id %s" % ident
+
+    def resolve_task(self, token, day=None):
+        """把用户敲的那个数解析成任务：**面板上的第几条**。
+
+        两种写法：
+          * ``3``     —— 面板上的第 3 条（正常用法）
+          * ``id:15`` —— 明说「按内部 id」，给 `task list` / 归档里那些**不在面板上**
+                         的任务留的口子（切不了天又必须处理它时用）
+
+        面板上找不到、而这个数又正好是某条任务的内部 id 时也照收，并明说一句是按 id
+        认的。两头都不沾边就报清楚：面板现在只有 #1…#几。
+        """
+        text = str(token).strip()
+        if text.lower().startswith("id:"):
+            return self.task_store.get(text[3:])
+        try:
+            want = int(text)
+        except (TypeError, ValueError):
+            raise ValueError("任务序号得是数字；你给的是 %r" % (token,)) from None
+        day = day or self.sel_date
+        by_no, _no_of = self.task_number_index(day)
+        task = by_no.get(want)
+        if task is not None:
+            return task
+        for candidate in self.task_store.list():
+            if candidate.get("id") == want:
+                self.say("（%d 超过面板的 #1–#%d，按内部 id 认：%s）"
+                         % (want, len(by_no),
+                            self.task_store.focusmate_title(candidate, 20)), "warn")
+                return candidate
+        raise ValueError("面板上现在只有 #1–#%d，没有 #%d（切天看别的日子，"
+                         "或 `task list` 看全部）" % (len(by_no), want))
 
     def task_index_title(self, task):
         """任务面板里那一格的字：记号 + （🔁）+ 裁过的标题。"""
@@ -2198,7 +2306,7 @@ class Warden(object):
             style = STYLE_DONE
         if task.get("id") == selected:
             style += " reverse"
-        return [Text(str(task.get("id")), style=style),
+        return [Text(str(self.task_no(task) or "?"), style=style),
                 Text(self.task_index_title(task), style=style)]
 
     def plan_rows_for(self, day):
@@ -3587,27 +3695,35 @@ class Warden(object):
             self.say("`--note`：任务 %s 已经不在了（%s 之后没得写），忽略。"
                      % (task_id, action), "warn")
             return None
-        self.say("✅ 任务 %d 备注：%s"
-                 % (task["id"], self.task_store.notes(task) or "（空）"), "ok")
+        self.say("✅ 任务 %s 备注：%s"
+                 % (self.task_label(task), self.task_store.notes(task) or "（空）"), "ok")
         return task
 
     def _apply_assign(self, result, session_token, action):
-        """``--assign`` 的收尾：拿到任务就挂，拿不到就说一声（不改任何东西）。"""
-        task_id = None
-        if isinstance(result, dict) and result.get("id") is not None:
-            task_id = result["id"]
-        elif isinstance(result, (int, str)) and str(result).isdigit():
-            task_id = int(result)
-        if task_id is None:
+        """``--assign`` 的收尾：拿到任务就挂，拿不到就说一声（不改任何东西）。
+
+        ``result`` 是**任务对象**（create/duplicate/select 的返回值），所以这里直接
+        走内部的 :meth:`_assign_task` —— 绝不能再把它扔回 ``cmd_task_assign`` 让
+        「序号解析」重新认一遍（内部 id 和面板序号是两套数，绕回去就会挂错任务）。
+        """
+        task = result if isinstance(result, dict) and result.get("id") is not None else None
+        if task is None and self.selected_task_id is not None:
+            try:
+                task = self.task_store.get(self.selected_task_id)
+            except ValueError:
+                task = None
+        if task is None:
             self.say("`--assign` 只对会产出任务的动作用得上（create/modify/select）；"
                      "%s 没有可挂的任务，忽略。" % action, "warn")
             return None
-        self.selected_task_id = task_id
-        return self.cmd_task_assign([str(task_id), str(session_token)])
+        self.selected_task_id = task["id"]
+        return self._assign_task(task, str(session_token))
 
     def _dispatch_task(self, action, rest):
-        # `task 3 duplicate -a 1`：动作写在 ID 后面（需求里的语法就是这个顺序）
-        if action.isdigit() and rest:
+        # `task 3 duplicate -a 1`：动作写在序号后面（需求里的语法就是这个顺序）。
+        # `id:15` 也走这条：它是「明说按内部 id」的写法（面板上没有的任务）。
+        numeric = action.isdigit() or action.startswith("id:")
+        if numeric and rest:
             verb = str(rest[0]).lower()
             if verb in ("duplicate", "dup", "copy", "复制"):
                 return self.cmd_task_duplicate([action] + rest[1:])
@@ -3652,9 +3768,9 @@ class Warden(object):
         if action in ("list", "ls", "show"):
             self.say("任务 %d 条；看本视图表格即可。" % len(self.task_store.list()), "info")
             return False
-        # 裸任务 ID 就是 select：`task 8` ≡ `task select 8`，
-        # 于是 `task 8 -a 1` = 「选中任务 8 再挂到表格 #1」。
-        if action.isdigit():
+        # 裸序号就是 select：`task 3` ≡ `task select 3`，
+        # 于是 `task 3 -a 1` = 「选中第 3 条再挂到表格 #1」。
+        if numeric:
             if rest:
                 raise ValueError("`task %s` 就等于 `task select %s`，后面不用再跟东西；"
                                  "要挂到 session 用 -a/--assign（例如 task %s -a %s）。"
@@ -3749,8 +3865,8 @@ class Warden(object):
         if repeat_spec:
             task = self.cmd_task_repeat([str(task["id"]), repeat_spec], quiet=True)
         self.selected_task_id = task["id"]
-        self.say("✅ 任务 %d 已创建（字段：%s）"
-                 % (task["id"], self.task_store.summarize(task) or "空"), "ok")
+        self.say("✅ 任务 %s 已创建（字段：%s）"
+                 % (self.task_label(task), self.task_store.summarize(task) or "空"), "ok")
         return task
 
     def cmd_task_repeat(self, args, quiet=False):
@@ -3761,22 +3877,22 @@ class Warden(object):
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
-            raise ValueError("用法：task repeat <任务 ID> <周几@HH:MM|off>")
-        task = self.task_store.get(toks[0])
+            raise ValueError("用法：task repeat <任务序号> <周几@HH:MM|off>")
+        task = self.resolve_task(toks[0])
         if len(toks) == 1:
             rep = task.get("repeat")
             if not rep:
-                self.say("任务 %d 不是重复任务。" % task["id"], "info")
+                self.say("任务 %s 不是重复任务。" % self.task_label(task), "info")
             else:
-                self.say("任务 %d 每周 %s %s（%s min；落点 %d 次）"
-                         % (task["id"], rep.get("weekday_label"), rep.get("start"),
+                self.say("任务 %s 每周 %s %s（%s min；落点 %d 次）"
+                         % (self.task_label(task), rep.get("weekday_label"), rep.get("start"),
                             rep.get("duration") or "?", len(rep.get("occurrences") or {})),
                          "info")
             return task
         spec = toks[1].lower()
         if spec in ("off", "none", "clear", "cancel"):
             task = self.task_store.clear_repeat(task["id"])
-            self.say("✅ 任务 %d 的每周重复已取消。" % task["id"], "ok")
+            self.say("✅ 任务 %s 的每周重复已取消。" % self.task_label(task), "ok")
             return task
         parsed = cfg.parse_repeat_spec(toks[1])
         # 锚点：同一天里同一时刻那场 session 的时长（找不到就用 50）
@@ -3791,8 +3907,9 @@ class Warden(object):
         task = self.task_store.set_repeat(task["id"], parsed["weekday_label"],
                                          parsed["start"], duration)
         if not quiet:
-            self.say("✅ 任务 %d 每周 %s %s 重复（锚定 %dmin 那场）"
-                     % (task["id"], parsed["weekday_label"], parsed["start"], duration), "ok")
+            self.say("✅ 任务 %s 每周 %s %s 重复（锚定 %dmin 那场）"
+                     % (self.task_label(task), parsed["weekday_label"],
+                        parsed["start"], duration), "ok")
         return task
 
     def cmd_task_note(self, args):
@@ -3803,36 +3920,38 @@ class Warden(object):
         if not args:
             raise ValueError("用法：task note <任务 ID> <备注文本>（不写文本 = 清空）")
         text = " ".join(str(x) for x in args[1:]).strip()
-        task = self.task_store.set_notes(args[0], text)
-        self.say("✅ 任务 %d 备注%s：%s"
-                 % (task["id"], "已清空" if not text else "",
+        task = self.task_store.set_notes(self.resolve_task(args[0])["id"], text)
+        self.say("✅ 任务 %s 备注%s：%s"
+                 % (self.task_label(task), "已清空" if not text else "",
                     self.task_store.notes(task) or "（空）"), "ok")
         return task
 
     def cmd_task_delete(self, args):
         if not args:
-            raise ValueError("用法：task delete <任务 ID>")
-        task = self.task_store.delete(args[0])
+            raise ValueError("用法：task delete <任务序号>")
+        task = self.task_store.delete(self.resolve_task(args[0])["id"])
         if self.selected_task_id == task["id"]:
             self.selected_task_id = None
-        self.say("✅ 已删除任务 %d：%s" % (task["id"], self.task_store.summarize(task)), "ok")
+        self.say("✅ 已删除任务 %s：%s"
+                 % (self.task_label(task), self.task_store.summarize(task)), "ok")
         return True
 
     def cmd_task_modify(self, args):
         if len(args) < 3:
-            raise ValueError("用法：task modify <任务 ID> <字段> <新值>")
-        task_id, field = args[0], args[1]
+            raise ValueError("用法：task modify <任务序号> <字段> <新值>")
+        task_id, field = self.resolve_task(args[0])["id"], args[1]
         value = " ".join(str(x) for x in args[2:])
         task = self.task_store.modify(task_id, field, value)
-        self.say("✅ 任务 %d.%s = %r" % (task["id"], field, value), "ok")
+        self.say("✅ 任务 %s.%s = %r" % (self.task_label(task), field, value), "ok")
         return task
 
     def cmd_task_select(self, args):
         if not args:
-            raise ValueError("用法：task select <任务 ID>")
-        task = self.task_store.get(args[0])
+            raise ValueError("用法：task select <任务序号>")
+        task = self.resolve_task(args[0])
         self.selected_task_id = task["id"]
-        self.say("已选中任务 %d：%s" % (task["id"], self.task_store.summarize(task)), "cmd")
+        self.say("已选中任务 %s：%s"
+                 % (self.task_label(task), self.task_store.summarize(task)), "cmd")
         return task
 
     def _task_for_assign(self):
@@ -3863,12 +3982,13 @@ class Warden(object):
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
-            raise ValueError("用法：task <任务 ID> duplicate [-a <session ID>]")
-        task = self.task_store.get(toks[0])
+            raise ValueError("用法：task <任务序号> duplicate [-a <session ID>]")
+        task = self.resolve_task(toks[0])
         copy = self.task_store.duplicate(task["id"])
         self.selected_task_id = copy["id"]
-        self.say("✅ 任务 %d「%s」→ 复制成 #%d（同一条 OmniFocus：%s）"
-                 % (task["id"], self.task_store.focusmate_title(task, 40), copy["id"],
+        self.say("✅ 任务 %s「%s」→ 复制成 %s（同一条 OmniFocus：%s）"
+                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
+                    self.task_label(copy),
                     (task.get("omnifocus") or {}).get("id") or "未关联"), "ok")
         return copy
 
@@ -3881,12 +4001,12 @@ class Warden(object):
         local_only = "--local" in toks
         toks = [t for t in toks if t != "--local"]
         if not toks:
-            raise ValueError("用法：task <任务 ID> drop [--local]")
-        task = self.task_store.get(toks[0])
+            raise ValueError("用法：task <任务序号> drop [--local]")
+        task = self.resolve_task(toks[0])
         note = "" if local_only else self.omni_drop(task)
         task = self.task_store.set_status(task["id"], ts.STATUS_DROPPED, reason="cmd-drop")
-        self.say("✗ 任务 %d「%s」已放弃%s"
-                 % (task["id"], self.task_store.focusmate_title(task, 40),
+        self.say("✗ 任务 %s「%s」已放弃%s"
+                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                     ("；" + note) if note else "（只改了本地）"), "ok")
         return task
 
@@ -3897,8 +4017,8 @@ class Warden(object):
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
-            raise ValueError("用法：task <任务 ID> done [实际分钟数]")
-        task = self.task_store.get(toks[0])
+            raise ValueError("用法：task <任务序号> done [实际分钟数]")
+        task = self.resolve_task(toks[0])
         minutes = None
         if len(toks) > 1:
             try:
@@ -3909,8 +4029,8 @@ class Warden(object):
         self.task_store.archive_local(self.task_store.get(task["id"]))
         note_fm = self.fm_complete(task)
         note_of = self.omni_complete(task)
-        self.say("✓ 任务 %d「%s」完成%s%s%s"
-                 % (task["id"], self.task_store.focusmate_title(task, 40),
+        self.say("✓ 任务 %s「%s」完成%s%s%s"
+                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                     ("（%d 分钟）" % minutes) if minutes else "",
                     ("；" + note_fm) if note_fm else "",
                     ("；" + note_of) if note_of else ""), "ok")
@@ -3933,7 +4053,7 @@ class Warden(object):
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
             raise ValueError("用法：task <任务 ID> link [omnifocus:///task/PK | PK]")
-        task_id = toks[0]
+        task_id = self.resolve_task(toks[0])["id"]
         rest = toks[1:]
         auto = not rest
         if auto:
@@ -3952,8 +4072,8 @@ class Warden(object):
             raise ValueError("认不出 OmniFocus 任务 primary key：%r（要 omnifocus:///task/… "
                              "或裸 PK；只有标题的那种粘贴认不出来）" % (" ".join(rest),))
         task = self.task_store.link_omnifocus(task_id, info["id"], title=info.get("title"))
-        self.say("🔗 任务 %d 已关联 OmniFocus %s%s%s"
-                 % (task["id"], info["id"],
+        self.say("🔗 任务 %s 已关联 OmniFocus %s%s%s"
+                 % (self.task_label(task), info["id"],
                     ("「%s」" % info["title"]) if info.get("title") else "",
                     "（链接是从剪贴板读的）" if auto else ""), "ok")
         return task
@@ -4021,20 +4141,20 @@ class Warden(object):
             task = self.task_store.create({"title": title}, omnifocus=omnifocus)
             made.append(task)
             if item.get("id"):
-                self.say("✅ 导入任务 %d「%s」→ OmniFocus %s%s"
-                         % (task["id"], title, item["id"],
+                self.say("✅ 导入任务 %s「%s」→ OmniFocus %s%s"
+                         % (self.task_label(task), title, item["id"],
                             "（链接是从剪贴板读的）" if item.get("from_clipboard") else ""),
                          "ok")
             else:
-                self.say("✅ 导入任务 %d「%s」（只有标题：认不出 OmniFocus primary key，"
-                         "所以**没有关联**）" % (task["id"], title), "warn")
+                self.say("✅ 导入任务 %s「%s」（只有标题：认不出 OmniFocus primary key，"
+                         "所以**没有关联**）" % (self.task_label(task), title), "warn")
                 self.say("   要连上那条 OmniFocus 任务：回 OmniFocus ⌘C 它，"
-                         "再敲 `task %d link`（不带参数就是读剪贴板）。"
-                         % task["id"], "info")
+                         "再敲 `task %s link`（不带参数就是读剪贴板）。"
+                         % self.task_no(task), "info")
         if made:
             self.selected_task_id = made[-1]["id"]
         if made and assign_to:
-            self.cmd_task_assign([str(made[-1]["id"]), assign_to])
+            self._assign_task(made[-1], assign_to)
         return made[-1] if made else None
 
     @staticmethod
@@ -4127,13 +4247,13 @@ class Warden(object):
         sess = task.get("session") or {}
         fm = task.get("focusmate") or {}
         if not sess and not (fm.get("task_id") or fm.get("id")):
-            self.say("任务 %d 本来就没挂 session（也没 Focusmate task），不用下架。"
-                     % task["id"], "info")
+            self.say("任务 %s 本来就没挂 session（也没 Focusmate task），不用下架。"
+                     % self.task_label(task), "info")
             return task
         note = self.fm_delete_task(task)
         task = self.task_store.unassign(task["id"], reason=reason)
-        self.say("⏏ 任务 %d「%s」已从 %s %s 下架%s"
-                 % (task["id"], self.task_store.focusmate_title(task, 40),
+        self.say("⏏ 任务 %s「%s」已从 %s %s 下架%s"
+                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                     sess.get("date") or "（没有日期）", sess.get("start") or "",
                     "；%s" % note if note else ""), "ok")
         return task
@@ -4153,31 +4273,32 @@ class Warden(object):
         """
         toks = [str(a).strip() for a in args if str(a).strip()]
         if len(toks) < 2:
-            raise ValueError("用法：task <任务 ID> swap <任务 ID>")
-        a = self.task_store.get(toks[0])
-        b = self.task_store.get(toks[1])
+            raise ValueError("用法：task <任务序号> swap <任务序号>")
+        a = self.resolve_task(toks[0])
+        b = self.resolve_task(toks[1])
         if a["id"] == b["id"]:
-            raise ValueError("swap 要给两条不同的任务（都写成了 %d）" % a["id"])
+            raise ValueError("swap 要给两条不同的任务（都写成了 %s）"
+                             % self.task_label(a))
         sa = a.get("session") or {}
         sb = b.get("session") or {}
         same = (sa and sb and (sa.get("date"), sa.get("start"))
                 == (sb.get("date"), sb.get("start")))
         if not sa and not sb:
-            self.say("任务 %d 和 %d 都还赋闲（没挂 session）—— 没有位置可换。"
-                     % (a["id"], b["id"]), "warn")
+            self.say("任务 %s 和 %s 都还赋闲（没挂 session）—— 没有位置可换。"
+                     % (self.task_label(a), self.task_label(b)), "warn")
             return [a["id"], b["id"]]
         if same:
-            self.say("任务 %d 和 %d 都在 %s %s，位置本来就一样，不用换。"
-                     % (a["id"], b["id"], sa.get("date") or "?", sa.get("start") or "?"),
-                     "info")
+            self.say("任务 %s 和 %s 都在 %s %s，位置本来就一样，不用换。"
+                     % (self.task_label(a), self.task_label(b),
+                        sa.get("date") or "?", sa.get("start") or "?"), "info")
             return [a["id"], b["id"]]
 
         def where(sess):
             return ("%s %s" % (sess.get("date") or "?", sess.get("start") or "?")
                     if sess else "赋闲")
 
-        self.say("互换位置：任务 %d（%s）↔ 任务 %d（%s）"
-                 % (a["id"], where(sa), b["id"], where(sb)), "cmd")
+        self.say("互换位置：任务 %s（%s）↔ 任务 %s（%s）"
+                 % (self.task_label(a), where(sa), self.task_label(b), where(sb)), "cmd")
         # 1) 两边都先下架：旧场次上那条 Focusmate task 一起删掉，账才干净
         if sa:
             self._task_detach(a, reason="swap")
@@ -4190,22 +4311,26 @@ class Warden(object):
                 continue
             idx, row = self._row_for_session(sess)
             if row is None:
-                self.say("⚠ 任务 %d 原来的位置 %s 不在当前表格里（那天没在显示），"
-                         "所以它现在是赋闲的 —— 切到那天再 `task %d -a <编号>`。"
-                         % (task["id"], where(sess), task["id"]), "warn")
+                self.say("⚠ 任务 %s 原来的位置 %s 不在当前表格里（那天没在显示），"
+                         "所以它现在是赋闲的 —— 切到那天再 `task %s -a <编号>`。"
+                         % (self.task_label(task), where(sess),
+                            self.task_label(task)), "warn")
                 continue
             try:
-                self.cmd_task_assign([str(task["id"]), str(idx)], refresh=False)
+                self._assign_task(task, str(idx), refresh=False)
                 done.append(task["id"])
             except Exception as e:                      # noqa: BLE001 - 一条失败不挡另一条
                 self.had_error = True
-                self.say("❌ 任务 %d 没能挂回 %s：%s" % (task["id"], where(sess), e), "error")
+                self.say("❌ 任务 %s 没能挂回 %s：%s"
+                         % (self.task_label(task), where(sess), e), "error")
         self.rebuild_rows()
         idle_now = [t for t, sess in ((a, sb), (b, sa)) if not sess]
         if done:
-            moved_txt = "、".join("任务 %d → %s" % (tid, where(sa if tid == b["id"] else sb))
-                                  for tid in done)
-            idle_txt = ("；赋闲的：" + "、".join("任务 %d" % t["id"] for t in idle_now)
+            moved_txt = "、".join(
+                "任务 %s → %s" % (self.task_label(b if tid == b["id"] else a),
+                                  where(sa if tid == b["id"] else sb))
+                for tid in done)
+            idle_txt = ("；赋闲的：" + "、".join(self.task_label(t) for t in idle_now)
                         if idle_now else "")
             self.say("✅ 位置已互换：%s%s" % (moved_txt, idle_txt), "ok")
         return [a["id"], b["id"]]
@@ -4232,8 +4357,9 @@ class Warden(object):
             self.say("session #%d（%s）上挂着 %d 条（没给 -a，只看不动）："
                      % (src_idx, where, len(tasks)), "info")
             for task in tasks:
-                self.say("   %d %s%s"
-                         % (task["id"], self.task_store.focusmate_title(task, 40),
+                self.say("   %s %s%s"
+                         % (self.task_label(task),
+                            self.task_store.focusmate_title(task, 40),
                             "" if self.task_store.is_open(task) else "（已收工）"))
             self.say("   全量转移用 `task -s %d -a <目标编号>`；全部下架用 "
                      "`task -s %d -a none`。" % (src_idx, src_idx), "info")
@@ -4257,12 +4383,13 @@ class Warden(object):
                 if kind == "none":
                     moved.append(task["id"])
                     continue
-                self.cmd_task_assign([str(task["id"]), str(tgt_idx)], refresh=False)
+                self._assign_task(task, str(tgt_idx), refresh=False)
                 moved.append(task["id"])
             except Exception as e:                      # noqa: BLE001 - 一条失败不挡其余
                 self.had_error = True
                 failed.append((task["id"], e))
-                self.say("❌ 任务 %d 转移失败：%s" % (task["id"], e), "error")
+                self.say("❌ 任务 %s 转移失败：%s"
+                         % (self.task_label(task), e), "error")
         self.rebuild_rows()
         if not self.offline:
             try:
@@ -4290,11 +4417,26 @@ class Warden(object):
         if not args:
             raise ValueError("用法：task assign <session ID|none|current>（先 task select/create）")
         if len(args) >= 2:
-            task = self.task_store.get(args[0])
+            task = self.resolve_task(args[0])
             session_token = args[1]
         else:
             task = self._task_for_assign()
             session_token = args[0]
+        return self._assign_task(task, session_token, refresh=refresh)
+
+    def _assign_task(self, task, session_token, refresh=True):
+        """把**已经拿到手**的任务挂到某一场（或下架）。内部路径全走这儿。
+
+        ``cmd_task_assign`` 负责「用户敲的那个数 → 任务」，这里负责「任务 → 挂」。
+        分开的原因很实际：内部调用方（swap / 批量转移 / refresh --check 重挂）
+        手里是任务对象，绕回按序号解析会挂错人。
+        """
+        # 手上那份可能是「刚创建 / 刚改完备注之前」的快照，挂之前重读一遍：
+        # Focusmate 那条 task 的标题和 description 要的是**现在**的字段。
+        try:
+            task = self.task_store.get(task.get("id"))
+        except (ValueError, TypeError):
+            pass
         session_idx, row = self._resolve_assign_target(session_token)
         if self._session_kind(session_token) == "current" and row is not None:
             self.say("「当前这一场」= 表格 #%d（%s %s %s）"
@@ -4329,13 +4471,14 @@ class Warden(object):
         moved = bool(prev) and (prev.get("date") != date_iso
                                or prev.get("start") != row.get("startLabel"))
         if moved:
-            self.say("注意：任务 %d 原来挂在 %s %s；本地会改记到这场，Focusmate 上那条旧 task "
+            self.say("注意：任务 %s 原来挂在 %s %s；本地会改记到这场，Focusmate 上那条旧 task "
                      "不会跟着挪（完成时间照样会归档）。"
-                     % (task["id"], prev.get("date"), prev.get("start")), "warn")
+                     % (self.task_label(task), prev.get("date"), prev.get("start")), "warn")
         already = [t for t in self.task_store.tasks_for_session(date_iso, row.get("startLabel"))
                    if t.get("id") != task["id"]]
-        self.say("把任务 %d「%s」挂到 session #%d（%s %s）%s…"
-                 % (task["id"], title, session_idx, date_iso, row.get("startLabel"),
+        self.say("把任务 %s「%s」挂到 session #%d（%s %s）%s…"
+                 % (self.task_label(task), title, session_idx, date_iso,
+                    row.get("startLabel"),
                     "（这场已有 %d 个任务，再去挂一个）" % len(already) if already else ""), "cmd")
         res = self.bridge.call("add_task", timeout=240,
                                startMs=row["startMs"], meetingId=row["id"],
@@ -4368,8 +4511,8 @@ class Warden(object):
         if total > 1:
             extra = "（这场现在共 %d 个任务，表格里会一起列出来）" % total
         via = res.get("via")
-        self.say("✅ 任务 %d 已挂到 session #%d；Focusmate task id=%s%s%s"
-                 % (task["id"], session_idx, res.get("taskId") or "?",
+        self.say("✅ 任务 %s 已挂到 session #%d；Focusmate task id=%s%s%s"
+                 % (self.task_label(task), session_idx, res.get("taskId") or "?",
                     "（via %s）" % via if via else "", extra), "ok")
         return True
 
@@ -4410,8 +4553,8 @@ class Warden(object):
                                        startMs=row["startMs"], meetingId=row["id"],
                                        title=title, notes=str(notes))
                 if not res.get("verified"):
-                    raise ValueError("重复任务 %d 没能挂到 %s %s（Focusmate 没确认）"
-                                     % (task["id"], iso, hit["start"]))
+                    raise ValueError("重复任务 %s 没能挂到 %s %s（Focusmate 没确认）"
+                                     % (self.task_label(task), iso, hit["start"]))
                 focusmate = {"task_id": res.get("taskId"),
                              "session_id": row["id"], "attached_at": ts._now(),
                              "title": title}
@@ -4427,7 +4570,9 @@ class Warden(object):
         if not self.offline:
             try:
                 for task_id, start in self.materialize_repeats():
-                    self.say("🔁 任务 %d 已挂到 %s %s" % (task_id, self.sel_date, start), "ok")
+                    self.say("🔁 任务 %s 已挂到 %s %s"
+                             % (self.task_label(self.task_store.get(task_id)),
+                                self.sel_date, start), "ok")
             except Exception as e:                      # noqa: BLE001
                 self.had_error = True
                 self.say("重复任务挂载失败：%s" % e, "warn")
@@ -4488,8 +4633,13 @@ class Warden(object):
             fields = rec.get("fields") or {}
             title = (fields.get("title") or fields.get("name")
                      or self.task_store._one_line(fields)[:60] or "（空任务）")
+            try:
+                live = self.task_store.get(rec.get("task_id"))
+            except (ValueError, TypeError):
+                live = None
             line = "✅ 完成：任务 %s「%s」· 完成时间 %s · session %s %s" % (
-                rec.get("task_id") or "?", title,
+                self.task_label(live) if live else "id %s" % (rec.get("task_id") or "?"),
+                title,
                 fm.get("completed_at") or "?", sess.get("date") or "?",
                 sess.get("start") or "?")
             note = rec.get("notes") or self.task_store.notes({"fields": fields})
@@ -4663,7 +4813,8 @@ class Warden(object):
             note = self.omni_complete(task)
             if note:
                 done.append((task["id"], note))
-                self.say("↗ 写回 OmniFocus：任务 %d %s" % (task["id"], note), "ok")
+                self.say("↗ 写回 OmniFocus：任务 %s %s"
+                         % (self.task_label(task), note), "ok")
         return done
 
     # -- 收尾用的几个动作（收尾和命令共用同一套，不写两遍）--------------
@@ -4779,6 +4930,8 @@ class Warden(object):
         """收尾流程要「碰外面世界」的那几个口子（其余全在 postsession.Review 里）。"""
         return {
             "say": lambda text, kind="info": self.say(text, kind),
+            # 收尾面板上写的编号必须是**面板序号**（和用户正看着的那块表格一个数）
+            "label": lambda task: self.task_label(task),
             "drop_omnifocus": lambda task: self.omni_drop(task),
             "complete_focusmate": lambda task: self.fm_complete(task),
             "delete_focusmate_task": lambda task: self.fm_delete_task(task),
@@ -4819,7 +4972,8 @@ class Warden(object):
                 self.task_store.set_status(task_id, ts.STATUS_COMPLETED,
                                            at=row.get("completed_at"),
                                            reason="omnifocus-completed")
-                self.say("✓ 任务 %d 在 OmniFocus 里已完成" % task_id, "ok")
+                self.say("✓ 任务 %s 在 OmniFocus 里已完成"
+                         % self.task_label(task), "ok")
         self.writeback_completions()
         return rows
 
@@ -5329,8 +5483,9 @@ class Warden(object):
             except ValueError:
                 continue
             cleared.append(task)
-            self.say("清掉任务 %d「%s」的绑定（原来 %s %s，这一场排布改了）"
-                     % (task.get("id"), self.task_store.summarize(task, max_len=24),
+            self.say("清掉任务 %s「%s」的绑定（原来 %s %s，这一场排布改了）"
+                     % (self.task_label(task),
+                        self.task_store.summarize(task, max_len=24),
                         (task.get("session") or {}).get("date") or period.get("date"),
                         key[0]), "warn")
         return cleared
@@ -5997,8 +6152,9 @@ class Warden(object):
         fixed = 0
         for task, verdict in bad:
             sess = task.get("session") or {}
-            self.say("⚠ 任务 %d「%s」%s（本地记着挂在 %s %s）—— 重挂…"
-                     % (task["id"], self.task_store.focusmate_title(task, 30), verdict,
+            self.say("⚠ 任务 %s「%s」%s（本地记着挂在 %s %s）—— 重挂…"
+                     % (self.task_label(task), self.task_store.focusmate_title(task, 30),
+                        verdict,
                         sess.get("date") or "?", sess.get("start") or "?"), "warn")
             idx, row = self._row_for_session(sess)
             if row is None or row.get("id") is None:
@@ -6006,7 +6162,7 @@ class Warden(object):
                          "warn")
                 continue
             try:
-                self.cmd_task_assign([str(task["id"]), str(idx)], refresh=False)
+                self._assign_task(task, str(idx), refresh=False)
                 fixed += 1
             except Exception as e:                  # noqa: BLE001 - 一条失败不挡其余
                 self.had_error = True

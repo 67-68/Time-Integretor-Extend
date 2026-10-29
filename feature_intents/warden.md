@@ -82,9 +82,9 @@ sync [--days N]     跑 download_calendar.py populate：日历 → 覆盖 data.c
 force-check         忽略重试上限/退避：把所有没订上的 session 各强制重订一次
 refresh / r         全量刷新看板（session + 任务完成状态 + 统计 + 收尾面板 + 各种缓存）
 refresh --check/-c  同上，**再对账一遍**：该订没订上 / 该挂没挂上 → 能修的当场修
-task 8 -an          从它那一场下架（≡ -a none，删掉 Focusmate 那条 task）
-task 8 -ac          挂到当前这一场（≡ -a current）
-task 32 swap 21     两条任务互换位置（一条赋闲也行）
+task 3 -an          从它那一场下架（≡ -a none，删掉 Focusmate 那条 task）
+task 3 -ac          挂到当前这一场（≡ -a current）
+task 3 swap 5       两条任务互换位置（一条赋闲也行）
 task -s 5 -a 6      把 session #5 上的全部任务转移到 #6（-a none = 全部下架）
 start               启动 daemon（先让 bridge 放开浏览器）
 stop                停用 daemon（**要敲宣言**）
@@ -581,8 +581,10 @@ python3 warden.py install-deps
   的排最前，之后一场 session 一段（按开始时间）、段内按任务 ID 升序，同类的挨在一起
   （详见 `task.md`）。
 - `task` 入口长出四个位置动作：`-an`（下架）/ `-ac`（当前这一场）/
-  `32 swap 21`（互换位置）/ `-s 5 -a 6`（整场转移）；紧凑写法由 repl_kit 的
+  `3 swap 5`（互换位置）/ `-s 5 -a 6`（整场转移）；紧凑写法由 repl_kit 的
   `ShortFlag` 统一展开，补全和提示都跟着走。
+- 任务命令里的数字是**序号 = 面板上的第几条**（1 起、连续、随 refresh/收工重排），
+  不是内部 id；面板上没有的任务用 `id:N` 显式指定（详见 `task.md`）。
 - `refresh --check`（`-c`）：重拉 + 对账（该订没订上 → 叫 daemon 补；该挂没挂上 →
   重挂），所以「本地账本说挂上了、Focusmate 上其实没有」这种半截状态能被自己发现。
   不带 `--check` 的 `refresh` 也已经是**全量**刷新（见上面那节），只是不动外面东西。

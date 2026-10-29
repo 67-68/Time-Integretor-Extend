@@ -148,6 +148,13 @@ def mkwarden():
     return w.Warden(console, FakeBridge(), no_clear=True, offline=True)
 
 
+def tno(wd_, task):
+    """这条任务在**面板上**是第几条 —— 命令里要敲的就是这个数（不是内部 id）。"""
+    no = wd_.task_no(task)
+    assert no, "任务 %r 不在 %s 的面板上" % ((task or {}).get("id"), wd_.sel_date)
+    return no
+
+
 print("== 时段排布：T1 50 50；后续行时段列留空 ==")
 wd = mkwarden()
 check("session T1 50 50 受理", wd.handle("session T1 50 50"), True)
@@ -268,54 +275,62 @@ check("归档里有 session", arch[0]["session"]["focusmate_session_id"], "sess-
 check("归档里有 Focusmate 完成时间", arch[0]["focusmate"]["completed_at"],
       "2026-10-26T12:00:00Z")
 
-print("== 裸 ID 等价 select：task 8 ≡ task select 8，task 8 -a 1 ==")
-check("task create 77 显式 ID", wd.handle("task create 77 title=裸ID"), True)
-check("task 77 受理（裸 ID）", wd.handle("task 77"), True)
-check("裸 ID 真的选中了任务 77", wd.selected_task_id, 77)
+print("== 裸序号等价 select：task 3 ≡ task select 3，task 3 -a 1 ==")
+check("task create 77 title=裸号", wd.handle("task create title=裸号"), True)
+bare = [t for t in wd.task_store.list()
+        if (t.get("fields") or {}).get("title") == "裸号"][0]
+bare_no = tno(wd, bare)
+check("task <序号> 受理（裸序号 = select）", wd.handle("task %d" % bare_no), True)
+check("裸序号真的选中了那条", wd.selected_task_id, bare["id"])
 check_true("说的还是 select 那套话",
-           any("已选中任务 77" in m[2] for m in wd.messages))
-check("task select 77 照样能用", wd.handle("task select 77"), True)
+           any("已选中任务 #%d" % bare_no in m[2] for m in wd.messages))
+check("task select <序号> 照样能用",
+      wd.handle("task select %d" % bare_no), True)
 
 row1200 = [r for r in wd.rows if r["startLabel"] == "12:00"][0]
 idx1200 = wd.rows.index(row1200) + 1
 wd.bridge.calls = []
-check("task 77 -a N：选中 + 挂上一步到位",
-      wd.handle("task 77 -a %d" % idx1200), True)
-check("真的挂到那一场了", wd.task_store.get(77)["session"]["start"], "12:00")
+check("task <序号> -a N：选中 + 挂上一步到位",
+      wd.handle("task %d -a %d" % (bare_no, idx1200)), True)
+check("真的挂到那一场了",
+      wd.task_store.get(bare["id"])["session"]["start"], "12:00")
 check("bridge 只调了一次 add_task",
       len([c for c in wd.bridge.calls if c[0] == "add_task"]), 1)
-check("选中状态落在 77 上", wd.selected_task_id, 77)
+check("选中状态落在它身上", wd.selected_task_id, bare["id"])
 
-check("task 77 -n 也能用",
-      wd.handle("task 77 -n 材料在这 https://example.com/bare"), True)
-check("备注写进去了", wd.task_store.notes(wd.task_store.get(77)),
+check("task <序号> -n 也能用",
+      wd.handle("task %d -n 材料在这 https://example.com/bare" % bare_no), True)
+check("备注写进去了", wd.task_store.notes(wd.task_store.get(bare["id"])),
       "材料在这 https://example.com/bare")
 
-check("裸 ID 后面再跟东西 → 受理但报错",
-      wd.handle("task 77 %d" % idx1200), True)
+check("裸序号后面再跟东西 → 受理但报错",
+      wd.handle("task %d %d" % (bare_no, idx1200)), True)
 check_true("提示改用 -a/--assign",
            any("要挂到 session 用 -a/--assign" in m[2] for m in wd.messages))
-check("报错时没改任何绑定", wd.task_store.get(77)["session"]["start"], "12:00")
+check("报错时没改任何绑定",
+      wd.task_store.get(bare["id"])["session"]["start"], "12:00")
 
-check("不存在的裸 ID → 受理但报错", wd.handle("task 999"), True)
-check_true("说任务 999 没有",
-           any("没有任务 999" in m[2] for m in wd.messages))
+check("不存在的序号 → 受理但报错", wd.handle("task 999"), True)
+check_true("说清面板上只有 1..N，没有 999",
+           any("没有 #999" in m[2] and "面板上现在只有" in m[2] for m in wd.messages))
 
 check("未知动作 → 受理但报错", wd.handle("task 装死"), True)
-check_true("错误提示里也提一句裸 ID",
-           any("task 8 ≡ task select 8" in m[2] for m in wd.messages))
-wd.handle("task delete 77")
-check("收尾把 77 删掉", [t for t in wd.task_store.list() if t["id"] == 77], [])
+check_true("错误提示里也提一句裸序号",
+           any("task select" in m[2] for m in wd.messages))
+wd.handle("task delete %d" % tno(wd, wd.task_store.get(bare["id"])))
+check("收尾把那条删掉",
+      [t for t in wd.task_store.list() if t["id"] == bare["id"]], [])
 
 wd.rebuild_rows()
 # task sync 之后这条任务就算「完成」了（Focusmate 的 completedAt）→ 前面带 ✓
+_paper_no = tno(wd, wd.task_store.get(5))
 check("表格 task 列是「状态记号 + 编号: 标题」",
       [r.get("task_text") for r in wd.rows if r["startLabel"] == "11:00"][0],
-      "✓5: 论文")
+      "✓%d: 论文" % _paper_no)
 
 print("== 契约视图：task 列「编号: 标题」+ 下面那块两列任务表格 ==")
 row1100 = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
-check("task 列带任务编号", row1100["task_text"], "✓5: 论文")
+check("task 列带任务编号", row1100["task_text"], "✓%d: 论文" % _paper_no)
 # 同一场两个任务 → 用 | 分隔；新加的那条还没收工 → 记号是 ·
 wd.handle("task create title=第二条 --assign %d" % (wd.rows.index(row1100) + 1))
 row1100 = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
@@ -379,7 +394,8 @@ check("没 assign 的是亮蓝（深色背景上 dark_blue 等于隐形，用户
       (str(num_f.style), str(title_f.style)), (w.STYLE_ACTIVE, w.STYLE_ACTIVE))
 check("已完成染绿", str(wd._task_index_cells(wd.task_store.get(5), None)[1].style),
       w.STYLE_DONE)
-check("编号列显示任务 ID", str(num_a), str(task_assigned["id"]))
+check("编号列显示的是**面板序号**（不是内部 id）",
+      str(num_a), str(tno(wd, task_assigned)))
 # 状态记号：完成 ✓ / 进行中 ·（表格里「什么都没有」曾经分不清是哪种）
 done_task = wd.task_store.get(5)
 num_d, title_d = wd._task_index_cells(done_task, None)
@@ -451,7 +467,8 @@ check("同一天同一场只留一条痕迹（后一次覆盖前一次）",
 wd.day_offset = 0
 
 print("== 备注：task note / note= 收敛成 notes ==")
-wd.handle("task note 5 材料在这 https://example.com/set3")
+wd.handle("task note %d 材料在这 https://example.com/set3"
+          % tno(wd, wd.task_store.get(5)))
 check("task note 写进 notes", wd.task_store.get(5)["fields"]["notes"],
       "材料在这 https://example.com/set3")
 wd.handle("task create title=带备注 note=https://example.com/b")
@@ -514,7 +531,9 @@ ft_id = wd.task_store.get(done_task)["focusmate"]["task_id"]
 wd.bridge.completed[ft_id] = "2026-10-27T12:50:00Z"
 wd.messages = []
 wd.cmd_task_sync(quiet=True)
-check_true("Recent 里报了完成", any("完成：任务 %d" % done_task in m[2] for m in wd.messages))
+check_true("Recent 里报了完成（编号是面板序号）",
+           any("完成：任务 #%d" % tno(wd, wd.task_store.get(done_task)) in m[2]
+               for m in wd.messages))
 check_true("Recent 里带备注", any("https://example.com/done" in m[2] for m in wd.messages))
 arch = wd.task_store.load_archive()["records"]
 check("归档记录里有 notes", [r["notes"] for r in arch if r["task_id"] == done_task],
@@ -563,16 +582,25 @@ check_true("消息里说了这场已有几个任务",
 
 print("== 任务改挂到别的场次：会提醒，旧 task 的完成时间也不丢 ==")
 wd.messages = []
-check("task select 5", wd.handle("task select 5"), True)
-check("把 5 改挂到另一场", wd.handle("task assign %d" % idx1200), True)
+check("task select <序号>", wd.handle("task select %d" % tno(wd, wd.task_store.get(5))), True)
+check("把它改挂到另一场", wd.handle("task assign %d" % idx1200), True)
 check_true("提醒旧场次那条 task 不会跟着挪",
            any("不会跟着挪" in m[2] for m in wd.messages))
 check("旧场次已记进 previous_session/focusmate",
       wd.task_store.get(5)["session"]["start"], "12:00")
 
+# 不在今天面板上的（昨天/前天处理过的）走 `id:N` 显式按内部 id 删
 for t in list(wd.task_store.list()):
-    wd.handle("task delete %d" % t["id"])
-check("task delete", wd.task_store.list(), [])
+    wd.handle("task delete id:%d" % t["id"])
+check("task delete（id:N 显式按内部 id 也能删）", wd.task_store.list(), [])
+wd.handle("task create title=甲")
+wd.handle("task create title=乙")
+wd.handle("task delete 1")
+check("task delete 按面板序号删（删完序号重排，剩下的变成 #1）",
+      [(t["fields"]["title"], tno(wd, t)) for t in wd.task_store.list()], [("乙", 1)])
+for t in list(wd.task_store.list()):
+    wd.handle("task delete id:%d" % t["id"])
+check("清干净", wd.task_store.list(), [])
 
 
 # ---------------------------------------------------------------- 剪贴板导入
@@ -812,6 +840,9 @@ _shell = wd4.shell
 check("task 后面能 Tab 到紧凑写法",
       [c for c in _shell.complete("task ") if c.startswith("-")],
       ["-an", "-ac", "--assign", "-a", "--note", "-n", "--from", "-s"])
+check("task 后面 Tab 补的是**面板序号**（1..N 连续，不是内部 id）",
+      [c for c in _shell.complete("task ") if c.isdigit()],
+      [str(i) for i in range(1, len(wd4.task_panel_order()) + 1)])
 check("敲了 -a 之后 Tab 补的是紧凑写法",
       [c for c in _shell.complete("task -a") if c.startswith("-") and c != "-a"],
       ["-an", "-ac"])
@@ -1026,6 +1057,64 @@ check("task -s 后面再跟动作 → 受理但报错",
 check_true("提示 -s 是批量后缀", any("批量后缀" in m[2] for m in wd3.messages))
 check("报错时没动任何东西", wd3.bridge.calls, [])
 
+print("== 序号：面板上的第几条，从 1 到 N 连续（不是内部 id）==")
+wd6 = fresh_warden()
+for _ in range(5):
+    wd6.handle("task create title=序号用")
+nums = sorted(wd6.task_no(t) for t in wd6.task_store.list())
+check("五条任务的序号正好是 1..5（内部 id 早就跳到几十了，也没关系）", nums, [1, 2, 3, 4, 5])
+check("序号跟「面板顺序」是同一份口径",
+      [wd6.task_no(t) for t in wd6.task_panel_order()], [1, 2, 3, 4, 5])
+check("内部 id 确实已经不是 1..5 了（证明这两套数不是一回事）",
+      [t["id"] for t in wd6.task_panel_order()] != [1, 2, 3, 4, 5], True)
+
+# 删掉中间那条 → 后面的往前顶，还是 1..N 连续
+victim = wd6.task_panel_order()[1]
+wd6.handle("task delete %d" % wd6.task_no(victim))
+check("删掉 #2 之后，剩下的还是 1..4 连续",
+      sorted(wd6.task_no(t) for t in wd6.task_store.list()), [1, 2, 3, 4])
+check("被删的那条真的没了",
+      [t for t in wd6.task_store.list() if t["id"] == victim["id"]], [])
+
+# 序号直接进命令：`task 2 drop`
+target = wd6.task_panel_order()[1]
+wd6.handle("task 2 drop")
+check("task 2 drop 动的是「面板第 2 条」",
+      ts.TaskStore.status_of(wd6.task_store.get(target["id"])), "dropped")
+check("放弃之后它挪到「放弃」那一段（序号还是重排过的 1..N）",
+      wd6.task_no(wd6.task_store.get(target["id"])),
+      len(wd6.task_panel_order()))
+
+# 面板外的任务：数字超过 N 时按内部 id 认，并明说一句
+off = wd6.task_store.create({"title": "面板外的"})
+# 很久以前就放弃掉了 → 今天面板上不该有它（status_at 也得挪到那天，别用「现在」）
+wd6.task_store.mark_processed(off["id"], "2020-01-01", "09:00", "drop")
+wd6.task_store.set_status(off["id"], ts.STATUS_DROPPED, at="2020-01-01T09:10:00")
+check("它不在今天面板上", wd6.task_no(wd6.task_store.get(off["id"])), None)
+wd6.messages = []
+check("内部 id 当序号敲 → 受理（并说明是按 id 认的）",
+      wd6.handle("task note %d 面板外的备注" % off["id"]), True)
+check_true("说清是按内部 id 认的",
+           any("按内部 id 认" in m[2] for m in wd6.messages))
+check("备注也确实写到了那条上",
+      wd6.task_store.get(off["id"])["fields"]["notes"], "面板外的备注")
+
+# 显式写法：id:N 永远指内部 id（面板上有同号也照 id 走）
+first = wd6.task_panel_order()[0]
+wd6.messages = []
+check("id:N 写法受理", wd6.handle("task note id:%d 显式备注" % first["id"]), True)
+check("id:N 也认动作写在后面（task id:N done）",
+      wd6.handle("task id:%d done" % wd6.task_store.create({"title": "临时"})["id"]), True)
+check("id:N 写到了这一条上",
+      wd6.task_store.get(first["id"])["fields"]["notes"], "显式备注")
+check_true("id:N 不会再提示「按内部 id 认」（本来就是明说的）",
+           not any("按内部 id 认" in m[2] for m in wd6.messages))
+
+# 任务视图（视图 4）里两列都在：序号 + 内部 id
+_view4 = [v for v in w.VIEWS if v.key == "4"][0](wd6).render()[0]
+check("任务视图有「序号」列", [str(c.header) for c in _view4.columns][:2],
+      ["序号", "id"])
+
 print("== 任务面板排序：先状态分段（进行中/完成/放弃），段内按位置连号 ==")
 wd3 = fresh_warden()
 idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
@@ -1107,13 +1196,15 @@ _panel = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()[1]
 _cols, _rows = wd3.task_index_layout(wd3.task_panel_order())
 wd3.frame_width = _real_width
 _lines = panel_numbers(_panel)
+_want = list(range(1, len(wd3.task_panel_order()) + 1))   # 面板序号就是 1..N
 check("一行里有好几对（160 列摊开了）", max(len(x) for x in _lines) > 1, True)
-check("第一行 = 排序后的前几对（按列填的话这里会是第 1、%d、%d 条，正是「序号很乱」）"
-      % (_cols + 1, _cols * 2 + 1),
-      _lines[0], [t["id"] for t in wd3.task_panel_order()][:_cols])
-check("把行连起来读 = task_panel_order() 的顺序（一行一行填，不是一列一列填）",
-      [n for line in _lines for n in line],
-      [t["id"] for t in wd3.task_panel_order()])
+check("第一行 = 序号 1..%d（按列填的话这里会是第 1、%d、%d 条，正是「序号很乱」）"
+      % (_cols, _cols + 1, _cols * 2 + 1),
+      _lines[0], _want[:_cols])
+check("把行连起来读 = 1..N（一行一行填，不是一列一列填）",
+      [n for line in _lines for n in line], _want)
+check("序号是连续的 1..N，没有跳号",
+      sorted(n for line in _lines for n in line), _want)
 check("行数 = ceil(条数 / 并排的对数)", len(_lines), _rows)
 
 print("== refresh：把屏幕上每块组件的状态都重新对一遍（只读外面世界）==")
