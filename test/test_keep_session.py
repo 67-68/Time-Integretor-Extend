@@ -176,23 +176,28 @@ check("没有实际场次 → 照常下单", len(BOOKED), 1)
 
 print("== 已经过去的场次：实际覆盖了就别记「没做」==")
 clear()
-API.extend([
-    {"start": _start - datetime.timedelta(hours=3), "duration": 25, "id": "p1"},
-    {"start": _start - datetime.timedelta(hours=3) + datetime.timedelta(minutes=30),
-     "duration": 50, "id": "p2"},
-])
-past_start = _start - datetime.timedelta(hours=3) + datetime.timedelta(minutes=15)
-past_key = sch.key_of(past_start.date(), past_start.strftime("%H:%M"))
-write_csv(["# t", "%s,%s,75" % (sch.weekday_of_day(past_start.date()),
-                                past_start.strftime("%H:%M"))])
-_now = datetime.datetime.now()
-_orig_now = None
-ks.WINDOW_HOURS = 24
-ks.run_once()
-# 那场已经开始了 → 进 past 分支（只对账）
-slots = ks.load_state()["slots"]
-check("过去的场次被认账成 booked", (slots.get(past_key) or {}).get("status"), "booked")
-check("没记「没做」的罪", ks.load_sins().get("sins", []), [])
+_past_start = _start - datetime.timedelta(hours=3) + datetime.timedelta(minutes=15)
+if _past_start.date() != datetime.date.today():
+    # daemon 的一轮只看「今天起」的契约行（窗口从 now 开始，不回头）。刚过零点时
+    # `_start - 3h` 会落到昨天，这一节就**造不出**「今天、已经过去」的一行，
+    # 断言会假红 —— 与其改成另一件事，不如明说跳过。
+    print("skip 现在离零点太近（past_start=%s 已经是昨天），这一节跳过" % _past_start)
+else:
+    API.extend([
+        {"start": _start - datetime.timedelta(hours=3), "duration": 25, "id": "p1"},
+        {"start": _start - datetime.timedelta(hours=3) + datetime.timedelta(minutes=30),
+         "duration": 50, "id": "p2"},
+    ])
+    past_start = _past_start
+    past_key = sch.key_of(past_start.date(), past_start.strftime("%H:%M"))
+    write_csv(["# t", "%s,%s,75" % (sch.weekday_of_day(past_start.date()),
+                                    past_start.strftime("%H:%M"))])
+    ks.WINDOW_HOURS = 24
+    ks.run_once()
+    # 那场已经开始了 → 进 past 分支（只对账）
+    slots = ks.load_state()["slots"]
+    check("过去的场次被认账成 booked", (slots.get(past_key) or {}).get("status"), "booked")
+    check("没记「没做」的罪", ks.load_sins().get("sins", []), [])
 
 
 # ---------------------------------------------------------------- 热重载

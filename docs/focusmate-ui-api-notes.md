@@ -60,6 +60,14 @@ PROFILE_DIR=/tmp/fm-profile node test/probe_xxx.mjs   # 写落到 /tmp
 >
 > 出错截图现在**只是诊断附件**：写不进去（沙箱 EPERM）只记日志，绝不再盖掉真正的报错；
 > 首选目录不可写会自动退到 `<tmp>/focusmate-mcp/screenshots`。
+>
+> **2026-10-30 补**：node 侧（`scripts/_lib.mjs`、`bridge.mjs`、四个 CLI 脚本）
+> 以前自己拼 profile 路径（`FOCUSMATE_CONFIG_DIR || ~/.focusmate-mcp`），而 warden
+> 起 bridge 时不传那个变量 —— 于是 daemon 用工作区 profile、bridge 用老位置那个
+> 9 月的 profile，TUI 每条命令都「未登录」。现在解析只有一份：
+> `scripts/mcp_home.mjs`（优先级同 `main.py`，且**只有真带着 `browser-data/Default`
+> 的目录才会被选中**，不会凭空造一个没登录的新 profile）。桥的 `{"cmd":"where"}`
+> 随时能问出「现在读的是哪个、怎么选出来的」。
 
 ### 1.3 静/动态两条腿
 

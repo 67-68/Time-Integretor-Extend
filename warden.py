@@ -250,6 +250,8 @@ import omnifocus as of  # noqa: E402  OmniFocus：链接解析 + 读写（osascr
 import postsession as psv  # noqa: E402  session 结束 15s 后的收尾（纯逻辑）
 
 BRIDGE_JS = os.path.join(HERE, "scripts", "bridge.mjs")
+#: bridge 的 stderr（`_lib` 的 die()/log 都落这儿）—— 报错信息里直接指过去。
+BRIDGE_LOG = os.path.join(TEMP, "warden-bridge.log")
 
 # 罪案区的全局锁：有未认罪的 sin 时，除了宣言什么都不受理。
 # 上限只影响一轮循环里反复敲错的次数（敲错就继续鸣笛、继续锁）。
@@ -436,6 +438,55 @@ class BridgeError(RuntimeError):
     pass
 
 
+#: 桥的「话」→ 人该干什么。认得出的才翻，认不出原样放过去（别猜）。
+_AUTH_HINTS = ("未登录", "登录态", "Firebase token", "token 已过期", "重新登录", "AUTH_REQUIRED")
+
+
+def explain_bridge_error(msg, profile=""):
+    """把 bridge 回来的错翻成「下一步做什么」。
+
+    踩过：登录态失效时前端只显示「内部调用了 process.exit(1)，已转成命令级失败」
+    —— bridge 侧现在会把 `die()` 的真话拼在 `｜` 后面，这里再补上动作和
+    profile（多 profile 时「读的是哪个」比错本身更关键）。
+    """
+    text = (msg or "").strip() or "未知错误"
+    if any(k in text for k in _AUTH_HINTS):
+        # 桥自己已经把「先跑 --auth」和 profile 写进话里了就别重复，只说漏的那句
+        if "--auth" not in text:
+            text += "　　下一步：`python3 main.py --auth` 重新登录一次"
+        if profile and profile not in text:
+            text += "（桥读的 profile：%s）" % profile
+        return text
+    if "process.exit(" in text and "｜" not in text:
+        return text + "（bridge 的 die() 不走响应帧；真话在 %s）" % BRIDGE_LOG
+    return text
+
+
+#: 进程级缓存：Focusmate 运行目录（bridge 子进程和 daemon 必须同一个）。
+_FOCUSMATE_HOME = ""
+_FOCUSMATE_HOME_TRIED = False
+
+
+def focusmate_home():
+    """和 main.py / daemon 用**同一个**运行目录。
+
+    踩过：bridge 没传 FOCUSMATE_CONFIG_DIR，`scripts/_lib.mjs` 就退回
+    `~/.focusmate-mcp`（9 月的老 profile、登录态早过期），而 daemon 用工作区的
+    `temp/focusmate-home`。结果 daemon 一切正常、TUI 每条命令都「未登录」。
+    """
+    global _FOCUSMATE_HOME, _FOCUSMATE_HOME_TRIED
+    if _FOCUSMATE_HOME or _FOCUSMATE_HOME_TRIED:
+        return _FOCUSMATE_HOME
+    _FOCUSMATE_HOME_TRIED = True  # 失败也只试一次：这函数会被每帧的表头叫到
+    try:
+        import main as mainmod  # 只为了它那份「运行目录」逻辑，不启动任何东西
+        home = mainmod.ensure_mcp_home()
+    except Exception:
+        home = ""
+    _FOCUSMATE_HOME = home or ""
+    return _FOCUSMATE_HOME
+
+
 class Bridge(object):
     """scripts/bridge.mjs 的客户端：起进程、发命令、收响应。
 
@@ -454,7 +505,9 @@ class Bridge(object):
         self.next_id = 1
         self.events = []
         self.fatal = None
-        self.stderr_path = os.path.join(TEMP, "warden-bridge.log")
+        self.stderr_path = BRIDGE_LOG
+        #: 桥自己报上来的 profile 目录（ready / ping 里带回来的），报错时告诉人
+        self.profile = ""
         self.last_idle_close = None
         # 命令是串行的（bridge 侧一条条跑），所以这边也上锁：
         # 收尾的后台核对线程和主线程可能同时说话，协议是「一问一答」的，
@@ -463,16 +516,30 @@ class Bridge(object):
 
     # -- 生命周期
 
-    def start(self):
-        if self.proc and self.proc.poll() is None:
-            return
+    def _child_env(self):
+        """给 bridge 子进程的环境。
+
+        **必须**把运行目录传下去：不传的话 `scripts/_lib.mjs` 会按自己的优先级
+        猜，而它以前猜的是老位置 `~/.focusmate-mcp` —— 那儿的登录态早过期了。
+        表现是 daemon 一切正常、TUI 每条命令都「未登录」（真踩过，见
+        `focusmate_home()` 的注释）。
+        """
         env = dict(os.environ)
         if self.headed:
             env["WARDEN_BRIDGE_HEADED"] = "1"
         if self.idle_ms is not None:
             env["WARDEN_BRIDGE_IDLE_MS"] = str(self.idle_ms)
+        home = focusmate_home()
+        if home:
+            env["FOCUSMATE_CONFIG_DIR"] = home
         if self.profile_dir:
             env["FOCUSMATE_PROFILE_DIR"] = self.profile_dir
+        return env
+
+    def start(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        env = self._child_env()
         os.makedirs(TEMP, exist_ok=True)
         self.errf = open(self.stderr_path, "a")
         self.proc = subprocess.Popen(
@@ -548,6 +615,8 @@ class Bridge(object):
                     self.last_idle_close = time.time()
                 if f["event"] == "fatal":
                     self.fatal = f.get("error")
+                if f.get("profileDir"):
+                    self.profile = f["profileDir"]
             else:
                 kept.append(f)
         for f in kept:
@@ -597,6 +666,10 @@ class Bridge(object):
                 self.events.append(f)
                 if f["event"] == "idle-closed":
                     self.last_idle_close = time.time()
+                if f["event"] == "fatal":
+                    self.fatal = f.get("error")
+                if f.get("profileDir"):
+                    self.profile = f["profileDir"]
                 if f["event"] == "eof":
                     raise BridgeError("bridge 的 stdout 关了（看 %s）" % self.stderr_path)
                 continue
@@ -604,8 +677,12 @@ class Bridge(object):
                 # 不该发生（命令是串行的），但别把响应丢了
                 continue
             if not f.get("ok"):
-                raise BridgeError(f.get("error") or "未知错误")
-            return f.get("result") or {}
+                raise BridgeError(
+                    explain_bridge_error(f.get("error"), self.profile or self.profile_dir or ""))
+            r = f.get("result") or {}
+            if r.get("profileDir"):
+                self.profile = r["profileDir"]
+            return r
 
     def browser_state(self):
         """(bridge 活着?, 浏览器开着?) —— 用 ping，但不启动浏览器。"""
@@ -2873,6 +2950,16 @@ class Warden(object):
         else:
             bridge_cell = Text("○ DOWN", style="bold red")
             bridge_cell.append("  " + (err or "还没起（第一次命令会自动起）"), style="dim")
+        # 桥读的 profile 和 daemon 的不是一个 → 一律红字点名。这条静默地错过一次：
+        # 登录态只在工作区那个 profile 里，桥去读老的 ~/.focusmate-mcp，每条命令
+        # 都「未登录」，而表头还写着 READY/IDLE 看着一切正常。
+        seen = getattr(self.bridge, "profile", "") or ""
+        want = focusmate_home()
+        if seen and want:
+            want_profile = os.path.join(want, "browser-data")
+            if os.path.abspath(seen) != os.path.abspath(want_profile):
+                bridge_cell.append("\n⚠ profile 不是 daemon 那个：%s" % seen,
+                                   style="bold red")
         if self.bridge_note:
             bridge_cell.append("\n" + self.bridge_note, style="yellow")
 

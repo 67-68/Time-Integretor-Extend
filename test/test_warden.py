@@ -174,6 +174,8 @@ class FakeBridge(object):
         self.replies = replies or {}
         self.last_idle_close = None
         self.browser = False
+        #: 桥自己报上来的 profile（真 Bridge 在 __init__ 里有；表头会读它）
+        self.profile = ""
 
     def call(self, cmd, timeout=240, **kw):
         self.calls.append((cmd, kw))
@@ -1098,6 +1100,77 @@ check("一行 \\x1b[Z 认作 Shift+Tab（切专注模式）", wd.handle("\x1b[Z"
 check("shift-tab 文字写法也认", wd.handle("shift-tab"), True)
 check("普通一行照常执行（不返回 False）", wd.handle("day 0"), True)
 check("quit 仍然返回 False", wd.handle("quit"), False)
+
+# ---------------------------------------------------------------- bridge 读哪个 profile
+#
+# 事故：warden 起 bridge 时没传 FOCUSMATE_CONFIG_DIR，`scripts/_lib.mjs` 就退回
+# 老位置 ~/.focusmate-mcp（9 月的 profile，登录态早过期），而 daemon 用的是工作区
+# 的 temp/focusmate-home。于是 daemon 一切正常、TUI 每条命令都「未登录」，界面
+# 上还只显示一句「内部调用了 process.exit(1)，已转成命令级错误」。
+w.BRIDGE_LOG = os.path.join(TMP, "warden-bridge.log")
+
+check_true("运行目录非空（main.py 解析出来的那个）", w.focusmate_home())
+check_true("运行目录是个绝对路径", os.path.isabs(w.focusmate_home()))
+check("两次调用结果一样（进程级缓存，表头每帧都会问）",
+      w.focusmate_home(), w.focusmate_home())
+
+env = w.Bridge(None)._child_env()
+check("子进程 env 带着 FOCUSMATE_CONFIG_DIR", env.get("FOCUSMATE_CONFIG_DIR"),
+      w.focusmate_home())
+check("子进程 env 里没有 FOCUSMATE_PROFILE_DIR（没点名就不硬塞）",
+      "FOCUSMATE_PROFILE_DIR" in env, False)
+env2 = w.Bridge(None, profile_dir="/tmp/some-profile")._child_env()
+check("--profile-dir 会传给子进程", env2.get("FOCUSMATE_PROFILE_DIR"), "/tmp/some-profile")
+check("换成点名 profile 时运行目录照样传", env2.get("FOCUSMATE_CONFIG_DIR"),
+      w.focusmate_home())
+
+# 桥回的错要翻成「下一步做什么」，别再只给一句 process.exit 噪音
+check("登录态错的翻译：带上动作和 profile",
+      w.explain_bridge_error("未登录（页面跳到了 /login）。", "/p/browser-data"),
+      "未登录（页面跳到了 /login）。　　下一步：`python3 main.py --auth` 重新登录一次"
+      "（桥读的 profile：/p/browser-data）")
+check("桥自己已经说过 --auth 就不重复，只补 profile",
+      w.explain_bridge_error("未登录。先跑 `python3 main.py --auth` 登录一次。", "/p"),
+      "未登录。先跑 `python3 main.py --auth` 登录一次。（桥读的 profile：/p）")
+check("话里已经有这个 profile 就不再加一遍",
+      w.explain_bridge_error("未登录。先跑 `python3 main.py --auth`。profile=/p", "/p"),
+      "未登录。先跑 `python3 main.py --auth`。profile=/p")
+check("只有 process.exit 噪音时指到日志文件",
+      w.explain_bridge_error("内部调用了 process.exit(1)，已转成命令级失败"),
+      "内部调用了 process.exit(1)，已转成命令级失败"
+      "（bridge 的 die() 不走响应帧；真话在 %s）" % w.BRIDGE_LOG)
+check("认不出的错原样放过（不猜、不硬套话术）",
+      w.explain_bridge_error("找不到 startMs=1 的 session"), "找不到 startMs=1 的 session")
+check("空错误也给个说法", w.explain_bridge_error(""), "未知错误")
+
+# 表头：桥读的 profile 和 daemon 的不是一个 → 红字点名（别在登录态失效时还写着 READY）
+
+
+def header_text(bridge_profile, daemon_home):
+    """用假 bridge 画一遍表头，返回纯文本。"""
+    wd2 = mkwarden()
+    fb = FakeBridge()
+    fb.profile = bridge_profile
+    fb.browser_state = lambda: (True, True, "")
+    wd2.bridge = fb
+    old = w.focusmate_home
+    w.focusmate_home = lambda: daemon_home          # 别去摸真目录
+    try:
+        buf = io.StringIO()
+        wd2.console = Console(file=buf, width=200, force_terminal=False)
+        wd2.console.print(wd2.render_header())
+        return plain(buf.getvalue())
+    finally:
+        w.focusmate_home = old
+
+
+txt = header_text("/elsewhere/browser-data", "/work/temp/focusmate-home")
+check_true("profile 对不上时表头红字点名", "profile 不是 daemon 那个" in txt)
+check_true("点名里带着桥真正读的路径", "/elsewhere/browser-data" in txt)
+check("对得上时不出这行",
+      "profile 不是 daemon 那个" in header_text(
+          "/work/temp/focusmate-home/browser-data", "/work/temp/focusmate-home"),
+      False)
 
 shutil.rmtree(TMP, ignore_errors=True)
 

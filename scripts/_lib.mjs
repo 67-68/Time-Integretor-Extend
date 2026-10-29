@@ -11,11 +11,10 @@
  * - 所有请求都在页面上下文里 fetch，指纹 = 官方前端。
  */
 import { createRequire } from "module";
-import os from "os";
 import path from "path";
+import { REPO_ROOT, resolveProfile } from "./mcp_home.mjs";
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
-const REPO_ROOT = path.resolve(__dirname, "..");
 
 // ---------------------------------------------------------------- playwright
 
@@ -47,10 +46,20 @@ export const { chromium } = loadPlaywright();
 export const API_BASE = "https://api.focusmate.com/v1";
 export const APP_URL = "https://app.focusmate.com";
 
-export const CONFIG_DIR =
-  process.env.FOCUSMATE_CONFIG_DIR || path.join(os.homedir(), ".focusmate-mcp");
-export const PROFILE_DIR =
-  process.env.FOCUSMATE_PROFILE_DIR || path.join(CONFIG_DIR, "browser-data");
+// 运行目录 / profile 的解析只有一份实现（scripts/mcp_home.mjs）：
+// 老代码这里写死 `FOCUSMATE_CONFIG_DIR || ~/.focusmate-mcp`，而 warden 起
+// bridge 时不传那个变量 —— 于是 daemon 用工作区 profile、bridge 用 9 月的老
+// profile，每条命令都「未登录」。见那个文件的头注释。
+const _home = resolveProfile();
+export const CONFIG_DIR = _home.home;
+export const PROFILE_DIR = _home.profileDir;
+/** 这个 profile 是怎么选出来的（env:profile / workspace / legacy …），报错时带上。 */
+export const PROFILE_SOURCE = _home.source;
+
+/** 一句话说清「用的是哪个 profile、怎么来的」—— 所有 die() 都带它。 */
+export function describeProfile() {
+  return `profile=${PROFILE_DIR}（${PROFILE_SOURCE}）`;
+}
 
 /** session 面板里 "My Task" 的活动类型（实测枚举）。 */
 export const ACTIVITY_TYPES = { 100: "Anything", 200: "Desk", 400: "Moving" };
@@ -176,14 +185,17 @@ export async function openSession({ headless = true, viewport } = {}) {
     await page.goto(`${APP_URL}/dashboard`, { waitUntil: "domcontentloaded" });
   } catch (e) {
     await ctx.close().catch(() => {});
-    die(`打不开 Focusmate：${e.message}（网络？或 profile 被别的进程占用？）`);
+    die(`打不开 Focusmate：${e.message}（网络？或 profile 被别的进程占用？${describeProfile()}）`);
   }
   // Firebase 有长连接，networkidle 等不到；给 SPA 渲染 + 刷新 token 的时间
   await page.waitForTimeout(7000);
 
   if (page.url().includes("/login")) {
     await ctx.close().catch(() => {});
-    die("未登录。先跑 `python3 main.py --auth`（或 focusmate_auth）登录一次。");
+    die(
+      `未登录（页面跳到了 /login）。先跑 \`python3 main.py --auth\` 登录一次；` +
+        `要是那边登录过还这样，就是 profile 选错了：${describeProfile()}`
+    );
   }
   return { ctx, page };
 }
@@ -236,8 +248,9 @@ export async function getToken(page, { attempts = 3 } = {}) {
     await page.waitForTimeout(5000);
   }
   const tok = await readToken(page);
-  if (!tok) die("拿不到 Firebase token：profile 里没有登录态，先跑一次登录。");
-  if (jwtExpMs(tok) <= Date.now()) die("token 已过期且自动刷新失败，请重新登录一次。");
+  if (!tok) die(`拿不到 Firebase token：profile 里没有登录态，先跑一次登录。${describeProfile()}`);
+  if (jwtExpMs(tok) <= Date.now())
+    die(`token 已过期且自动刷新失败，请重新登录一次。${describeProfile()}`);
   return tok;
 }
 

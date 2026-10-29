@@ -233,11 +233,19 @@ check("但状态框还在", "┏━━ 状态" in out, True)
 
 print("== edit-tomorrow：今天可以先安排明天 ==")
 wd = mkwarden()
-tomorrow = TODAY + datetime.timedelta(days=1)
 now = datetime.datetime.now()
-# 造一场「明天但现在就在 24 小时窗口里」的 session：明天 00:15
-start = datetime.datetime.combine(tomorrow, datetime.time(0, 15))
-check("明天 00:15 本来在执行区（24h 窗口内）",
+# 造一场「明天、而且现在就在 24 小时窗口里」的 session。
+# 以前写死「明天 00:15」：离 now 是 24h10m，**过了午夜就落到窗口外**，于是每天
+# 00:00–00:15 这一节必红（用例自己没错，是 fixture 卡在窗口边界上）。现在取
+# 「now+1h」；那要是还在今天，就退到明天 00:00 —— 最远正好是 now+24h，
+# 而 zone_name 的窗口是闭区间（`start <= now + 24h`），必在窗口内。
+start = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+if start.date() == now.date():
+    start = datetime.datetime.combine(now.date() + datetime.timedelta(days=1),
+                                      datetime.time(0, 0))
+tomorrow = start.date()
+hhmm = start.strftime("%H:%M")
+check("明天 %s 本来在执行区（24h 窗口内）" % hhmm,
       sch.zone_name(start, now), "locked")
 check("edit-tomorrow 开着 → 明天按草稿区算",
       wd.effective_zone(sch.zone_name(start, now), tomorrow), "draft")
@@ -249,8 +257,8 @@ check("今天不受影响", wd.effective_zone("locked", TODAY), "locked")
 check("过去的日子不受影响",
       wd.effective_zone("locked", TODAY - datetime.timedelta(days=1)), "locked")
 
-# 真实行：明天 00:15 的契约，草稿区 → cancel 不用敲宣言
-write_csv(["# test", "%s,00:15,25" % tomorrow.isoformat()])
+# 真实行：明天那一场（hhmm）的契约，草稿区 → cancel 不用敲宣言
+write_csv(["# test", "%s,%s,25" % (tomorrow.isoformat(), hhmm)])
 wd = mkwarden()
 wd.reload_entries()
 wd.api_rows = []
@@ -266,7 +274,7 @@ try:
 finally:
     __import__("builtins").input = builtins_input
 check("草稿区取消：直接成功、不用宣言", ok, True)
-check("data.csv 那行没了", "00:15" not in sch.read_text(), True)
+check("data.csv 那行没了", hhmm not in sch.read_text(), True)
 
 shutil.rmtree(TMP, ignore_errors=True)
 

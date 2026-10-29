@@ -59,6 +59,32 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
 项目原本提的五个概念里，**Panic Action 按用户要求不实现** ——「一键强行触发倒计时」
 会绕过 daemon 的节奏和契约窗口，且和取消的阻力设计自相矛盾。
 
+## 桥读的 profile 必须和 daemon 是同一个
+
+TUI 的浏览器活儿全在 `scripts/bridge.mjs` 里干，daemon 在 `keep_session.py` 里干，
+两边共用一个 Chromium profile。**同一个**这两个字是有代价的：真踩过一次
+「daemon 一切正常、TUI 每条命令都『未登录』」，原因是
+
+- daemon：`main.py` 早早把 `FOCUSMATE_CONFIG_DIR` 指到工作区 `temp/focusmate-home`
+  （登录态第一次也迁过去了）；
+- bridge：`warden.py` 起它时**只**在显式 `--profile-dir` 时才传变量，于是
+  `scripts/_lib.mjs` 退回自己拼的默认值 `~/.focusmate-mcp` —— 9 月的老 profile。
+
+界面表现是「拉列表失败：内部调用了 process.exit(1)，已转成命令级失败」：
+`_lib` 的 `die()` 是 `console.error` + `process.exit`，被 bridge 转成异常后真因全丢了。
+
+现在三件事钉住它：
+
+| 位置 | 做法 |
+|---|---|
+| `scripts/mcp_home.mjs` | profile 解析**只有这一份**（优先级同 `main.py`；只认**真带着** `browser-data/Default` 的目录，免得凭空造一个没登录的新 profile） |
+| `warden.py` `Bridge._child_env()` | 子进程一律带 `FOCUSMATE_CONFIG_DIR=focusmate_home()`（就是 `main.ensure_mcp_home()` 那个） |
+| `bridge.mjs` | stderr 捞进环形缓冲，失败时把最后一条 `[ERROR]` 拼进 `error`；登录态类失败缓存 60s，不再每次都冷启动浏览器空转 |
+
+看板上还有两道可见的保险：表头 Bridge 那行在「桥读的 profile ≠ daemon 的」时红字点名；
+`{"cmd":"where"}`（bridge 协议）不启动浏览器就能问出「现在读哪个、怎么选出来的」。
+报错文案也会补上下一步动作（`python3 main.py --auth`）和桥实际读的 profile 路径。
+
 ## 命令
 
 ```

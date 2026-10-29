@@ -34,8 +34,14 @@ ping / snapshot / title / mute / cancel / tasks / add_task / complete_task / rel
 
 ## 前置
 
-1. **已登录**：`~/.focusmate-mcp/browser-data` 里有登录态。
-   没登录就先 `python3 main.py --auth`。
+1. **已登录**：profile 里有登录态。没登录就先 `python3 main.py --auth`。
+   profile 在哪儿**不要自己拼路径**，统一看 `scripts/mcp_home.mjs`：
+   `FOCUSMATE_PROFILE_DIR` > `FOCUSMATE_CONFIG_DIR` / `FOCUSMATE_MCP_HOME` >
+   工作区 `temp/focusmate-home` > 老位置 `~/.focusmate-mcp`（都带 profile 才用）。
+   和 `main.py` / daemon 是同一条优先级 —— 以前 node 侧写死「env 或
+   `~/.focusmate-mcp`」，于是 daemon 用工作区 profile、bridge 用 9 月的老 profile，
+   TUI 每条命令都「未登录」，而界面只显示一句「内部调用了 process.exit(1)」。
+   想知道当前读的是哪个：`{"cmd":"where"}`（见下），或看 warden 表头那行红字。
 2. **别和 daemon / MCP 并发跑**：它们共用同一个 Chromium profile，会抢锁。
    （跑之前 `python3 keep_session.py daemon stop`，或者接受偶发失败。）
 3. `playwright` 能解析到（优先用 `temp/focusmate-mcp/node_modules`，兜底全局）。
@@ -128,6 +134,7 @@ stdout   {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 | cmd | 参数 | 说明 |
 |---|---|---|
 | `ping` | — | 探活（不启动浏览器） |
+| `where` | — | 用的哪个 profile / 怎么选出来的 / 上次登录态失败是什么（也不启动浏览器） |
 | `snapshot` | `date?` | 列某天（默认今天）的 session |
 | `title` | `startMs` `meetingId?` `title` | 改标题 |
 | `mute` | `startMs` `meetingId?` `quiet` | 开/关 quiet mode |
@@ -141,7 +148,13 @@ stdout   {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 > 这个坑踩过一次，`Bridge.call()` 现在见到 `id` 直接抛错。
 
 环境变量：`WARDEN_BRIDGE_IDLE_MS`（空闲多少 ms 放开浏览器，默认 120000，0=不放开）、
-`WARDEN_BRIDGE_HEADED=1`（有头）、`FOCUSMATE_PROFILE_DIR`（profile 目录）。
+`WARDEN_BRIDGE_HEADED=1`（有头）、`FOCUSMATE_CONFIG_DIR`（运行目录，和
+`main.py`/daemon 同一个）、`FOCUSMATE_PROFILE_DIR`（点名 profile，压过运行目录）。
+
+失败时响应里除了 `error` 还有 `detail`：**`die()` 的真因**（`_lib` 是
+`console.error` + `process.exit`，转成异常以后只剩「内部调用了 process.exit(1)」，
+所以桥把 stderr 捞进环形缓冲，把最后一条 `[ERROR]` 行拼回 `error`）。
+登录态类失败还会缓存 60s，期间后续命令直接回同一句话，不再冷启动 Chromium 空转。
 
 ---
 

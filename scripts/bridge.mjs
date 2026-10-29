@@ -52,10 +52,18 @@
  *    空闲 IDLE_MS（默认 120s）就把浏览器关掉、释放锁，下次命令再冷启动。
  *
  * 环境变量：
- *   FOCUSMATE_PROFILE_DIR     profile 目录（默认 ~/.focusmate-mcp/browser-data）
+ *   FOCUSMATE_CONFIG_DIR      运行目录（和 main.py / daemon 同一个；不传就按
+ *                             scripts/mcp_home.mjs 的优先级自己找，见那里头注释）
+ *   FOCUSMATE_PROFILE_DIR     profile 目录（点名，压过上面那个）
  *   WARDEN_BRIDGE_IDLE_MS     空闲关浏览器的毫秒数，0 = 永不关
  *   WARDEN_BRIDGE_HEADED      1 = 有头模式（看操作过程 / 调试）
  *   PLAYWRIGHT_MODULE         playwright 模块路径（_lib 用）
+ *
+ * 6. **`die()` 的真话要捡回来**：`_lib` 的 `die()` 先 `console.error` 再
+ *    `process.exit`，转成异常以后只剩「内部调用了 process.exit(1)」这一句，
+ *    真因（「未登录。先跑 --auth」）全在 stderr 里 —— 前端看到的等于没线索。
+ *    所以这里把 stderr/stdout 都捞进环形缓冲，失败时把最后一条 `[ERROR]` 行
+ *    拼进响应：`{"error": "...｜未登录（页面跳到了 /login）…", "detail": "..."}`。
  *
  * 退出码：0 正常 / 1 fatal（playwright 装不上等）
  */
@@ -67,8 +75,51 @@ import { attachTaskViaApi, completeTaskViaApi } from "./task_attach.mjs";
 
 // 真正的 stdout 句柄，只有 send() 能用
 const realOut = process.stdout.write.bind(process.stdout);
+const realErr = process.stderr.write.bind(process.stderr);
+
+// die() 的真话都在 stderr 上（console.error / warn / log），而 process.exit
+// 一抛就只剩一句「内部调用了 process.exit(1)」。所以两边都抄一份进环形缓冲，
+// 失败时把最后一条 [ERROR] 行拼回响应 —— 否则排查全靠去翻日志文件。
+const LIBLOG_MAX = 120;
+const libLog = [];
+function remember(chunk) {
+  try {
+    for (const line of String(chunk).split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      libLog.push(s);
+      if (libLog.length > LIBLOG_MAX) libLog.shift();
+    }
+  } catch {
+    /* 记日志本身失败不许影响命令 */
+  }
+}
 // 之后所有 console.log / process.stdout.write（含 _lib 的 log）都改道 stderr
-process.stdout.write = (chunk, enc, cb) => process.stderr.write(chunk, enc, cb);
+process.stdout.write = (chunk, enc, cb) => {
+  remember(chunk);
+  return realErr(chunk, enc, cb);
+};
+process.stderr.write = (chunk, enc, cb) => {
+  remember(chunk);
+  return realErr(chunk, enc, cb);
+};
+
+/** 最后一条像「原因」的行：优先 [ERROR]，没有就空着。 */
+function libDetail() {
+  for (let i = libLog.length - 1; i >= 0; i--) {
+    if (libLog[i].includes("[ERROR]")) {
+      return libLog[i].replace(/^\[focusmate\](\[ERROR\])?\s*/, "").trim();
+    }
+  }
+  return "";
+}
+
+/** 这句错是不是「登录态没了」——决定要不要缓存住，别把浏览器空转 20 遍。 */
+function isAuthError(text) {
+  return /未登录|登录态|Firebase token|token 已过期|重新登录|\/login|AUTH_REQUIRED/.test(
+    String(text || "")
+  );
+}
 
 function send(obj) {
   realOut(JSON.stringify(obj) + "\n");
@@ -416,10 +467,27 @@ const handlers = {
       pid: process.pid,
       browser: browserUp(),
       tokenExp: token ? jwtExpMs(token) : 0,
+      home: lib.CONFIG_DIR,
       profileDir: lib.PROFILE_DIR,
+      profileSource: lib.PROFILE_SOURCE,
       headless: HEADLESS,
       idleMs: IDLE_MS,
       uptimeMs: Date.now() - startedAt,
+    };
+  },
+
+  /** 「你到底在读哪个 profile」—— 排查登录态/多 profile 的第一句（不开浏览器）。 */
+  async where() {
+    const p = await handlers.ping();
+    return {
+      home: p.home,
+      profileDir: p.profileDir,
+      profileSource: p.profileSource,
+      browser: p.browser,
+      tokenExp: p.tokenExp,
+      tokenLive: !!p.tokenExp && p.tokenExp > Date.now(),
+      lastAuthError: lastAuth ? { at: lastAuth.at, error: lastAuth.error } : null,
+      logTail: libLog.slice(-8),
     };
   },
 
@@ -648,20 +716,66 @@ const handlers = {
 
 const queue = { p: Promise.resolve() };
 
+/**
+ * 登录态刚失败过：短时间内的后续命令**直接回同一句话**，不再冷启动 Chromium。
+ *
+ * 踩过：profile 选错时每条命令都要花 15s 开浏览器 → 进 /login → die()，
+ * TUI 里连敲十来下就是十来次白等，日志里刷出 20 条一模一样的「未登录」。
+ * 登录态不可能在 60s 内自己好，所以这 60s 里直接告诉人「先 --auth」。
+ */
+const AUTH_COOLDOWN_MS = 60000;
+let lastAuth = null;
+//: 这些命令本身就是在查救护信息 / 收尾，不该被冷却挡住。
+const BYPASS_COOLDOWN = new Set(["ping", "where", "release", "shutdown"]);
+
 function handle(req) {
   queue.p = queue.p.then(async () => {
     const id = req && req.id !== undefined ? req.id : null;
     const cmd = req && req.cmd;
     const t0 = Date.now();
     inCommand = true;
+    libLog.length = 0; // 这一条命令的日志，别混上一条的
     try {
+      if (!BYPASS_COOLDOWN.has(cmd) && lastAuth && Date.now() - lastAuth.at < AUTH_COOLDOWN_MS) {
+        const left = Math.ceil((AUTH_COOLDOWN_MS - (Date.now() - lastAuth.at)) / 1000);
+        send({
+          id,
+          ok: false,
+          cmd,
+          ms: 0,
+          error: lastAuth.error + `（刚失败过，${left}s 内不再开浏览器重试）`,
+          detail: `刚失败过，${left}s 内不再开浏览器重试`,
+          cached: true,
+        });
+        return;
+      }
       const fn = handlers[cmd];
       if (!fn) throw new Error("未知命令：" + JSON.stringify(cmd));
       const result = await fn(req);
+      lastAuth = null; // 有命令成功了，登录态至少目前是活的
       send({ id, ok: true, cmd, ms: Date.now() - t0, result });
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
-      send({ id, ok: false, cmd, ms: Date.now() - t0, error: msg });
+      // die() 转成异常以后只剩「内部调用了 process.exit(1)」，真因在 stderr。
+      // 有真因就**替掉**那句噪音，别让前端同时读两句废话。
+      const detail = libDetail();
+      const noise = /^内部调用了 process\.exit\(/.test(msg);
+      let error = msg;
+      if (detail && !msg.includes(detail)) error = noise ? detail : msg + "｜" + detail;
+      if (isAuthError(error)) {
+        lastAuth = { at: Date.now(), cmd, error };
+        // 这个浏览器已经是登录页了，留着只会继续误导下一条命令
+        await closeBrowser("auth-failed").catch(() => {});
+      }
+      send({
+        id,
+        ok: false,
+        cmd,
+        ms: Date.now() - t0,
+        error,
+        detail,
+        exitCode: (e && e.__libExit) || 0,
+      });
     } finally {
       inCommand = false;
       resetIdle();
@@ -713,7 +827,9 @@ resetIdle();
 send({
   event: "ready",
   pid: process.pid,
+  home: lib.CONFIG_DIR,
   profileDir: lib.PROFILE_DIR,
+  profileSource: lib.PROFILE_SOURCE,
   headless: HEADLESS,
   idleMs: IDLE_MS,
   idleAutoClose: IDLE_MS > 0,
