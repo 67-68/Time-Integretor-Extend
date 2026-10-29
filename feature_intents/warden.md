@@ -558,8 +558,9 @@ python3 warden.py install-deps
   那几场永远补不回来。详见 `session_plan.md`。
 - 第五个视图 `设置 / 规则` + `set <id> <value>`；`edit-tomorrow` 让「明天」临时按
   草稿区处理（`Warden.effective_zone`），`tomorrow-plan` 是「明日时间安排」的规格。
-- 契约表格下面那块任务面板**按位置分组**：`未挂 session` 永远第一组，之后每场
-  session 一组（按开始时间）、组内按任务 ID 升序（详见 `task.md`）。
+- 契约表格下面那块任务面板**按位置连号排**（还是原来那一张表，不拆）：`未挂 session`
+  的排最前，之后一场 session 一段（按开始时间）、段内按任务 ID 升序，同类的挨在一起
+  （详见 `task.md`）。
 - `task` 入口长出四个位置动作：`-an`（下架）/ `-ac`（当前这一场）/
   `32 swap 21`（互换位置）/ `-s 5 -a 6`（整场转移）；紧凑写法由 repl_kit 的
   `ShortFlag` 统一展开，补全和提示都跟着走。

@@ -324,38 +324,12 @@ check_true("两条任务用 | 分开且都带状态记号",
 check_true("标题长的那条被 trim 了（带 …）或本来就不长",
            "…" in row1100["task_text"] or len(row1100["task_text"]) < 40)
 
-def panel_tables(renderable):
-    """任务面板 → 里面那几张（分组的）表。
-
-    面板现在是「一行表头 + 每组一张小表」（需求：按位置分组、未挂 session 在最前），
-    所以断言要落到「组」这一层，而不是一张大表。
-    """
-    kids = getattr(renderable, "renderables", None) or [renderable]
-    return [r for r in kids if hasattr(r, "columns")]
-
-
-def panel_texts(renderable):
-    """面板里那些纯文本行（表头 + 每个组的组名）。"""
-    kids = getattr(renderable, "renderables", None) or [renderable]
-    return [str(k) for k in kids if not hasattr(k, "columns")]
-
-
-def panel_head(renderable):
-    """面板最上面那两行（图例 + 账目）。"""
-    return " ".join(panel_texts(renderable)[:2])
-
-
 contract = [v for v in w.VIEWS if v.key == "1"][0](wd)
 parts = contract.render()
 check("契约视图先给契约表格、再给任务面板（收尾面板在打断栏位里）", len(parts), 2)
-check_true("第二块是任务面板", "Task · 任务" in panel_head(parts[1]))
-_panel_tables = panel_tables(parts[1])
-check_true("任务面板里至少有一张表（未挂 session 那一组）", len(_panel_tables) >= 1)
-check("每组表里是 number/task 一对一对的",
-      [len(t.columns) % 2 for t in _panel_tables], [0] * len(_panel_tables))
-check("表头按对数重复（每组都一样）",
-      sorted({tuple(str(c.header) for c in t.columns) for t in _panel_tables}),
-      sorted({tuple(["number", "task"] * (len(t.columns) // 2)) for t in _panel_tables}))
+check_true("第二块就是那张任务面板（一张表，不拆）", hasattr(parts[1], "columns"))
+check_true("任务面板标题里写了记号图例", "Task · 任务" in str(parts[1].title))
+check("面板里是 number/task 一对一对的", len(parts[1].columns) % 2, 0)
 
 print("== 任务面板：屏幕够宽就摊成 3 / 4 列（不再固定两列）==")
 # 列数只跟「终端有多宽」和「标题最长有多长」有关，所以把宽度显式喂进去。
@@ -386,9 +360,8 @@ wd.frame_width = lambda: 160
 _wide_cols = wd.task_index_layout(wd.task_panel_tasks() or _many, width=160)[0]
 _wide_panel = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
 wd.frame_width = _real_width
-wide_table = panel_tables(_wide_panel)[0]
-check_true("160 列 → 组里的表至少摊成 2 列（每列 2 个 column）",
-           len(wide_table.columns) >= 2 and len(wide_table.columns) % 2 == 0)
+wide_table = _wide_panel
+check("160 列 → 表里的 column 数 = 2 * 列数", len(wide_table.columns), 2 * _wide_cols)
 check("列数还是偶数（number/task 一对一对的）", len(wide_table.columns) % 2, 0)
 
 # 染色：已挂到 session 的 = 红，没挂的 = 深蓝
@@ -415,12 +388,12 @@ check("完成的染绿", str(num_d.style), "green")
 check("进行中的打 ·", str(title_f).startswith("·"), True)
 check("task_mark：进行中 = ·", wd.task_mark(task_free), "·")
 check("task_mark：完成 = ✓", wd.task_mark(done_task), "✓")
-index_panel = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
-check_true("任务面板表头写了记号图例", "✓ 完成" in panel_head(index_panel))
-check_true("表头有一行账（几条进行中/完成/放弃）",
-           "%d 条：" % len(wd.task_panel_tasks()) in panel_head(index_panel))
-check_true("表头写清这块面板的口径（今天 = 没做完的 + 今天处理过的）",
-           "今天处理过的" in panel_head(index_panel))
+index_table = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+check_true("任务面板标题里写了记号图例", "✓ 完成" in str(index_table.title))
+check_true("表尾有一行账（几条进行中/完成/放弃）",
+           "%d 条：" % len(wd.task_panel_tasks()) in str(index_table.caption))
+check_true("表尾写清这块面板的口径（今天 = 没做完的 + 今天处理过的）",
+           "今天处理过的" in str(index_table.caption))
 
 print("== 任务面板按天：今天 = 没做完的 + 今天处理过的；过去那天固化 ==")
 today_iso = TODAY.isoformat()
@@ -459,8 +432,8 @@ check("昨天面板固化：只剩那天处理过的", a_id in yday_ids, True)
 check("跳过的也算那天处理过（问过它、你说先放着）", d_id in yday_ids, True)
 check("昨天面板上今天还开着、昨天没碰过的不出现", b_id in yday_ids, False)
 _past = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
-check_true("过去那天的表头写清「固化」口径", "过去就固化" in panel_head(_past))
-check_true("过去那天的表头带日期", yday_iso in panel_head(_past))
+check_true("过去那天的表尾写清「固化」口径", "过去就固化" in str(_past.caption))
+check_true("过去那天的表尾带日期", yday_iso in str(_past.caption))
 
 wd.day_offset = -2
 before_ids = [t["id"] for t in wd.task_panel_tasks()]
@@ -1053,7 +1026,7 @@ check("task -s 后面再跟动作 → 受理但报错",
 check_true("提示 -s 是批量后缀", any("批量后缀" in m[2] for m in wd3.messages))
 check("报错时没动任何东西", wd3.bridge.calls, [])
 
-print("== 任务面板：按位置分组，未挂 session 的在最前面 ==")
+print("== 任务面板：按位置连号排（未挂 session 最前），还是一张表 ==")
 wd3 = fresh_warden()
 idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
 idx12 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "12:00"][0]
@@ -1062,35 +1035,38 @@ early_b = mk("早场乙", idx11)
 early_a = mk("早场甲", idx11)
 idle_x = mk("赋闲甲")
 idle_y = mk("赋闲乙")
-groups = wd3.task_panel_groups()
-check("第一组永远是「未挂 session」", groups[0][0], "未挂 session")
-check("未挂那一组里就是那两条赋闲的",
-      [t["id"] for t in groups[0][1]], [idle_x["id"], idle_y["id"]])
-check("第二组是 11:00 那一场（按时间先后，不是按创建顺序）",
-      groups[1][0].startswith("11:00–11:50"), True)
-check("组名带时长", groups[1][0], "11:00–11:50 · 50min")
-check("第三组是 12:00", groups[2][0].startswith("12:00–12:50"), True)
-check("组内按任务 ID 升序（不是按挂上去的先后）",
-      [t["id"] for t in groups[1][1]], sorted([early_a["id"], early_b["id"]]))
-check("收工的任务仍回它自己那一组（不在单独的分组里）",
+order = wd3.task_panel_order()
+check("未挂 session 的排在最前面",
+      [t["id"] for t in order[:2]], [idle_x["id"], idle_y["id"]])
+check("接着是 11:00 那场的两条（按时间先后，不是按创建顺序）",
+      [t["id"] for t in order[2:4]], sorted([early_a["id"], early_b["id"]]))
+check("最后是 12:00 那场", [t["id"] for t in order[4:]], [late["id"]])
+check("同一场的那几条挨在一起（连号，不是 32、15 混着）",
+      [(t.get("session") or {}).get("start") for t in order],
+      [None, None, "11:00", "11:00", "12:00"])
+check("排序不改变「面板里有哪几条」这份口径",
+      sorted(t["id"] for t in order), sorted(t["id"] for t in wd3.task_panel_tasks()))
+check("收工的任务仍跟着它自己那一场走（不单独挪到最后）",
       (wd3.task_store.drop(early_b["id"], reason="test") and
-       [t["id"] for t in wd3.task_panel_groups()[1][1]]),
+       [t["id"] for t in wd3.task_panel_order()[2:4]]),
       sorted([early_a["id"], early_b["id"]]))
-check("面板分组和「按天取哪些任务」是同一份口径",
-      sum(len(group) for _l, group in wd3.task_panel_groups()),
-      len(wd3.task_panel_tasks()))
 
+# 渲染里真的按这个顺序摆：把列数钉成 1 列，读出来的顺序就该等于 task_panel_order()
+_orig_layout = wd3.task_index_layout
+wd3.task_index_layout = lambda tasks, width=None: (1, len(tasks))
 _panel = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()[1]
-_tables = panel_tables(_panel)
-_labels = panel_texts(_panel)[2:]          # 前两行是图例 + 总账，之后每组一行组名
-check("每组一张表", len(_tables), 3)
-check("每组也各有一行组名", len(_labels), 3)
-check("组名按顺序出现（未挂 session 在最前）",
-      [_labels[0].strip().startswith("未挂 session"),
-       _labels[1].strip().startswith("11:00"),
-       _labels[2].strip().startswith("12:00")], [True, True, True])
-check("组名带这一组几条", _labels[0].strip(), "未挂 session · 2")
-check("表头仍是 number/task 一对", len(_tables[0].columns) % 2, 0)
+_buf = io.StringIO()
+w.Console(file=_buf, width=80, highlight=False, color_system=None).print(_panel)
+wd3.task_index_layout = _orig_layout
+check_true("面板还是那一张表（不是拆成好几张）", hasattr(_panel, "columns"))
+check("还是 number/task 一对一对的", len(_panel.columns) % 2, 0)
+check_true("标题里仍是图例（没被组名顶掉）", "Task · 任务" in str(_panel.title))
+check_true("表尾仍是账目", "%d 条：" % len(wd3.task_panel_order()) in str(_panel.caption))
+_text = _buf.getvalue()
+_titles = [t["fields"]["title"] for t in wd3.task_panel_order()]
+check("单列渲染时，表里的顺序就是 task_panel_order() 的顺序（排序真的进了渲染）",
+      sorted(range(len(_titles)), key=lambda i: _text.index(_titles[i])),
+      list(range(len(_titles))))
 
 print("== refresh --check：对账（该订的 session / 该挂的 task）==")
 wd3 = fresh_warden()

@@ -2075,63 +2075,30 @@ class Warden(object):
                 touched.append(task)
         return open_tasks + touched
 
-    def task_panel_groups(self, day=None):
-        """任务面板的**分组 + 排序** → ``[(组名, [任务…]), …]``。
+    def task_panel_order(self, day=None):
+        """任务面板的**排序** —— 一张表，但按位置连号排。
 
         需求：「每次 refresh 之后重排序，不然看着一大堆 32、15 的 task 混杂」+
-        「同类任务放一起，未挂 session 的 group 放最前面」。
+        「同类任务放一起，未挂 session 的放最前面」。
 
-        分组口径只有一个 —— **位置**（也就是那一场 session）：
-          * ``未挂 session``            ← 永远排第一组（还没安排的活先看见）
-          * ``11:00–11:50 · 50min``     ← 每场 session 一组，按开始时间先后
-        组内按任务 ID 升序：同一个位置上的几条任务彼此是「一起干」的，编号顺序
-        最好认（也最稳定 —— 不会因为一次 refresh 就换位置）。
-        已收工（✓/✗）的任务回它自己那一组，不单独成组：那场干成了什么，就在那场里看。
+        口径只有一个 —— **位置**（也就是那一场 session）：
+
+          * 未挂 session 的排在最前（还没安排的活先看见）；
+          * 其余按 session 的时间先后聚成段，同一场的那几条挨在一起；
+          * 段内按任务 ID 升序：同一场上的几条是「一起干」的，编号顺序最好认，
+            也最稳定（不会因为一次 refresh 就换位置）。
+
+        这是**排序**不是**拆表**：面板还是那一张表，只是同类的连号排在一起。
+        已收工（✓/✗）的任务跟着它自己那一场走，不单独挪到后面。
         """
-        day = day or self.sel_date
-        tasks = self.task_panel_tasks(day)
-        idle = []
-        buckets = {}
-        order = []
-        for task in tasks:
+        def key(task):
             sess = task.get("session") or {}
             if not sess:
-                idle.append(task)
-                continue
-            key = (sess.get("date") or "", sess.get("start") or "")
-            if key not in buckets:
-                buckets[key] = []
-                order.append(key)
-            buckets[key].append(task)
-        groups = []
-        if idle:
-            groups.append(("未挂 session", sorted(idle, key=lambda t: t.get("id") or 0)))
-        for key in sorted(order):
-            groups.append((self._session_group_label(key, day),
-                           sorted(buckets[key], key=lambda t: t.get("id") or 0)))
-        return groups
+                return (0, "", "", task.get("id") or 0)
+            return (1, sess.get("date") or "", sess.get("start") or "",
+                    task.get("id") or 0)
 
-    def _session_group_label(self, key, day=None):
-        """``("2026-08-15", "11:00")`` → ``11:00–11:50 · 50min``（别的日期带上日期）。
-
-        终点/时长去表格行里找同一场（表格行的 endLabel/durationMin 是权威的）；
-        找不到就只报开始时间 —— 不猜。
-        """
-        iso, start = key
-        for row in self.rows:
-            if (row.get("date") or "") == iso and row.get("startLabel") == start:
-                end = row.get("endLabel")
-                dur = row.get("durationMin")
-                label = "%s–%s" % (start, end) if end else start
-                if dur:
-                    label += " · %dmin" % dur
-                break
-        else:
-            label = start
-        today = (day or self.sel_date).isoformat()
-        if iso and iso != today:
-            label = "%s %s" % (iso, label)
-        return label
+        return sorted(self.task_panel_tasks(day), key=key)
 
     def task_index_title(self, task):
         """任务面板里那一格的字：记号 + （🔁）+ 裁过的标题。"""
@@ -2163,20 +2130,33 @@ class Warden(object):
         return cols, rows
 
     def render_task_index(self):
-        """契约视图里那块「任务面板」：**按位置分组**，组内编号+任务并排。
+        """契约视图里那块「任务面板」：编号+任务 并排，列数看屏幕宽度。
 
-        内容按天决定（见 :meth:`task_panel_tasks`），顺序按位置（见
-        :meth:`task_panel_groups`）：未挂 session 的一组在最前，其余每场 session
-        一组，按时间先后。每组自己摊列（屏幕够宽就 3/4 列）—— 组小的时候不至于
-        为了对齐别人的宽度而空出一大片。
-        配色见文件头那段「配色」。
+        内容按天决定（见 :meth:`task_panel_tasks`）：今天 = 没做完的 + 今天处理过的，
+        过去那天 = 只有那天处理过的。**顺序**按位置（见 :meth:`task_panel_order`）：
+        未挂 session 的排最前，之后一场 session 一段，段内按编号 —— 还是这一张表，
+        只是同类的连号挨在一起，不再是一堆 32、15 混着。配色见文件头那段「配色」。
         """
-        groups = self.task_panel_groups()
-        if not groups:
+        tasks = self.task_panel_order()
+        if not tasks:
             return None
-        tasks = [task for _label, group in groups for task in group]
-        out = []
-        # 表头一行：图例 + 总账。分组之后每组一个标题，图例就只写一次。
+        cols, rows = self.task_index_layout(tasks)
+        columns = [tasks[i * rows:(i + 1) * rows] for i in range(cols)]
+        t = Table(title="Task · 任务（· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走；"
+                        "[bright_red]红[/] = 已挂 session）",
+                  box=box.SIMPLE_HEAVY, header_style="bold magenta",
+                  title_justify="left", expand=False)
+        for _ in range(cols):
+            t.add_column("number", justify="left", no_wrap=True)
+            t.add_column("task", no_wrap=True, overflow="crop")
+        selected = self.selected_task_id
+        for i in range(rows):
+            cells = []
+            for col in columns:
+                task = col[i] if i < len(col) else None
+                cells.extend(self._task_index_cells(task, selected))
+            t.add_row(*cells)
+        # 表尾一行账：这张面板里到底几条收工了 —— 光看记号容易被标题淹掉。
         counts = {ts.STATUS_ACTIVE: 0, ts.STATUS_COMPLETED: 0, ts.STATUS_DROPPED: 0}
         for task in tasks:
             counts[ts.TaskStore.status_of(task)] = counts.get(
@@ -2184,37 +2164,11 @@ class Warden(object):
         scope = ("今天 = 没做完的 + 今天处理过的"
                  if self.sel_date >= datetime.date.today()
                  else "%s = 那天处理过的（过去就固化）" % self.sel_date.isoformat())
-        legend = Text()
-        legend.append("Task · 任务 ", style="bold magenta")
-        legend.append("· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走   红", style="dim")
-        legend.append(" = 已挂 session", style="dim")
-        out.append(legend)
-        # 账目单独一行：图例 + 账目挤一行会在窄一点的终端上折成两截，很难看。
-        out.append(Text(
-            "%d 条：%d 进行中 · %d 完成 · %d 放弃（收工的不删，只打记号 · %s）"
-            % (len(tasks), counts[ts.STATUS_ACTIVE],
-               counts[ts.STATUS_COMPLETED], counts[ts.STATUS_DROPPED], scope),
-            style="dim"))
-        selected = self.selected_task_id
-        for label, group in groups:
-            cols, rows = self.task_index_layout(group)
-            columns = [group[i * rows:(i + 1) * rows] for i in range(cols)]
-            t = Table(box=None, show_header=False, padding=(0, 2), expand=False)
-            for _ in range(cols):
-                t.add_column("number", justify="left", no_wrap=True)
-                t.add_column("task", no_wrap=True, overflow="crop")
-            for i in range(rows):
-                cells = []
-                for col in columns:
-                    task = col[i] if i < len(col) else None
-                    cells.extend(self._task_index_cells(task, selected))
-                t.add_row(*cells)
-            # 组名单独占一行（不塞进 table.title）：rich 的 title 会被表格宽度
-            # 折行，窄组就变成「未挂 session · 」换行「2」，看着像坏了。
-            style = STYLE_MUTED if label == "未挂 session" else "magenta"
-            out.append(Text("  %s · %d" % (label, len(group)), style=style))
-            out.append(t)
-        return Group(*out) if len(out) > 1 else out[0]
+        t.caption = ("%d 条：%d 进行中 · %d 完成 · %d 放弃 "
+                     "（收工的不删，只打记号 · %s）"
+                     % (len(tasks), counts[ts.STATUS_ACTIVE],
+                        counts[ts.STATUS_COMPLETED], counts[ts.STATUS_DROPPED], scope))
+        return t
 
     def _task_index_cells(self, task, selected):
         """一行里的一对（编号, 标题）。没任务时给两个空格占位。"""
