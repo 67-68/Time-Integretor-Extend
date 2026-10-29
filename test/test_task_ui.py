@@ -348,9 +348,9 @@ check("1 条任务 = 1 列", wd.task_index_layout(_many[:1], width=1000), (1, 1)
 check("22 条 / 4 列 = 6 行，最后一列不满也不多开一列",
       wd.task_index_layout(_many + [{"id": 21, "fields": {}}, {"id": 22, "fields": {}}],
                            width=160), (4, 6))
-# 每列几条往下读：20 条 4 列 → 第 2 列从编号 6 开始（不是第 3 条）
+# 20 条并排 4 对 → 5 行（填法是「一行一行」，见下面「填法」那一节）
 _cols, _rows = wd.task_index_layout(_many, width=160)
-check("编号从上往下读，不是从左往右读", (_rows, _many[_rows]["id"]), (5, 6))
+check("20 条并排 4 对 = 5 行", (_cols, _rows), (4, 5))
 
 # 真的画出来：160 列的终端里，表里是 2*cols 个 column
 _real_width = wd.frame_width
@@ -1026,7 +1026,7 @@ check("task -s 后面再跟动作 → 受理但报错",
 check_true("提示 -s 是批量后缀", any("批量后缀" in m[2] for m in wd3.messages))
 check("报错时没动任何东西", wd3.bridge.calls, [])
 
-print("== 任务面板：按位置连号排（未挂 session 最前），还是一张表 ==")
+print("== 任务面板排序：先状态分段（进行中/完成/放弃），段内按位置连号 ==")
 wd3 = fresh_warden()
 idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
 idx12 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "12:00"][0]
@@ -1036,6 +1036,8 @@ early_a = mk("早场甲", idx11)
 idle_x = mk("赋闲甲")
 idle_y = mk("赋闲乙")
 order = wd3.task_panel_order()
+check("五条都还在进行中（先看「待办」这一段）",
+      [ts.TaskStore.status_of(t) for t in order], ["active"] * 5)
 check("未挂 session 的排在最前面",
       [t["id"] for t in order[:2]], [idle_x["id"], idle_y["id"]])
 check("接着是 11:00 那场的两条（按时间先后，不是按创建顺序）",
@@ -1046,12 +1048,24 @@ check("同一场的那几条挨在一起（连号，不是 32、15 混着）",
       [None, None, "11:00", "11:00", "12:00"])
 check("排序不改变「面板里有哪几条」这份口径",
       sorted(t["id"] for t in order), sorted(t["id"] for t in wd3.task_panel_tasks()))
-check("收工的任务仍跟着它自己那一场走（不单独挪到最后）",
-      (wd3.task_store.drop(early_b["id"], reason="test") and
-       [t["id"] for t in wd3.task_panel_order()[2:4]]),
-      sorted([early_a["id"], early_b["id"]]))
 
-# 渲染里真的按这个顺序摆：把列数钉成 1 列，读出来的顺序就该等于 task_panel_order()
+# 状态是第一维：收工的一律挪到后面，不再跟待办混在一行里
+wd3.task_store.set_status(early_a["id"], ts.STATUS_COMPLETED,
+                          at=datetime.datetime.now().isoformat(timespec="seconds"))
+wd3.task_store.drop(early_b["id"], reason="test")
+order = wd3.task_panel_order()
+check("三段顺序：进行中 → 完成 → 放弃",
+      [ts.TaskStore.status_of(t) for t in order],
+      ["active", "active", "active", "completed", "dropped"])
+check("进行中那一段的前两条仍是未挂 session 的", 
+      [t["id"] for t in order[:2]], [idle_x["id"], idle_y["id"]])
+check("完成的单独一段（不再跟待办混着）", [t["id"] for t in order[3:4]],
+      [early_a["id"]])
+check("放弃的排在最后", [t["id"] for t in order[4:]], [early_b["id"]])
+check("放弃的那条仍记得自己挂在哪一场（位置没丢）",
+      (order[4].get("session") or {}).get("start"), "11:00")
+
+# 渲染里真的按这个顺序摆 —— 把列数钉成 1 列，读出来就该等于 task_panel_order()
 _orig_layout = wd3.task_index_layout
 wd3.task_index_layout = lambda tasks, width=None: (1, len(tasks))
 _panel = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()[1]
@@ -1067,6 +1081,110 @@ _titles = [t["fields"]["title"] for t in wd3.task_panel_order()]
 check("单列渲染时，表里的顺序就是 task_panel_order() 的顺序（排序真的进了渲染）",
       sorted(range(len(_titles)), key=lambda i: _text.index(_titles[i])),
       list(range(len(_titles))))
+
+print("== 任务面板填法：一行一行填，一行里读过去编号是递增的 ==")
+
+
+def panel_numbers(renderable):
+    """把画出来的面板按「行」读：每行里那些「编号 + 记号标题」的编号。
+
+    行的顺序 = 屏幕上的顺序。用来钉「一行一行填」这件事：按列填的话，
+    一行读过去会是 15 / 39 / 42 / 28（用户反馈的「序号很乱」）。
+    """
+    buf = io.StringIO()
+    w.Console(file=buf, width=200, highlight=False, color_system=None).print(renderable)
+    out = []
+    for line in buf.getvalue().splitlines():
+        nums = [int(n) for n in re.findall(r"(?:^|\s)(\d+)\s+(?=[·✓✗⤼])", line)]
+        if nums:
+            out.append(nums)
+    return out
+
+
+_real_width = wd3.frame_width
+wd3.frame_width = lambda: 160
+_panel = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()[1]
+_cols, _rows = wd3.task_index_layout(wd3.task_panel_order())
+wd3.frame_width = _real_width
+_lines = panel_numbers(_panel)
+check("一行里有好几对（160 列摊开了）", max(len(x) for x in _lines) > 1, True)
+check("第一行 = 排序后的前几对（按列填的话这里会是第 1、%d、%d 条，正是「序号很乱」）"
+      % (_cols + 1, _cols * 2 + 1),
+      _lines[0], [t["id"] for t in wd3.task_panel_order()][:_cols])
+check("把行连起来读 = task_panel_order() 的顺序（一行一行填，不是一列一列填）",
+      [n for line in _lines for n in line],
+      [t["id"] for t in wd3.task_panel_order()])
+check("行数 = ceil(条数 / 并排的对数)", len(_lines), _rows)
+
+print("== refresh：把屏幕上每块组件的状态都重新对一遍（只读外面世界）==")
+wd3 = fresh_warden()
+idx11 = [i for i, r in enumerate(wd3.rows, 1) if r["startLabel"] == "11:00"][0]
+kept = mk("refresh用", idx11)
+fm_kept = kept["focusmate"]["task_id"]
+wd3.bridge.calls = []
+_spy = []
+wd3.materialize_repeats = lambda: (_spy.append("repeats") or [])
+wd3.writeback_completions = lambda: _spy.append("writeback")
+
+# (1) 任务的完成状态：外面（Focusmate）说完成了 → refresh 之后本地跟着收工
+wd3.bridge.completed[fm_kept] = datetime.datetime.now().isoformat(timespec="seconds")
+check("refresh 受理", wd3.handle("refresh"), True)
+check("refresh 去拉了 GET /v1/tasks（任务完成状态靠它，不用再手敲 task sync）",
+      [c[0] for c in wd3.bridge.calls].count("tasks"), 1)
+check("refresh 只在读：不落重复任务、不写回 OmniFocus（那是 task sync 的事）",
+      _spy, [])
+check("refresh 不在 Focusmate 上建/删 task",
+      [c[0] for c in wd3.bridge.calls if c[0] in ("add_task", "delete_task")], [])
+check("Focusmate 说完成了 → 本地任务跟着收工",
+      ts.TaskStore.status_of(wd3.task_store.get(kept["id"])), "completed")
+check_true("刚收工的那条进了归档",
+           kept["id"] in [r.get("task_id")
+                          for r in wd3.task_store.load_archive().get("records") or []])
+check("画帧缓存被作废（不会停在旧画面上）", wd3.shell.frame_rev > 0, True)
+
+# (2) 统计：已经加载过、且超过 TTL 才重算（没看过 / 没过期都别白拉网）
+_stat_calls = []
+wd3.cmd_stat = lambda *a, **k: (_stat_calls.append(1) or True)
+wd3.stat = {"total_completed": 0, "days": 0}
+wd3.stat_at = datetime.datetime.now()
+wd3.handle("refresh")
+check("统计没过期 → refresh 不重算", _stat_calls, [])
+wd3.stat_at = datetime.datetime.now() - datetime.timedelta(
+    seconds=w.st.CACHE_TTL + 60)
+wd3.handle("refresh")
+check("统计过期了 → refresh 顺手重算", len(_stat_calls), 1)
+wd3.stat = None
+wd3.handle("refresh")
+check("统计从没加载过 → refresh 不替用户拉", len(_stat_calls), 1)
+
+# (3) 各种「上次算出来先存着」的缓存都作废
+wd3._snapshot_cache["随便"] = 1
+wd3._log_tail_memo = ("sig", ["a"])
+wd3.handle("refresh")
+check("快照缓存被清掉", wd3._snapshot_cache, {})
+check("日志尾巴缓存被清掉", wd3._log_tail_memo, None)
+
+# (4) 收尾面板：正在问的那一轮，refresh 之后手里是最新的任务状态
+#     （收尾进行中时命令行被收尾状态机接管，所以这里直接敲 cmd_refresh）
+still = mk("收尾里的那条", idx11)
+wd3.begin_review({"date": ISO, "start": "11:00"})
+check_true("进了收尾（面板上有它）", wd3.review is not None)
+check("收尾面板上现在问的就是那条",
+      [t["id"] for t in wd3.review.tasks], [still["id"]])
+wd3.task_store.drop(still["id"], reason="在外面处理掉了")
+check("refresh 受理（收尾进行中，走实作那一层）", wd3.cmd_refresh([]), True)
+check("refresh 之后收尾面板上的任务是最新的",
+      ts.TaskStore.status_of(wd3.review.tasks[0]), "dropped")
+check("重读不会把人问回去（当前问第几条不变）", wd3.review.index, 0)
+wd3.review = None
+
+# (5) 离线：不去碰外面（也不报错），界面照样重画
+off = mkwarden()
+off.bridge.calls = []
+check("离线 refresh 照样受理", off.handle("refresh"), True)
+check("离线不去拉 Focusmate 任务",
+      [c for c in off.bridge.calls if c[0] == "tasks"], [])
+check_true("离线 read 完照样有表格（退化快照）", off.rows or off.offline is True)
 
 print("== refresh --check：对账（该订的 session / 该挂的 task）==")
 wd3 = fresh_warden()

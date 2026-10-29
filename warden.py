@@ -266,8 +266,14 @@ MESSAGE_KEEP = 12
 # 别让第一条把第二条挤出屏幕（列的 overflow="crop" 只能整体截断）。
 TASK_CELL_TITLE_MAX = 18
 
-# 契约表格下面那块任务面板：2 列是底线，屏幕够宽就摊成 3 列、4 列（编号从上往下读）。
+# 契约表格下面那块任务面板：2 列是底线，屏幕够宽就摊成 3 列、4 列。
+# 填法是**一行一行**（左→右、上→下），所以一行里读过去编号是递增的。
 TASK_INDEX_MAX_COLS = 4
+
+# 任务面板里的「状态段」：待办的先出现，收工的往后放。
+# 用户反馈过「放弃的任务和待办任务放在一起，没有 grouping」—— 所以状态是第一维，
+# 段内再按位置（未挂 session 最前 → 场次时间 → 编号）。
+TASK_PANEL_BANDS = (ts.STATUS_ACTIVE, ts.STATUS_COMPLETED, ts.STATUS_DROPPED)
 
 # `-a` 的两个特殊取值：不进表格编号，直接按语义办。
 #   none    = 下架（删掉 Focusmate 那条 task，本地断绑定）→ `task 8 -an`
@@ -1028,7 +1034,8 @@ class ContractView(View):
         w = self.w
         return [
             _cmd("refresh", w.cmd_refresh,
-                 "重新拉选中那天的 session；--check 顺手让 daemon 对账并修正", ("r", "reload"),
+                 "全量刷新看板（session/任务完成状态/统计/收尾面板）；"
+                 "--check 再对账并修正", ("r", "reload"),
                  usage="refresh [--check]",
                  options=("--check", "-c"),
                  hint=_hint_refresh),
@@ -2076,26 +2083,31 @@ class Warden(object):
         return open_tasks + touched
 
     def task_panel_order(self, day=None):
-        """任务面板的**排序** —— 一张表，但按位置连号排。
+        """任务面板的**排序** —— 一张表，但同类的连号排在一起。
 
-        需求：「每次 refresh 之后重排序，不然看着一大堆 32、15 的 task 混杂」+
-        「同类任务放一起，未挂 session 的放最前面」。
+        需求两条：
+          * 「每次 refresh 之后重排序，不然看着一大堆 32、15 的 task 混杂」
+          * 「放弃的任务和待办任务还是放在一起，没有 grouping」
 
-        口径只有一个 —— **位置**（也就是那一场 session）：
+        所以排序有**两个维度**，先状态、后位置：
 
-          * 未挂 session 的排在最前（还没安排的活先看见）；
-          * 其余按 session 的时间先后聚成段，同一场的那几条挨在一起；
-          * 段内按任务 ID 升序：同一场上的几条是「一起干」的，编号顺序最好认，
-            也最稳定（不会因为一次 refresh 就换位置）。
+          1. **状态段**：进行中 → 完成 → 放弃（``TASK_PANEL_BANDS``）。
+             待办归待办、收工归收工，不再 15(待办) / 33(放弃) / 38(放弃) 混着。
+          2. **位置**（段内）：未挂 session 的最前，之后按场次时间聚成段，
+             同一场的那几条挨在一起。
+          3. 段内最后按任务 ID 升序：同一场上的几条是「一起干」的，编号顺序最好认，
+             也最稳定（不会因为一次 refresh 就换位置）。
 
-        这是**排序**不是**拆表**：面板还是那一张表，只是同类的连号排在一起。
-        已收工（✓/✗）的任务跟着它自己那一场走，不单独挪到后面。
+        这是**排序**不是**拆表**：面板还是那一张表，只是同类连号。
         """
+        rank = {status: i for i, status in enumerate(TASK_PANEL_BANDS)}
+
         def key(task):
+            band = rank.get(ts.TaskStore.status_of(task), len(rank))
             sess = task.get("session") or {}
             if not sess:
-                return (0, "", "", task.get("id") or 0)
-            return (1, sess.get("date") or "", sess.get("start") or "",
+                return (band, 0, "", "", task.get("id") or 0)
+            return (band, 1, sess.get("date") or "", sess.get("start") or "",
                     task.get("id") or 0)
 
         return sorted(self.task_panel_tasks(day), key=key)
@@ -2109,10 +2121,14 @@ class Warden(object):
         return prefix + title
 
     def task_index_layout(self, tasks, width=None):
-        """``(几列, 每列几条)``：屏幕够宽就摊成 3 列、4 列，装不下回来 2 列。
+        """``(几对并排, 几行)``：屏幕够宽就摊成 3 对、4 对，装不下回来 2 对。
 
         需求：不该永远只有两列 —— 宽屏上白白浪费半屏，任务一多还得翻。
         一「对」的宽度 = 编号列 + 1 空格 + 标题列，两对之间 rich 再给 2 列 padding。
+
+        填法是**一行一行**（左→右、上→下），不是一列一列。以前按列填，四列的
+        宽屏上一行读过去是 15 / 39 / 42 / 28，看着就是「序号很乱」；按行填之后
+        一行里的编号是递增的，同一段的连号也在同一行上并排。
         """
         if not tasks:
             return 1, 0
@@ -2133,15 +2149,15 @@ class Warden(object):
         """契约视图里那块「任务面板」：编号+任务 并排，列数看屏幕宽度。
 
         内容按天决定（见 :meth:`task_panel_tasks`）：今天 = 没做完的 + 今天处理过的，
-        过去那天 = 只有那天处理过的。**顺序**按位置（见 :meth:`task_panel_order`）：
-        未挂 session 的排最前，之后一场 session 一段，段内按编号 —— 还是这一张表，
-        只是同类的连号挨在一起，不再是一堆 32、15 混着。配色见文件头那段「配色」。
+        过去那天 = 只有那天处理过的。**顺序**见 :meth:`task_panel_order`：先按状态
+        分段（进行中 → 完成 → 放弃），段内未挂 session 最前、之后一场一段、段内按编号。
+        还是这一张表，只是同类的连号挨在一起；格子是**一行一行**填的，所以一行
+        从左读到右编号是递增的。配色见文件头那段「配色」。
         """
         tasks = self.task_panel_order()
         if not tasks:
             return None
         cols, rows = self.task_index_layout(tasks)
-        columns = [tasks[i * rows:(i + 1) * rows] for i in range(cols)]
         t = Table(title="Task · 任务（· 进行中 / ✓ 完成 / ✗ 放弃 / ⤼ 转移走；"
                         "[bright_red]红[/] = 已挂 session）",
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
@@ -2151,9 +2167,9 @@ class Warden(object):
             t.add_column("task", no_wrap=True, overflow="crop")
         selected = self.selected_task_id
         for i in range(rows):
+            chunk = tasks[i * cols:(i + 1) * cols]      # 一行就是连续的几对
             cells = []
-            for col in columns:
-                task = col[i] if i < len(col) else None
+            for task in chunk + [None] * (cols - len(chunk)):
                 cells.extend(self._task_index_cells(task, selected))
             t.add_row(*cells)
         # 表尾一行账：这张面板里到底几条收工了 —— 光看记号容易被标题淹掉。
@@ -4415,6 +4431,20 @@ class Warden(object):
             except Exception as e:                      # noqa: BLE001
                 self.had_error = True
                 self.say("重复任务挂载失败：%s" % e, "warn")
+        ok = self.sync_task_completions(quiet=quiet)
+        # 完成的时候把「完成 + 截止时间」写回 OmniFocus（幂等，写过的不再写）
+        self.writeback_completions()
+        if not quiet:
+            self.report_omnifocus_links()
+        return ok
+
+    def sync_task_completions(self, quiet=True):
+        """**只读**那一半：``GET /v1/tasks`` → 对齐完成状态（`refresh` 用它）。
+
+        和 :meth:`cmd_task_sync` 的区别只有一件事：这里不往外面写 —— 不把「每周重复」
+        落到焦点场次上（那会真的在 Focusmate 建 task）、也不写回 OmniFocus。
+        ``refresh`` 要能随时敲，不能敲一下就在外面多出一条任务。
+        """
         res = self.bridge.call("tasks", timeout=180)
         remote = res.get("tasks") if isinstance(res, dict) else res
         before = len(self.task_store.load_archive().get("records") or [])
@@ -4422,12 +4452,9 @@ class Warden(object):
         self.task_sync_at = time.time()
         if n:
             self.announce_completions(before)
-        # 完成的时候把「完成 + 截止时间」写回 OmniFocus（幂等，写过的不再写）
-        self.writeback_completions()
         if not quiet:
             self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
                      % (len(matched), n), "ok")
-            self.report_omnifocus_links()
         return True
 
     def report_omnifocus_links(self):
@@ -5798,16 +5825,98 @@ class Warden(object):
            或者上次只做了半截）→ 重新挂。
         3. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
 
-        不带 ``--check`` 的 ``refresh`` 一点没变（只拉数，不碰任何东西）。
+        不带 ``--check`` 的 ``refresh`` **不动外面任何东西**，但它不是只管一行数：
+        它把看板上每块组件的状态都重新对一遍账（见 :meth:`refresh_all`）——
+        表格、任务完成状态、统计、收尾面板、各种缓存。
         """
         toks = [str(tok).lower() for tok in (args or [])]
         want_check = any(tok in ("--check", "-c", "check", "查", "对账", "核对")
                          for tok in toks)
+        pulled = self.refresh_all()
         if not want_check:
-            return self.refresh()
-        pulled = self.refresh()
+            return pulled
         checked = self.check_and_fix()
         return checked and pulled is not False
+
+    def refresh_all(self):
+        """``refresh`` 实作的**全量**那一半：把屏幕上**每块组件**的状态都对一遍。
+
+        需求：「refresh 需要刷新这个界面每个组件的状态」。所以不再只是「重拉 session
+        列表、重算表格」，而是一条命令把看板上每一块拆开重新对账（**只读外面世界**：
+        不订场、不挂任务、不改 data.csv）：
+
+        ==================  ============================================
+        组件                刷什么
+        ==================  ============================================
+        契约表格            重读 data.csv / 日历下载层 / 时段 layout → 重拉 session
+        任务面板            任务的**完成状态**（``GET /v1/tasks``，只读同步）
+        统计视图            已经加载过、且超过 TTL 的那份数字重算一次
+        收尾面板            正在问的那一轮从任务库里重读一遍
+        警告 / 静音         缓存作废（mute 缓存、快照缓存、日志尾巴）
+        画帧缓存            作废 → 下一帧按新状态重排版
+        ==================  ============================================
+
+        失败不拦路：任何一块刷不动就记一句警告，其余照刷 —— refresh 是「再对一次账」，
+        不是「全有或全无」。
+        """
+        self.forget_caches()
+        pulled = self.refresh()
+        self.refresh_task_state()
+        self.refresh_stat_state()
+        self.refresh_review_state()
+        self.forget_caches()
+        self.invalidate()
+        return pulled
+
+    def forget_caches(self):
+        """把所有「上次算出来就先存着」的东西作废（refresh 的前后各来一次）。"""
+        forget_mute_cache()
+        try:
+            self._snapshot_cache.clear()
+        except Exception:                              # noqa: BLE001 - 没有就算了
+            pass
+        self._log_tail_memo = None
+        try:
+            self.reload_periods()
+        except Exception as e:                         # noqa: BLE001 - 文件坏了也别崩
+            self.say("日历下载层/时段 layout 读不了（表格照旧用上次的）：%s" % e, "warn")
+
+    def refresh_task_state(self):
+        """任务的完成状态对齐 Focusmate（``GET /v1/tasks``，**只读**）。
+
+        走 :meth:`sync_task_completions` 而不是 ``cmd_task_sync``：refresh 不能
+        顺手在 Focusmate 上建 task（重复任务落地）、也不写回 OmniFocus。
+        """
+        if self.offline:
+            return False
+        try:
+            return self.sync_task_completions(quiet=True)
+        except Exception as e:                         # noqa: BLE001 - 刷不动就不刷
+            self.had_error = True
+            self.say("任务完成状态没能刷新：%s: %s" % (type(e).__name__, e), "warn")
+            return False
+
+    def refresh_stat_state(self):
+        """统计视图那份数字：**加载过**且过期才重算（没看过就别替用户拉）。"""
+        if self.offline or self.stat is None:
+            return False
+        if self.stat_at is not None:
+            age = (datetime.datetime.now() - self.stat_at).total_seconds()
+            if age < st.CACHE_TTL:
+                return False
+        return self.cmd_stat()
+
+    def refresh_review_state(self):
+        """收尾面板：正在问的那一轮从任务库重读（用户可能刚在外面改了状态）。"""
+        review = self.review
+        if review is None:
+            return False
+        try:
+            review.reload()
+        except Exception as e:                         # noqa: BLE001 - 收尾比刷新重要
+            self.say("收尾面板没能重读任务（照旧继续问）：%s" % e, "warn")
+            return False
+        return True
 
     def check_and_fix(self):
         """把「该订没订上 / 该挂没挂上」都查一遍并修掉（``refresh --check`` 的实作）。"""
@@ -5819,9 +5928,10 @@ class Warden(object):
         fixed += self.check_bookings()
         fixed += self.check_task_attachments()
         # 修完再拉一次：表格要显示的是**修完**的样子，不是修之前的
+        # （走全量：刚刚重挂过 task，任务面板/画帧缓存也得跟着换）
         if fixed:
             try:
-                self.refresh(quiet=True)
+                self.refresh_all()
             except Exception:                       # noqa: BLE001 - 拉不到就算了
                 pass
         if fixed:
@@ -6107,7 +6217,8 @@ class Warden(object):
             ('title N "文本"', '把 #N 的标题改成文本；title N "" 清空'),
             ("force-check", "忽略重试上限/退避：把所有没订上的 session 各强制重订一次"),
             ("sync [--days N]", "跑 download_calendar.py populate：日历 → 覆盖 data.csv"),
-            ("refresh  (r)", "重新拉选中那天的 session（会重编号）"),
+            ("refresh  (r)", "全量刷新：session（会重编号）+ 任务完成状态 + 统计 + 收尾面板；"
+                             "refresh --check 再对账并修正"),
             ("start", "启动 daemon（会先让 bridge 放开浏览器）"),
             ("stop（契约视图）", "停用 daemon（和取消一样要敲宣言）"),
             ("stop（专注视图）", "消耗一次暂停：暂停 5 分钟，每天最多 3 次，daemon 不念你"),

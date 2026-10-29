@@ -484,6 +484,15 @@ class Review(object):
         except ValueError:
             self.tasks = [t for t in self.tasks if self._still_there(t)]
 
+    def reload(self):
+        """外面把库刷新了（``refresh`` / ``task sync``）：面板上的任务重读一遍。
+
+        公开版本只为让 warden 在 refresh 时能喊一嗓子 —— 不给它碰私有方法的机会。
+        重读**不改**当前问到哪一条（index 不动），否则刷个新就把人问回去了。
+        """
+        self._refresh()
+        return self
+
     def mark_processed(self, task, action):
         """给任务留一笔「这一天的这一场处理过它」。
 

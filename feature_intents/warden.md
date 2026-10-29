@@ -80,7 +80,7 @@ title 2 "Math Past Paper"
 title 2 ""          清空标题
 sync [--days N]     跑 download_calendar.py populate：日历 → 覆盖 data.csv
 force-check         忽略重试上限/退避：把所有没订上的 session 各强制重订一次
-refresh / r         重新拉选中那天的 session（ID 会重编号）
+refresh / r         全量刷新看板（session + 任务完成状态 + 统计 + 收尾面板 + 各种缓存）
 refresh --check/-c  同上，**再对账一遍**：该订没订上 / 该挂没挂上 → 能修的当场修
 task 8 -an          从它那一场下架（≡ -a none，删掉 Focusmate 那条 task）
 task 8 -ac          挂到当前这一场（≡ -a current）
@@ -110,9 +110,28 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 （`session` / `period` / `relocate` / `force-check`）。同理，任务视图里的
 `refresh` 只跑 `GET /v1/tasks` 同步完成时间，也不订场。
 
+### `refresh`：看板上每块组件都重新对一次账
+
+`refresh` 不只是「重拉 session 列表」——它是**刷新这界面**，所以一条命令把每块组件都
+拆开对一遍（`refresh_all()`），而且**只读外面世界**：不订场、不挂任务、不改 data.csv、
+不落「每周重复」（那会在 Focusmate 上真建 task，走 `task sync`）、不写回 OmniFocus
+（完成状态只读 `GET /v1/tasks`，见 `sync_task_completions()`）：
+
+| 组件 | 刷什么 |
+| --- | --- |
+| 契约表格 | 重读 `data.csv` / 日历下载层 / 时段 layout → 重拉 session |
+| 任务面板 | 任务的**完成状态**：`GET /v1/tasks` 只读同步（不用再手敲 `task sync`） |
+| 重复任务 | **不碰** —— 落地会真的在 Focusmate 建 task，那是 `task sync` 的事 |
+| 统计视图 | 已经加载过、且超过 TTL 的那份数字重算一次（没看过就不替用户拉） |
+| 收尾面板 | 正在问的那一轮从任务库重读（`Review.reload()`，不把人问回去） |
+| 警告 / 静音 / 日志 | mute 缓存、快照缓存、日志尾巴缓存一律作废 |
+| 画帧缓存 | `invalidate()` → 下一帧按新状态重排版，不会停在旧画面上 |
+
+任何一块刷不动就记一句警告、其余照刷 —— refresh 是「再对一次账」，不是「全有或全无」。
+
 ### `refresh --check`：对账并修正
 
-`refresh` 本身仍然是**纯读**（只拉数）。加 `--check`（`-c`）才多走一步
+`refresh` 本身仍然是**纯读**（不碰外面任何东西）。加 `--check`（`-c`）才多走一步
 `check_and_fix()` —— 它只做两件事，而且两件都是「先看外面的世界，再掰回来」：
 
 1. **该订没订上的 session**（`check_bookings()`）：执行区里「契约有、API 没有」的行
@@ -566,6 +585,7 @@ python3 warden.py install-deps
   `ShortFlag` 统一展开，补全和提示都跟着走。
 - `refresh --check`（`-c`）：重拉 + 对账（该订没订上 → 叫 daemon 补；该挂没挂上 →
   重挂），所以「本地账本说挂上了、Focusmate 上其实没有」这种半截状态能被自己发现。
+  不带 `--check` 的 `refresh` 也已经是**全量**刷新（见上面那节），只是不动外面东西。
 - `session` 默认**只加这一天**（`temp/session-extras.json`），`session --permanent`
   才写成按星期几重复的长期规则（`temp/session-rules.json`）；两者都在重算
   `data.csv` 时并进去，sync 不会冲掉。
@@ -573,8 +593,10 @@ python3 warden.py install-deps
   单独裁到 `TASK_CELL_TITLE_MAX`（18）个字再拼，别让第一条把第二条挤出屏幕；
   标题优先取 `title`/`name` 字段（`focusmate_title`），不是整条 `1. … 2. …` 摘要。
 - **契约表格下面多了一块「任务面板」**（`Warden.render_task_index()`）：
-  编号 + 标题成对并排，**列数跟着屏幕宽度走**（2 列是底线，宽屏自动摊成 3 / 4 列，
-  `TASK_INDEX_MAX_COLS`；编号从上往下读，不空列）。配色分工：已挂 session = 亮红、
+  编号 + 标题成对并排，**并排对数跟着屏幕宽度走**（2 对是底线，宽屏自动摊成 3 / 4 对，
+  `TASK_INDEX_MAX_COLS`；**一行一行填**，一行里从左读到右就是排序里的连号）。
+  顺序见 `task_panel_order()`：先按状态分段（进行中 → 完成 → 放弃），段内未挂 session
+  最前、之后按场次时间、段内按编号（详见 `task.md`）。配色分工：已挂 session = 亮红、
   没挂 = 亮蓝、完成 = 绿、收工（放弃/转移）= 亮灰。
   布局顺序 = 契约表格 → 任务面板 → Recent（Recent 仍由 `frame()` 接在后面）。
 - **任务面板按天取值**（`Warden.task_panel_tasks()`）：今天（以及以后）= **所有没做完的**
