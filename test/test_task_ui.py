@@ -839,7 +839,8 @@ wd4 = fresh_warden()
 _shell = wd4.shell
 check("task 后面能 Tab 到紧凑写法",
       [c for c in _shell.complete("task ") if c.startswith("-")],
-      ["-an", "-ac", "--assign", "-a", "--note", "-n", "--from", "-s"])
+      ["-an", "-ac", "-m", "--assign", "-a", "--note", "-n", "--from", "-s",
+       "--mark", "--repeat"])
 check("task 后面 Tab 补的是**面板序号**（1..N 连续，不是内部 id）",
       [c for c in _shell.complete("task ") if c.isdigit()],
       [str(i) for i in range(1, len(wd4.task_panel_order()) + 1)])
@@ -849,6 +850,12 @@ check("敲了 -a 之后 Tab 补的是紧凑写法",
 check("-a 后面补「编号 + none + current」（不再混进一堆动作词）",
       _shell.complete("task -a "), ["1", "2", "3", "none", "current"])
 check("-s 后面只补编号", _shell.complete("task -s "), ["1", "2", "3"])
+check("-m 后面补「complete / discard」",
+      _shell.complete("task -m "), ["complete", "discard"])
+check("--mark 后面也补「complete / discard」",
+      _shell.complete("task --mark "), ["complete", "discard"])
+check("-m 的提示行说的是手动改本地状态",
+      "手动改本地状态" in _shell.hint_line("task 3 -m"), True)
 check("-an / -ac 打完了：提示说不用再跟东西",
       "-an ≡ -a none" in _shell.hint_line("task -an"), True)
 check("提示行认得「动作写在 ID 后面」",
@@ -922,15 +929,20 @@ _live = {
     "endLabel": (_live_start + dt.timedelta(minutes=50)).strftime("%H:%M"),
     "durationMin": 50, "id": "sess-live", "title": "", "quiet": False, "matched": True,
 }
-wd3.bridge.sessions = plan_sessions(wd3) + [_live]
-wd3.refresh()
+# 当前这一场的判定直接只看 rows；把 rows 钉成只有「刚开始 5 分钟」这一场，
+# 否则跑 testing 的钟点正好撞上 11:00 那场时，会变成两场都在进行中（时间型假红）。
+_prev_rows = wd3.rows
+wd3.rows = [_live]
 wd3.bridge.calls = []
-check("task <id> -ac 受理", wd3.handle("task %d -ac" % detached["id"]), True)
-check("挂到了正在进行的这一场",
-      wd3.task_store.get(detached["id"])["session"]["start"],
-      _live_start.strftime("%H:%M"))
-check("bridge 收到的是这一场的 id",
-      [c for c in wd3.bridge.calls if c[0] == "add_task"][0][1]["meetingId"], "sess-live")
+try:
+    check("task <id> -ac 受理", wd3.handle("task %d -ac" % detached["id"]), True)
+    check("挂到了正在进行的这一场",
+          wd3.task_store.get(detached["id"])["session"]["start"],
+          _live_start.strftime("%H:%M"))
+    check("bridge 收到的是这一场的 id",
+          [c for c in wd3.bridge.calls if c[0] == "add_task"][0][1]["meetingId"], "sess-live")
+finally:
+    wd3.rows = _prev_rows
 check_true("说的是「当前这一场」", any("当前" in m[2] for m in wd3.messages))
 
 wd3.bridge.sessions = plan_sessions(wd3)
@@ -1110,6 +1122,53 @@ check("id:N 写到了这一条上",
 check_true("id:N 不会再提示「按内部 id 认」（本来就是明说的）",
            not any("按内部 id 认" in m[2] for m in wd6.messages))
 
+print("== task -m/--mark：手动完成 / 放弃只改本地账本 ==")
+mark_done = wd6.task_store.create({"title": "手动标完成"})
+mark_drop = wd6.task_store.create({"title": "手动标放弃"})
+mark_long = wd6.task_store.create({"title": "长写法标完成"})
+external = []
+wd6.omni_complete = lambda *a, **k: external.append("complete") or ""
+wd6.omni_drop = lambda *a, **k: external.append("drop") or ""
+wd6.bridge.calls = []
+arch_before = len(wd6.task_store.load_archive().get("records") or [])
+check("task <id> -m complete 受理",
+      wd6.handle("task id:%d -m complete" % mark_done["id"]), True)
+check("本地状态 = completed",
+      wd6.task_store.status_of(wd6.task_store.get(mark_done["id"])), ts.STATUS_COMPLETED)
+check("状态原因 = cmd-mark-complete",
+      wd6.task_store.get(mark_done["id"]).get("status_reason"), "cmd-mark-complete")
+check("完成标记会落一份归档",
+      len(wd6.task_store.load_archive().get("records") or []), arch_before + 1)
+check("task -m discard <id> 受理",
+      wd6.handle("task -m discard id:%d" % mark_drop["id"]), True)
+check("本地状态 = dropped",
+      wd6.task_store.status_of(wd6.task_store.get(mark_drop["id"])), ts.STATUS_DROPPED)
+check("状态原因 = cmd-mark-discard",
+      wd6.task_store.get(mark_drop["id"]).get("status_reason"), "cmd-mark-discard")
+check("task --mark=complete <id> 也认",
+      wd6.handle("task --mark=complete id:%d" % mark_long["id"]), True)
+check("--mark=complete 状态 = completed",
+      wd6.task_store.status_of(wd6.task_store.get(mark_long["id"])), ts.STATUS_COMPLETED)
+check("mark 完全没碰外部（Focusmate / OmniFocus）", external, [])
+check("mark 也没调用 bridge", wd6.bridge.calls, [])
+# 重复标同一个状态 = 幂等：不要再写第二份归档
+arch_now = len(wd6.task_store.load_archive().get("records") or [])
+wd6.handle("task id:%d -m complete" % mark_done["id"])
+check("重复 -m complete 不会再写归档",
+      len(wd6.task_store.load_archive().get("records") or []), arch_now)
+# 不给任务 → 标当前选中的那条
+selected = wd6.task_store.create({"title": "选中后标放弃"})
+wd6.handle("task select id:%d" % selected["id"])
+wd6.handle("task -m discard")
+check("task -m discard 默认标当前选中的任务",
+      wd6.task_store.status_of(wd6.task_store.get(selected["id"])), ts.STATUS_DROPPED)
+# 不能和批量 -s 混用
+wd6.messages = []
+check("mark 和 -s 批量混用 → 受理但报错",
+      wd6.handle("task -s 1 -m complete"), True)
+check_true("提示 mark 是单条动作",
+           any("不能和 `-s/--from` 批量一起用" in m[2] for m in wd6.messages))
+
 # 任务视图（视图 4）里两列都在：序号 + 内部 id
 _view4 = [v for v in w.VIEWS if v.key == "4"][0](wd6).render()[0]
 check("任务视图有「序号」列", [str(c.header) for c in _view4.columns][:2],
@@ -1288,14 +1347,21 @@ try:
     fm = attached_task["focusmate"]["task_id"]
     check("先确认替身里它挂在 11:00 那场", wd3.bridge.attached.get(fm), "sess-11:00")
 
-    # (1) 一切正常 → 什么都不该修
-    wd3.bridge.calls = []
-    check("没有问题时 --check 也受理", wd3.handle("refresh --check"), True)
-    check("没有问题时不去调 check 下单", [r for r in ran], [])
-    check("没有问题时不去重挂",
-          [c for c in wd3.bridge.calls if c[0] == "add_task"], [])
-    check_true("明确报「没有发现要修的」",
-               any("没有发现要修的" in m[2] for m in wd3.messages))
+    # (1) 一切正常 → 不订场、不重挂；但仍要补写「本地已完成、OmniFocus 还没写回」的
+    _wb = []
+    _real_writeback = wd3.writeback_completions
+    wd3.writeback_completions = lambda: (_wb.append(1) or [])
+    try:
+        wd3.bridge.calls = []
+        check("没有问题时 --check 也受理", wd3.handle("refresh --check"), True)
+        check("没有问题时不去调 check 下单", [r for r in ran], [])
+        check("没有问题时不去重挂",
+              [c for c in wd3.bridge.calls if c[0] == "add_task"], [])
+        check("--check 会补写 OmniFocus（refresh_all 只同步本地状态）", _wb, [1])
+        check_true("明确报「没有发现要修的」",
+                   any("没有发现要修的" in m[2] for m in wd3.messages))
+    finally:
+        wd3.writeback_completions = _real_writeback
 
     # (2) 本地说挂着，Focusmate 说挂到别处了 → 重挂
     wd3.bridge.attached[fm] = "sess-12:00"

@@ -771,6 +771,69 @@ omni.writes = []
 wd.handle("task id:%d drop" % task4["id"])
 check("drop 会连带 OmniFocus", omni.writes, [("drop", "pk3", None)])
 
+# Focusmate 勾完成 → 本地落 completed → 写回 OmniFocus（refresh / 收尾都走这条）
+task_fm = store.create({"title": "Focusmate 已完成"})
+store.assign(task_fm["id"], {"date": "2026-10-27", "start": "13:00", "duration": 50})
+wd.cmd_task_link(["id:%d" % task_fm["id"], "omnifocus:///task/pk-fm-done"])
+wd.bridge.replies["tasks"] = {"tasks": [{
+    "id": "fm-task-done", "title": "Focusmate 已完成", "completed": True,
+    "completedAt": "2026-10-27T05:50:00.000Z",
+}]}
+task_fm = store.get(task_fm["id"])
+store.attach_focusmate(task_fm["id"], {"task_id": "fm-task-done"})
+omni.rows = []
+omni.writes = []
+wd.offline = False
+try:
+    wd.sync_completion_state()
+finally:
+    wd.offline = True
+task_fm = store.get(task_fm["id"])
+check("Focusmate completedAt → 本地 completed", task_fm["status"], ts.STATUS_COMPLETED)
+check("Focusmate completedAt → 状态原因可追溯",
+      task_fm["status_reason"], "focusmate-completed")
+check("Focusmate completedAt → 同一轮写回 OmniFocus", omni.writes,
+      [("complete", "pk-fm-done", "2026-10-27T13:50:00")])
+
+# task view 的 refresh / 全局 refresh 都走 refresh_task_state —— 只读，但必须能看见完成
+task_refresh = store.create({"title": "refresh 也要看见完成"})
+store.assign(task_refresh["id"], {"date": "2026-10-27", "start": "15:00", "duration": 50})
+store.attach_focusmate(task_refresh["id"], {"task_id": "fm-refresh-done"})
+wd.offline = False
+try:
+    wd.bridge.replies["tasks"] = {"tasks": [{
+        "id": "fm-refresh-done", "title": "refresh 也要看见完成", "completed": True,
+        "completedAt": "2026-10-27T07:50:00.000Z",
+    }]}
+    wd.refresh_task_state()
+finally:
+    wd.offline = True
+check("refresh 的任务同步路径能看到 Focusmate 已完成",
+      store.get(task_refresh["id"])["status"], ts.STATUS_COMPLETED)
+
+# refresh --check：Focusmate 已勾完的 task 只在 /tasks/completed → 不能被当成「挂丢了」
+# 再建一条。bridge 的 tasks 合并两半后，_attachment_verdict 应认它仍然挂在原 session。
+task_attached = store.create({"title": "已经勾完不要再建"})
+store.assign(task_attached["id"], {
+    "date": "2026-10-27", "start": "14:00", "duration": 50,
+    "focusmate_session_id": "sess-attached",
+})
+store.attach_focusmate(task_attached["id"], {"task_id": "fm-attached"})
+wd.offline = False
+try:
+    wd.bridge.replies["tasks"] = {"tasks": [{
+        "id": "fm-attached", "title": "已经勾完不要再建", "completed": True,
+        "completedAt": "2026-10-27T06:50:00.000Z",
+        # 就算服务端没给 attachment，完成态本身也必须阻止「重挂成第二条」
+        "attachments": [],
+    }]}
+    wd.bridge.calls = []
+    fixed = wd.check_task_attachments()
+finally:
+    wd.offline = True
+check("已完成 task 不再触发重挂（attachment 缺失也一样）", fixed, 0)
+check("没有额外调 add_task", [c for c in wd.bridge.calls if c[0] == "add_task"], [])
+
 # task N duplicate -a M
 task5 = store.create({"title": "复制的源头"})
 wd.cmd_task_link(["id:%d" % task5["id"], "omnifocus:///task/pk5"])

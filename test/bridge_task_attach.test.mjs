@@ -2,7 +2,13 @@
 //   node --test test/bridge_task_attach.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attachTaskViaApi, taskCreateBodies, taskAttachShapes } from "../scripts/task_attach.mjs";
+import {
+  attachTaskViaApi,
+  completeTaskViaApi,
+  mergeTaskLists,
+  taskCreateBodies,
+  taskAttachShapes,
+} from "../scripts/task_attach.mjs";
 
 const MEETING = { id: "sess-uuid-1", startMs: 1790842500000 };
 
@@ -112,4 +118,48 @@ test("候选 body / 端点形状：由简到繁，且都带 attachments", () => 
     assert.ok(JSON.stringify(body).includes(MEETING.id), "每个候选都得指向这场 session");
   }
   assert.deepEqual(taskAttachShapes(null, MEETING.id, {}), []);
+});
+
+test("进行中 / 已完成两个列表按 id 合并，不丢完成项", () => {
+  const active = [{ id: "a", title: "还在做" }];
+  const done = [
+    { id: "b", title: "做完了", completed: true, completedAt: "2026-10-30T02:00:00Z" },
+    { id: "a", title: "同一条的完成态", completed: true },
+  ];
+  const merged = mergeTaskLists(active, done);
+  assert.equal(merged.length, 2);
+  assert.equal(merged.find((t) => t.id === "a").completed, true,
+    "同一 id 以更后面的列表为准（完成态不能被进行中列表盖回去）");
+  assert.equal(merged.find((t) => t.id === "b").completedAt, "2026-10-30T02:00:00Z");
+});
+
+test("complete_task：完成之后从 /tasks 消失、在 /tasks/completed 里仍能复核", async () => {
+  const state = {
+    active: [{ id: "task-1", title: "写论文", completedAt: null }],
+    completed: [],
+    calls: [],
+  };
+  const deps = {
+    callApi: async (method, path, body) => {
+      state.calls.push([method, path, body]);
+      if (method === "POST" && path === "/tasks/task-1/complete") {
+        const task = state.active.shift();
+        task.completed = true;
+        task.completedAt = "2026-10-30T02:50:20.698791+00:00";
+        state.completed.push(task);
+        return { status: 200, json: task };
+      }
+      return { status: 404, json: null, text: "no route" };
+    },
+    // 模拟拉取「进行中 + 已完成」两边的 findTask：完成前在 active，完成后在 completed。
+    findTask: async (id) => {
+      const hit = [...state.active, ...state.completed].find((t) => t.id === id);
+      return hit || null;
+    },
+  };
+  const out = await completeTaskViaApi(deps, "task-1");
+  assert.equal(out.via, "POST /tasks/{id}/complete");
+  assert.equal(out.task.completedAt, "2026-10-30T02:50:20.698791+00:00");
+  assert.equal(state.active.length, 0);
+  assert.equal(state.completed.length, 1);
 });

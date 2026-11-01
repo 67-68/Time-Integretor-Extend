@@ -21,8 +21,11 @@ ping / snapshot / title / mute / cancel / tasks / add_task / complete_task / rel
 ```
 
 - `add_task startMs title? notes? via?` —— 给某场 session 挂 task（API 优先、DOM 兜底，都复核）；
-- `complete_task taskId` —— 把一条 task 勾完成（候选端点 + `GET /tasks` 复核 `completedAt`，
-  见 `task_attach.mjs` 的 `completeTaskShapes()`；**这条没有真机验证过**）。
+- `tasks` —— 同时拉 `GET /tasks`（未完成）和 `GET /tasks/completed`（已完成，支持 cursor
+  分页）再按 id 合并。**只读 `/tasks` 看不到已勾完的 task**，这是「Focusmate 勾了但
+  warden / OmniFocus 没同步」的根因；
+- `complete_task taskId` —— `POST /tasks/{id}/complete`，完成后再从
+  `/tasks/completed` 复核 `completedAt`；每一步写 `temp/logs/YYYY-MM-DD.jsonl`。
 
 `_lib.mjs` 是共用底座（起浏览器、取 token、调内部 API、按时间找 session、CLI 解析）。
 

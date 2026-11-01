@@ -116,6 +116,9 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task <序号> duplicate [-a N]` | 复制一条（字段 + 本地标签 + **同一条 OmniFocus**），可顺手挂到 #N |
 | `task <序号> done [分钟]` | 完成：本地完成 + 归档 + Focusmate 勾上 + **OmniFocus 完成并写回截止时间** |
 | `task <序号> drop [--local]` | 放弃：本地放弃；默认**OmniFocus 也放弃**，`--local` 只改本地 |
+| `task <序号> -m complete`（`--mark complete`） | **手动记账**：本地 completed + 归档；不勾 Focusmate、不当场写 OmniFocus（之后的同步仍会按单向契约写回） |
+| `task <序号> -m discard`（`--mark discard`） | **手动记账**：本地 dropped；完全不动 Focusmate / OmniFocus |
+| `task -m complete` / `task -m discard` | 不写序号 = 标记当前选中的任务；`-m` 与 `--mark`、后缀位置都等价 |
 | `task <序号> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
 | `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus，可一次多行 |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
@@ -126,6 +129,12 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task -s 5 -a none` | 把 session #5 上的全部任务下架 |
 | `task -s 5` | 只列 #5 上现在挂着谁（只看不动） |
 | `refresh --check`（`-c`） | 重拉 session **+ 对账**：该订没订上、该挂没挂上 → 修 |
+
+`-m/--mark` 也是任何 task 动作都能带的后缀，但它和 `done` / `drop` 的分工要说清：
+
+- `done` / `drop` 是**动作**，会按契约去勾 Focusmate、写 OmniFocus；
+- `-m complete` / `-m discard` 是**手动记账**，只改本地状态，不碰外部系统；
+  `complete` 会进完成归档，`discard` 不会产生任何自动外部写回。
 
 `--assign N` 是**任何** task 子命令都认的后缀（`_split_assign()` 在 `cmd_task()` 入口
 统一摘掉），所以这些写法都成立：

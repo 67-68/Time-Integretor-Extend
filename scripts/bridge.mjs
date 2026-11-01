@@ -69,7 +69,52 @@
  */
 
 import readline from "readline";
-import { attachTaskViaApi, completeTaskViaApi } from "./task_attach.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { attachTaskViaApi, completeTaskViaApi, mergeTaskLists } from "./task_attach.mjs";
+
+// ---------------------------------------------------------------- 每日运行日志
+
+// 与 Python 侧 runtime_log.py 同一个目录、同一套「按本地日期分文件」约定：
+//   temp/logs/YYYY-MM-DD.jsonl
+// 每行一个 JSON。日志是旁路：写不进去也绝不能影响命令。
+const LOG_DIR = process.env.TI_LOG_DIR || path.join(process.cwd(), "temp", "logs");
+
+function localDay(d = new Date()) {
+  const pad = (n) => (n < 10 ? "0" + n : "" + n);
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+}
+
+function logEvent(area, event, fields = {}) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const rec = {
+      ts: new Date().toISOString(),
+      area,
+      event,
+      ...fields,
+    };
+    fs.appendFileSync(path.join(LOG_DIR, localDay() + ".jsonl"),
+      JSON.stringify(rec) + "\n", "utf8");
+  } catch {
+    /* 日志失败不能影响业务 */
+  }
+}
+
+function taskLogRow(t) {
+  return {
+    id: t?.id,
+    title: t?.title || "",
+    completed: !!(t?.completed || t?.completedAt || t?.completed_at),
+    completedAt: t?.completedAt || t?.completed_at || null,
+    createdAt: t?.createdAt || t?.created_at || null,
+    attachments: (t?.attachments || []).map((a) => ({
+      type: a?.type || a?.attachmentType || "",
+      externalId: a?.externalId ?? a?.id ?? "",
+      startMs: a?.startMs ?? null,
+    })),
+  };
+}
 
 // ---------------------------------------------------------------- 独占 stdout
 
@@ -314,6 +359,7 @@ function normalizeTask(t) {
     id: t.id,
     title: t.title || "",
     description: t.description || "",
+    completed: !!(t.completed || t.completedAt || t.completed_at),
     completedAt: t.completedAt || t.completed_at || null,
     createdAt: t.createdAt || t.created_at || null,
     attachments: (t.attachments || []).map((a) => ({
@@ -323,13 +369,86 @@ function normalizeTask(t) {
   };
 }
 
-async function listTasksRaw() {
-  const r = await callApi("GET", "/tasks");
+function tasksFromResponse(r, endpoint) {
   if (r.status !== 200) {
-    throw new Error("GET /tasks 失败：HTTP " + r.status + " " + String(r.text || "").slice(0, 300));
+    logEvent("focusmate", "tasks_pull_page_error", {
+      endpoint,
+      status: r.status,
+      error: String(r.text || "").slice(0, 1000),
+    });
+    throw new Error(
+      "GET " + endpoint + " 失败：HTTP " + r.status + " " + String(r.text || "").slice(0, 300)
+    );
   }
   const arr = r.json?.tasks ?? (Array.isArray(r.json) ? r.json : r.json?.data ?? []);
-  return Array.isArray(arr) ? arr : [];
+  const rows = Array.isArray(arr) ? arr : [];
+  logEvent("focusmate", "tasks_pull_page", {
+    endpoint,
+    status: r.status,
+    count: rows.length,
+    hasMore: !!r.json?.hasMore,
+    nextCursor: r.json?.nextCursor ?? null,
+    tasks: rows.map(taskLogRow),
+  });
+  return rows;
+}
+
+/** 未完成的 task —— GET /tasks 只返回这一半（Focusmate 的完成项不在这里）。 */
+async function listIncompleteTasksRaw() {
+  return tasksFromResponse(await callApi("GET", "/tasks"), "/tasks");
+}
+
+/** 已完成的 task —— 单独一页一页拉；GET /tasks 看不到它们。 */
+async function listCompletedTasksRaw() {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 50; page++) {
+    const path = "/tasks/completed" + (cursor ? "?cursor=" + encodeURIComponent(cursor) : "");
+    const r = await callApi("GET", path);
+    out.push(...tasksFromResponse(r, "/tasks/completed"));
+    if (!r.json?.hasMore || !r.json?.nextCursor) break;
+    cursor = r.json.nextCursor;
+  }
+  return out;
+}
+
+/**
+ * 两个列表合在一起。
+ *
+ * 「关联任务完成之后没同步」的真因：Focusmate 的 GET /tasks 只列**未完成**
+ * 的 task，勾完的会从那里消失、只在 GET /tasks/completed 出现。以前只读
+ * /tasks → 本地永远看不到 completedAt → 不会写回 OmniFocus。
+ */
+async function listAllTasksRaw() {
+  const started = Date.now();
+  logEvent("focusmate", "tasks_pull_start", { source: "/tasks + /tasks/completed" });
+  let completedFailed = null;
+  const [active, completed] = await Promise.all([
+    listIncompleteTasksRaw(),
+    listCompletedTasksRaw().catch((e) => {
+      // 老服务端/临时故障时退回只看未完成，不把整条命令拖死。
+      completedFailed = String(e && e.message ? e.message : e);
+      logEvent("focusmate", "tasks_pull_completed_error", { error: completedFailed });
+      process.stderr.write("[focusmate][WARN] 拉已完成 task 失败：" + brief(e) + "\n");
+      return [];
+    }),
+  ]);
+  const merged = mergeTaskLists(active, completed);
+  logEvent("focusmate", "tasks_pull_done", {
+    source: "/tasks + /tasks/completed",
+    active_count: active.length,
+    completed_count: completed.length,
+    total: merged.length,
+    completed_fetch_failed: completedFailed,
+    elapsed_ms: Date.now() - started,
+    tasks: merged.map(taskLogRow),
+  });
+  return merged;
+}
+
+/** 只给 attach/复核用：新建中的 task 必在未完成列表里。 */
+async function listTasksRaw() {
+  return listIncompleteTasksRaw();
 }
 
 async function pickTextLocator(candidates) {
@@ -549,7 +668,7 @@ const handlers = {
   },
 
   async tasks() {
-    const all = await listTasksRaw();
+    const all = await listAllTasksRaw();
     const rows = all.map(normalizeTask);
     return { count: rows.length, tasks: rows };
   },
@@ -605,13 +724,15 @@ const handlers = {
   async complete_task(req) {
     const taskId = String(req.taskId || "");
     if (!taskId) throw new Error("complete_task 要 taskId（Focusmate task 的 id）");
+    const started = Date.now();
     const attempts = [];
+    logEvent("focusmate", "task_complete_start", { taskId });
     try {
       const done = await completeTaskViaApi(
         {
           callApi,
           findTask: async (id) => {
-            const all = await listTasksRaw();
+            const all = await listAllTasksRaw();
             const hit = all.find((t) => String(t.id) === String(id));
             return hit ? normalizeTask(hit) : null;
           },
@@ -620,7 +741,7 @@ const handlers = {
       );
       attempts.push(...(done.attempts || []));
       const task = normalizeTask(done.task || {});
-      return {
+      const result = {
         verified: !!task.completedAt,
         already: !!done.already,
         via: done.via || null,
@@ -629,8 +750,19 @@ const handlers = {
         completedAt: task.completedAt,
         attempts,
       };
+      logEvent("focusmate", "task_complete_result", {
+        ...result,
+        elapsed_ms: Date.now() - started,
+      });
+      return result;
     } catch (e) {
       attempts.push(...((e && e.attempts) || []));
+      logEvent("focusmate", "task_complete_error", {
+        taskId,
+        attempts,
+        error: String(e && e.message ? e.message : e),
+        elapsed_ms: Date.now() - started,
+      });
       const err = new Error((e && e.message ? e.message : String(e)) +
         (attempts.length ? "｜试过：" + attempts.join("；") : ""));
       err.attempts = attempts;
@@ -646,7 +778,7 @@ const handlers = {
     if (!taskId) throw new Error("delete_task 要 taskId（Focusmate task 的 id）");
     let before = null;
     try {
-      const all = await listTasksRaw();
+      const all = await listAllTasksRaw();
       before = all.find((t) => String(t.id) === taskId) || null;
     } catch (e) {
       // 列不出来也继续删：删完还会复核
@@ -663,7 +795,7 @@ const handlers = {
       await sleep(i === 0 ? 300 : 800);
       let all = [];
       try {
-        all = await listTasksRaw();
+        all = await listAllTasksRaw();
       } catch (e) {
         continue;
       }

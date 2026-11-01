@@ -130,19 +130,56 @@ TUI 里的用法：`task import`（不给参数 = 读剪贴板导入并自动关
 
 写回是**幂等**的：写过的记在 `task.omnifocus.writeback.completed` 上，重复同步不会重复写。
 
+触发写回的地方有四个：
+
+1. `task done` / 收尾 D（直接完成）；
+2. `task sync`（拉 Focusmate 完成状态后补写）；
+3. 收尾自动核对（session 结束后）；
+4. **`refresh --check`**（对账时补写「本地已完成但还没写回」的）。
+   裸 `refresh` 仍然只读、不写 OmniFocus；`refresh --check` 本来就是"把不对的掰回来"，
+   所以包含这一步。
+
 ## 4. 收尾时「读」一次
 
+> ⚠️ Focusmate 的 `GET /v1/tasks` **只返回未完成的 task**；勾完的会从列表消失，
+> 只在 `GET /v1/tasks/completed` 里（可带 cursor 分页）。所以 bridge 的 `tasks`
+> 必须两边都拉、按 id 合并 —— 只拉 `/tasks` 时本地永远等不到 `completedAt`，
+> 也就不会触发 OmniFocus 写回。
+
 `Warden.sync_completion_state()`（收尾入口调它）：
-1. `GET /v1/tasks`（bridge）→ `task_store.reconcile()` → Focusmate 的 `completedAt`
-   进归档，**并且把本地 `status` 落成 `completed`**（以前只归档不改状态，靠读文件时
-   的老数据兼容规则兜，于是界面上「有完成却看不见 ✓」，用户反馈过）；
+1. `GET /v1/tasks` + `GET /v1/tasks/completed`（bridge）→ `task_store.reconcile()`
+   → Focusmate 的 `completedAt` 进归档，**并且把本地 `status` 落成 `completed`**
+   （以前只归档不改状态，靠读文件时的老数据兼容规则兜，于是界面上「有完成却看不见 ✓」，
+   用户反馈过）；
 2. `omnifocus.py list` **一次** → 哪条 OmniFocus 任务已经 `completed`，本地跟着标完成；
 3. `writeback_completions()` 把「本地完成但还没写回」的补写回去。
 
 OmniFocus 读不到（权限没给 / 没装）只变成一句警告：收尾照常进行，
 只是少了「OmniFocus 那边也勾了」这条信息。
 
-## 5. 权限（第一次用之前点一次）
+## 5. 运行日志（按天）
+
+Focusmate 拉 task、Focusmate 勾完成、OmniFocus 读写都会写 JSONL：
+
+```text
+temp/logs/YYYY-MM-DD.jsonl
+```
+
+一行一个事件，关键事件：
+
+| `area` | `event` | 里面有什么 |
+|---|---|---|
+| `focusmate` | `tasks_pull_page` | 本次请求的端点、HTTP 状态、任务数、`hasMore`、这一页的每条 task（id/title/completed/completedAt/attachments） |
+| `focusmate` | `tasks_pull_done` | `/tasks` 与 `/tasks/completed` 各多少条、合并后总数、耗时、合并后的任务快照 |
+| `focusmate` | `task_complete_start/result/error` | 勾哪条 task、尝试过哪些端点、复核到的 completedAt、错误 |
+| `omnifocus` | `status_pull_start/result/error` | 读 OmniFocus 全部任务的结果、本地关联数、已完成数 |
+| `omnifocus` | `complete_start/result/error` | 本地任务 id / 标题 / pk / due、写前状态、`changed`、写后 `after.completed`、错误 kind / exit code / detail |
+| `omnifocus` | `writeback_scan_start/result` | 本轮补写扫到哪些本地已完成任务、写了几条 |
+
+日志不会写 token / cookie。`TI_LOG_DIR=/path` 可以改目录（Node 桥和 Python
+共用这个变量）。日志只是旁路：目录写不进去不会影响任务流程。
+
+## 6. 权限（第一次用之前点一次）
 
 macOS 不允许一个 app 悄悄控制另一个 app。第一次跑
 `python3 omnifocus_tasks.py` 会弹「终端（或 iTerm）想要控制 OmniFocus」——
@@ -156,7 +193,7 @@ tccutil reset AppleEvents
 被拒时 `omnifocus_tasks.py` 退出码是 **3**，warden 里会显示
 「自动化权限被拒」而不是一句「失败」——看到这一句就别再试了，去点开关。
 
-## 6. 关掉它
+## 7. 关掉它
 
 ```
 set omnifocus off

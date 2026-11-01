@@ -270,6 +270,1145 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-10-28T19:50:37",
+      "task_id": 35,
+      "fields": {
+        "title": "doAndMarkPhysic",
+        "due": "2026-10-28T19:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-28",
+        "start": "19:00",
+        "end": "19:50",
+        "duration": "50",
+        "focusmate_session_id": "ccde9fd7-1833-4dcc-967c-28134d1e2d81",
+        "previous_due": "2026-10-28T17:45:00"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 70,
+      "status_at": "2026-10-28T19:50:37",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "7fa4d17f-7a46-4121-bd70-44359ec5d24a",
+        "title": "doAndMarkPhysic",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-10-28T20:50:59",
+      "task_id": 37,
+      "fields": {
+        "title": "historyReading",
+        "due": "2026-10-28T20:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-28",
+        "start": "20:00",
+        "end": "20:50",
+        "duration": "50",
+        "focusmate_session_id": "6c92d764-4826-41cc-86c8-acc1798d67be",
+        "previous_due": "2026-10-28T19:50:00"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 45,
+      "status_at": "2026-10-28T20:50:59",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "c251df55-8d21-41bc-a331-2dfb0f298f83",
+        "title": "historyReading",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-10-29T08:33:02",
+      "task_id": 29,
+      "fields": {
+        "title": "flashcards",
+        "due": "2026-10-29T00:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 11,
+        "date": "2026-10-28",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": 50,
+        "focusmate_session_id": "177d5afc-62f6-49cd-8d85-68edb0490c95"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 20,
+      "status_at": "2026-10-29T08:33:02",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "1771fcd0-a541-4152-86d7-792da133b9f3",
+        "title": "flashcards",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-10-29T23:37:29",
+      "task_id": 52,
+      "fields": {
+        "title": "起草辅助判断（每天的任务）系统",
+        "due": "2026-10-29T19:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-10-29",
+        "start": "19:00",
+        "end": "19:50",
+        "duration": 50,
+        "focusmate_session_id": "96f2a48d-3136-4850-a796-0e7639653fed"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 50,
+      "status_at": "2026-10-29T23:37:29",
+      "omnifocus": {
+        "id": "ey1qIW72_7F",
+        "url": "omnifocus:///task/ey1qIW72_7F",
+        "title": "起草辅助判断（每天的任务）系统",
+        "linked_at": "2026-10-29T09:53:25"
+      },
+      "focusmate": {
+        "task_id": "a1ee612d-4f75-42ed-8da1-e4c809e2cd14",
+        "title": "起草辅助判断（每天的任务）系统",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 1,
+      "fields": {
+        "title": "完成并correct计算机set3"
+      },
+      "session": {
+        "index": 1,
+        "date": "2026-10-27",
+        "start": "11:00",
+        "end": "11:50",
+        "duration": 50,
+        "focusmate_session_id": "b011cccd-f0cd-4c1a-a287-25c36b7dbaea"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "42cabb17-d387-4c8a-b4b3-dee63a44e1bf",
+        "title": "完成并correct计算机set3",
+        "description": "",
+        "completed_at": "2026-10-27T03:50:23.606928+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "b011cccd-f0cd-4c1a-a287-25c36b7dbaea"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 1,
+      "fields": {
+        "title": "完成并correct计算机set3"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-10-27",
+        "start": "16:45",
+        "end": "17:35",
+        "duration": 50,
+        "focusmate_session_id": "963e65f3-7e38-47c4-98cb-8f51c7ffecd9"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "608b45ca-f1e9-4c3c-8d09-84311c0c9c86",
+        "title": "完成并correct计算机set3",
+        "description": "",
+        "completed_at": "2026-10-27T09:36:38.762982+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "963e65f3-7e38-47c4-98cb-8f51c7ffecd9"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 2,
+      "fields": {
+        "title": "从我自己的PR获取额外的题目assign"
+      },
+      "session": {
+        "index": 1,
+        "date": "2026-10-27",
+        "start": "11:00",
+        "end": "11:50",
+        "duration": 50,
+        "focusmate_session_id": "b011cccd-f0cd-4c1a-a287-25c36b7dbaea"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "b5c6f60a-799e-4a06-a5d7-91221d970ee6",
+        "title": "从我自己的PR获取额外的题目assign",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:13.848746+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "b011cccd-f0cd-4c1a-a287-25c36b7dbaea"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 3,
+      "fields": {
+        "title": "做物理的set1并correct"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-10-27",
+        "start": "16:45",
+        "end": "17:35",
+        "duration": 50,
+        "focusmate_session_id": "963e65f3-7e38-47c4-98cb-8f51c7ffecd9"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "78406bd0-be06-424a-8745-36f0d7e0d24c",
+        "title": "做物理的set1并correct",
+        "description": "",
+        "completed_at": "2026-10-27T11:49:43.493749+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "963e65f3-7e38-47c4-98cb-8f51c7ffecd9"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 4,
+      "fields": {
+        "title": "correct物理的LastYearQuestionsAndCorrect"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-10-27",
+        "start": "16:45",
+        "end": "17:35",
+        "duration": 50,
+        "focusmate_session_id": "963e65f3-7e38-47c4-98cb-8f51c7ffecd9"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "b183513b-8a23-4189-a0a4-8c449f8d5129",
+        "title": "correct物理的LastYearQuestionsAndCorrect",
+        "description": "",
+        "completed_at": "2026-10-27T09:36:37.487589+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "963e65f3-7e38-47c4-98cb-8f51c7ffecd9"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 5,
+      "fields": {
+        "title": "correctHardQuestion"
+      },
+      "session": {
+        "index": 2,
+        "date": "2026-10-27",
+        "start": "12:00",
+        "end": "12:25",
+        "duration": 25,
+        "focusmate_session_id": "17813890-2fa3-4b3b-aeff-0882d6246378"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "c5c8cf19-81e0-4290-b0ac-b4329a2eeb71",
+        "title": "correctHardQuestion",
+        "description": "",
+        "completed_at": "2026-10-27T04:18:23.010187+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "17813890-2fa3-4b3b-aeff-0882d6246378"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 6,
+      "fields": {
+        "title": "hardQuestion11"
+      },
+      "session": {
+        "index": 4,
+        "date": "2026-10-27",
+        "start": "19:00",
+        "end": "19:50",
+        "duration": 50,
+        "focusmate_session_id": "e1a7a7bd-b3a8-4391-8dd6-cacccd54482c"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "9aa02b81-00ac-4256-8744-9406e6992918",
+        "title": "hardQuestion11",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:14.348953+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "e1a7a7bd-b3a8-4391-8dd6-cacccd54482c"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 7,
+      "fields": {
+        "title": "correctOtherSatQues"
+      },
+      "session": {
+        "index": 2,
+        "date": "2026-10-27",
+        "start": "12:00",
+        "end": "12:25",
+        "duration": 25,
+        "focusmate_session_id": "17813890-2fa3-4b3b-aeff-0882d6246378"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "0070df75-e3c7-4457-b7d1-f59461020784",
+        "title": "correctOtherSatQues",
+        "description": "",
+        "completed_at": "2026-10-27T04:18:22.129840+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "17813890-2fa3-4b3b-aeff-0882d6246378"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 8,
+      "fields": {
+        "title": "完成bluebook6英语部分"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-10-27",
+        "start": "20:00",
+        "end": "21:15",
+        "duration": 75,
+        "focusmate_session_id": "27a899aa-230d-4bb7-b7ab-76fe5a5e88c7"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "043dce63-dfa1-48d7-8012-af873921154b",
+        "title": "完成bluebook6英语部分",
+        "description": "",
+        "completed_at": "2026-10-27T14:31:36.683256+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "27a899aa-230d-4bb7-b7ab-76fe5a5e88c7"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 9,
+      "fields": {
+        "title": "sat数学题目修正"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-10-27",
+        "start": "22:15",
+        "end": "23:05",
+        "duration": 50,
+        "focusmate_session_id": "1786542c-e8a3-4286-a192-87b70fa6dace"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "a31a969d-534f-47c8-8fab-3509ea897283",
+        "title": "sat数学题目修正",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:17.469824+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "1786542c-e8a3-4286-a192-87b70fa6dace"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 10,
+      "fields": {
+        "title": "sat数学bluebook6"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-10-27",
+        "start": "22:15",
+        "end": "23:05",
+        "duration": 50,
+        "focusmate_session_id": "1786542c-e8a3-4286-a192-87b70fa6dace"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "bb657dfd-cb23-4848-8738-4beb97115bf1",
+        "title": "sat数学bluebook6",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:16.217542+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "1786542c-e8a3-4286-a192-87b70fa6dace"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 11,
+      "fields": {
+        "title": "闪卡复习（英语+音乐）"
+      },
+      "session": {
+        "index": 7,
+        "date": "2026-10-27",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": 50,
+        "focusmate_session_id": "29442be3-0e04-4429-bd05-e985ee9d2446"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "69c7914e-c370-4c9c-af81-5fa230c2f227",
+        "title": "闪卡复习（英语+音乐）",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:21.052895+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "29442be3-0e04-4429-bd05-e985ee9d2446"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 12,
+      "fields": {
+        "title": "闪卡学习（CS）"
+      },
+      "session": {
+        "index": 7,
+        "date": "2026-10-27",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": 50,
+        "focusmate_session_id": "29442be3-0e04-4429-bd05-e985ee9d2446"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "7eabc384-103d-4856-8b76-f31fab47d5c6",
+        "title": "闪卡学习（CS）",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:20.415690+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "29442be3-0e04-4429-bd05-e985ee9d2446"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 13,
+      "fields": {
+        "title": "correct物理的LastYearQuestionsAndCorrect",
+        "due": "2026-10-27T21:15:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-10-27",
+        "start": "20:00",
+        "end": "21:15",
+        "duration": 75,
+        "focusmate_session_id": "27a899aa-230d-4bb7-b7ab-76fe5a5e88c7"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "a3c129b5-6b88-4949-a295-eb1311353f27",
+        "title": "correct物理的LastYearQuestionsAndCorrect",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:16.524884+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "27a899aa-230d-4bb7-b7ab-76fe5a5e88c7"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 14,
+      "fields": {
+        "title": "hardQuestion11",
+        "due": "2026-10-27T21:15:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-10-27",
+        "start": "20:00",
+        "end": "21:15",
+        "duration": 75,
+        "focusmate_session_id": "27a899aa-230d-4bb7-b7ab-76fe5a5e88c7"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "41221983-c783-4666-8118-8da9de31b39d",
+        "title": "hardQuestion11",
+        "description": "",
+        "completed_at": "2026-10-27T12:13:56.100733+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "27a899aa-230d-4bb7-b7ab-76fe5a5e88c7"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 17,
+      "fields": {
+        "title": "物理lastyear",
+        "due": "2026-10-28T16:15:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-10-28",
+        "start": "15:00",
+        "end": "16:15",
+        "duration": 75,
+        "focusmate_session_id": "2981ed35-4539-47b4-818a-fceb92f18abb",
+        "previous_due": "2026-10-28T10:35:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "ba4bab52-19fa-4251-a7ea-92ef49c49901",
+        "title": "物理lastyear",
+        "description": "",
+        "completed_at": "2026-10-28T07:48:15.821642+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "e5abc05d-cec4-434c-b8c6-dbf19fa79b9b"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 18,
+      "fields": {
+        "title": "sat数学题目修正",
+        "due": "2026-10-28T00:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-27",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": "50",
+        "focusmate_session_id": "29442be3-0e04-4429-bd05-e985ee9d2446"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "94a75875-062a-446d-b3b4-c795b7ad69a2",
+        "title": "sat数学题目修正",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:19.047408+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "29442be3-0e04-4429-bd05-e985ee9d2446"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 19,
+      "fields": {
+        "title": "sat数学bluebook6",
+        "due": "2026-10-28T00:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-27",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": "50",
+        "focusmate_session_id": "29442be3-0e04-4429-bd05-e985ee9d2446"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "2adf16e2-835c-4431-89b3-3c46418579bd",
+        "title": "sat数学bluebook6",
+        "description": "",
+        "completed_at": "2026-10-27T15:38:46.009869+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "29442be3-0e04-4429-bd05-e985ee9d2446"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 21,
+      "fields": {
+        "title": "创建任务",
+        "due": "2026-10-28T10:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 2,
+        "date": "2026-10-28",
+        "start": "09:45",
+        "end": "10:35",
+        "duration": 50,
+        "focusmate_session_id": "d1180ebb-1b12-4dbb-9a7f-1bce16bbc2b5"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "fbcd9b81-cf4c-410e-9f4d-130291cbedc5",
+        "title": "创建任务",
+        "description": "",
+        "completed_at": "2026-10-28T02:15:38.014113+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "d1180ebb-1b12-4dbb-9a7f-1bce16bbc2b5"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 22,
+      "fields": {
+        "title": "cs flashcards",
+        "due": "2026-10-28T11:10:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 4,
+        "date": "2026-10-28",
+        "start": "10:45",
+        "end": "11:10",
+        "duration": 25,
+        "focusmate_session_id": "adb6ac45-fdac-4667-a2fe-5c36ea978b83"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "e9244c8c-93ad-4c95-8955-2fc8d92502ec",
+        "title": "cs flashcards",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:25.522405+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "adb6ac45-fdac-4667-a2fe-5c36ea978b83"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 23,
+      "fields": {
+        "title": "物理需要review unit 的东西（之前的闪卡） anki and suvat and new flashcards i add to physic",
+        "due": "2026-10-28T21:25:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 9,
+        "date": "2026-10-28",
+        "start": "21:00",
+        "end": "21:25",
+        "duration": 25,
+        "focusmate_session_id": "a67f720e-8c75-4a7e-a6de-905d6f6b7add",
+        "previous_due": "2026-10-28T11:10:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "02c68d5d-3f16-459c-9444-0891392a7dbd",
+        "title": "物理需要review unit 的东西（之前的闪卡） anki and suvat and new flashcards i add to physic",
+        "description": "",
+        "completed_at": "2026-10-28T13:26:04.782552+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "a67f720e-8c75-4a7e-a6de-905d6f6b7add"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 23,
+      "fields": {
+        "title": "物理需要review unit 的东西（之前的闪卡） anki and suvat and new flashcards i add to physic",
+        "due": "2026-10-28T21:25:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 4,
+        "date": "2026-10-28",
+        "start": "10:45",
+        "end": "11:10",
+        "duration": 25,
+        "focusmate_session_id": "adb6ac45-fdac-4667-a2fe-5c36ea978b83"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "890896c6-fa0b-465c-abeb-97e1be031561",
+        "title": "物理需要review unit 的东西（之前的闪卡） anki and suvat and new flashcards i add to physic",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:23.342149+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "adb6ac45-fdac-4667-a2fe-5c36ea978b83"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 26,
+      "fields": {
+        "title": "csPreviousPractices",
+        "due": "2026-10-28T10:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 2,
+        "date": "2026-10-28",
+        "start": "09:45",
+        "end": "10:35",
+        "duration": 50,
+        "focusmate_session_id": "d1180ebb-1b12-4dbb-9a7f-1bce16bbc2b5"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "3e256fc3-6fbf-4c12-b851-20388fc9b9d1",
+        "title": "csPreviousPractices",
+        "description": "",
+        "completed_at": "2026-10-28T07:34:21.719723+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "d1180ebb-1b12-4dbb-9a7f-1bce16bbc2b5"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 27,
+      "fields": {
+        "title": "physic mco teams, weekly materials inclass quiz",
+        "due": "2026-10-28T16:15:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-10-28",
+        "start": "15:00",
+        "end": "16:15",
+        "duration": 75,
+        "focusmate_session_id": "2981ed35-4539-47b4-818a-fceb92f18abb"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "d59d118d-00ec-4f21-add9-24ee011f42f1",
+        "title": "physic mco teams, weekly materials inclass quiz",
+        "description": "",
+        "completed_at": "2026-10-28T07:48:17.706928+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "e5abc05d-cec4-434c-b8c6-dbf19fa79b9b"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 29,
+      "fields": {
+        "title": "flashcards",
+        "due": "2026-10-29T00:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 11,
+        "date": "2026-10-28",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": 50,
+        "focusmate_session_id": "177d5afc-62f6-49cd-8d85-68edb0490c95"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "1771fcd0-a541-4152-86d7-792da133b9f3",
+        "title": "flashcards",
+        "description": "",
+        "completed_at": "2026-10-29T00:33:13.461780+00:00",
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 35,
+      "fields": {
+        "title": "doAndMarkPhysic",
+        "due": "2026-10-28T19:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-28",
+        "start": "19:00",
+        "end": "19:50",
+        "duration": "50",
+        "focusmate_session_id": "ccde9fd7-1833-4dcc-967c-28134d1e2d81",
+        "previous_due": "2026-10-28T17:45:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "7fa4d17f-7a46-4121-bd70-44359ec5d24a",
+        "title": "doAndMarkPhysic",
+        "description": "",
+        "completed_at": "2026-10-28T11:26:57.208450+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "ccde9fd7-1833-4dcc-967c-28134d1e2d81"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 37,
+      "fields": {
+        "title": "historyReading",
+        "due": "2026-10-28T20:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-28",
+        "start": "20:00",
+        "end": "20:50",
+        "duration": "50",
+        "focusmate_session_id": "6c92d764-4826-41cc-86c8-acc1798d67be",
+        "previous_due": "2026-10-28T19:50:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "c251df55-8d21-41bc-a331-2dfb0f298f83",
+        "title": "historyReading",
+        "description": "",
+        "completed_at": "2026-10-28T12:50:35.391543+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "6c92d764-4826-41cc-86c8-acc1798d67be"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 47,
+      "fields": {
+        "title": "看rubric",
+        "due": "2026-10-29T12:20:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-10-29",
+        "start": "11:30",
+        "end": "12:20",
+        "duration": 50,
+        "focusmate_session_id": "e3d70184-689e-43bd-bb2a-a77f0d4a6e24",
+        "previous_due": "2026-10-29T11:20:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "d111a6a3-563c-4838-91f7-e0318601b50d",
+        "title": "看rubric",
+        "description": "",
+        "completed_at": "2026-10-29T04:20:42.019724+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "e3d70184-689e-43bd-bb2a-a77f0d4a6e24"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 52,
+      "fields": {
+        "title": "起草辅助判断（每天的任务）系统",
+        "due": "2026-10-29T19:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-10-29",
+        "start": "19:00",
+        "end": "19:50",
+        "duration": 50,
+        "focusmate_session_id": "96f2a48d-3136-4850-a796-0e7639653fed"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "a1ee612d-4f75-42ed-8da1-e4c809e2cd14",
+        "title": "起草辅助判断（每天的任务）系统",
+        "description": "",
+        "completed_at": "2026-10-30T02:50:20.698791+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "020efc47-db69-41f4-b3ba-19d7b4085b54"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:15:03",
+      "task_id": 60,
+      "fields": {
+        "title": "test",
+        "due": "2026-10-30T20:20:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-10-30",
+        "start": "19:30",
+        "end": "20:20",
+        "duration": 50,
+        "focusmate_session_id": "85ba23ae-e1b4-46be-9b56-c6deb6579854"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "d2b377a7-091b-4a14-a767-beb6dc1c1d35",
+        "title": "test",
+        "description": "",
+        "completed_at": "2026-10-30T03:14:59.989905+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "85ba23ae-e1b4-46be-9b56-c6deb6579854"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-30T11:16:14",
+      "task_id": 61,
+      "fields": {
+        "title": "test",
+        "due": "2026-10-30T21:20:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 4,
+        "date": "2026-10-30",
+        "start": "20:30",
+        "end": "21:20",
+        "duration": 50,
+        "focusmate_session_id": "1b9e53a0-ccdd-4fb5-b9aa-35c332aba7e8"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "21bee141-0789-465a-bf21-84e63a876ab7",
+        "title": "test",
+        "description": "",
+        "completed_at": "2026-10-30T03:16:05.122601+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "1b9e53a0-ccdd-4fb5-b9aa-35c332aba7e8"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-31T15:50:16",
+      "task_id": 58,
+      "fields": {
+        "title": "sat数学题目修正",
+        "due": "2026-10-31T15:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-10-31",
+        "start": "15:00",
+        "end": "15:50",
+        "duration": 50,
+        "focusmate_session_id": "d58818aa-a062-450e-bee3-4dd7415a535b",
+        "previous_due": "2026-10-29T17:35:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "41774e74-e09d-4a64-afd1-600f22fd14e5",
+        "title": "sat数学题目修正",
+        "description": "",
+        "completed_at": "2026-10-31T07:34:58.326764+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "d58818aa-a062-450e-bee3-4dd7415a535b"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-10-31T17:33:09",
+      "task_id": 66,
+      "fields": {
+        "title": "correct today english",
+        "due": "2026-10-31T16:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-10-31",
+        "start": "16:00",
+        "end": "16:50",
+        "duration": "50",
+        "focusmate_session_id": null,
+        "previous_due": "2026-10-31T15:50:00"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 50,
+      "status_at": "2026-10-31T17:33:09",
+      "omnifocus": {
+        "id": "g_euCVBV9Km",
+        "url": "omnifocus:///task/g_euCVBV9Km",
+        "title": "correct today english",
+        "linked_at": "2026-10-31T15:20:13"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "correct today english",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-01T00:20:03",
+      "task_id": 68,
+      "fields": {
+        "title": "do math flashcards",
+        "due": "2026-10-31T18:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 10,
+        "date": "2026-10-31",
+        "start": "17:45",
+        "end": "18:35",
+        "duration": 50,
+        "focusmate_session_id": "e8717d8d-9cef-4558-8dbf-9bb81872e41a"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 15,
+      "status_at": "2026-11-01T00:20:03",
+      "omnifocus": {
+        "id": "dXTnZMfpESb",
+        "url": "omnifocus:///task/dXTnZMfpESb",
+        "title": "do math flashcards",
+        "linked_at": "2026-10-31T18:12:42"
+      },
+      "focusmate": {
+        "task_id": "467e1e65-d2e1-46dd-9ec5-9e21940b91fd",
+        "title": "do math flashcards",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

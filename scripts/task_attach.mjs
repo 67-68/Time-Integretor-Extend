@@ -17,6 +17,18 @@
  * bridge.mjs 只负责把真实的 callApi / tasksForMeeting / deleteTask 传进来。
  */
 
+
+/** 合并「进行中」与「已完成」两个列表；同一 id 以后出现的那条为准。 */
+export function mergeTaskLists(...lists) {
+  const byId = new Map();
+  for (const list of lists) {
+    for (const task of list || []) {
+      if (task && task.id != null) byId.set(String(task.id), task);
+    }
+  }
+  return Array.from(byId.values());
+}
+
 /** POST /tasks 的候选 body（由简到繁）。 */
 export function taskCreateBodies(title, notes, meetingId) {
   const att = [{ type: "session", externalId: meetingId }];

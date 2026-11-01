@@ -28,6 +28,7 @@
 4. **任务**：本地 JSON 任务库（字段不校验）+ 挂到 session + Focusmate 完成归档
    + OmniFocus 单向联动。
    `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync`；
+   `task <序号> -m complete|discard` 是**只改本地账本**的手动状态标记（不碰外部）；
    `task assign` 成功后才写本地，Focusmate 侧 task id / completedAt 都会记回来。
    `--repeat 周几@HH:MM` 让任务每周重复：只在「同一星期几、同一时刻、同一时长」的
    那场 session 上落地；排布被改过（例如 50 拆成 25+25）时这一周就不落，但 repeat
@@ -248,6 +249,7 @@ import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + �
 import settings_store as cfg  # noqa: E402  设置项注册表 + data/settings.json
 import omnifocus as of  # noqa: E402  OmniFocus：链接解析 + 读写（osascript 子进程）
 import postsession as psv  # noqa: E402  session 结束 15s 后的收尾（纯逻辑）
+import runtime_log as rl  # noqa: E402  按天落盘的 JSONL 运行日志（Focusmate 拉取 / OmniFocus 写回）
 
 BRIDGE_JS = os.path.join(HERE, "scripts", "bridge.mjs")
 #: bridge 的 stderr（`_lib` 的 die()/log 都落这儿）—— 报错信息里直接指过去。
@@ -289,7 +291,29 @@ TASK_SESSION_CURRENT = ("current", "cur", "now", "当前", "现在", "这一场"
 TASK_SHORT_FLAGS = (
     repl_kit.ShortFlag("-an", ("--assign", "none"), note="从 session 下架"),
     repl_kit.ShortFlag("-ac", ("--assign", "current"), note="挂到当前这一场"),
+    # `-m` 展开成 `--mark`，后面那个词（complete / discard）照常跟着：
+    # `task 3 -m complete` ≡ `task 3 --mark complete`。
+    repl_kit.ShortFlag("-m", ("--mark",), note="手动标记 complete/discard"),
 )
+
+# 手动状态标记：`task 3 -m complete` / `task 3 --mark discard`。
+# 这是**账本动作**，不是「完成/放弃」那套外部联动：
+#   complete = 本地 completed + 归档（不勾 Focusmate、不当场写 OmniFocus）
+#   discard  = 本地 dropped（完全不动 Focusmate / OmniFocus）
+# 之后的 `task sync` / `refresh --check` 仍会按单向契约，把本地 completed 写回
+# OmniFocus；discard 永远没有自动写回。
+TASK_MARK_WORDS = ("complete", "discard")
+TASK_MARK_STATES = {
+    "complete": ts.STATUS_COMPLETED,
+    "completed": ts.STATUS_COMPLETED,
+    "done": ts.STATUS_COMPLETED,
+    "完成": ts.STATUS_COMPLETED,
+    "discard": ts.STATUS_DROPPED,
+    "discarded": ts.STATUS_DROPPED,
+    "drop": ts.STATUS_DROPPED,
+    "dropped": ts.STATUS_DROPPED,
+    "放弃": ts.STATUS_DROPPED,
+}
 
 # ---------------------------------------------------------------- 配色
 # 终端背景**一定是深色**的（用户反馈："有些字根本看不见"）。所以这里只有三条规矩：
@@ -790,14 +814,18 @@ def _task_command(w):
     return repl_kit.Command(
         name="task",
         handler=w.cmd_task,
-        summary="任务 CRUD / 挂到 session / 同步完成时间（任何视图都能敲）",
+        summary="任务 CRUD / 挂到 session / 手动标记状态 / 同步完成时间（任何视图都能敲）",
         aliases=(),
         section="通用",
         usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
-              " ... [-a <编号|none|current>] [-s <编号>] [-n 备注]",
-        options=("create", "import", "delete", "modify", "note", "assign", "select",
-                 "swap", "repeat", "sync", "archive", "inspect-due",
-                 "--assign", "-a", "--note", "-n", "--from", "-s", "--repeat"),
+              " ... [-a <编号|none|current>] [-s <编号>] [-n 备注]"
+              " [-m complete|discard]",
+        # 把 flag 放在 action 词前面：补全列表有 20 项上限，flag 被挤到后面
+        # 就等于「有这个选项但 Tab 永远看不到」。
+        options=("--assign", "-a", "--note", "-n", "--from", "-s", "--mark", "--repeat",
+                 "create", "import", "delete", "modify", "note", "assign", "select",
+                 "swap", "repeat", "sync", "archive", "inspect-due"),
+        values={"--mark": TASK_MARK_WORDS, "-m": TASK_MARK_WORDS},
         short=TASK_SHORT_FLAGS,
         completer=lambda prior: task_completer(w, prior),
         hint=_hint_task,
@@ -910,7 +938,11 @@ def _hint_task(parts):
     if not words:
         return repl_kit.Hint("动作", TASK_ACTION_WORDS,
                              note="后缀：-a <编号|none|current> · -s <编号> 批量 · -n 备注"
-                                  " · 字段随便写")
+                                  " · -m complete|discard · 字段随便写")
+    if any(tok in words for tok in ("--mark", "-m")):
+        return repl_kit.Hint("取值", TASK_MARK_WORDS,
+                             note="手动改本地状态：complete = 完成并归档（不勾 Focusmate）"
+                                  "· discard = 放弃（不动外部）")
     if any(tok in words for tok in ("-an", "-ac")):
         return repl_kit.Hint("参数", ("（不用再跟东西）",),
                              note="-an ≡ -a none（下架）· -ac ≡ -a current（当前这一场）")
@@ -929,9 +961,10 @@ def _hint_task(parts):
     if head and (head[0].isdigit() or head[0].startswith("id:")):
         if len(head) == 1:
             return repl_kit.Hint("动作", ("swap", "duplicate", "drop", "done", "link",
-                                          "-a <编号>"),
+                                          "-m complete|discard", "-a <编号>"),
                                  note="数字是面板序号（swap 5 = 和第 5 条换位置）"
-                                      " · -a none 下架 · -a current 挂到当前这一场")
+                                      " · -m 手动标状态 · -a none 下架"
+                                      " · -a current 挂到当前这一场")
         head = head[1:]
     action = head[0] if head else ""
     if action in ("import", "粘贴", "导入"):
@@ -963,8 +996,8 @@ def _hint_task(parts):
         return repl_kit.Hint("参数", ("<session ID>",),
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
     return repl_kit.Hint("参数", TASK_ACTION_WORDS,
-                         note="任何动作都能带 -a <编号|none|current> / -n 备注；"
-                              "-s <编号> 是批量（那一场的全部任务）")
+                         note="任何动作都能带 -a <编号|none|current> / -n 备注"
+                              " / -m complete|discard；-s <编号> 是批量（那一场的全部任务）")
 
 
 class View(object):
@@ -3611,10 +3644,17 @@ class Warden(object):
         裸任务 ID 就是 select（``task 8`` ≡ ``task select 8``），所以最短的挂法是
         ``task 8 -a 1``。
 
-        任何子命令后面都可以跟三个后缀（都能组合）：
+        任何子命令后面都可以跟这些后缀（都能组合）：
           ``--assign <session ID>``（``-a`` 同义）= 顺手挂到那一场
           ``--note <备注>``（``-n`` 同义）= 顺手写备注（可以塞网址）
+          ``--mark complete|discard``（``-m`` 同义）= 手动改本地状态
           ``--from <session ID>``（``-s`` 同义）= 批量：那一场上的**全部**任务
+
+        ``-m/--mark`` 是**账本动作**，不代替 ``done`` / ``drop`` 的外部联动：
+          - ``complete`` = 本地 completed + 归档；不勾 Focusmate，不当场写 OmniFocus
+          - ``discard``  = 本地 dropped；完全不动 Focusmate / OmniFocus
+        之后的 ``task sync`` / ``refresh --check`` 仍会按单向契约把本地 completed
+        写回 OmniFocus；discard 没有自动写回。
 
         ``-a`` 有两个特殊取值，替代「表格编号」：
           ``none``    = 下架（删掉 Focusmate 那条 task，本地断绑定）→ ``task 8 -an``
@@ -3627,6 +3667,8 @@ class Warden(object):
             task select 1 -n "https://notion.so/xxx"
             task 8 -an                  ← 从它那一场下架（≡ task 8 -a none）
             task 8 -ac                  ← 挂到当前这一场（≡ task 8 -a current）
+            task 3 -m complete          ← 只把本地 #3 标成完成（并归档）
+            task -m discard 3           ← 只把本地 #3 标成放弃（外头都不动）
             task 32 swap 21             ← 两条任务互换位置
             task -s 5 -a 6              ← 把 #5 上的全部任务转移到 #6
             task -s 5 -a none           ← 把 #5 上的全部任务下架
@@ -3647,21 +3689,33 @@ class Warden(object):
         assign_to, kept = self._split_assign(toks)
         source, kept = self._split_source(kept)
         note_text, kept = self._split_note(kept)
+        mark_status, kept = self._split_mark(kept)
         if source is not None:
+            if mark_status is not None:
+                raise ValueError("`-m/--mark` 是单条任务的状态标记，不能和 `-s/--from` 批量一起用；"
+                                 "先切到那天再逐条标。")
             # `-s` 本身就是动作（批量），后面不该再有子命令：``task -s 5 -a 6``。
             if kept:
                 raise ValueError("`-s/--from` 是批量后缀，后面不要再跟动作（%s）；"
                                  "写成 `task -s 5 -a 6` 这样。" % kept[0])
             return self._apply_bulk(source, assign_to)
-        if not kept:
-            raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）")
-        action = kept[0].lower()
-        rest = kept[1:]
-        result = self._dispatch_task(action, rest)
+        if not kept and mark_status is None:
+            raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
+                             "或后缀 -m/--mark")
+        if kept:
+            action = kept[0].lower()
+            rest = kept[1:]
+            result = self._dispatch_task(action, rest)
+        else:
+            # `task -m complete`：标记当前选中的任务。
+            action = "mark"
+            result = None
         if note_text is not None:
             self._apply_note(result, note_text, action)
         if assign_to is not None:
             self._apply_assign(result, assign_to, action)
+        if mark_status is not None:
+            result = self._apply_mark(result, mark_status, action)
         return result
 
     @staticmethod
@@ -3758,6 +3812,43 @@ class Warden(object):
             i += 1
         return note, kept
 
+    @staticmethod
+    def _split_mark(toks):
+        """把 ``--mark complete`` / ``--mark=complete`` / ``-m discard`` 摘出来。
+
+        和 ``-a`` / ``-n`` 一样是后缀，位置随便：``task 3 -m complete`` 和
+        ``task -m complete 3`` 等价。``-m`` 只认两个值：
+
+          ``complete`` = 本地 completed + 归档（不勾 Focusmate、不写 OmniFocus）
+          ``discard``  = 本地 dropped（完全不动外部）
+        """
+        status = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = str(toks[i])
+            low = tok.lower()
+            if low in ("--mark", "-m"):
+                if i + 1 >= len(toks):
+                    raise ValueError("--mark 后面要跟 complete 或 discard"
+                                     "（例如 task 3 -m complete）")
+                value = str(toks[i + 1])
+                i += 2
+            elif low.startswith("--mark=") or low.startswith("-m="):
+                value = tok.split("=", 1)[1]
+                i += 1
+            else:
+                kept.append(tok)
+                i += 1
+                continue
+            want = TASK_MARK_STATES.get(value.strip().lower())
+            if want is None:
+                raise ValueError("`-m/--mark` 只认 complete 或 discard；你给的是 %r" % value)
+            if status is not None and status != want:
+                raise ValueError("`-m/--mark` 一次只能给一个状态（complete / discard）。")
+            status = want
+        return status, kept
+
     NO_TASK_ACTIONS = ("delete", "sync", "refresh", "reconcile", "archive", "history",
                        "归档", "list", "ls", "show", "done", "complete", "完成",
                        "drop", "放弃")
@@ -3805,6 +3896,49 @@ class Warden(object):
             return None
         self.selected_task_id = task["id"]
         return self._assign_task(task, str(session_token))
+
+    def _apply_mark(self, result, status, action):
+        """``-m/--mark`` 的收尾：只改本地账本，不碰 Focusmate / OmniFocus。
+
+        和 ``done`` / ``drop`` 的分工：
+          * ``done`` = 本地完成 + 归档 + 勾 Focusmate + 写回 OmniFocus
+          * ``drop`` = 本地放弃（默认还让 OmniFocus 放弃）
+          * ``-m complete`` / ``-m discard`` = **只动账本**。
+
+        本地 completed 之后，下一次 ``task sync`` / ``refresh --check`` 仍会按
+        单向契约把完成写回 OmniFocus；discard 则没有任何自动外部动作。
+        """
+        task = result if isinstance(result, dict) and result.get("id") is not None else None
+        if task is None and self.selected_task_id is not None:
+            try:
+                task = self.task_store.get(self.selected_task_id)
+            except ValueError:
+                task = None
+        if task is None:
+            raise ValueError("`-m/--mark` 要跟一条任务：`task 3 -m complete` / "
+                             "`task -m discard 3`（没有选中的任务可标）")
+        task_id = task["id"]
+        current = self.task_store.status_of(task)
+        if current == status:
+            self.say("任务 %s 已经是「%s」，没有改。"
+                     % (self.task_label(task),
+                        "完成" if status == ts.STATUS_COMPLETED else "放弃"), "info")
+            return task
+        if status == ts.STATUS_COMPLETED:
+            task = self.task_store.complete(task_id, reason="cmd-mark-complete")
+            self.task_store.archive_local(self.task_store.get(task_id),
+                                          reason="cmd-mark-complete")
+            self.say("✓ 任务 %s「%s」已标记完成（只改本地账本：没勾 Focusmate、"
+                     "没当场写 OmniFocus；之后同步仍会按单向契约写回）"
+                     % (self.task_label(task), self.task_store.focusmate_title(task, 40)),
+                     "ok")
+        else:
+            task = self.task_store.drop(task_id, reason="cmd-mark-discard")
+            self.say("✗ 任务 %s「%s」已标记放弃（只改本地账本：Focusmate / OmniFocus 都没动）"
+                     % (self.task_label(task), self.task_store.focusmate_title(task, 40)),
+                     "ok")
+        self.selected_task_id = task_id
+        return task
 
     def _dispatch_task(self, action, rest):
         # `task 3 duplicate -a 1`：动作写在序号后面（需求里的语法就是这个顺序）。
@@ -4670,6 +4804,24 @@ class Warden(object):
             self.report_omnifocus_links()
         return ok
 
+    @staticmethod
+    def _focusmate_task_summary(remote):
+        """日志用：Focusmate task 拉取结果摘要（不记 token，只记任务事实）。"""
+        rows = remote if isinstance(remote, list) else []
+        done = [r for r in rows if isinstance(r, dict)
+                and (r.get("completedAt") or r.get("completed_at") or r.get("completed"))]
+        return {
+            "count": len(rows),
+            "completed_count": len(done),
+            "completed": [{
+                "id": r.get("id") or r.get("taskId"),
+                "title": r.get("title"),
+                "completed": bool(r.get("completed")),
+                "completedAt": r.get("completedAt") or r.get("completed_at"),
+                "attachments": r.get("attachments") or [],
+            } for r in done],
+        }
+
     def sync_task_completions(self, quiet=True):
         """**只读**那一半：``GET /v1/tasks`` → 对齐完成状态（`refresh` 用它）。
 
@@ -4677,11 +4829,27 @@ class Warden(object):
         落到焦点场次上（那会真的在 Focusmate 建 task）、也不写回 OmniFocus。
         ``refresh`` 要能随时敲，不能敲一下就在外面多出一条任务。
         """
-        res = self.bridge.call("tasks", timeout=180)
+        started = time.monotonic()
+        rl.log_event("focusmate", "task_pull_start", source="sync_task_completions")
+        try:
+            res = self.bridge.call("tasks", timeout=180)
+        except Exception as e:  # noqa: BLE001 - 先记日志，再按原样抛给上层
+            rl.log_event("focusmate", "task_pull_error", source="sync_task_completions",
+                         elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                         error="%s: %s" % (type(e).__name__, e))
+            raise
         remote = res.get("tasks") if isinstance(res, dict) else res
         before = len(self.task_store.load_archive().get("records") or [])
         n, matched = self.task_store.reconcile(remote or [])
         self.task_sync_at = time.time()
+        summary = self._focusmate_task_summary(remote or [])
+        summary.update({
+            "source": "sync_task_completions",
+            "matched": matched,
+            "archived": n,
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+        })
+        rl.log_event("focusmate", "task_pull_result", **summary)
         if n:
             self.announce_completions(before)
         if not quiet:
@@ -4761,19 +4929,57 @@ class Warden(object):
             return due
         return ts.session_due(task.get("session") or {}) or ""
 
+    @staticmethod
+    def _omni_log_fields(task, pk=None):
+        fields = task.get("fields") or {}
+        omni = task.get("omnifocus") or {}
+        return {
+            "task_id": task.get("id"),
+            "task_status": task.get("status"),
+            "task_title": fields.get("title") or fields.get("name") or "",
+            "pk": pk or omni.get("id"),
+            "due": fields.get("due") or "",
+            "session": task.get("session") or None,
+            "writeback_before": dict(omni.get("writeback") or {}),
+        }
+
     def omni_complete(self, task, minutes=None, at=None):
         """OmniFocus：完成 + 把截止时间写回 session 终点。返回一句人话。"""
         pk = ts.TaskStore.omnifocus_id(task)
         if not pk:
             return ""
-        if not self.omnifocus_enabled():
-            return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
+        started = time.monotonic()
+        enabled = self.omnifocus_enabled()
+        fields = self._omni_log_fields(task, pk)
         due = self.omni_due_of(task)
+        rl.log_event("omnifocus", "complete_start", minutes=minutes, at=at,
+                     enabled=enabled, api_due=due or None, **fields)
+        if not enabled:
+            rl.log_event("omnifocus", "complete_skipped", reason="disabled_or_unavailable",
+                         **fields)
+            return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
         try:
             res = self.omnifocus.complete(pk, at=at, due=due or None, yes=True)
         except of.OmniFocusError as e:
             self.had_error = True
+            rl.log_event(
+                "omnifocus", "complete_error", kind=e.kind, exit_code=e.exit_code,
+                detail=e.detail, message=str(e),
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
             return "OmniFocus 写回失败：%s" % e
+        after = res.get("after") if isinstance(res, dict) else None
+        effective = None if not isinstance(after, dict) else bool(after.get("completed"))
+        rl.log_event(
+            "omnifocus", "complete_result",
+            changed=res.get("changed") if isinstance(res, dict) else None,
+            effective=effective,
+            before=res.get("before") if isinstance(res, dict) else None,
+            after=after,
+            repeat_clone_id=res.get("repeat_clone_id") if isinstance(res, dict) else None,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
+        if effective is False:
+            self.had_error = True
+            return "OmniFocus 写回失败：写完复核 completed 仍为 false（pk %s）" % pk
         try:
             self.task_store.set_omnifocus_writeback(task["id"], "completed")
         except ValueError:
@@ -4786,13 +4992,33 @@ class Warden(object):
         pk = ts.TaskStore.omnifocus_id(task)
         if not pk:
             return ""
-        if not self.omnifocus_enabled():
+        started = time.monotonic()
+        enabled = self.omnifocus_enabled()
+        fields = self._omni_log_fields(task, pk)
+        rl.log_event("omnifocus", "drop_start", at=at, enabled=enabled, **fields)
+        if not enabled:
+            rl.log_event("omnifocus", "drop_skipped", reason="disabled_or_unavailable",
+                         **fields)
             return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
         try:
             res = self.omnifocus.drop(pk, at=at, yes=True)
         except of.OmniFocusError as e:
             self.had_error = True
+            rl.log_event(
+                "omnifocus", "drop_error", kind=e.kind, exit_code=e.exit_code,
+                detail=e.detail, message=str(e),
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
             return "OmniFocus 放弃失败：%s" % e
+        after = res.get("after") if isinstance(res, dict) else None
+        effective = None if not isinstance(after, dict) else bool(after.get("dropped"))
+        rl.log_event(
+            "omnifocus", "drop_result",
+            changed=res.get("changed") if isinstance(res, dict) else None,
+            effective=effective, before=res.get("before") if isinstance(res, dict) else None,
+            after=after, elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
+        if effective is False:
+            self.had_error = True
+            return "OmniFocus 放弃失败：写完复核 dropped 仍为 false（pk %s）" % pk
         try:
             self.task_store.set_omnifocus_writeback(task["id"], "dropped")
         except ValueError:
@@ -4807,12 +5033,27 @@ class Warden(object):
         if not task_id:
             return ""
         if self.offline:
+            rl.log_event("focusmate", "complete_skipped", task_id=task["id"],
+                         focusmate_task_id=task_id, reason="offline")
             return "离线模式：没去勾 Focusmate"
+        started = time.monotonic()
+        rl.log_event("focusmate", "complete_start", task_id=task["id"],
+                     focusmate_task_id=task_id,
+                     title=self.task_store.focusmate_title(task, 120))
         try:
             res = self.bridge.call("complete_task", timeout=180, taskId=task_id)
         except BridgeError as e:
             self.had_error = True
+            rl.log_event("focusmate", "complete_error", task_id=task["id"],
+                         focusmate_task_id=task_id, error=str(e),
+                         elapsed_ms=round((time.monotonic() - started) * 1000, 1))
             return "Focusmate 勾完成失败：%s" % e
+        rl.log_event(
+            "focusmate", "complete_result", task_id=task["id"],
+            focusmate_task_id=task_id, verified=bool(res.get("verified")),
+            already=bool(res.get("already")), via=res.get("via"),
+            completedAt=res.get("completedAt"), attempts=res.get("attempts") or [],
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1))
         if not res.get("verified"):
             return "Focusmate 没确认勾上（可以手动点一下）"
         stamp = res.get("completedAt") or ts._now()
@@ -4860,13 +5101,20 @@ class Warden(object):
         只在收尾的核对里调用（一次 list 拿到全部，缓存在 client 里）。
         读不到就返回空 dict —— 收尾照常进行，只是少了「OmniFocus 那边也勾了」这条信息。
         """
-        if not self.omnifocus_enabled():
+        started = time.monotonic()
+        enabled = self.omnifocus_enabled()
+        rl.log_event("omnifocus", "status_pull_start", enabled=enabled)
+        if not enabled:
+            rl.log_event("omnifocus", "status_pull_skipped", reason="disabled_or_unavailable")
             return {}
         rows = None
         try:
             rows = self.omnifocus.list_tasks(refresh=True)
         except of.OmniFocusError as e:
             self.had_error = True
+            rl.log_event("omnifocus", "status_pull_error", kind=e.kind,
+                         exit_code=e.exit_code, detail=e.detail, message=str(e),
+                         elapsed_ms=round((time.monotonic() - started) * 1000, 1))
             self.say("读 OmniFocus 失败：%s" % e, "warn")
             return {}
         by_id = {}
@@ -4878,6 +5126,17 @@ class Warden(object):
             pk = ts.TaskStore.omnifocus_id(task)
             if pk and str(pk) in by_id:
                 out[task["id"]] = by_id[str(pk)]
+        done = [{
+            "task_id": task_id,
+            "pk": row.get("id"),
+            "name": row.get("name"),
+            "completed": bool(row.get("completed")),
+            "completed_at": row.get("completed_at"),
+        } for task_id, row in out.items()]
+        rl.log_event(
+            "omnifocus", "status_pull_result", row_count=len(rows or []),
+            linked_count=len(out), completed_count=sum(1 for x in done if x["completed"]),
+            linked=done, elapsed_ms=round((time.monotonic() - started) * 1000, 1))
         return out
 
     def writeback_completions(self, tasks=None):
@@ -4887,7 +5146,11 @@ class Warden(object):
         把这条截止时间一起写回 OmniFocus —— 于是 OmniFocus 里记的是「这一场是什么时候结束的」。
         """
         done = []
-        if not self.omnifocus_enabled():
+        enabled = self.omnifocus_enabled()
+        rl.log_event("omnifocus", "writeback_scan_start", enabled=enabled)
+        if not enabled:
+            rl.log_event("omnifocus", "writeback_scan_skipped",
+                         reason="disabled_or_unavailable")
             return done
         for task in (tasks if tasks is not None else self.task_store.list()):
             if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
@@ -4902,6 +5165,7 @@ class Warden(object):
                 done.append((task["id"], note))
                 self.say("↗ 写回 OmniFocus：任务 %s %s"
                          % (self.task_label(task), note), "ok")
+        rl.log_event("omnifocus", "writeback_scan_result", written=done)
         return done
 
     # -- 收尾用的几个动作（收尾和命令共用同一套，不写两遍）--------------
@@ -5036,15 +5300,28 @@ class Warden(object):
         返回 ``{本地任务 id: omni 行}``。
         """
         if not self.offline:
+            started = time.monotonic()
+            rl.log_event("focusmate", "task_pull_start", source="sync_completion_state")
             try:
                 res = self.bridge.call("tasks", timeout=180)
                 remote = res.get("tasks") if isinstance(res, dict) else res
                 before = len(self.task_store.load_archive().get("records") or [])
                 n, matched = self.task_store.reconcile(remote or [])
                 self.task_sync_at = time.time()
+                summary = self._focusmate_task_summary(remote or [])
+                summary.update({
+                    "source": "sync_completion_state",
+                    "matched": matched,
+                    "archived": n,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                })
+                rl.log_event("focusmate", "task_pull_result", **summary)
                 if n:
                     self.announce_completions(before)
             except (BridgeError, ValueError) as e:
+                rl.log_event("focusmate", "task_pull_error", source="sync_completion_state",
+                             elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                             error="%s: %s" % (type(e).__name__, e))
                 self.say("核对 Focusmate 完成状态失败：%s" % e, "warn")
         rows = self.sync_omnifocus_status()
         # OmniFocus 那边已经勾了完成的，本地也标完成（然后走一遍写回，把截止时间对齐）
@@ -6063,9 +6340,10 @@ class Warden(object):
         1. **该订没订上的 session**：执行区里契约有、API 没有的 → 让 daemon 补一轮
            （``keep_session.py check``，仍走 daemon 自己的重试上限/退避，不越权）。
         2. **该挂没挂上的 task**：本地记着「任务 8 挂在 11:00 那场」，但 Focusmate
-           的 ``GET /v1/tasks`` 里那条 task 没有指向那场的 attachment（手动删过、
-           或者上次只做了半截）→ 重新挂。
-        3. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
+           的 task 列表里那条 task 没有指向那场的 attachment（手动删过、
+           或者上次只做了半截）→ 重新挂。**已完成的 task 不重挂**。
+        3. **已完成但还没写回 OmniFocus 的 task**：补写「完成 + 截止时间」。
+        4. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
 
         不带 ``--check`` 的 ``refresh`` **不动外面任何东西**，但它不是只管一行数：
         它把看板上每块组件的状态都重新对一遍账（见 :meth:`refresh_all`）——
@@ -6161,14 +6439,23 @@ class Warden(object):
         return True
 
     def check_and_fix(self):
-        """把「该订没订上 / 该挂没挂上」都查一遍并修掉（``refresh --check`` 的实作）。"""
+        """把「该订没订上 / 该挂没挂上 / 该写回没写回」查一遍并修掉。
+
+        这是 ``refresh --check`` 的实作。``refresh_all`` 本身只读外面世界，
+        所以 Focusmate 完成后同步成本地 ``completed`` 的任务，要在这里补写
+        OmniFocus；否则用户只会看到本地 ✓，OmniFocus 永远不动。
+        """
         if self.offline:
             self.say("refresh --check：离线模式下没有外部世界可查，只重画了表格。", "warn")
             return False
-        self.say("refresh --check：对账 —— 该订的 session、该挂的 task…", "cmd")
+        self.say("refresh --check：对账 —— 该订的 session、该挂的 task、该写回的完成…", "cmd")
         fixed = 0
         fixed += self.check_bookings()
         fixed += self.check_task_attachments()
+        # refresh_all 刚把 Focusmate 的 completedAt 同步成本地 completed；这里要
+        # 把「本地已完成但还没写回」的补写到 OmniFocus。否则用户敲 refresh --check
+        # 只能看到本地 ✓，OmniFocus 那边永远不动（正是这次反馈的问题）。
+        fixed += len(self.writeback_completions())
         # 修完再拉一次：表格要显示的是**修完**的样子，不是修之前的
         # （走全量：刚刚重挂过 task，任务面板/画帧缓存也得跟着换）
         if fixed:
@@ -6272,6 +6559,10 @@ class Warden(object):
         row = remote.get(tid)
         if row is None:
             return "Focusmate 那边这条 task 已经不在了"
+        # 已完成/已放弃的 task 不该触发「重挂」：任务已经收工，哪怕 attachment
+        # 对不上（例如 Focusmate 后续改了挂载信息），再建一条也只会多一个幽灵。
+        if row.get("completed") or row.get("completedAt") or row.get("completed_at"):
+            return ""
         ids = [str(a.get("externalId") or a.get("id") or "")
                for a in (row.get("attachments") or [])]
         if want not in ids:
