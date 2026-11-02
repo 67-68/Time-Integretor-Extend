@@ -227,14 +227,35 @@ def fmt_minutes(total):
     return "%02d:%02d" % (total // 60, total % 60)
 
 
+def _clock_minutes(raw):
+    """``HH:MM`` → 分钟数，**允许 24:xx**（= 第二天的 00:xx）。
+
+    跨午夜的时段在日历数据里有两种写法：``23:15–00:05`` 和 ``23:15–24:05``。
+    :func:`parse_hhmm` 是给「用户输入一个时刻」用的，只认 00:00–23:59；这里多认
+    一种 24:05，免得跨午夜那一段被读成「终点 00:05 比起点 23:15 还早」的坏数据。
+    """
+    got = parse_hhmm(raw)
+    if got is not None:
+        return got
+    match = re.match(r"^24:([0-5]\d)$", str(raw if raw is not None else "").strip())
+    if match:
+        return 24 * 60 + int(match.group(1))
+    return None
+
+
 def _range_of(rec):
-    """一条 reservation / session → ``(start_min, end_min)``；坏数据 None。"""
+    """一条 reservation / session / 时段 → ``(start_min, end_min)``；坏数据 None。
+
+    终点**早于**起点就当成跨了午夜（+24h）：23:15–00:05 读成 ``(1395, 1445)``，
+    而不是 ``(1395, 5)``。formatter 的区间判断（谁占了时间、时间窗尾部在哪）全靠
+    这个归一，错了就会把「当天最后一段」认成倒数第二段。
+    """
     start = rec.get("start_min")
     end = rec.get("end_min")
     if start is None:
-        start = parse_hhmm(rec.get("start"))
+        start = _clock_minutes(rec.get("start"))
     if end is None:
-        end = parse_hhmm(rec.get("end"))
+        end = _clock_minutes(rec.get("end"))
     if start is None or end is None:
         return None
     start, end = int(start), int(end)
@@ -245,6 +266,27 @@ def _range_of(rec):
 
 def overlaps(a, b):
     return a[0] < b[1] and b[0] < a[1]
+
+
+def reservation_range(task, reservation):
+    """这条任务占掉的区间 ``(start_min, end_min)``；认不出来就 None。
+
+    正常记录里 ``reservation`` 自己就带 ``start`` / ``end``。老记录（或人手改过
+    的）可能只剩 ``date`` + ``start``，这时退回这条任务自己的 session、再不行就
+    用「start + 任务时长」——「已经排过的任务不占时间」会让下一条任务被排到同一
+    段上，两个人在同一场 Focusmate 里撞车。
+    """
+    got = _range_of(reservation)
+    if got is not None:
+        return got
+    got = _range_of((task or {}).get("session") or {})
+    if got is not None:
+        return got
+    start = _clock_minutes((reservation or {}).get("start"))
+    span = task_duration(task)
+    if start is None or not span:
+        return None
+    return start, start + int(span)
 
 
 def collect_reservations(tasks, day_iso=None):
@@ -262,7 +304,7 @@ def collect_reservations(tasks, day_iso=None):
             continue
         if day_iso and reservation.get("date") != day_iso:
             continue
-        got = _range_of(reservation)
+        got = reservation_range(task, reservation)
         if got is None:
             continue
         rec = dict(reservation)
@@ -327,13 +369,15 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
     if not sessions:
         raise HookError("formatter end：这一天没有任何已排的 session，没法排期。")
 
+    # 时段终点必须是**绝对分钟**（相对时段起点归一），否则 23:15–00:05 会算成 5 分钟，
+    # 「当天最后一段」就永远轮不到它。_range_of 已经处理了跨午夜。
     period_end = {}
     for period in ctx.get("periods") or ():
         if not isinstance(period, dict):
             continue
-        got = parse_hhmm(period.get("end"))
+        got = _range_of(period)
         if got is not None:
-            period_end[period.get("id")] = got
+            period_end[period.get("id")] = got[1]
 
     task_id = ctx.get("task_id", task.get("id"))
     reservations = []
@@ -360,6 +404,10 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
             period_end_min = sess_end + break_got
         # 这个 session 真正能占到的窗口尾 = min(时段终点, session 终点 + 休息)。
         window_end = min(int(period_end_min), int(sess_end) + break_got)
+        if window_end <= sess_start + int(duration):
+            # 时段给的终点比「起点 + 任务时长」还早（坏 layout / 跨午夜没认出来）：
+            # 退回 session 终点 + 休息，绝不让 reservation 反过来（start > end）。
+            window_end = int(sess_end) + break_got
         candidates.append((window_end, sess_duration, sess_start, sess_end,
                            session, period_end_min))
     if not candidates:

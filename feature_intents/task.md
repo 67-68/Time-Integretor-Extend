@@ -458,6 +458,19 @@ task -t / task -f                      # 只看预设列表，不动任务
 - 所有 session 都装不下 → 明确报错；
 - 可选参数：`break_minutes=5`、`date=YYYY-MM-DD|today|tomorrow`。
 
+**跨午夜的时段要按「同一根时间轴」比。** 一天最后那段常常是 `23:15–00:05`
+（「看书」那种），时段终点 `00:05` 读成 5 分钟的话，它的「窗口尾」就会比
+`22:15` 那一段还小 —— `end` 于是永远排不进真正的最后一段（2026-11-02 的
+T6 就是这么被跳过的）。所以区间一律经 `task_hooks._range_of()` 归一：终点
+早于起点就 +24h（`23:15–00:05` → `1395–1445`），`24:05` 这种写法也认。
+`formatter.reservation` 里的 `start` / `end` 仍然是 `HH:MM`（会写成 `23:35` /
+`00:05`），`fields.due` 由 `task_store.session_due()` 用「起点 + 时长」算，
+自然落到第二天（`2026-11-03T00:05:00`）。
+
+老记录里 `formatter.reservation` 可能只剩 `{date, start}`（没有 `end`）。
+`task_hooks.reservation_range()` 会退回这条任务自己的 session、再不行用
+「start + 任务时长」——不然它就不占时间，下一条任务会被排到同一场上。
+
 ## 截止时间 = 它被分配的那场 session 的终点
 
 `task_store.assign()` 里写死的规则（用户需求「任务被分配的 session 时间自动等于

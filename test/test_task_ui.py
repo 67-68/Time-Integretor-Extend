@@ -1738,6 +1738,69 @@ check_true("明确警告没有持续时间",
 nodur = [t for t in wdh.task_store.list() if t["fields"].get("title") == "没时长"][0]
 check("没时长不会偷偷挂 formatter", nodur.get("formatter"), None)
 
+# 4.5) 跨午夜的时段（23:15–00:05）必须算「当天最后一段」。
+#      以前的 bug：时段终点按 HH:MM 读成 5 分钟，跨午夜那段的「窗口尾」比 T4 还小，
+#      end 就永远不会排进它 —— 用户 23:15–00:05 的「看书」那段一直空着。
+print("== formatter end：跨午夜的时段（23:15–00:05）也是「当天最后一段」 ==")
+_data = sp.load_download()
+_data["periods"].append({
+    "id": "T9", "date": ISO, "start": "23:15", "end": "00:05",
+    "type": "工作", "name": "看书", "calendar": "工作", "title": "看书",
+    "start_iso": "%sT23:15:00+08:00" % ISO,
+    "end_iso": "%sT00:05:00+08:00" % (TODAY + datetime.timedelta(days=1)).isoformat()})
+sp.save_download(_data)
+wdh.reload_periods()
+check("T9（23:15–00:05）排成一场 50 分钟", wdh.handle("period T9 50"), True)
+wdh.reload_entries()
+wdh.bridge.sessions = plan_sessions(wdh)
+wdh.rebuild_rows()
+
+# 纯函数层：终点早于起点就是跨了午夜，读成绝对分钟；24:05 这种写法也认。
+check("_range_of 把 23:15–00:05 读成 (1395, 1445)",
+      w.th._range_of({"start": "23:15", "end": "00:05"}), (1395, 1445))
+check("_range_of 也认 23:15–24:05 这种写法",
+      w.th._range_of({"start": "23:15", "end": "24:05"}), (1395, 1445))
+check("24:05 能读成 1445 分钟", w.th._clock_minutes("24:05"), 1445)
+
+# 老记录 / 手改过的 reservation 只剩 {date, start}：必须仍然算「被占了」，
+# 否则下一条任务会被排到同一场上（两个任务抢一场 Focusmate）。
+_legacy = {"id": 9001, "status": "active", "fields": {"duration": "25"},
+           "formatter": {"name": "end",
+                         "reservation": {"date": ISO, "start": "17:30"}},
+           "session": {"date": ISO, "start": "17:30", "end": "18:00", "duration": 25}}
+check("只剩 date+start 的旧 reservation 退回自己的 session 算占用",
+      [(r["start_min"], r["end_min"])
+       for r in w.th.collect_reservations([_legacy], ISO)], [(1050, 1080)])
+_legacy_nosess = dict(_legacy, session=None)
+check("连 session 都没有就用 start + 任务时长",
+      [(r["start_min"], r["end_min"])
+       for r in w.th.collect_reservations([_legacy_nosess], ISO)], [(1050, 1075)])
+
+wdh.messages = []
+wdh.bridge.calls = []
+check("task create title=深夜闪卡 duration=25 -f end 受理",
+      wdh.handle("task create title=深夜闪卡 duration=25 -f end"), True)
+night = [t for t in wdh.task_store.list() if t["fields"].get("title") == "深夜闪卡"][0]
+nres = (night.get("formatter") or {}).get("reservation") or {}
+check("end 认出了跨午夜那段 T9（不是倒数第二段 T4）", nres.get("period_id"), "T9")
+check("在 23:15–00:05 那场的尾部截出 25 分钟 + 5 分钟休息",
+      [nres.get("start"), nres.get("end")], ["23:35", "00:05"])
+check("挂的是 23:15 那场 50 分钟 session",
+      [night["session"]["start"], night["session"]["duration"]], ["23:15", 50])
+check("截止时间跨到第二天 00:05",
+      night["fields"].get("due"),
+      "%sT00:05:00" % (TODAY + datetime.timedelta(days=1)).isoformat())
+
+# 这一段被占了以后，下一条要退回「第二晚」那段，而不是又排进 T9 或排到过去。
+wdh.messages = []
+check("第二条 duration=25 -f end 受理",
+      wdh.handle("task create title=深夜闪卡2 duration=25 -f end"), True)
+night2 = [t for t in wdh.task_store.list() if t["fields"].get("title") == "深夜闪卡2"][0]
+nres2 = (night2.get("formatter") or {}).get("reservation") or {}
+check_true("第二条不再占 T9", nres2.get("period_id") != "T9")
+check_true("第二条的占用区间是合法的正区间",
+           w.th._range_of(nres2)[1] - w.th._range_of(nres2)[0] > 0)
+
 # 5) trigger 框架可以用：注册一个 demo 之后，task -t 能列出来、能挂到任务上。
 @w.th.register_trigger("demo_after_task", params=("task_id",), help="测试用 trigger")
 def _demo_trigger(ctx, task_id):
