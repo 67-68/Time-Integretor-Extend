@@ -1472,6 +1472,98 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-02T17:05:22",
+      "task_id": 85,
+      "fields": {
+        "title": "数学易错 10",
+        "due": "2026-11-02T17:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-11-02",
+        "start": "16:15",
+        "end": "17:05",
+        "duration": "50",
+        "focusmate_session_id": "38a7dc78-1f2d-42d5-86c1-289ee2f7ce4f",
+        "previous_due": "2026-11-02T16:05:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "22b76f6b-04f7-437a-9d76-1470ef457ea4",
+        "title": "数学易错 10",
+        "description": "",
+        "completed_at": "2026-11-02T09:02:25.290575+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "38a7dc78-1f2d-42d5-86c1-289ee2f7ce4f"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-02T17:05:22",
+      "task_id": 86,
+      "fields": {
+        "title": "语法难 20 个",
+        "due": "2026-11-02T17:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-11-02",
+        "start": "16:15",
+        "end": "17:05",
+        "duration": "50",
+        "focusmate_session_id": "38a7dc78-1f2d-42d5-86c1-289ee2f7ce4f",
+        "previous_due": "2026-11-02T16:05:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "4693f6d5-8a99-467e-9703-c61d53d5977b",
+        "title": "语法难 20 个",
+        "description": "",
+        "completed_at": "2026-11-02T08:40:36.616708+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "38a7dc78-1f2d-42d5-86c1-289ee2f7ce4f"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-02T18:05:26",
+      "task_id": 89,
+      "fields": {
+        "title": "rpq",
+        "due": "2026-11-02T18:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-11-02",
+        "start": "17:15",
+        "end": "18:05",
+        "duration": 50,
+        "focusmate_session_id": "c684467c-9bf9-4906-bbc4-c5bf7fdad62b"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "b06b2bbe-b25e-4d39-95ca-7091ef083dbc",
+        "title": "rpq",
+        "description": "",
+        "completed_at": "2026-11-02T09:53:03.424024+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "c684467c-9bf9-4906-bbc4-c5bf7fdad62b"
+          }
+        ]
+      }
     }
   ]
 }

@@ -29,6 +29,11 @@ def check_true(label, got):
 TMP = tempfile.mkdtemp(prefix="task-store-test-")
 TASKS = os.path.join(TMP, "tasks.json")
 ARCHIVE = os.path.join(TMP, "archive.json")
+# 兜底：这个文件里所有 store 都显式给了路径，但**默认路径**（ts.TaskStore()）
+# 会指向 data/tasks.json —— 那是用户的真任务库。把环境变量也钉到临时目录，
+# 以后谁手滑写了不带路径的 TaskStore()，也炸不到真数据（真炸过一次）。
+os.environ["TI_TASKS_FILE"] = TASKS
+os.environ["TI_TASK_ARCHIVE"] = ARCHIVE
 store = ts.TaskStore(TASKS, ARCHIVE)
 
 print("== CRUD：字段不校验 ==")
@@ -295,6 +300,69 @@ child3 = store2.get(child3["id"])
 check("子任务可以有自己的 reservation",
       (child3["formatter"].get("reservation") or {}).get("date"),
       child3["repeat_date"])
+
+print("== OmniFocus 重复任务翻篇：还开着的记录跟着换 primary key ==")
+store4 = ts.TaskStore(TASKS, ARCHIVE)
+for old_task in store4.list():
+    store4.delete(old_task["id"])
+series = store4.create({"title": "每天闪卡"},
+                       omnifocus={"id": "pk-old", "title": "每天闪卡"})
+done_one = store4.create({"title": "今天"}, omnifocus={"id": "pk-old", "title": "每天闪卡"})
+store4.set_status(done_one["id"], ts.STATUS_COMPLETED, reason="test")
+open_one = store4.create({"title": "明天"}, omnifocus={"id": "pk-old", "title": "每天闪卡"})
+other = store4.create({"title": "无关"}, omnifocus={"id": "pk-other", "title": "无关"})
+dropped = store4.create({"title": "放弃的"}, omnifocus={"id": "pk-old", "title": "每天闪卡"})
+store4.set_status(dropped["id"], ts.STATUS_DROPPED, reason="test")
+moved = store4.advance_omnifocus("pk-old", "pk-new", exclude_task_id=done_one["id"])
+check("改挂的是还开着的记录（本体 + 明天的）",
+      sorted(moved), sorted([series["id"], open_one["id"]]))
+check("本体的 key 换成新的", store4.get(series["id"])["omnifocus"]["id"], "pk-new")
+check("url 跟着换",
+      store4.get(series["id"])["omnifocus"]["url"], "omnifocus:///task/pk-new")
+check("source 指针也换（来源还是 OmniFocus）",
+      store4.get(series["id"])["source"]["id"], "pk-new")
+check("收工的那条留在旧 key（它说的就是那一次）",
+      store4.get(done_one["id"])["omnifocus"]["id"], "pk-old")
+check("放弃的那条也留在旧 key",
+      store4.get(dropped["id"])["omnifocus"]["id"], "pk-old")
+check("无关任务一个字节都不动", store4.get(other["id"])["omnifocus"]["id"], "pk-other")
+check("旧 key 留档（能查「这条路以前挂在哪」）",
+      [(p["id"], p["reason"]) for p in store4.get(open_one["id"])["omnifocus"]["previous"]],
+      [("pk-old", "repeat-clone")])
+check("排他 id 不会被改挂（就是刚写完回的那条）",
+      store4.advance_omnifocus("pk-new", "pk-newer", exclude_task_id=series["id"]),
+      [open_one["id"]])
+check("换成同一个 key 是空操作", store4.advance_omnifocus("pk-new", "pk-new"), [])
+check("没有这个 key 是空操作", store4.advance_omnifocus("pk-nope", "pk-x"), [])
+# 落盘再读回来：previous 不能丢（_coerce_omnifocus 只认白名单字段）
+again = ts.TaskStore(TASKS, ARCHIVE).get(open_one["id"])
+check("previous 落盘以后还在",
+      [(p["id"], p["reason"]) for p in again["omnifocus"]["previous"]],
+      [("pk-old", "repeat-clone"), ("pk-new", "repeat-clone")])
+
+# 本体再往下生成子任务：新的一次是**新的账**，别把 writeback / previous 抄下去
+store4.set_omnifocus_writeback(series["id"], "completed")
+store4.set_repeat(series["id"], "mon", "22:15", 50)
+fresh = store4.create_repeat_occurrence(series["id"], datetime.date(2026, 11, 9))
+check("子任务继承本体当下的 primary key",
+      (fresh["omnifocus"] or {}).get("id"), "pk-new")
+check("子任务不带本体的 writeback 痕迹（否则永远不写回）",
+      (fresh["omnifocus"] or {}).get("writeback"), None)
+check("子任务不带本体的 previous 历史",
+      (fresh["omnifocus"] or {}).get("previous"), None)
+
+print("== 写之前留一份上一版（活数据写坏了能回去）==")
+for path in (TASKS + ".bak",):
+    if os.path.exists(path):
+        os.remove(path)
+store5 = ts.TaskStore(TASKS, ARCHIVE)
+kept = store5.create({"title": "要保住的那条"})
+old_text = open(TASKS, encoding="utf-8").read()
+store5.modify(kept["id"], "title", "改过的那条")
+check("第二次写留了一份上一版", os.path.exists(TASKS + ".bak"), True)
+with open(TASKS + ".bak", encoding="utf-8") as f:
+    check("备份里是改之前的那一版", f.read() == old_text, True)
+check("现在的文件是改之后的样子", store5.get(kept["id"])["fields"]["title"], "改过的那条")
 
 print("== 坏 JSON 不炸 ==")
 with open(TASKS, "w", encoding="utf-8") as f:

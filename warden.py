@@ -4886,7 +4886,7 @@ class Warden(object):
             raise ValueError("用法：task <任务序号> drop [--local]")
         task = self.resolve_task(toks[0])
         template = ts.TaskStore.is_repeat_template(task)
-        note = "" if local_only else self.omni_drop(task)
+        note = "" if local_only else self.omni_drop(task, all_occurrences=template)
         task = self.task_store.set_status(task["id"], ts.STATUS_DROPPED, reason="cmd-drop")
         self.say("✗ 任务 %s「%s」已放弃%s%s"
                  % (self.task_label(task), self.task_store.focusmate_title(task, 40),
@@ -5821,8 +5821,8 @@ class Warden(object):
                 self.had_error = True
                 self.say("重复任务挂载失败：%s" % e, "warn")
         ok = self.sync_task_completions(quiet=quiet)
-        # 完成的时候把「完成 + 截止时间」写回 OmniFocus（幂等，写过的不再写）
-        self.writeback_completions()
+        # 完成写回 OmniFocus 已经在那里面做了（sync_task_completions 末尾），
+        # 这里只补一句「到底关联上了几条」。
         if not quiet:
             self.report_omnifocus_links()
         return ok
@@ -5846,11 +5846,17 @@ class Warden(object):
         }
 
     def sync_task_completions(self, quiet=True):
-        """**只读**那一半：``GET /v1/tasks`` → 对齐完成状态（`refresh` 用它）。
+        """``GET /v1/tasks`` → 对齐完成状态（`refresh` / `task sync` 都走它）。
 
-        和 :meth:`cmd_task_sync` 的区别只有一件事：这里不往外面写 —— 不把「每周重复」
-        落到焦点场次上（那会真的在 Focusmate 建 task）、也不写回 OmniFocus。
-        ``refresh`` 要能随时敲，不能敲一下就在外面多出一条任务。
+        和 :meth:`cmd_task_sync` 的区别只有一件事：这里不往 Focusmate 写 —— 不把
+        「每周重复」落到焦点场次上（那会真的在 Focusmate 建 task）。``refresh`` 要能
+        随时敲，不能敲一下就在外面多出一条任务。
+
+        **但 OmniFocus 的完成写回会做。** 「在 Focusmate 勾掉了」是一条已经发生的
+        事实，不是 warden 的新决定：本地跟着打 ✓ 的同时，OmniFocus 那条也得完成。
+        以前这一步只挂在 `task sync` / 收尾 / `refresh --check` 上，于是「Focusmate
+        勾掉了 → 本地 ✓（收尾就不会再问它了）→ OmniFocus 一直没动」——用户反馈的
+        就是这个：**没有任何命令会再想起这条任务**。
         """
         started = time.monotonic()
         rl.log_event("focusmate", "task_pull_start", source="sync_task_completions")
@@ -5875,6 +5881,8 @@ class Warden(object):
         rl.log_event("focusmate", "task_pull_result", **summary)
         if n:
             self.announce_completions(before)
+        # Focusmate 说完成的，OmniFocus 那边补上（幂等：写过的记在 writeback 上）
+        self.writeback_completions()
         if not quiet:
             self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
                      % (len(matched), n), "ok")
@@ -5966,6 +5974,40 @@ class Warden(object):
             "writeback_before": dict(omni.get("writeback") or {}),
         }
 
+    def _omni_repeat_advance(self, task, pk, res):
+        """写完之后「OmniFocus 那条是重复任务，已经翻到下一次」这种情况。
+
+        ``omnifocus_tasks.py set --complete`` 在重复任务上返回的 ``after`` 是**新
+        那一次**的快照（``completed`` 当然是 false），同时把新 primary key 放在
+        ``repeat_clone_id`` 里。以前这里只把它写进日志、当没看见 —— 后果是：
+
+        * 复核 `after.completed` 判成「写回失败」→ 不记 writeback → 下一次同步
+          再写一遍 → OmniFocus 的重复表被一次次往前推；
+        * 本地还开着的记录全挂在**旧 key**（已经完成的那一次）上，下一次的活
+          在 OmniFocus 里永远勾不掉 —— 用户看到的正是「本地 ✓ 了、OmniFocus
+          那条还没完成」。
+
+        返回 ``(advanced, moved)``：真的翻篇了没有、跟着改挂的本地任务 id。
+        """
+        if not isinstance(res, dict):
+            return False, []
+        clone = str(res.get("repeat_clone_id") or "").strip()
+        if not clone or clone == str(pk):
+            return False, []
+        try:
+            moved = self.task_store.advance_omnifocus(pk, clone,
+                                                      exclude_task_id=task.get("id"))
+        except (ValueError, TypeError):
+            moved = []
+        return True, moved
+
+    @staticmethod
+    def _omni_repeat_note(advanced, clone, moved):
+        if not advanced:
+            return ""
+        return "；OmniFocus 那是重复任务，已经翻到下一次 %s，%d 条还没收工的本地记录改挂过去了" % (
+            clone, len(moved))
+
     def omni_complete(self, task, minutes=None, at=None):
         """OmniFocus：完成 + 把截止时间写回 session 终点。返回一句人话。"""
         pk = ts.TaskStore.omnifocus_id(task)
@@ -5992,6 +6034,10 @@ class Warden(object):
             return "OmniFocus 写回失败：%s" % e
         after = res.get("after") if isinstance(res, dict) else None
         effective = None if not isinstance(after, dict) else bool(after.get("completed"))
+        advanced, moved = self._omni_repeat_advance(task, pk, res)
+        if effective is False and advanced:
+            # 重复任务：`after` 是**新那一次**（还没完成很正常），这一条确实写成功了
+            effective = True
         rl.log_event(
             "omnifocus", "complete_result",
             changed=res.get("changed") if isinstance(res, dict) else None,
@@ -5999,6 +6045,8 @@ class Warden(object):
             before=res.get("before") if isinstance(res, dict) else None,
             after=after,
             repeat_clone_id=res.get("repeat_clone_id") if isinstance(res, dict) else None,
+            repeat_advanced=advanced,
+            repeat_moved=moved,
             elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
         if effective is False:
             self.had_error = True
@@ -6008,23 +6056,30 @@ class Warden(object):
         except ValueError:
             pass
         changed = ", ".join(res.get("changed") or [])
-        return "OmniFocus %s 完成%s" % (pk, ("（%s）" % changed) if changed else "")
+        return "OmniFocus %s 完成%s%s" % (
+            pk, ("（%s）" % changed) if changed else "",
+            self._omni_repeat_note(advanced, res.get("repeat_clone_id"), moved))
 
-    def omni_drop(self, task, at=None):
-        """OmniFocus：放弃这条任务（只给「真的不要了」用）。"""
+    def omni_drop(self, task, at=None, all_occurrences=False):
+        """OmniFocus：放弃这条任务（只给「真的不要了」用）。
+
+        ``all_occurrences`` 给重复任务本体用：放弃「这一套」而不是「这一次」，
+        否则 OmniFocus 会照着重复规则继续生出下一次。
+        """
         pk = ts.TaskStore.omnifocus_id(task)
         if not pk:
             return ""
         started = time.monotonic()
         enabled = self.omnifocus_enabled()
         fields = self._omni_log_fields(task, pk)
-        rl.log_event("omnifocus", "drop_start", at=at, enabled=enabled, **fields)
+        rl.log_event("omnifocus", "drop_start", at=at, enabled=enabled,
+                     all_occurrences=all_occurrences, **fields)
         if not enabled:
             rl.log_event("omnifocus", "drop_skipped", reason="disabled_or_unavailable",
                          **fields)
             return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
         try:
-            res = self.omnifocus.drop(pk, at=at, yes=True)
+            res = self.omnifocus.drop(pk, at=at, all_occurrences=all_occurrences, yes=True)
         except of.OmniFocusError as e:
             self.had_error = True
             rl.log_event(
@@ -6034,11 +6089,16 @@ class Warden(object):
             return "OmniFocus 放弃失败：%s" % e
         after = res.get("after") if isinstance(res, dict) else None
         effective = None if not isinstance(after, dict) else bool(after.get("dropped"))
+        advanced, moved = self._omni_repeat_advance(task, pk, res)
+        if effective is False and advanced:
+            # 重复任务：放弃的是「这一次」，OmniFocus 已经翻到下一次了
+            effective = True
         rl.log_event(
             "omnifocus", "drop_result",
             changed=res.get("changed") if isinstance(res, dict) else None,
             effective=effective, before=res.get("before") if isinstance(res, dict) else None,
-            after=after, elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
+            after=after, repeat_advanced=advanced, repeat_moved=moved,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
         if effective is False:
             self.had_error = True
             return "OmniFocus 放弃失败：写完复核 dropped 仍为 false（pk %s）" % pk
@@ -6047,7 +6107,9 @@ class Warden(object):
         except ValueError:
             pass
         changed = ", ".join(res.get("changed") or [])
-        return "OmniFocus %s 已放弃%s" % (pk, ("（%s）" % changed) if changed else "")
+        return "OmniFocus %s 已放弃%s%s" % (
+            pk, ("（%s）" % changed) if changed else "",
+            self._omni_repeat_note(advanced, res.get("repeat_clone_id"), moved))
 
     def fm_complete(self, task):
         """Focusmate：把这条 task 勾完成（走 bridge 的内部 API，GET 复核 completedAt）。"""
@@ -6144,14 +6206,35 @@ class Warden(object):
         for row in rows or []:
             if row.get("id"):
                 by_id[str(row["id"])] = row
+        tasks = self.task_store.list()
+        # 同一条 OmniFocus 任务在本地可能挂着好几条记录（转移留下的旧记录、重复任务
+        # 的子任务）。其中一条要是「**我们自己写回**完成的」，那这条 OmniFocus 的
+        # completed 就已经有归属了 —— 别再拿它去把**还开着**的兄弟记录也带成 ✓：
+        # 重复任务今天这条写完回，明天那条会被判成「已完成」，活还没干就没了。
+        claimed = set()
+        for task in tasks:
+            if ts.TaskStore.is_repeat_template(task):
+                continue
+            pk = ts.TaskStore.omnifocus_id(task)
+            if not pk:
+                continue
+            wb = (task.get("omnifocus") or {}).get("writeback") or {}
+            if (self.task_store.status_of(task) == ts.STATUS_COMPLETED
+                    and wb.get("completed")):
+                claimed.add(str(pk))
         out = {}
-        for task in self.task_store.list():
+        held = []
+        for task in tasks:
             if ts.TaskStore.is_repeat_template(task):
                 # 本体不是一次可完成的活；同一条 OmniFocus 的完成状态只对齐到子任务。
                 continue
             pk = ts.TaskStore.omnifocus_id(task)
-            if pk and str(pk) in by_id:
-                out[task["id"]] = by_id[str(pk)]
+            if not pk or str(pk) not in by_id:
+                continue
+            if str(pk) in claimed and self.task_store.is_open(task):
+                held.append(task["id"])
+                continue
+            out[task["id"]] = by_id[str(pk)]
         done = [{
             "task_id": task_id,
             "pk": row.get("id"),
@@ -6162,6 +6245,7 @@ class Warden(object):
         rl.log_event(
             "omnifocus", "status_pull_result", row_count=len(rows or []),
             linked_count=len(out), completed_count=sum(1 for x in done if x["completed"]),
+            claimed_pks=sorted(claimed), held_task_ids=held,
             linked=done, elapsed_ms=round((time.monotonic() - started) * 1000, 1))
         return out
 
@@ -7418,9 +7502,11 @@ class Warden(object):
         3. **已完成但还没写回 OmniFocus 的 task**：补写「完成 + 截止时间」。
         4. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
 
-        不带 ``--check`` 的 ``refresh`` **不动外面任何东西**，但它不是只管一行数：
-        它把看板上每块组件的状态都重新对一遍账（见 :meth:`refresh_all`）——
-        表格、任务完成状态、统计、收尾面板、各种缓存。
+        不带 ``--check`` 的 ``refresh`` **不在外面新造东西**（不订场、不在 Focusmate
+        建 task、不改 data.csv），但它不是只管一行数：它把看板上每块组件的状态都
+        重新对一遍账（见 :meth:`refresh_all`）——表格、任务完成状态、统计、收尾面板、
+        各种缓存。其中「Focusmate 已经说完成了」的 task 会**顺手写回 OmniFocus**
+        （幂等；这不是新决定，是同一条事实的第二个账本）。
         """
         toks = [str(tok).lower() for tok in (args or [])]
         want_check = any(tok in ("--check", "-c", "check", "查", "对账", "核对")
@@ -7435,14 +7521,15 @@ class Warden(object):
         """``refresh`` 实作的**全量**那一半：把屏幕上**每块组件**的状态都对一遍。
 
         需求：「refresh 需要刷新这个界面每个组件的状态」。所以不再只是「重拉 session
-        列表、重算表格」，而是一条命令把看板上每一块拆开重新对账（**只读外面世界**：
+        列表、重算表格」，而是一条命令把看板上每一块拆开重新对账（**不新造东西**：
         不订场、不挂任务、不改 data.csv）：
 
         ==================  ============================================
         组件                刷什么
         ==================  ============================================
         契约表格            重读 data.csv / 日历下载层 / 时段 layout → 重拉 session
-        任务面板            任务的**完成状态**（``GET /v1/tasks``，只读同步）
+        任务面板            任务的**完成状态**（``GET /v1/tasks`` 拉，Focusmate 说完成的
+                            顺手把 OmniFocus 也补成完成 —— 幂等）
         统计视图            已经加载过、且超过 TTL 的那份数字重算一次
         收尾面板            正在问的那一轮从任务库里重读一遍
         警告 / 静音         缓存作废（mute 缓存、快照缓存、日志尾巴）
@@ -7475,10 +7562,12 @@ class Warden(object):
             self.say("日历下载层/时段 layout 读不了（表格照旧用上次的）：%s" % e, "warn")
 
     def refresh_task_state(self):
-        """任务的完成状态对齐 Focusmate（``GET /v1/tasks``，**只读**）。
+        """任务的完成状态对齐 Focusmate（``GET /v1/tasks``）。
 
         走 :meth:`sync_task_completions` 而不是 ``cmd_task_sync``：refresh 不能
-        顺手在 Focusmate 上建 task（重复任务落地）、也不写回 OmniFocus。
+        顺手在 Focusmate 上建 task（重复任务落地）。**完成写回 OmniFocus 照做** ——
+        「Focusmate 勾掉了」是已经发生的事实，本地打 ✓ 的同时 OmniFocus 也得完成
+        （幂等；没有要写的就一次子进程都不起），见 :meth:`sync_task_completions`。
         """
         if self.offline:
             return False
@@ -7514,9 +7603,9 @@ class Warden(object):
     def check_and_fix(self):
         """把「该订没订上 / 该挂没挂上 / 该写回没写回」查一遍并修掉。
 
-        这是 ``refresh --check`` 的实作。``refresh_all`` 本身只读外面世界，
-        所以 Focusmate 完成后同步成本地 ``completed`` 的任务，要在这里补写
-        OmniFocus；否则用户只会看到本地 ✓，OmniFocus 永远不动。
+        这是 ``refresh --check`` 的实作。完成写回 OmniFocus 已经由 ``refresh_all``
+        → :meth:`refresh_task_state` → :meth:`sync_task_completions` 顺手做掉了
+        （幂等），这里只管 session 和 task 挂载这两件事。
         """
         if self.offline:
             self.say("refresh --check：离线模式下没有外部世界可查，只重画了表格。", "warn")
@@ -7525,9 +7614,8 @@ class Warden(object):
         fixed = 0
         fixed += self.check_bookings()
         fixed += self.check_task_attachments()
-        # refresh_all 刚把 Focusmate 的 completedAt 同步成本地 completed；这里要
-        # 把「本地已完成但还没写回」的补写到 OmniFocus。否则用户敲 refresh --check
-        # 只能看到本地 ✓，OmniFocus 那边永远不动（正是这次反馈的问题）。
+        # 保险起见再扫一遍「本地已完成但还没写回」的：上面的重挂可能刚把一条任务
+        # 的 Focusmate 链接修好，而 writeback 是幂等的（写过的记在 writeback 上）。
         fixed += len(self.writeback_completions())
         # 修完再拉一次：表格要显示的是**修完**的样子，不是修之前的
         # （走全量：刚刚重挂过 task，任务面板/画帧缓存也得跟着换）
@@ -7880,6 +7968,12 @@ class Warden(object):
             "契约表 task 列来源记号：🔁=重复任务子任务，🔗=有 OmniFocus 关联，"
             "两个都有就是 🔁🔗；⏱=挂了 formatter（不是「重复」的意思）。"
             "本体不进契约面板，只在 task 视图里显示为 id:N、来源记号只有 🔗。\n"
+            "OmniFocus 写回：**只要知道一条任务完成了就一定写**（task done / 收尾 D / "
+            "task sync / 收尾自动核对 / 任何一次 refresh 同步完成状态），幂等；"
+            "放弃则会放弃 OmniFocus 那条（收尾 A/C/E 那些「换账本」的动作用 --local）。"
+            "OmniFocus 那条自己要是重复任务，写完会在那边翻到下一次（新 primary key），"
+            "本地还开着的记录（本体 + 后面的子任务）自动改挂过去 —— 不然下一次的活"
+            "永远勾不掉；放弃本体时带 --all-occurrences，连那一套一起放弃。\n"
             "任务视图：task 命令在任何视图都能敲；任务字段不校验，JSON 存在 data/tasks.json。\n"
             "设置视图：列出所有设置项和解释；set <id> <value> 改，"
             "edit-tomorrow / tomorrow-plan 见那里的说明。\n"

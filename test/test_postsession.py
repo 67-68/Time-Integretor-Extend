@@ -1262,6 +1262,153 @@ check_true("新的一帧画的是第二条", "栏位里的第二条" in _f2)
 del wd.shell._frame_clock
 wd.review = None
 
+# ------------------------------------ Focusmate 说完成了 → OmniFocus 得跟着完成
+
+
+print("== 写回：Focusmate 勾掉之后，OmniFocus 那条也得完成 ==")
+psv.clear()
+wd.review = None
+for old in store.list():
+    store.delete(old["id"])
+
+
+class _OnlineBridge(FakeBridge):
+    """在线替身：`tasks` 里那条已经被人勾掉了（completedAt 有值）。"""
+
+    def __init__(self, done_tasks):
+        FakeBridge.__init__(self)
+        self.done_tasks = done_tasks
+
+    def call(self, cmd, timeout=240, **kw):
+        self.calls.append((cmd, kw))
+        if cmd == "tasks":
+            return {"tasks": list(self.done_tasks)}
+        return FakeBridge.call(self, cmd, timeout=timeout, **kw)
+
+
+def online_warden(done_tasks):
+    console = Console(file=io.StringIO(), width=160, force_terminal=False)
+    wd2 = w.Warden(console, _OnlineBridge(done_tasks), no_clear=True, offline=False)
+    wd2.reload_entries()
+    wd2.omnifocus = FakeOmni()
+    return wd2
+
+
+done_task = store.create({"title": "在 Focusmate 勾掉的那条"})
+store.assign(done_task["id"], {"date": "2026-10-27", "start": "12:00", "duration": 50})
+store.attach_focusmate(done_task["id"], {"task_id": "ft-done-1"},
+                       session=store.get(done_task["id"])["session"])
+wd.cmd_task_link(["id:%d" % done_task["id"], "omnifocus:///task/pk-done"])
+online = online_warden([{"id": "ft-done-1", "title": "在 Focusmate 勾掉的那条",
+                         "completedAt": "2026-10-27T04:50:00Z"}])
+# 用同一条任务库：online warden 的 task_store 指向同一个 TI_TASKS_FILE
+online.task_store = store
+check("Focusmate 那条一开始是进行中", store.is_open(store.get(done_task["id"])), True)
+check("裸 refresh 的那一步（refresh_task_state）受理", online.refresh_task_state(), True)
+check("refresh：Focusmate 说完成了 → 本地跟着收工",
+      ts.TaskStore.status_of(store.get(done_task["id"])), "completed")
+check("refresh：**同时**把 OmniFocus 那条写成完成（不用再敲 task sync）",
+      online.omnifocus.writes,
+      [("complete", "pk-done", "2026-10-27T12:50:00")])
+check("写回留了痕迹（下次不会重复写）",
+      bool((store.get(done_task["id"])["omnifocus"].get("writeback") or {})
+           .get("completed")), True)
+online.omnifocus.writes = []
+online.refresh_task_state()
+check("再来一次 refresh 不会重复写", online.omnifocus.writes, [])
+
+# 反向：OmniFocus 那边**已经是完成**的（用户自己勾的），本地跟着收工，
+# 但同一条 OmniFocus 上如果还有「自己写回完成」的兄弟记录，别拿它去带别人。
+print("== 写回：重复任务（OmniFocus 那边会翻到下一次）==")
+for old in store.list():
+    store.delete(old["id"])
+
+
+class _RepeatOmni(FakeOmni):
+    """OmniFocus 的重复任务：勾掉这一次，它自己生出下一次（新 primary key）。"""
+
+    def __init__(self, clone_id="pk-next"):
+        FakeOmni.__init__(self)
+        self.clone_id = clone_id
+
+    def complete(self, pk, at=None, due=None, yes=True, timeout=None):
+        self.writes.append(("complete", pk, due))
+        return {"ok": True, "changed": ["completed", "due"],
+                "before": {"id": pk, "completed": False},
+                # 重复任务写完，`after` 是**新那一次**，completed 当然是 false
+                "after": {"id": self.clone_id, "completed": False},
+                "repeat_clone_id": self.clone_id}
+
+
+template = store.create({"title": "每天闪卡", "duration": "25"},
+                        omnifocus={"id": "pk-series", "title": "每天闪卡"},
+                        source={"kind": "omnifocus", "id": "pk-series"})
+store.set_repeat(template["id"], "mon", "22:15", 50)
+template = store.get(template["id"])
+child = store.create_repeat_occurrence(template["id"], "2026-11-02")
+tomorrow = store.create_repeat_occurrence(template["id"], "2026-11-03")
+check("子任务继承了 OmniFocus 链接",
+      (child.get("omnifocus") or {}).get("id"), "pk-series")
+
+repeat_wd = mkwarden()
+repeat_wd.omnifocus = _RepeatOmni()
+repeat_wd.task_store = store
+note = repeat_wd.omni_complete(store.get(child["id"]))
+check("重复任务写回**不算失败**（写完返回的是下一次）",
+      "失败" in note, False)
+check("写回留了痕迹（不会每次都把重复表往前推）",
+      bool((store.get(child["id"])["omnifocus"].get("writeback") or {}).get("completed")), True)
+check("今天这条还挂在**旧** key 上（它说的就是这一次）",
+      (store.get(child["id"])["omnifocus"] or {}).get("id"), "pk-series")
+check("明天的子任务改挂到**下一次**的 key",
+      (store.get(tomorrow["id"])["omnifocus"] or {}).get("id"), "pk-next")
+check("本体也改挂到下一次的 key",
+      (store.get(template["id"])["omnifocus"] or {}).get("id"), "pk-next")
+check("旧 key 留了档",
+      [(p.get("id"), p.get("reason"))
+       for p in (store.get(tomorrow["id"])["omnifocus"] or {}).get("previous") or []],
+      [("pk-series", "repeat-clone")])
+repeat_wd.omnifocus.writes = []
+repeat_wd.writeback_completions()
+check("写过的不会再写一遍（重复表不会被推着走）", repeat_wd.omnifocus.writes, [])
+check_true("只改挂还开着的记录（收工的那几条不动）",
+           repeat_wd.task_store.is_open(store.get(tomorrow["id"])))
+
+# OmniFocus 说「这条已完成」时，别拿它把同一个 key 上还开着的兄弟记录也带成完成：
+# 兄弟里已经有一条是**我们自己写回**完成的，那这次完成就有归属了。
+print("== 写回：同一条 OmniFocus 不会把还开着的兄弟记录也带成完成 ==")
+for old in store.list():
+    store.delete(old["id"])
+twin_done = store.create({"title": "今天这次"},
+                         omnifocus={"id": "pk-twin", "title": "每天闪卡"})
+store.set_status(twin_done["id"], ts.STATUS_COMPLETED, reason="test")
+store.set_omnifocus_writeback(twin_done["id"], "completed")
+twin_open = store.create({"title": "明天那次"},
+                         omnifocus={"id": "pk-twin", "title": "每天闪卡"})
+twin_wd = mkwarden()
+twin_wd.task_store = store
+twin_wd.omnifocus = FakeOmni([{"id": "pk-twin", "name": "每天闪卡", "completed": True,
+                               "completed_at": "2026-11-02T22:00:00"}])
+rows = twin_wd.sync_omnifocus_status()
+check("自己写回完成的那条照样对得上", twin_done["id"] in rows, True)
+check("还开着的兄弟记录**不**跟着被判成完成", twin_open["id"] in rows, False)
+
+# 用户自己在 OmniFocus 里勾的（本地没有任何「写回完成」的记录）→ 照旧跟着收工
+for old in store.list():
+    store.delete(old["id"])
+manual = store.create({"title": "用户在 OmniFocus 勾的"},
+                      omnifocus={"id": "pk-manual", "title": "用户在 OmniFocus 勾的"})
+manual_wd = mkwarden()
+manual_wd.task_store = store
+manual_wd.omnifocus = FakeOmni([{"id": "pk-manual", "name": "用户在 OmniFocus 勾的",
+                                 "completed": True,
+                                 "completed_at": "2026-11-02T22:00:00"}])
+manual_wd.sync_completion_state()
+check("OmniFocus 里手动勾掉的 → 本地跟着完成",
+      ts.TaskStore.status_of(store.get(manual["id"])), "completed")
+check("跟着完成之后也补写了一次截止时间（幂等）",
+      [w[0] for w in manual_wd.omnifocus.writes], ["complete"])
+
 print()
 if fails:
     print("%d 项失败：" % len(fails))

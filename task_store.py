@@ -31,6 +31,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -113,6 +114,20 @@ def _atomic_write(path, obj):
                 os.unlink(tmp)
         except OSError:
             pass
+
+
+def _backup_before_write(path):
+    """留一份**上一版**（``xxx.bak``）：任务库是活数据，写坏了就再也回不去。
+
+    真踩过：一次测试不小心把 ``data/tasks.json`` 当成临时库清空重写，
+    旧内容连一个字节都找不回来。备份只留一代（每次写覆盖上一次），
+    60KB 的文件不值当为它做轮转。
+    """
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            shutil.copyfile(path, path + ".bak")
+    except OSError:
+        pass
 
 
 def _empty_store():
@@ -334,10 +349,14 @@ def session_due(session):
 
 
 def _coerce_omnifocus(raw):
-    """OmniFocus 关联：``{"id": primary key, "url", "title", "linked_at", "writeback"}``。
+    """OmniFocus 关联：``{"id": primary key, "url", "title", "linked_at", "writeback", "previous"}``。
 
     只有 ``id``（primary key）是硬的：链接解析不出来就没有关联，
     绝不拿标题去猜一条任务（猜错比没有更糟）。
+
+    ``previous`` 是「这条本地任务**以前**挂在哪些 primary key 上」——OmniFocus 的
+    重复任务每完成一次就会生出新一次（新 key），还开着的本地记录得跟着走
+    （见 :meth:`TaskStore.advance_omnifocus`），换下来的旧 key 留档备查。
     """
     if not isinstance(raw, dict):
         return None
@@ -353,6 +372,18 @@ def _coerce_omnifocus(raw):
     writeback = raw.get("writeback")
     if isinstance(writeback, dict) and writeback:
         out["writeback"] = {str(k): v for k, v in writeback.items()}
+    previous = []
+    for item in (raw.get("previous") or []):
+        if not isinstance(item, dict):
+            continue
+        old = str(item.get("id") or "").strip()
+        if not old:
+            continue
+        previous.append({"id": old,
+                         "replaced_at": item.get("replaced_at"),
+                         "reason": item.get("reason")})
+    if previous:
+        out["previous"] = previous
     return out
 
 
@@ -668,6 +699,7 @@ class TaskStore(object):
             return _empty_store()
 
     def save(self, store):
+        _backup_before_write(self.path)
         _atomic_write(self.path, _clean_store(store))
 
     def list(self):
@@ -830,6 +862,56 @@ class TaskStore(object):
             omni["writeback"] = wb
             task["omnifocus"] = omni
         return self._mutate(task_id, apply)
+
+    def advance_omnifocus(self, old_pk, new_pk, exclude_task_id=None,
+                          reason="repeat-clone"):
+        """OmniFocus 那条是**重复任务**：勾掉这一次，它自己生成了「下一次」（新 key）。
+
+        于是「一条 OmniFocus 任务 = 这一次」这件事必须跟着走：**还开着的**本地
+        记录（重复任务本体、还没到的子任务、拆出来的复制品）一律改挂新 key。
+
+        不改挂会出两个真事（都踩过）：
+
+        * 下一次写回打在一条**已经完成**的旧任务上，OmniFocus 那边永远勾不掉；
+        * 旧 key 在 OmniFocus 里是 completed，而「本地跟着 OmniFocus 标完成」那条
+          规则会把**明天**的子任务也带成 ✓ —— 明天的活还没干就没了。
+
+        已经收工/放弃的记录留在旧 key 上：它们说的就是那一次已经结束的活。
+        返回改挂过的本地任务 id（空 list = 没人跟着走，比如子任务都是收工的）。
+        """
+        old_pk = str(old_pk or "").strip()
+        new_pk = str(new_pk or "").strip()
+        if not old_pk or not new_pk or old_pk == new_pk:
+            return []
+        store = self.load()
+        stamp = _now()
+        moved = []
+        for task in store["tasks"]:
+            if exclude_task_id is not None and task["id"] == int(exclude_task_id):
+                continue
+            omni = task.get("omnifocus") or {}
+            if str(omni.get("id") or "") != old_pk:
+                continue
+            if not TaskStore.is_open(task):
+                continue
+            previous = list(omni.get("previous") or [])
+            previous.append({"id": old_pk, "replaced_at": stamp, "reason": reason})
+            task["omnifocus"] = {
+                "id": new_pk,
+                "url": "omnifocus:///task/%s" % new_pk,
+                "title": omni.get("title"),
+                "linked_at": omni.get("linked_at") or stamp,
+                "previous": previous,
+            }
+            source = task.get("source")
+            if isinstance(source, dict) and str(source.get("kind")) == "omnifocus":
+                task["source"] = dict(source, id=new_pk,
+                                      url="omnifocus:///task/%s" % new_pk)
+            task["updated_at"] = stamp
+            moved.append(task["id"])
+        if moved:
+            self.save(store)
+        return moved
 
     def add_tag(self, task_id, tag):
         """加一个本地标签；已经有了就返回 False（幂等）。"""
@@ -1395,10 +1477,17 @@ class TaskStore(object):
         # due / due_source 属于之前那一次；子任务挂上 session 时由 assign() 重写。
         child_fields.pop("due", None)
         child_fields.pop("due_source", None)
+        # 新的一次是**新的账**：本体的 writeback 痕迹（写回过了）和 previous
+        # （以前挂过哪些 primary key）不该跟着抄 —— 抄了的话这条子任务会被判成
+        # 「已经写回过了」，OmniFocus 那边就永远不会被勾掉。
+        child_omni = None
+        if parent.get("omnifocus"):
+            child_omni = {k: v for k, v in parent["omnifocus"].items()
+                          if k not in ("writeback", "previous")}
         child = self.create(
             child_fields,
             tags=list(parent.get("tags") or []),
-            omnifocus=dict(parent["omnifocus"]) if parent.get("omnifocus") else None,
+            omnifocus=child_omni,
             source={"kind": "repeat", "parent": parent["id"], "date": iso},
             repeat_parent=parent["id"], repeat_date=iso,
         )

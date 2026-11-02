@@ -1521,8 +1521,9 @@ wd3.bridge.completed[fm_kept] = datetime.datetime.now().isoformat(timespec="seco
 check("refresh 受理", wd3.handle("refresh"), True)
 check("refresh 去拉了 GET /v1/tasks（任务完成状态靠它，不用再手敲 task sync）",
       [c[0] for c in wd3.bridge.calls].count("tasks"), 1)
-check("refresh 只在读：不落重复任务、不写回 OmniFocus（那是 task sync 的事）",
-      _spy, [])
+check("refresh 不落重复任务（不在 Focusmate 上建 task）", "repeats" in _spy, False)
+check("refresh 会补写 OmniFocus 的完成（Focusmate 说完成了就是完成了）",
+      "writeback" in _spy, True)
 check("refresh 不在 Focusmate 上建/删 task",
       [c[0] for c in wd3.bridge.calls if c[0] in ("add_task", "delete_task")], [])
 check("Focusmate 说完成了 → 本地任务跟着收工",
@@ -1597,7 +1598,9 @@ try:
         check("没有问题时不去调 check 下单", [r for r in ran], [])
         check("没有问题时不去重挂",
               [c for c in wd3.bridge.calls if c[0] == "add_task"], [])
-        check("--check 会补写 OmniFocus（refresh_all 只同步本地状态）", _wb, [1])
+        # refresh_all 同步完成状态时就会写回一次，check_and_fix 收尾再扫一次
+        # （幂等：写过的记在 writeback 上，第二次什么都不写）
+        check("--check 会补写 OmniFocus", bool(_wb), True)
         check_true("明确报「没有发现要修的」",
                    any("没有发现要修的" in m[2] for m in wd3.messages))
     finally:

@@ -130,14 +130,49 @@ TUI 里的用法：`task import`（不给参数 = 读剪贴板导入并自动关
 
 写回是**幂等**的：写过的记在 `task.omnifocus.writeback.completed` 上，重复同步不会重复写。
 
-触发写回的地方有四个：
+触发写回的地方（**只要知道一条任务完成了就会写**）：
 
 1. `task done` / 收尾 D（直接完成）；
 2. `task sync`（拉 Focusmate 完成状态后补写）；
 3. 收尾自动核对（session 结束后）；
-4. **`refresh --check`**（对账时补写「本地已完成但还没写回」的）。
-   裸 `refresh` 仍然只读、不写 OmniFocus；`refresh --check` 本来就是"把不对的掰回来"，
-   所以包含这一步。
+4. **任何一次同步完成状态的 `refresh`**（`sync_task_completions` 末尾，含裸 `refresh`
+   和 `refresh --check`）。`refresh` 仍然**不在外面新造东西**（不订场、不在
+   Focusmate 建 task、不改 data.csv），但「Focusmate 勾掉了」是一条已经发生的
+   事实，本地打 ✓ 的同时 OmniFocus 那条也得完成 —— 否则本地一 ✓，收尾就再也
+   不会问它，**没有任何命令会再想起这条任务**（真实踩过：用户只能人肉 `task sync`）。
+
+写回扫的是「本地 `completed` + 有 primary key + `writeback.completed` 还没记」，
+所以补写是幂等的；一次 sync 里没有这种任务就**一个子进程都不起**。
+
+### 重复任务：OmniFocus 那边会「翻到下一次」
+
+`omnifocus_tasks.py set --complete` 打在**重复任务**上时，OmniFocus 的行为是
+「这一次完成 + 立刻生出下一次」，返回的 `after` 是**新那一次**的快照
+（`completed: false`），新 primary key 在 `repeat_clone_id` 里。
+
+于是 warden 必须做两件事，否则就出两个真事：
+
+| 不做 | 后果 |
+|---|---|
+| 把 `after.completed == false` 当失败 | 报「写回失败」、不记 writeback → 每次同步再写一遍 → OmniFocus 的重复表被一次次往前推 |
+| 不把新 key 接过来 | 本地还开着的记录（本体 / 明天的子任务）全挂在**旧 key**（已完成的那次）上 → 下一次的活在 OmniFocus 里永远勾不掉，还会被「OmniFocus 已完成」带成假完成 |
+
+所以 `omni_complete()` / `omni_drop()` 看见 `repeat_clone_id` 就：
+`repeat_advanced = true`（日志里能看到）、照常记 writeback、并调
+`task_store.advance_omnifocus(old_pk, new_pk)` 把**还开着的**本地记录改挂到新 key
+（旧 key 留在 `omnifocus.previous` 里备查；已经收工/放弃的记录留在旧 key 上，
+它们说的就是那一次已经结束的活）。
+
+`task <本体> drop` 会带 `--all-occurrences`：放弃「这一套」，而不是只放弃这一次
+（否则 OmniFocus 会照着重复规则继续生出下一次）。
+
+### 反向那一次「读」的边界
+
+「用户在 OmniFocus 里手动勾完成 → 本地跟着标完成」只在**这条完成还没有归属**时做。
+同一条 OmniFocus 在本地可能挂着好几条记录（转移的旧记录、重复任务的子任务）：
+其中一条要是我们自己写回完成的（`writeback.completed` 有值），就不再拿它去把
+同一个 key 上**还开着**的兄弟记录也带成 ✓（否则今天的子任务写完回，明天的
+子任务直接被判成完成）。
 
 ## 4. 收尾时「读」一次
 
@@ -172,8 +207,8 @@ temp/logs/YYYY-MM-DD.jsonl
 | `focusmate` | `tasks_pull_page` | 本次请求的端点、HTTP 状态、任务数、`hasMore`、这一页的每条 task（id/title/completed/completedAt/attachments） |
 | `focusmate` | `tasks_pull_done` | `/tasks` 与 `/tasks/completed` 各多少条、合并后总数、耗时、合并后的任务快照 |
 | `focusmate` | `task_complete_start/result/error` | 勾哪条 task、尝试过哪些端点、复核到的 completedAt、错误 |
-| `omnifocus` | `status_pull_start/result/error` | 读 OmniFocus 全部任务的结果、本地关联数、已完成数 |
-| `omnifocus` | `complete_start/result/error` | 本地任务 id / 标题 / pk / due、写前状态、`changed`、写后 `after.completed`、错误 kind / exit code / detail |
+| `omnifocus` | `status_pull_start/result/error` | 读 OmniFocus 全部任务的结果、本地关联数、已完成数、`claimed_pks` / `held_task_ids`（因为「我们自己写过回」而没有跟着标完成的兄弟记录） |
+| `omnifocus` | `complete_start/result/error` | 本地任务 id / 标题 / pk / due、写前状态、`changed`、写后 `after.completed`、`repeat_clone_id` / `repeat_advanced` / `repeat_moved`（重复任务翻篇 + 改挂了几条）、错误 kind / exit code / detail |
 | `omnifocus` | `writeback_scan_start/result` | 本轮补写扫到哪些本地已完成任务、写了几条 |
 
 日志不会写 token / cookie。`TI_LOG_DIR=/path` 可以改目录（Node 桥和 Python

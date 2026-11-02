@@ -472,7 +472,20 @@ task -t / task -f                      # 只看预设列表，不动任务
 - 真正「重写到 OmniFocus」发生在**完成**的时候：`task done` / 收尾 D 会跑
   `omnifocus_tasks.py set --id <PK> --complete --due <session 终点> --yes`
   一条命令把「完成 + 截止时间」一起写回去。
+- **只要知道了一条任务完成，就一定会写回**：`task done`、收尾 D、`task sync`、
+  收尾自动核对，以及**任何一次同步完成状态的 refresh**（`sync_task_completions`
+  末尾）。以前 refresh 只把 Focusmate 的 `completedAt` 同步成本地 `✓` 不写
+  OmniFocus —— 而本地一 ✓，收尾就再也不会问它了，于是「Focusmate 勾掉了、
+  OmniFocus 那条永远没完成」，只能靠人肉 `task sync` 补。
 - 写回幂等：`omnifocus.writeback.completed` 记过就不再写第二次。
+- OmniFocus 那条如果是**重复任务**，`set --complete` 会在 OmniFocus 里直接生出
+  「下一次」（新 primary key，返回在 `repeat_clone_id` 里）。这**不是失败**：
+  写回照记、本地还开着的记录（本体 + 之后的子任务 + 复制品）一律改挂新 key
+  （`task_store.advance_omnifocus()`，旧 key 留在 `omnifocus.previous` 里）。
+  不改挂的话，下一次写回会打在一条已经完成的旧任务上，OmniFocus 永远勾不掉。
+- 同一条 OmniFocus 上「本地跟着 OmniFocus 标完成」也有边界：如果这条的完成是
+  **我们自己写回**的（`writeback.completed` 有值），就不再拿它去把同一个 key 上
+  还开着的兄弟记录带成 ✓（否则明天的子任务会被今天的完成吃掉）。
 - 细节见 [`docs/omnifocus.md`](../docs/omnifocus.md)。
 
 ## 收尾（postsession）
