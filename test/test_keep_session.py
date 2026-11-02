@@ -150,8 +150,10 @@ check("记下了它是「覆盖」认账", rec().get("match"), "covered")
 check_true("actual 那句人话写进去了", "25" in (rec().get("actual") or ""))
 check("没记罪（冤枉过一次，别再冤枉）", ks.load_sins().get("sins", []), [])
 check_true("日志里说清是认账", any("认账" in m for m in LOGS))
+_extra_a = (_start - datetime.timedelta(minutes=15)).strftime("%H:%M")
+_extra_b = (_start + datetime.timedelta(minutes=15)).strftime("%H:%M")
 check_true("日志里报出计划外的两场",
-           any("计划外" in m and "16:" not in m for m in LOGS))
+           any("计划外" in m and _extra_a in m and _extra_b in m for m in LOGS))
 
 print("== 计划 09:30 / 实际 09:45 同样算落地（挪了半格）==")
 clear()

@@ -93,6 +93,38 @@ check("HTML 剪贴板抓 href + 锚文本",
       [(i["id"], i["title"]) for i in of.html_links(html)], [("kc-9", "数学 & 易错")])
 
 
+print("== omnifocus 重复规则查询：只读脚本 + 信封解析 ==")
+_script = of.build_repetition_script("pk-repeat")
+check_true("脚本走 evaluate javascript", "evaluate javascript js" in _script)
+check_true("脚本只查 Task.byIdentifier", "Task.byIdentifier" in _script)
+check_true("信封 tool 是 omnifocus_repetition", "omnifocus_repetition" in _script)
+check_true("脚本取 repetitionRule.ruleString", "repetitionRule" in _script
+           and "ruleString" in _script)
+_rep = of.parse_repetition_result(json.dumps({
+    "tool": "omnifocus_repetition", "version": 1, "ok": True,
+    "repeated": True, "id": "pk-repeat", "name": "每周三闪卡",
+    "rule_string": "FREQ=WEEKLY;BYDAY=WE", "method": "DueDate",
+    "due": "2026-11-04T11:10:00", "planned": None, "defer": None,
+    "next": "2026-11-04T11:10:00", "estimated_minutes": 25,
+}))
+check("repeated=True 解出来", _rep["repeated"], True)
+check("ruleString 解出来", _rep["rule_string"], "FREQ=WEEKLY;BYDAY=WE")
+check("estimated_minutes 是 int", _rep["estimated_minutes"], 25)
+_plain = of.parse_repetition_result(json.dumps({
+    "tool": "omnifocus_repetition", "version": 1, "ok": True,
+    "repeated": False, "id": "pk-plain", "name": "普通任务",
+    "rule_string": None, "due": None, "estimated_minutes": None,
+}))
+check("普通任务 repeated=False", _plain["repeated"], False)
+check("普通任务没有 rule", _plain["rule_string"], None)
+try:
+    of.parse_repetition_result('{"tool":"wrong","ok":true}')
+    _wrong_ok = False
+except ValueError:
+    _wrong_ok = True
+check("信封 tool 不对 → ValueError", _wrong_ok, True)
+
+
 print("== omnifocus 剪贴板：按 flavor 读（⌘V 到终端只剩标题）==")
 check("osascript 的 «data url …» 解出链接",
       of._decode_data("«data url 6F6D6E69666F6375733A2F2F2F7461736B2F6935424B584335754E6B30»"),

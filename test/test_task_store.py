@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """task_store.py 回归测试：任意字段 CRUD + session 关联 + Focusmate 完成归档。"""
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -226,6 +227,44 @@ check("旧 id 进 previous（归档还要用）",
 check("记下了为什么删", (fm.get("deleted_reason"), bool(fm.get("deleted_at"))),
       ("transfer", True))
 check("任务本身还在（没被删）", store2.get(t["id"])["fields"]["title"], "写论文")
+
+print("== 重复任务：本体 / occurrence 子任务 / source 指针 ==")
+day = datetime.date(2026, 11, 4)
+iso = day.isoformat()
+parent = store2.create(
+    {"title": "flashcard review", "duration": 25},
+    omnifocus={"id": "pk-repeat"},
+    source={"kind": "omnifocus", "id": "pk-repeat"},
+)
+parent = store2.set_repeat(parent["id"], "wed", "10:45", 25,
+                           rule="FREQ=DAILY",
+                           rule_anchor="2026-11-04T11:10:00",
+                           source="omnifocus", summary="每天 10:45（25 min）")
+check("本体是 repeat 模板", ts.TaskStore.is_repeat_template(parent), True)
+check("本体 source 指向 OF", parent["source"]["kind"], "omnifocus")
+check("本体来源记号只有 🔗", ts.TaskStore.origin_marks(parent), "🔗")
+child = store2.create_repeat_occurrence(parent["id"], day,
+                                        session={"date": iso, "start": "10:45",
+                                                 "end": "11:10", "duration": 25})
+check("子任务 repeat_parent 指向本体", child["repeat_parent"], parent["id"])
+check("子任务不是模板", ts.TaskStore.is_repeat_template(child), False)
+check("子任务 source 指向本体",
+      (child["source"]["kind"], child["source"]["parent"]), ("repeat", parent["id"]))
+check("子任务继承 OF 关联", child["omnifocus"]["id"], "pk-repeat")
+check("子任务来源记号 🔁 + 🔗", ts.TaskStore.origin_marks(child), "🔁🔗")
+check("子任务挂上了 session", child["session"]["start"], "10:45")
+check("本体自己没 session", parent.get("session"), None)
+check("同一天再生成是同一子任务",
+      store2.create_repeat_occurrence(parent["id"], day)["id"], child["id"])
+store2.record_occurrence(parent["id"], day, child_id=child["id"],
+                         session=child["session"],
+                         focusmate={"task_id": "ft-child"})
+parent2 = store2.get(parent["id"])
+occ = (parent2["repeat"]["occurrences"] or {})[iso]
+check("本体 occurrence 记 child_id / focusmate",
+      (occ.get("child_id"), (occ.get("focusmate") or {}).get("task_id")),
+      (child["id"], "ft-child"))
+check("本体仍然没有 session（不被 occurrence 污染）", parent2.get("session"), None)
 
 print("== 坏 JSON 不炸 ==")
 with open(TASKS, "w", encoding="utf-8") as f:

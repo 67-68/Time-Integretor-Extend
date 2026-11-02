@@ -30,11 +30,26 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
                   "writeback": {"completed": "..."}},
     "duplicate_of": null,                // 从哪条复制来的
     "actual_minutes": null,              // 「缺漏完成补充」手填的实际耗时
+    "source": {"kind": "omnifocus", "id": "kc-4VLAE_1L",
+               "url": "omnifocus:///task/kc-4VLAE_1L", "title": "写论文"},
     "trigger": {"name": "...", "params": [], "args": {}, "set_at": "..."},
     "formatter": {"name": "end", "params": [], "args": {}, "set_at": "...",
                   "reservation": {"date": "...", "start": "17:30", "end": "18:00",
                                   "session_start": "17:30", "session_duration": 25,
                                   "duration": 25, "break_minutes": 5}},
+    "repeat": {"rule": "FREQ=DAILY",          // OmniFocus 原 RRULE；老任务可为空
+               "rule_anchor": "2026-11-04T11:10:00",
+               "rule_offset_days": 0,          // 跨午夜：场次起点 - 规则锚点的日期差
+               "weekday": 2, "weekday_label": "wed",  // 首个场次的显示字段
+               "start": "10:45", "duration": 25,
+               "omnifocus": {"method": "DueDate", "schedule_type": "Regularly",
+                              "anchor_date_key": "DueDate"},
+               "occurrences": {"2026-11-04": {"child_id": 2,
+                                               "session": {...},
+                                               "focusmate": {...}}}},
+    // 下面是 occurrence 子任务独有的两项；本体没有
+    "repeat_parent": null,               // 子任务：本体 id；本体为 null
+    "repeat_date": null,                 // 子任务：这一天的 YYYY-MM-DD
     "history": [                         // 哪一天的哪一场「处理」过它（见下）
       {"day": "2026-10-27", "start": "11:00", "action": "skip", "at": "..."}
     ],
@@ -129,7 +144,7 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task <序号> -m discard`（`--mark discard`） | **手动记账**：本地 dropped；完全不动 Focusmate / OmniFocus |
 | `task -m complete` / `task -m discard` | 不写序号 = 标记当前选中的任务；`-m` 与 `--mark`、后缀位置都等价 |
 | `task <序号> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
-| `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus，可一次多行 |
+| `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus，可一次多行；如果 OmniFocus 里是重复任务，会先问要不要复制重复设置 |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
 | `task <序号> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |
 | `task <序号> -a current`（`-ac`） | 挂到**当前这一场**（进行中优先，其次最近一场） |
@@ -236,6 +251,34 @@ Focusmate 没有「把 task 挪到另一场」这个动作（只能建一条新�
 - 没有 `-a` 就只列一下（手滑不会掉东西）；`-a none` = 全量下架；
 - 源 = 目标 → 什么都不动。
 
+### 导入时检查 OmniFocus 重复任务
+
+OmniFocus 的 `repetitionRule` 不在 `omnifocus_tasks.py list` 的公开字段里，所以
+`omnifocus.Client.repetition_info(pk)` 单独用一次 **只读** 的 `evaluate javascript`
+查这一条：`ruleString` / `method` / `due` / `planned` / `next` /
+`estimated_minutes`。导入流程：
+
+1. 解析剪贴板 / 粘贴文本，拿到 OmniFocus primary key；
+2. 每条有 id 的都查一次 `repetition_info`；
+3. 有重复规则 → **先不建任务**，把候选挂到 `pending_import`，在 repl_kit 的
+   打断栏位问：`[y] 复制重复设置并导入 / [n] 只导入这一次 / [q] 取消`；
+4. 只有 `y` 才把规则写成本地 `repeat`；`n` 和普通导入完全一样；
+5. 查询失败（OmniFocus 没开 / 没有权限）不挡导入：明确说「没法核对，先按普通
+   任务导入」，绝不把查询失败当成重复任务。
+
+复制规则时不再翻译成「每周几」：
+
+- `ruleString` 原样存进 `repeat.rule`，`DAILY` / 多个 `BYDAY` / `INTERVAL` /
+  `COUNT` / `UNTIL` 都由 `dateutil.rrule` 按 OmniFocus 的语义展开；
+- `start` 优先用 `planned`，其次 `due - estimated_minutes`（warden assign 时把 due
+  写成 session 终点），再去那天**真实排期**里核对；都对不上且不在 15 分钟网格上
+  才说不能复制；
+- `rule_anchor` 保留 OF 的 due/planned 当 DTSTART；跨午夜时用
+  `rule_offset_days` 按场次起点去查 RRULE；
+- 只有 RRULE 本身解析不了（例如 `BYDAY=XX`）才拒绝复制，仍然可以只导入这一次；
+- 消息会显示「每天 10:45（25 min）」「每周一、三 22:15（50 min）」这种摘要，
+  同时 `task repeat <序号>` 会打印原 RRULE 和锚点。
+
 ### 为什么 `task import` 必须自己读剪贴板
 
 在 OmniFocus 里 ⌘C 一条任务、再到终端 ⌘V，**粘出来只有标题**：终端只接受剪贴板里
@@ -276,24 +319,59 @@ html/rtf/url 都原样返回纯文本），所以老实现其实一直在读纯�
 CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`。
 `archive` 默认按完成日期分组列出来，`--json` 原样打印整个文件，`--limit N` 只看最近 N 条。
 
-## 每周重复任务（repeated task）
+## 重复任务（repeated task）
 
-抽象出来的一层：任务可以带一个 `repeat`，描述「周几 + 起点 + 锚定时长」。
+重复任务拆成**本体（模板）**和**occurrence 子任务**两层，和 OmniFocus 的
+「一条重复任务 + 每次 occurrence」对齐：
 
-```json
-"repeat": {"weekday": 0, "weekday_label": "mon", "start": "22:15",
-           "duration": 50, "created_at": "...",
-           "occurrences": {"2026-10-26": {"session": {...}, "focusmate": {...}}}}
+```text
+本体 task#1
+  source = {"kind": "omnifocus", "id": "pk..."}   ← 来源指向 OmniFocus
+  repeat = 完整的 RRULE + start/duration
+  不挂 session → 【契约】表的 task 列永远看不到它
+
+到规则日 → occurrence 子任务 task#2
+  repeat_parent = 1
+  repeat_date = "2026-11-04"
+  source = {"kind": "repeat", "parent": 1, "date": "2026-11-04"}
+  fields / tags / omnifocus 从本体继承
+  真正去挂 session、显示在契约表里，来源记号 🔁
 ```
 
-- **只支持每周重复**：设在周一 22:15，就只影响周一那一场；周二周三不受影响。
-- 落点判据是「同一星期几 + 同一时刻 + 同一时长」：
-  `task_store.repeat_occurrence(task, day, sessions)`。
-- 所以**排布被改了，这一周就不落**：50 拆成 25+25 之后，两场 session 的时长都不是
-  50，重复任务在这一周消失 —— 但 `repeat` 设置本身一个字不改，下一周照旧。
-- `task sync` 会把落上的那一场挂到 Focusmate（`add_task` 复核成功才写本地），
-  并把 `occurrences[日期]` 记下来；完成时间同样从 `completedAt` 归档。
-- 界面上这一行的 task 列会带 `🔁` 前缀（说明它是重复任务自动挂上的，不是手 assign 的）。
+`repeat` 本体：
+
+```json
+"repeat": {"rule": "FREQ=DAILY",
+           "rule_anchor": "2026-11-04T11:10:00",
+           "rule_offset_days": 0,
+           "weekday": 2, "weekday_label": "wed",
+           "start": "10:45", "duration": 25,
+           "source": "omnifocus",
+           "summary": "每天 10:45（25 min）",
+           "occurrences": {"2026-11-04": {"child_id": 2,
+                                          "session": {...},
+                                          "focusmate": {...}}}}
+```
+
+- `rule` 是 OmniFocus `repetitionRule.ruleString` 原文。`DAILY`、`WEEKLY`、
+  多个 `BYDAY`、`INTERVAL`、`MONTHLY`、`YEARLY`、`COUNT` / `UNTIL` 全部由
+  `dateutil.rrule` 展开。
+- **日期**只看 `repeat_due_on(task, day)`：规则说这天有就有，不再要求当天必须
+  有同起点、同时长的 session。「具体什么时候」是生成之后挂哪一场的事。
+- 生成子任务时：先找同起点同时长的精确 session；找不到就选当天离
+  `repeat.start` 最近的一场；当天没有 session 也先生成子任务（不挂场）。
+- `task sync` 会给子任务挂 Focusmate；`repeat.occurrences[日期]` 只记本体的
+  账本（`child_id` + session + focusmate），**不会再拿本体去归档一份**。
+- 老的手动 `--repeat mon@22:15` 没有 `rule`，仍按 weekday 规则生成子任务；
+  `repeat_summary()` 对两种记录都给同一套人话
+  （`每天 10:45（25 min）` / `每周一、三 22:15（50 min）`）。
+- 契约表 task 列来源记号：
+  - `🔁` = 重复任务 occurrence 子任务
+  - `🔗` = 有 OmniFocus 关联（复制或继承）
+  - `🔁🔗` = 两者都有
+  - `⏱` = 挂了 formatter
+- 本体在 task 视图里仍可见（可以改规则 / 删除 / 看 RRULE），只是不进契约表的
+  task 列；`task repeat <本体序号>` 会打印 rule / anchor / 已生成次数。
 
 ## trigger / formatter（任务扩展点）
 

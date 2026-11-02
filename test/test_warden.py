@@ -708,6 +708,20 @@ for width in (40, 120):
     out = buf.getvalue()
     check("width=%d help 不炸" % width, "Traceback" not in out and "命令" in out, True)
     check("width=%d help 里有 session/day" % width, "session HH:MM LEN" in out and "day" in out, True)
+    compact = "".join(out.split())
+    check("width=%d help 里有 trigger 命令" % width, "task-t" in compact, True)
+    check("width=%d help 里有 formatter 命令" % width, "task-f" in compact, True)
+    if width >= 120:  # 40 列时 rich 只留命令列，说明文字放不下
+        check("width=%d help 里有 trigger 介绍" % width,
+              "trigger" in compact and "创建触发" in compact, True)
+        check("width=%d help 里有 formatter 介绍" % width,
+              "formatter" in compact and "排期算法" in compact, True)
+        check("width=%d help 里有 import 重复设置询问" % width,
+              "taskimport" in compact and "重复设置" in compact, True)
+        check("width=%d help 里有重复任务本体/子任务机制" % width,
+              "重复任务本体" in compact and "repeat_parent" in compact, True)
+        check("width=%d help 里有 🔁 / 🔗 来源记号" % width,
+              "🔁" in compact and "🔗" in compact, True)
 
 # 已匹配标记必须真的渲染出来（Text.append 不解析 markup，踩过）
 buf = io.StringIO()

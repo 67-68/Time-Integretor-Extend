@@ -198,6 +198,79 @@ check("下一周同一时刻 → 照旧落",
       store.repeat_occurrence(task, mon + datetime.timedelta(days=7),
                               [{"start": "22:15", "duration": 50}])["start"], "22:15")
 
+print("== RRULE：OmniFocus 的 DAILY / 多 BYDAY / INTERVAL / UNTIL 照原样展开 ==")
+# 用同一个任务改成「每天」；anchor 是 OF 的 due，start 是 session 起点
+store.set_repeat(task["id"], "mon", "22:15", 50,
+                 rule="FREQ=DAILY", rule_anchor="2026-10-26T23:05:00",
+                 source="omnifocus", summary="每天 22:15（50 min）")
+task = store.get(task["id"])
+check("DAILY 原样存 RRULE", task["repeat"]["rule"], "FREQ=DAILY")
+check("DAILY 存锚点", task["repeat"]["rule_anchor"], "2026-10-26T23:05:00")
+check("DAILY 摘要", ts.repeat_summary(task["repeat"]), "每天 22:15（50 min）")
+for offset in (0, 1, 2, 3):
+    day = mon + datetime.timedelta(days=offset)
+    check("DAILY %s 都落" % day,
+          bool(store.repeat_occurrence(task, day,
+                                       [{"start": "22:15", "duration": 50}])), True)
+
+store.set_repeat(task["id"], "mon", "22:15", 50,
+                 rule="FREQ=WEEKLY;BYDAY=MO,WE,FR",
+                 rule_anchor="2026-10-26T23:05:00", source="omnifocus")
+task = store.get(task["id"])
+_week = [mon + datetime.timedelta(days=i) for i in range(7)]
+check("多 BYDAY：只落一、三、五",
+      [d.weekday() for d in _week
+       if store.repeat_occurrence(task, d, [{"start": "22:15", "duration": 50}])],
+      [0, 2, 4])
+check("多 BYDAY 摘要", ts.repeat_summary(task["repeat"]),
+      "每周一、三、五 22:15（50 min）")
+
+store.set_repeat(task["id"], "mon", "22:15", 50,
+                 rule="FREQ=DAILY;INTERVAL=2",
+                 rule_anchor="2026-10-26T23:05:00", source="omnifocus")
+task = store.get(task["id"])
+check("INTERVAL=2：隔一天落",
+      [i for i in range(6)
+       if store.repeat_occurrence(task, mon + datetime.timedelta(days=i),
+                                  [{"start": "22:15", "duration": 50}])],
+      [0, 2, 4])
+check("INTERVAL=2 摘要", ts.repeat_summary(task["repeat"]),
+      "每 2 天 22:15（50 min）")
+
+store.set_repeat(task["id"], "mon", "22:15", 50,
+                 rule="FREQ=WEEKLY;BYDAY=MO;UNTIL=20261102T000000Z",
+                 rule_anchor="2026-10-26T23:05:00", source="omnifocus")
+task = store.get(task["id"])
+check("UNTIL（带 Z）能解析",
+      bool(store.repeat_occurrence(task, mon,
+                                   [{"start": "22:15", "duration": 50}])), True)
+check("UNTIL 之后不落",
+      store.repeat_occurrence(task, mon + datetime.timedelta(days=7),
+                              [{"start": "22:15", "duration": 50}]), None)
+
+print("== 跨午夜：RRULE 锚点周四，场次起点是周三 ==")
+store.set_repeat(task["id"], "wed", "23:15", 50,
+                 rule="FREQ=WEEKLY;BYDAY=TH",
+                 rule_anchor="2026-10-29T00:05:00", rule_offset_days=-1,
+                 source="omnifocus")
+task = store.get(task["id"])
+wed = datetime.date(2026, 10, 28)
+check("场次周三能落上", bool(store.repeat_occurrence(
+    task, wed, [{"start": "23:15", "duration": 50}])), True)
+check("规则锚点周四本身不落（那天的场次不是这个）",
+      store.repeat_occurrence(task, datetime.date(2026, 10, 29),
+                              [{"start": "23:15", "duration": 50}]), None)
+check("摘要按场次起点显示周三", ts.repeat_summary(task["repeat"]),
+      "每周三 23:15（50 min）")
+try:
+    store.set_repeat(task["id"], "mon", "22:15", 50,
+                     rule="FREQ=WEEKLY;BYDAY=XX",
+                     rule_anchor="2026-10-26T23:05:00")
+    bad_rule_ok = False
+except ValueError:
+    bad_rule_ok = True
+check("坏 RRULE 在写库前就被拒", bad_rule_ok, True)
+
 # ---------------------------------------------------------------- 界面整合
 
 print("== warden：task create --repeat + 表格里自动挂上 ==")
@@ -208,38 +281,56 @@ wd = mkwarden()
 check("建带 repeat 的任务", wd.handle("task create title=明日时间安排 --repeat %s@22:15" % WD), True)
 tasks = wd.task_store.list()
 check("建出一条任务", len(tasks), 1)
-rep = tasks[0].get("repeat") or {}
+parent = tasks[0]
+check("本体是 repeat 模板", ts.TaskStore.is_repeat_template(parent), True)
+rep = parent.get("repeat") or {}
 check("repeat 记的是今天这个星期几", rep.get("weekday_label"), WD)
 check("repeat 锚定的是那场 50min（按 layout 排出来的）",
       rep.get("duration"), 50)
-check("task 视图表格里显示 🔁",
-      "🔁 %s@22:15" % WD in render_text(wd.views[3].render()), True)
+check("task 视图表格里显示 🔁 + 人话摘要",
+      "🔁 每周%s 22:15（50 min）" % ts.CN_WEEKDAYS[ts.WEEKDAYS.index(WD)]
+      in render_text(wd.views[3].render()), True)
 
 wd.api_rows = [{"startMs": 0, "endMs": 0, "startLabel": "22:15", "endLabel": "23:05",
                 "durationMin": 50, "id": "sess-1", "title": "", "quiet": False,
                 "matched": False, "phase": "未开始"}]
 wd.rows_source = "bridge"
+# 到日子了：TUI 的每日自动扫描生成一条子任务（本体本身不进契约表 task 列）
+wd._repeat_gen_day = None
+wd.maybe_generate_repeat_occurrences()
 wd.rebuild_rows()
-check("表格那一行自动显示这个重复任务（状态记号 + 🔁 + 编号 + 标题）",
-      wd.rows[0]["task_text"], "·🔁%d: 明日时间安排" % 1)
+child = wd.task_store.occurrence_for(parent["id"], TODAY)
+check("今天生成了 occurrence 子任务", bool(child), True)
+check("子任务 repeat_parent 指向本体", child["repeat_parent"], parent["id"])
+check("本体自己不挂 session（契约表看不到它）", parent.get("session"), None)
+check("契约表格显示的是子任务（状态记号 + 🔁 + 编号 + 标题）",
+      wd.rows[0]["task_text"], "·🔁%d: 明日时间安排" % wd.task_no(child))
 check("行上标了这是重复任务", wd.rows[0]["task_repeat"], True)
+check("契约表 row 里只有子任务（本体被过滤）",
+      [t["id"] for t in wd.rows[0]["tasks"]], [child["id"]])
+check("来源记号：重复子任务 = 🔁", ts.TaskStore.origin_marks(child), "🔁")
 check("没有落点的日子不会显示任务（周二不看）",
       wd.repeated_task_for(OTHER, {"start": "22:15"}), None)
 
-print("== 拆分之后：这一周没有重复任务，设置不变 ==")
+print("== 拆分之后：精确匹配没了，但子任务照生（时间不重要）==")
 reset_tasks()
 wd = mkwarden()
 wd.handle("task create title=明日时间安排 --repeat %s@22:15" % WD)
+parent = wd.task_store.list()[0]
 wd.handle("period T1 25 25")            # 50 拆成 22:15+22:45 两场 25min
 wd.reload_periods()
-check("repeat 设置还在", (wd.task_store.list()[0].get("repeat") or {}).get("start"), "22:15")
+check("repeat 设置还在", (parent.get("repeat") or {}).get("start"), "22:15")
 sessions = wd.sessions_for_day_plan(TODAY)
 check("那天现在排出来的是 25+25", [(s["start"], s["duration"]) for s in sessions],
       [("22:15", 25), ("22:45", 25)])
-check("拆分后第一场也有没任务（时长对不上）",
-      wd.repeated_task_for(TODAY, {"start": "22:15"}), None)
-check("拆分后第二场也没有任务",
-      wd.repeated_task_for(TODAY, {"start": "22:45"}), None)
+parent = wd.task_store.get(parent["id"])
+check("严格同起点同长的精确匹配确实没了",
+      wd.task_store.repeat_occurrence(parent, TODAY, sessions), None)
+wd.ensure_repeat_occurrences(TODAY)
+child = wd.task_store.occurrence_for(parent["id"], TODAY)
+check("但子任务仍然生成", bool(child), True)
+check_true("挂到了当天某个 session（不是消失）",
+           (child.get("session") or {}).get("start") in ("22:15", "22:45"))
 
 print("== task sync：把重复任务挂到 session 上（Focusmate 复核成功才写本地）==")
 reset_tasks()
@@ -259,11 +350,16 @@ check("给这一场调了一次 add_task", len(adds), 1)
 check("add_task 用的是那场 session id", adds[0][1].get("meetingId"), "sess-9")
 task = wd.task_store.list()[0]
 occ = (task.get("repeat") or {}).get("occurrences") or {}
+child = wd.task_store.occurrence_for(task["id"], TODAY)
 check("落了今天的 occurrence", list(occ), [ISO])
+check("occurrence 指向子任务", occ[ISO].get("child_id"), child["id"])
 check("occurrence 记了 Focusmate task id",
       (occ[ISO].get("focusmate") or {}).get("task_id"), "ft-repeat-1")
 check("occurrence 记了那一场 session",
       (occ[ISO].get("session") or {}).get("focusmate_session_id"), "sess-9")
+check("Focusmate task 挂在子任务上，不在本体上",
+      ((child.get("focusmate") or {}).get("task_id"), task.get("focusmate")),
+      ("ft-repeat-1", {}))
 wd.bridge.calls = []
 wd.handle("task sync")
 check("再 sync 不会重复挂（幂等）",

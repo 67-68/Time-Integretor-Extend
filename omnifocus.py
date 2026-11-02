@@ -22,9 +22,10 @@
    那条路只能建任务、不能关联（见 :func:`clipboard_flavor` 上面的注释）。
 
 2. **读写调用**（子进程）
-   所有真正的 osascript 都发生在 ``omnifocus_tasks.py`` 里（那边的契约是
-   stdout 只有数据、退出码有意义）。这里只做三件事：起子进程、把 JSON 解析成
-   dict、把退出码翻译成 :class:`OmniFocusError`。
+   常规读写走 ``omnifocus_tasks.py``（那边的契约是 stdout 只有数据、退出码
+   有意义）；这里只负责起子进程、解析 JSON、翻译退出码。另有一个只读小查询
+   :meth:`Client.repetition_info`：用 Omni Automation 的 ``repetitionRule``
+   查单条任务是不是重复任务，给 ``task import`` 决定要不要复制规则。
 
    为什么不 import 那个脚本：写操作可能因为 TCC 权限弹框卡几十秒，甚至把
    OmniFocus 的前台焦点抢走；放在子进程里，超时/被杀都只影响这一次调用，
@@ -419,6 +420,153 @@ def clipboard_links():
     return found
 
 
+# ---------------------------------------------------------------- 重复规则（只读）
+
+#: 导入任务时用的一个小查询：只问「这一条有没有 repetitionRule」。
+#:
+#: 为什么不走 ``omnifocus_tasks.py list``：它的字段表是公开契约，重复规则不在里面；
+#: 而为了一个导入问句去改那边的输出会牵动所有下游。这里用同一套
+#: ``evaluate javascript`` 机制单独查一条，只读、不写、不影响 list 的结果。
+REPETITION_JS = r'''
+(() => {
+  const args = {{ARGS}};
+  const reply = obj => JSON.stringify(Object.assign(
+    { tool: "omnifocus_repetition", version: 1 }, obj
+  ));
+  const pad = n => (n < 10 ? "0" + n : "" + n);
+  const iso = d => {
+    if (!d) return null;
+    try {
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+        + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    } catch (e) {
+      return null;
+    }
+  };
+  const idOf = o => {
+    try { return o.id.primaryKey; } catch (e) { return null; }
+  };
+  try {
+    if (typeof Task === "undefined" || typeof Task.byIdentifier !== "function") {
+      return reply({
+        ok: false,
+        error: "omnijs_unavailable",
+        message: "当前 OmniFocus 不支持 Task.byIdentifier"
+      });
+    }
+    const task = Task.byIdentifier(args.id);
+    if (!task) {
+      return reply({ ok: false, error: "not_found", message: "找不到任务：" + args.id });
+    }
+    const rule = task.repetitionRule || null;
+    let next = null;
+    let ruleString = null;
+    let method = null;
+    let scheduleType = null;
+    let anchorDateKey = null;
+    let catchUpAutomatically = null;
+    if (rule) {
+      try { ruleString = rule.ruleString || null; } catch (e) {}
+      try { method = rule.method ? String(rule.method) : null; } catch (e) {}
+      try { scheduleType = rule.scheduleType ? String(rule.scheduleType) : null; } catch (e) {}
+      try { anchorDateKey = rule.anchorDateKey ? String(rule.anchorDateKey) : null; } catch (e) {}
+      try { catchUpAutomatically = !!rule.catchUpAutomatically; } catch (e) {}
+      try { next = iso(rule.firstDateAfterDate(new Date())); } catch (e) {}
+    }
+    return reply({
+      ok: true,
+      repeated: !!rule,
+      id: idOf(task) || args.id,
+      name: task.name || "",
+      rule_string: ruleString,
+      method: method,
+      schedule_type: scheduleType,
+      anchor_date_key: anchorDateKey,
+      catch_up_automatically: catchUpAutomatically,
+      due: iso(task.dueDate),
+      defer: iso(task.deferDate),
+      planned: iso(task.plannedDate),
+      next: next,
+      estimated_minutes: (task.estimatedMinutes === undefined
+        ? null : task.estimatedMinutes)
+    });
+  } catch (e) {
+    return reply({ ok: false, error: "exception", message: String(e) });
+  }
+})()
+'''
+
+
+def _applescript_string(text):
+    """Python 文本 → AppleScript 字符串字面量。"""
+    escaped = (str(text).replace("\\", "\\\\")
+               .replace('"', '\\"')
+               .replace("\r", "\\r")
+               .replace("\n", "\\n")
+               .replace("\t", "\\t"))
+    return '"' + escaped + '"'
+
+
+def build_repetition_script(pk, chunk_size=600):
+    """查一条 OmniFocus 任务的重复规则（只读）的完整 AppleScript。"""
+    pk = _clean_id(pk)
+    js = REPETITION_JS.replace(
+        "{{ARGS}}",
+        json.dumps({"id": pk}, ensure_ascii=False, separators=(",", ":")),
+    ).strip("\n")
+    chunks = [js[i:i + chunk_size] for i in range(0, len(js), chunk_size)] or [""]
+    lines = ["-- 由 omnifocus.py 生成：查重复规则（只读）"]
+    lines.append("set js to " + _applescript_string(chunks[0]))
+    for chunk in chunks[1:]:
+        lines.append("set js to js & " + _applescript_string(chunk))
+    lines.append('tell application "OmniFocus"')
+    lines.append("\treturn evaluate javascript js")
+    lines.append("end tell")
+    return "\n".join(lines) + "\n"
+
+
+def parse_repetition_result(text):
+    """把 ``build_repetition_script`` 的 stdout 解析成 dict。
+
+    失败（不是 JSON / tool 不对 / ok=false）抛 :class:`ValueError`；调用方
+    负责翻成 :class:`OmniFocusError`。纯函数，测试可以不碰 osascript。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("OmniFocus 没有返回重复规则（空输出）")
+    try:
+        data = json.loads(raw.splitlines()[-1])
+    except (ValueError, IndexError):
+        raise ValueError("重复规则查询返回的不是 JSON：%r" % raw[:160]) from None
+    if not isinstance(data, dict):
+        raise ValueError("重复规则查询应返回对象，实际是 %s" % type(data).__name__)
+    if data.get("tool") != "omnifocus_repetition":
+        raise ValueError("重复规则信封的 tool 不对：%r" % (data.get("tool"),))
+    if not data.get("ok"):
+        raise ValueError(data.get("message") or data.get("error") or "查询重复规则失败")
+    out = {
+        "repeated": bool(data.get("repeated")),
+        "id": str(data.get("id") or ""),
+        "name": str(data.get("name") or ""),
+        "rule_string": data.get("rule_string") or None,
+        "method": data.get("method") or None,
+        "schedule_type": data.get("schedule_type") or None,
+        "anchor_date_key": data.get("anchor_date_key") or None,
+        "catch_up_automatically": data.get("catch_up_automatically"),
+        "due": data.get("due") or None,
+        "defer": data.get("defer") or None,
+        "planned": data.get("planned") or None,
+        "next": data.get("next") or None,
+        "estimated_minutes": data.get("estimated_minutes"),
+    }
+    if out["estimated_minutes"] is not None:
+        try:
+            out["estimated_minutes"] = int(out["estimated_minutes"])
+        except (TypeError, ValueError):
+            out["estimated_minutes"] = None
+    return out
+
+
 # ---------------------------------------------------------------- 子进程调用
 
 
@@ -489,6 +637,46 @@ class Client(object):
             raise OmniFocusError("起不来子进程：%s" % e, kind="unavailable", exit_code=1) from None
         return proc.returncode, proc.stdout, proc.stderr
 
+    def _run_applescript(self, script, timeout=None):
+        """把一段 AppleScript 从 stdin 喂给 osascript，返回 stdout。
+
+        ``repetition_info`` 用这条：它只查一条任务，没必要再起一个 Python
+        子进程；仍然独占一次 osascript，超时/权限错误照常翻成
+        :class:`OmniFocusError`。
+        """
+        if not self.available():
+            raise OmniFocusError(self.why_unavailable(), kind="unavailable", exit_code=1)
+        self.calls += 1
+        try:
+            proc = subprocess.run(
+                [self.osascript], input=script, capture_output=True, text=True,
+                timeout=timeout if timeout is not None else self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise OmniFocusError(
+                "osascript 超过 %.0f 秒没返回" % (timeout or self.timeout),
+                kind="timeout", exit_code=1,
+            ) from None
+        except OSError as e:
+            raise OmniFocusError("起不来 osascript：%s" % e,
+                                 kind="unavailable", exit_code=1) from None
+        if proc.returncode != 0:
+            text = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+            lower = text.lower()
+            if ("not authorized" in lower or "not permitted" in lower
+                    or "-1743" in lower or "1743" in lower):
+                kind = "permission"
+            elif "application isn" in lower or "can’t be found" in lower or "can't be found" in lower:
+                kind = "unavailable"
+            else:
+                kind = "error"
+            raise OmniFocusError(
+                "查 OmniFocus 重复规则失败（退出码 %d）：%s"
+                % (proc.returncode, text.splitlines()[-1] if text else "(没有输出)"),
+                kind=kind, exit_code=proc.returncode, detail=text,
+            )
+        return proc.stdout
+
     @staticmethod
     def _raise_for(rc, out, err, what):
         """把退出码翻译成异常；成功（0）什么也不做。"""
@@ -549,6 +737,30 @@ class Client(object):
             if str(row.get("id") or "") == pk:
                 return row
         return None
+
+    def repetition_info(self, pk, timeout=None):
+        """查一条任务是不是 OmniFocus 的重复任务；返回 dict。
+
+        - ``repeated=False``：普通任务，``rule_string`` 等为 ``None``；
+        - ``repeated=True``：带 ``rule_string`` / ``method`` / ``due`` / ``planned``
+          / ``next`` / ``estimated_minutes`` 等字段，交给 warden 判断能不能
+          映射成本地「每周重复」；
+        - 查询本身失败抛 :class:`OmniFocusError`（导入方会退化成「没法核对，
+          先按普通任务导入」，不拿网络故障当重复任务）。
+
+        只读；不写 OmniFocus、不碰缓存。
+        """
+        pk = _clean_id(pk)
+        if not pk:
+            raise OmniFocusError("没有 OmniFocus primary key，查不了重复规则",
+                                 kind="bad_args", exit_code=2)
+        script = build_repetition_script(pk)
+        with self._lock:
+            out = self._run_applescript(script, timeout=timeout)
+        try:
+            return parse_repetition_result(out)
+        except ValueError as e:
+            raise OmniFocusError("查重复规则失败：%s" % e, kind="error", exit_code=1) from None
 
     def invalidate(self):
         self._cache = None

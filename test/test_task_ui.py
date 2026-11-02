@@ -609,6 +609,10 @@ print("== task import：读剪贴板是**动作**，-a 只是分流后缀（⌘V
 CLIP = [{"id": "i5BKXC5uNk0", "url": "omnifocus:///task/i5BKXC5uNk0",
          "title": "TI: Swap", "has_id": True, "raw": "omnifocus:///task/i5BKXC5uNk0"}]
 _real_clip = w.of.clipboard_links
+_real_repetition_info = wd.omnifocus.repetition_info
+# 普通导入用例不要因为本机装了 OmniFocus 就真的去跑 osascript：明确回答
+# 「不是重复任务」。专门测复制 repeat 的那一段再换掉这个替身。
+wd.omnifocus.repetition_info = lambda pk: {"repeated": False, "id": pk}
 w.of.clipboard_links = lambda: [dict(x) for x in CLIP]
 wd.messages = []
 check("task import（不带参数）就受理", wd.handle("task import"), True)
@@ -616,6 +620,9 @@ made = wd.task_store.get(wd.selected_task_id)
 check("从剪贴板读到了 OmniFocus primary key",
       (made.get("omnifocus") or {}).get("id"), "i5BKXC5uNk0")
 check("标题也来自剪贴板", made["fields"]["title"], "TI: Swap")
+check("普通 OmniFocus 任务来源记号 = 🔗",
+      ts.TaskStore.origin_marks(made), "🔗")
+check_true("契约表 task 列会画 🔗", "🔗" in wd.task_cell_text([made]))
 check_true("消息里说明链接是从剪贴板读的",
            any("链接是从剪贴板读的" in m[2] for m in wd.messages))
 
@@ -659,6 +666,172 @@ tgt = wd.task_store.create({"title": "先建后关联"})
 check("link 不带链接也受理", wd.handle("task %d link" % tgt["id"]), True)
 check("关联上了", (wd.task_store.get(tgt["id"]).get("omnifocus") or {}).get("id"),
       "i5BKXC5uNk0")
+w.of.clipboard_links = _real_clip
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
+
+
+# ---------------------------------------------------------------- 导入重复任务
+
+print("== task import：OmniFocus 是重复任务时先问「复制重复设置吗？」==")
+REPEATED_INFO = {
+    "repeated": True,
+    "id": "i5BKXC5uNk0",
+    "name": "TI: Swap",
+    "rule_string": "FREQ=WEEKLY;BYDAY=WE",
+    "method": "DueDate",
+    "schedule_type": "Regularly",
+    "due": "2026-11-04T11:10:00",
+    "planned": None,
+    "defer": None,
+    "next": "2026-11-04T11:10:00",
+    "estimated_minutes": 25,
+}
+wd.omnifocus.repetition_info = lambda pk: dict(REPEATED_INFO)
+w.of.clipboard_links = lambda: [dict(CLIP[0])]
+wd.messages = []
+check("重复任务 import：命令受理", wd.handle("task import"), True)
+check("问清楚之前**不建**本地任务", wd.task_store.list(), [])
+check("挂起了待确认导入", bool(wd.pending_import), True)
+_buf = io.StringIO()
+Console(file=_buf, width=160, force_terminal=False).print(wd.render_interrogate())
+_panel = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", _buf.getvalue())
+check_true("打断栏位里是导入询问", "导入重复任务" in _panel)
+check_true("面板里有 OF 规则", "FREQ=WEEKLY;BYDAY=WE" in _panel)
+check_true("面板里说明复制成本地什么", "每周三 10:45（25 min）" in _panel)
+check_true("面板里给了 y/n/q", all(x in _panel for x in ("[y]", "[n]", "[q]")))
+wd.messages = []
+check("乱敲不算回答、也不派发命令", wd.handle("task delete 1"), True)
+check("待确认还在", bool(wd.pending_import), True)
+check_true("提示要回答 y/n/q", any("等回答" in m[2] for m in wd.messages))
+wd.messages = []
+check("回答 n：只导入这一次", wd.handle("n"), True)
+plain = wd.task_store.get(wd.selected_task_id)
+check("普通导入建出来了", plain["fields"]["title"], "TI: Swap")
+check("n 不复制 repeat", plain.get("repeat"), None)
+check("待确认清掉了", wd.pending_import, None)
+check_true("消息说链接是从剪贴板读的",
+           any("链接是从剪贴板读的" in m[2] for m in wd.messages))
+
+# 再来一条：这次回答 y，复制成本地每周三 10:45
+wd.handle("task import")
+check("第二次又进入询问", bool(wd.pending_import), True)
+wd.messages = []
+check("回答 y：复制并导入", wd.handle("y"), True)
+copied = wd.task_store.get(wd.selected_task_id)
+rep = copied.get("repeat") or {}
+check("repeat 星期几 = 周三", rep.get("weekday_label"), "wed")
+check("repeat 起点 = due 11:10 - 25min = 10:45", rep.get("start"), "10:45")
+check("repeat 锚定时长 = 25", rep.get("duration"), 25)
+check("OF 的 RRULE 原文存下来了", rep.get("rule"), "FREQ=WEEKLY;BYDAY=WE")
+check("rule_anchor 存的是 OF 的 due", rep.get("rule_anchor"), "2026-11-04T11:10:00")
+check("没有跨午夜 → offset 0", rep.get("rule_offset_days"), 0)
+check("显示成可读摘要", ts.repeat_summary(rep), "每周三 10:45（25 min）")
+check("OF 的 method / scheduleType 也留档",
+      ((rep.get("omnifocus") or {}).get("method"),
+       (rep.get("omnifocus") or {}).get("schedule_type")),
+      ("DueDate", "Regularly"))
+check("本体 source 指向 OmniFocus",
+      ((copied.get("source") or {}).get("kind"),
+       (copied.get("source") or {}).get("id")),
+      ("omnifocus", "i5BKXC5uNk0"))
+check("本体来源记号是 🔗（它不是子任务）",
+      ts.TaskStore.origin_marks(copied), "🔗")
+check("它进了 repeated_tasks(周三)",
+      [t["id"] for t in wd.task_store.repeated_tasks(2)], [copied["id"]])
+check_true("消息说复制了重复设置",
+           any("已复制重复设置" in m[2] for m in wd.messages))
+# 到规则日：生成本体对应的 occurrence 子任务
+wd.ensure_repeat_occurrences(datetime.date(2026, 11, 4))
+child = wd.task_store.occurrence_for(copied["id"], datetime.date(2026, 11, 4))
+check("规则日生成了子任务", bool(child), True)
+check("子任务指向本体", child.get("repeat_parent"), copied["id"])
+check("子任务 source 指向本体",
+      ((child.get("source") or {}).get("kind"),
+       (child.get("source") or {}).get("parent")),
+      ("repeat", copied["id"]))
+check("子任务继承 OmniFocus 关联",
+      (child.get("omnifocus") or {}).get("id"), "i5BKXC5uNk0")
+check("子任务来源记号 = 🔁 + 🔗", ts.TaskStore.origin_marks(child), "🔁🔗")
+check("本体自己不被 assign", copied.get("session"), None)
+
+# q = 取消，什么都不建
+before = len(wd.task_store.list())
+wd.handle("task import")
+check("第三次进入询问", bool(wd.pending_import), True)
+check("回答 q 取消", wd.handle("q"), True)
+check("取消后没建任务", len(wd.task_store.list()), before)
+check("待确认清掉了", wd.pending_import, None)
+
+# FREQ=DAILY 现在也照原规则复制（不再退化成「只能每周」）
+wd.omnifocus.repetition_info = lambda pk: dict(
+    REPEATED_INFO, rule_string="FREQ=DAILY", estimated_minutes=25)
+wd.handle("task import")
+_buf = io.StringIO()
+Console(file=_buf, width=160, force_terminal=False).print(wd.render_interrogate())
+_panel = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", _buf.getvalue())
+check_true("DAILY 面板里给出复制后的摘要", "每天 10:45（25 min）" in _panel)
+check_true("DAILY 面板里仍然有 y", "[y]" in _panel)
+wd.messages = []
+check("DAILY 回答 y", wd.handle("y"), True)
+daily = wd.task_store.get(wd.selected_task_id)
+check("DAILY 存了原 RRULE", (daily.get("repeat") or {}).get("rule"), "FREQ=DAILY")
+check("DAILY 摘要", ts.repeat_summary(daily["repeat"]), "每天 10:45（25 min）")
+_next_day = datetime.date(2026, 11, 5)
+check("DAILY 第二天也落同一场",
+      (wd.task_store.repeat_occurrence(
+          daily, _next_day, [{"start": "10:45", "duration": 25}]) or {}).get("start"),
+      "10:45")
+
+# 连 dateutil 都解析不了的规则：仍然问，但说清楚只能普通导入
+wd.omnifocus.repetition_info = lambda pk: dict(
+    REPEATED_INFO, rule_string="FREQ=WEEKLY;BYDAY=XX", estimated_minutes=25)
+wd.handle("task import")
+_buf = io.StringIO()
+Console(file=_buf, width=160, force_terminal=False).print(wd.render_interrogate())
+_panel = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", _buf.getvalue())
+check_true("坏规则面板里说「不能复制」", "不能复制" in _panel)
+check_true("坏规则面板里没有 y 选项", "[y]" not in _panel)
+wd.messages = []
+check("坏规则按 y 也受理（不会卡死）", wd.handle("y"), True)
+bad = wd.task_store.get(wd.selected_task_id)
+check("坏规则不落 repeat", bad.get("repeat"), None)
+check_true("并明确警告复制不了",
+           any("复制不了" in m[2] for m in wd.messages))
+
+# 查 OmniFocus 本身失败：不挡导入，但说明「先按普通任务导入」
+def _rep_fail(pk):
+    raise RuntimeError("OmniFocus 没开")
+wd.omnifocus.repetition_info = _rep_fail
+wd.messages = []
+check("查重复规则失败也照样导入", wd.handle("task import"), True)
+check_true("并说明没法核对", any("没法核对" in m[2] for m in wd.messages))
+check("失败路径没有挂起询问", wd.pending_import, None)
+
+# 纯函数：planned 优先；跨午夜按 session 起点的星期几记
+_plan = w.task_repeat_plan_from_omnifocus({
+    "repeated": True, "rule_string": "FREQ=WEEKLY;BYDAY=WE",
+    "planned": "2026-11-04T10:45:00", "due": "2026-11-04T11:10:00",
+    "estimated_minutes": 25,
+})
+check("planned 存在时用它当起点", (_plan["weekday_label"], _plan["start"]),
+      ("wed", "10:45"))
+_midnight = w.task_repeat_plan_from_omnifocus({
+    "repeated": True, "rule_string": "FREQ=WEEKLY;BYDAY=TH",
+    "due": "2026-11-05T00:05:00", "estimated_minutes": 50,
+})
+check("跨午夜：本地按场次起点的周三记",
+      (_midnight["weekday_label"], _midnight["start"]), ("wed", "23:15"))
+check_true("跨午夜会在 note 里说明按起点星期",
+           "场次起点" in _midnight["note"])
+_match = w.task_repeat_plan_from_omnifocus({
+    "repeated": True, "rule_string": "FREQ=WEEKLY;BYDAY=WE",
+    "planned": "2026-11-04T10:45:00", "due": "2026-11-04T11:10:00",
+    "estimated_minutes": 25,
+}, sessions_for_day=lambda day: [{"start": "10:45", "duration": 25}])
+check_true("排期能对上时用真实 session 核对", "排期里对上了" in _match["note"])
+
+wd.omnifocus.repetition_info = _real_repetition_info
 w.of.clipboard_links = _real_clip
 for t in list(wd.task_store.list()):
     wd.handle("task delete %d" % t["id"])

@@ -10,9 +10,10 @@
   session 上；完成时间从 ``GET /v1/tasks`` 的 ``completedAt`` 读，不猜。
 - 完成后写一份只增不改的归档 ``data/task-archive.json``。归档里同时保留：
   本地任务字段、对应 session（日期/时间/API session id）、Focusmate 的完成时间。
-- 任务可以声明成**每周重复**（``repeat``）：记下「周几 + 起点 + 时长」，到那一周
-  就自动挂到同一时刻、同一时长的那场 session 上。排布被改了（例如 50 拆成
-  25+25）就不是同一场了 —— 这一周的重复任务自然消失，但 repeat 设置本身不变。
+- 任务可以声明成**重复**（``repeat``）：日期用 OmniFocus 的 ICS RRULE
+  （``rule`` + ``rule_anchor``）展开，``start`` / ``duration`` 决定落到当天哪一场
+  session；老式手写记录仍可按「周几 + 起点 + 时长」匹配。排布被改了（例如 50
+  拆成 25+25）就不是同一场了 —— 这一次的重复任务自然消失，但 repeat 设置不变。
 - 任务有**状态**（``active`` / ``completed`` / ``dropped``）、**本地标签**（``tags``）
   和**OmniFocus 关联**（``omnifocus``，只认 primary key）。完成/放弃的记录**不删**
   —— session 结束之后「那一场到底干成了什么」还要看得见。
@@ -40,7 +41,7 @@ DEFAULT_ARCHIVE_FILE = os.path.join(DATA_DIR, "task-archive.json")
 # 这些键是本地簿记，不属于用户字段。用户仍然可以随便写别的字段。
 RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate", "repeat",
             "status", "status_at", "tags", "omnifocus", "duplicate_of", "actual_minutes",
-            "history", "trigger", "formatter"}
+            "history", "trigger", "formatter", "source", "repeat_parent", "repeat_date"}
 
 #: 「这条任务在哪一天的 session 里被处理过」的痕迹（见 :meth:`TaskStore.mark_processed`）。
 #: 任务是按天固化的：今天的任务面板 = 所有没做完的 + 今天处理过的；过去那天只剩
@@ -145,6 +146,28 @@ def _coerce_task(raw, fallback_id=None):
     task["repeat"] = _coerce_repeat(task.get("repeat"))
     task["omnifocus"] = _coerce_omnifocus(task.get("omnifocus"))
     task["tags"] = _coerce_tags(task.get("tags"))
+    source = _coerce_source(task.get("source"))
+    if source is None and task["omnifocus"]:
+        # 老任务只有 omnifocus、没有 source：补一个指针，界面和「本体来源」
+        # 不用再分支判断两套字段。
+        source = _source_for_omnifocus(task["omnifocus"])
+    if source:
+        task["source"] = source
+    else:
+        task.pop("source", None)
+    try:
+        parent = task.get("repeat_parent")
+        if parent is None:
+            task.pop("repeat_parent", None)
+        else:
+            task["repeat_parent"] = int(parent)
+    except (TypeError, ValueError):
+        task.pop("repeat_parent", None)
+    repeat_date = str(task.get("repeat_date") or "").strip()
+    if repeat_date:
+        task["repeat_date"] = repeat_date
+    else:
+        task.pop("repeat_date", None)
     # 老数据没有 status：有 Focusmate 完成时间的就是「已完成」，否则「进行中」。
     status = str(task.get("status") or "").strip().lower()
     if status not in STATUSES:
@@ -305,38 +328,273 @@ def _coerce_omnifocus(raw):
     return out
 
 
+#: 中文「每周几」；只用于 repeat_summary，内部仍用 WEEKDAYS。
+CN_WEEKDAYS = ("一", "二", "三", "四", "五", "六", "日")
+#: ICS BYDAY 的两字母码 ↔ Python weekday。
+RRULE_WEEKDAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+
+#: rrulestr 构造出来的 RRULE 对象。键 = (rule, rule_anchor iso)：
+#: 每天画表 / 每次 sync 都会问「这一天是不是重复日」，不缓存会反复解析。
+_RRULE_CACHE = {}
+
+
+def normalize_rule(raw):
+    """把 OmniFocus / ICS 的规则串收敛成 ``FREQ=...`` 形式。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.upper().startswith("RRULE:"):
+        text = text[6:].strip()
+    return text or None
+
+
+def parse_iso_datetime(raw):
+    """``2026-11-04T11:10:00`` → naive datetime；认不出返回 None。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def rule_objects(rule, anchor):
+    """``(rule, dtstart)`` → dateutil RRULE；解析不了返回 None。
+
+    这里用 python-dateutil（``icalendar`` 的依赖，项目里本来就有）做真正的
+    ICS RRULE 展开，而不是自己拿 ``FREQ=WEEKLY`` 硬编码：OmniFocus 的
+    ``repetitionRule.ruleString`` 是标准 ICS 规则，日常规则、多 BYDAY、
+    INTERVAL、COUNT / UNTIL 都要能原样照做。
+    """
+    rule = normalize_rule(rule)
+    anchor = (anchor if isinstance(anchor, datetime.datetime)
+              else parse_iso_datetime(anchor))
+    if not rule or anchor is None:
+        return None
+    key = (rule, anchor.isoformat(timespec="seconds"))
+    if key in _RRULE_CACHE:
+        return _RRULE_CACHE[key]
+    try:
+        from dateutil.rrule import rrulestr
+    except ImportError:                                # pragma: no cover - 依赖已随 icalendar 装
+        return None
+    try:
+        rr = rrulestr(rule, dtstart=anchor)
+    except (ValueError, TypeError):
+        # OmniFocus / ICS 常把 UNTIL 写成 UTC（``...Z``），而我们的 dtstart 是
+        # 本地 naive datetime；dateutil 会因此报「naive 和 aware 不能比较」。
+        # 去掉 UNTIL 的 Z 再试（本地任务不需要时区级精确，日期一致就够）。
+        fallback = re.sub(r"(UNTIL=\d{8}T\d{6})Z", r"\1", rule, flags=re.I)
+        if fallback == rule:
+            return None
+        try:
+            rr = rrulestr(fallback, dtstart=anchor)
+        except (ValueError, TypeError):
+            return None
+    _RRULE_CACHE[key] = rr
+    return rr
+
+
+def rule_matches_day(rep, day):
+    """这条 ``repeat`` 的 RRULE 是否要求在 ``day`` 起一场。
+
+    返回 ``True`` / ``False``；没有 rule 信息时返回 ``None``（交给老逻辑按
+    ``weekday`` 判断）。``rule_offset_days`` 记录「session 起点 - 规则锚点」的
+    日期差：跨午夜的规则（due 周四 00:05、场次周三 23:15）要拿周四去问 RRULE。
+    """
+    if not isinstance(rep, dict):
+        return None
+    rule = normalize_rule(rep.get("rule"))
+    if not rule:
+        return None
+    anchor = parse_iso_datetime(rep.get("rule_anchor") or rep.get("anchor"))
+    rr = rule_objects(rule, anchor)
+    if rr is None:
+        return False
+    try:
+        offset = int(rep.get("rule_offset_days") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    rule_day = day - datetime.timedelta(days=offset)
+    start = datetime.datetime.combine(rule_day, datetime.time(0, 0))
+    end = start + datetime.timedelta(days=1)
+    try:
+        return bool(rr.between(start, end, inc=True))
+    except (ValueError, OverflowError):
+        return False
+
+
+def _rule_summary(rep):
+    """把 ICS 规则翻译成一句人话（不认识就保留原文）。"""
+    rule = normalize_rule(rep.get("rule"))
+    if not rule:
+        return ""
+    parts = {}
+    for piece in rule.split(";"):
+        if "=" in piece:
+            key, value = piece.split("=", 1)
+            parts[key.strip().upper()] = value.strip().upper()
+    freq = parts.get("FREQ", "")
+    every = parts.get("INTERVAL", "1")
+    try:
+        every_n = int(every)
+    except (TypeError, ValueError):
+        every_n = 1
+    if freq == "DAILY":
+        return ("每 %d 天" % every_n) if every_n > 1 else "每天"
+    if freq == "WEEKLY":
+        try:
+            offset = int(rep.get("rule_offset_days") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        days = [x for x in parts.get("BYDAY", "").split(",") if x]
+        names = []
+        for token in days:
+            code = re.sub(r"^[+-]?\d+", "", token).strip().upper()
+            if code in RRULE_WEEKDAYS:
+                # 跨午夜：due 周四 00:05、场次周三 23:15 → 显示周三，而不是
+                # 照抄 RRULE 的 TH 让用户以为复制错了。
+                names.append(CN_WEEKDAYS[(RRULE_WEEKDAYS[code] + offset) % 7])
+        head = ("每 %d 周" % every_n) if every_n > 1 else "每周"
+        if names:
+            return head + "、".join(names)
+        label = str(rep.get("weekday_label") or "").lower()[:3]
+        if label in WEEKDAYS:
+            return head + CN_WEEKDAYS[WEEKDAYS.index(label)]
+        return head
+    if freq == "MONTHLY":
+        head = ("每 %d 个月" % every_n) if every_n > 1 else "每月"
+        day = parts.get("BYMONTHDAY")
+        return (head + " %s 日" % day) if day else head
+    if freq == "YEARLY":
+        return ("每 %d 年" % every_n) if every_n > 1 else "每年"
+    return rule
+
+
+def repeat_summary(rep):
+    """``repeat`` → 给人看的一句话（``每天 10:45（25 min）``）。
+
+    OmniFocus 导入的规则用原 RRULE；老的手动 ``--repeat mon@22:15`` 走
+    ``weekday_label``。两种都在表格 / 消息里显示同一套话。
+    """
+    if not isinstance(rep, dict):
+        return ""
+    explicit = str(rep.get("summary") or "").strip()
+    if explicit:
+        return explicit
+    start = str(rep.get("start") or "").strip()
+    rule_label = _rule_summary(rep)
+    if not rule_label:
+        label = str(rep.get("weekday_label") or "").strip().lower()[:3]
+        rule_label = ("每周" + CN_WEEKDAYS[WEEKDAYS.index(label)]
+                      if label in WEEKDAYS else "重复")
+    duration = rep.get("duration")
+    tail = ("（%s min）" % duration) if duration else ""
+    return ("%s %s%s" % (rule_label, start, tail)).strip()
+
+
+def validate_rule(rule, anchor):
+    """导入 / 手改规则前先验一遍；返回 ``(ok, error)``。"""
+    rule = normalize_rule(rule)
+    if not rule:
+        return True, None
+    if parse_iso_datetime(anchor) is None:
+        return False, "规则缺少可用的锚点日期（rule_anchor）"
+    if rule_objects(rule, anchor) is None:
+        return False, "RRULE 解析不了：%s" % rule
+    return True, None
+
+
 def _coerce_repeat(raw):
     """把重复设置修成可用形状；坏的就当没设置。"""
     if not isinstance(raw, dict):
         return None
+    rule = normalize_rule(raw.get("rule"))
     wd = raw.get("weekday")
+    label = None
+    weekday = None
     if isinstance(wd, int) and 0 <= wd <= 6:
+        weekday = wd
         label = WEEKDAYS[wd]
     else:
         label = str(wd or "").strip().lower()[:3]
-        if label not in WEEKDAYS:
-            return None
+        if label in WEEKDAYS:
+            weekday = WEEKDAYS.index(label)
+        else:
+            label = None
     start = str(raw.get("start") or "").strip()
     if not re.match(r"^\d{1,2}:\d{2}$", start):
         return None
+    start = "%02d:%02d" % tuple(int(x) for x in start.split(":"))
+    if weekday is None:
+        # 规则任务可以没有 weekday：RRULE 决定日期，weekday 只剩「首日」
+        # 显示用。锚点也缺失时才真的没法用。
+        if not rule:
+            return None
+        anchor_dt = parse_iso_datetime(raw.get("rule_anchor") or raw.get("anchor"))
+        if anchor_dt is None:
+            return None
+        try:
+            offset = int(raw.get("rule_offset_days") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        weekday = (anchor_dt.date() + datetime.timedelta(days=offset)).weekday()
+        label = WEEKDAYS[weekday]
     try:
         duration = int(raw.get("duration"))
     except (TypeError, ValueError):
         duration = None
     out = {
-        "weekday": WEEKDAYS.index(label),
+        "weekday": weekday,
         "weekday_label": label,
-        "start": "%02d:%02d" % tuple(int(x) for x in start.split(":")),
+        "start": start,
         "duration": duration,
         "created_at": str(raw.get("created_at") or _now()),
         "occurrences": {},
     }
+    if rule:
+        out["rule"] = rule
+        out["rule_anchor"] = str(raw.get("rule_anchor") or raw.get("anchor") or "")
+        try:
+            out["rule_offset_days"] = int(raw.get("rule_offset_days") or 0)
+        except (TypeError, ValueError):
+            out["rule_offset_days"] = 0
+        if raw.get("source"):
+            out["source"] = str(raw.get("source"))
+        if raw.get("summary"):
+            out["summary"] = str(raw.get("summary"))
+        if isinstance(raw.get("omnifocus"), dict):
+            out["omnifocus"] = {str(k): v for k, v in raw["omnifocus"].items()}
     occ = raw.get("occurrences")
     if isinstance(occ, dict):
         for day, rec in occ.items():
             if isinstance(rec, dict):
                 out["occurrences"][str(day)] = dict(rec)
     return out
+
+
+def _coerce_source(raw):
+    """任务来源：``{"kind": "omnifocus"|"repeat", ...}``，坏形状当没有。"""
+    if isinstance(raw, dict):
+        out = {str(k): v for k, v in raw.items() if v is not None}
+        return out or None
+    text = str(raw or "").strip()
+    return {"kind": text} if text else None
+
+
+def _source_for_omnifocus(omnifocus):
+    """OmniFocus 关联 → 统一的 source 指针。"""
+    om = omnifocus if isinstance(omnifocus, dict) else {}
+    ident = str(om.get("id") or "").strip()
+    if not ident:
+        return None
+    return {"kind": "omnifocus", "id": ident,
+            "url": om.get("url") or ("omnifocus:///task/%s" % ident),
+            "title": om.get("title")}
 
 
 def _clean_store(raw):
@@ -399,11 +657,13 @@ class TaskStore(object):
 
     # -- CRUD ---------------------------------------------------------
     def create(self, fields=None, task_id=None, status=None, tags=None,
-               omnifocus=None):
+               omnifocus=None, source=None, repeat_parent=None, repeat_date=None):
         """创建任务。fields 不校验；task_id 可以显式指定（占位/导入场景）。
 
         ``tags`` 是本地标签，``omnifocus`` 是 ``{"id": primary key, ...}``
-        形式的关联（见 :meth:`link_omnifocus`）。
+        形式的关联（见 :meth:`link_omnifocus`）。``source`` 是来源指针
+        （``omnifocus`` 或 ``repeat``）；``repeat_parent`` / ``repeat_date``
+        只出现在重复任务生成的子任务上。
         """
         if fields is None:
             fields = {}
@@ -436,6 +696,15 @@ class TaskStore(object):
             "tags": _coerce_tags(tags),
             "omnifocus": _coerce_omnifocus(omnifocus),
         }
+        src = _coerce_source(source)
+        if src is None and task["omnifocus"]:
+            src = _source_for_omnifocus(task["omnifocus"])
+        if src:
+            task["source"] = src
+        if repeat_parent is not None:
+            task["repeat_parent"] = int(repeat_parent)
+        if repeat_date:
+            task["repeat_date"] = str(repeat_date)
         if task["status"] != STATUS_ACTIVE:
             task["status_at"] = stamp
         store["tasks"].append(task)
@@ -512,11 +781,16 @@ class TaskStore(object):
             task["omnifocus"] = _coerce_omnifocus({
                 "id": info["id"], "url": info["url"], "title": info["title"],
             })
+            # 重复子任务的 source 指向本体；别的任务被关联后 source 指向 OF。
+            if not task.get("repeat_parent"):
+                task["source"] = _source_for_omnifocus(task["omnifocus"])
         return self._mutate(task_id, apply)
 
     def unlink_omnifocus(self, task_id):
         def apply(task):
             task["omnifocus"] = None
+            if (task.get("source") or {}).get("kind") == "omnifocus":
+                task.pop("source", None)
         return self._mutate(task_id, apply)
 
     def set_omnifocus_writeback(self, task_id, what, at=None):
@@ -731,10 +1005,15 @@ class TaskStore(object):
         ``include_done=True``（默认）连**已完成 / 已放弃 / 已转移**的一起返回：
         用户要求 session 结束之后「那一场到底干成了什么」仍然看得到，
         所以状态由调用方打标记，而不是在这里筛掉。
+
+        重复任务的**本体**（模板）永远不算这一场的任务：哪怕旧数据给它留了
+        session，也在这里过滤掉；契约表 / 收尾只认 ``repeat_parent`` 子任务。
         """
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         out = []
         for task in self.list():
+            if self.is_repeat_template(task):
+                continue
             sess = task.get("session") or {}
             if sess.get("date") == iso and sess.get("start") == start:
                 if not include_done and not self.is_open(task):
@@ -884,12 +1163,19 @@ class TaskStore(object):
         return found
 
     # -- 每周重复 -----------------------------------------------------
-    def set_repeat(self, task_id, weekday, start, duration=None):
-        """把任务标成每周重复：``weekday`` 0-6（或 mon..sun），``start`` HH:MM。
+    def set_repeat(self, task_id, weekday, start, duration=None, rule=None,
+                   rule_anchor=None, rule_offset_days=0, source=None, summary=None,
+                   meta=None):
+        """把任务标成重复：``weekday`` 0-6（或 mon..sun），``start`` HH:MM。
 
         ``duration`` 是**锚定**用的：只有那一周同一时刻、同一时长的那场 session
         才算这次重复的落点。排布改了（拆分/换时长）就不再匹配 —— 这一周的重复
         任务消失，但 repeat 设置原封不动留着，下一周照旧。
+
+        ``rule`` 是 OmniFocus / ICS 的 ``FREQ=...`` 原文时，日期由 RRULE 展开决定
+        （``DAILY`` / 多个 ``BYDAY`` / ``INTERVAL`` / ``COUNT`` / ``UNTIL`` 都照做）；
+        ``weekday_label`` 退化成「首个场次是周几」的显示字段。``rule_anchor`` 是
+        DTSTART，``rule_offset_days`` 处理跨午夜（due 周四、场次周三）。
         """
         store = self.load()
         found = None
@@ -899,12 +1185,21 @@ class TaskStore(object):
                 break
         if found is None:
             raise ValueError("没有任务 %s" % task_id)
+        rule = normalize_rule(rule)
+        rule_anchor = str(rule_anchor or "").strip()
+        if rule:
+            ok, why = validate_rule(rule, rule_anchor)
+            if not ok:
+                raise ValueError(why)
         if isinstance(weekday, int):
             label = WEEKDAYS[weekday % 7]
         else:
             label = str(weekday or "").strip().lower()[:3]
         if label not in WEEKDAYS:
-            raise ValueError("星期几认不出来：%r（mon..sun / 周一..周日）" % (weekday,))
+            if not rule:
+                raise ValueError("星期几认不出来：%r（mon..sun / 周一..周日）" % (weekday,))
+            anchor_dt = parse_iso_datetime(rule_anchor)
+            label = WEEKDAYS[anchor_dt.weekday()]
         m = re.match(r"^(\d{1,2}):(\d{2})$", str(start or "").strip())
         if not m:
             raise ValueError("时间要写成 HH:MM；你给的是 %r" % (start,))
@@ -919,7 +1214,7 @@ class TaskStore(object):
             except (TypeError, ValueError):
                 raise ValueError("时长得是数字；你给的是 %r" % (duration,))
         kept = (found.get("repeat") or {}).get("occurrences") or {}
-        found["repeat"] = {
+        out = {
             "weekday": WEEKDAYS.index(label),
             "weekday_label": label,
             "start": "%02d:%02d" % (hour, minute),
@@ -927,6 +1222,22 @@ class TaskStore(object):
             "created_at": _now(),
             "occurrences": kept,
         }
+        if rule:
+            try:
+                offset = int(rule_offset_days or 0)
+            except (TypeError, ValueError):
+                offset = 0
+            out.update({
+                "rule": rule,
+                "rule_anchor": rule_anchor,
+                "rule_offset_days": offset,
+                "source": source or "rule",
+            })
+            if summary:
+                out["summary"] = str(summary)
+            if isinstance(meta, dict) and meta:
+                out["omnifocus"] = {str(k): v for k, v in meta.items() if v is not None}
+        found["repeat"] = out
         found["updated_at"] = _now()
         self.save(store)
         return found
@@ -946,30 +1257,70 @@ class TaskStore(object):
         return found
 
     def repeated_tasks(self, weekday=None):
-        """所有重复任务；``weekday`` 给了就只要那天会重复的。"""
+        """所有重复任务；``weekday`` 给了就做一次粗筛。
+
+        老式「每周 mon@22:15」能精确按 weekday 过滤；带 ``rule`` 的任务不能只看
+        weekday（DAILY、INTERVAL、多种 BYDAY 都可能，甚至跨午夜），所以一律留下，
+        交给 :meth:`repeat_occurrence` 用 RRULE 对具体日期判定。
+        """
         out = []
         for task in self.load()["tasks"]:
             rep = task.get("repeat")
             if not rep:
                 continue
-            if weekday is not None and rep.get("weekday") != int(weekday) % 7:
-                continue
+            if weekday is not None and not rep.get("rule"):
+                if rep.get("weekday") != int(weekday) % 7:
+                    continue
             out.append(task)
         return out
+
+    @staticmethod
+    def is_repeat_template(task):
+        """本体：带 ``repeat``、且自己不是某次 occurrence 生成出来的子任务。"""
+        return bool((task or {}).get("repeat")) and not (task or {}).get("repeat_parent")
+
+    @staticmethod
+    def is_repeat_occurrence(task):
+        """某一天由重复本体生成的子任务。"""
+        return bool((task or {}).get("repeat_parent"))
+
+    @staticmethod
+    def origin_marks(task):
+        """契约表格 / 面板用的来源记号：🔁 重复子任务，🔗 OmniFocus 关联。"""
+        marks = ""
+        if (task or {}).get("repeat_parent"):
+            marks += "🔁"
+        if TaskStore.omnifocus_id(task):
+            marks += "🔗"
+        return marks
+
+    @staticmethod
+    def repeat_due_on(task, day):
+        """只问日期：``day`` 这一天该不该有这条重复任务的 occurrence。
+
+        不看 session、不看起点时长 —— 「这一天具体什么时候」是生成之后挂哪一场
+        的事。带 rule 用 RRULE，老记录退回 weekday。
+        """
+        rep = task.get("repeat") if isinstance(task, dict) else None
+        if not rep:
+            return False
+        matched = rule_matches_day(rep, day)
+        if matched is None:
+            want_wd = day.weekday() if hasattr(day, "weekday") else int(day) % 7
+            return int(rep.get("weekday", -1)) == want_wd
+        return bool(matched)
 
     @staticmethod
     def repeat_occurrence(task, day, sessions):
         """这个任务在 ``day`` 那天落在哪一场上；落不上返回 None。
 
         ``sessions`` 是那天**排好的** session（``start`` / ``duration`` 够用）。
-        匹配条件是「同一星期几 + 同一时刻 + 同一时长」：时长对不上就是排布被改过
-        （例如 50 拆成 25+25），这一周的重复任务就不落。
+        日期判定优先走 ``repeat.rule``（原生 ICS RRULE，和 OmniFocus 一样）；
+        老式记录没有 rule 时退回「同一星期几 + 同一时刻 + 同一时长」。
+        最后都要在真实 session 里找到同起点、同时长的场次才算落上。
         """
         rep = task.get("repeat") if isinstance(task, dict) else None
-        if not rep:
-            return None
-        want_wd = day.weekday() if hasattr(day, "weekday") else int(day) % 7
-        if int(rep.get("weekday", -1)) != want_wd:
+        if not rep or not TaskStore.repeat_due_on(task, day):
             return None
         for sess in sessions or []:
             if sess.get("start") != rep.get("start"):
@@ -978,6 +1329,70 @@ class TaskStore(object):
                 continue
             return sess
         return None
+
+    def occurrence_for(self, parent_id, day):
+        """本体 ``parent_id`` 在 ``day`` 已生成的那条子任务；没有返回 None。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        try:
+            want = int(parent_id)
+        except (TypeError, ValueError):
+            return None
+        for task in self.list():
+            if task.get("repeat_parent") == want and task.get("repeat_date") == iso:
+                return task
+        return None
+
+    def create_repeat_occurrence(self, parent_id, day, session=None):
+        """由重复本体生成当天的子任务（本地；Focusmate 由调用方另做）。
+
+        - 子任务复制本体的 fields / tags / OmniFocus 关联；
+        - ``repeat_parent`` 指向本体，``repeat_date`` 是这一天；
+        - ``source`` 写成 ``{"kind": "repeat", "parent": ...}``；
+        - 先不复制本体的 ``repeat``：子任务本身不再是一套规则。
+        """
+        parent = self.get(parent_id)
+        if not self.is_repeat_template(parent):
+            raise ValueError("任务 %s 不是重复任务本体" % parent_id)
+        exists = self.occurrence_for(parent["id"], day)
+        if exists:
+            return exists
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        child_fields = dict(parent.get("fields") or {})
+        # due / due_source 属于之前那一次；子任务挂上 session 时由 assign() 重写。
+        child_fields.pop("due", None)
+        child_fields.pop("due_source", None)
+        child = self.create(
+            child_fields,
+            tags=list(parent.get("tags") or []),
+            omnifocus=dict(parent["omnifocus"]) if parent.get("omnifocus") else None,
+            source={"kind": "repeat", "parent": parent["id"], "date": iso},
+            repeat_parent=parent["id"], repeat_date=iso,
+        )
+        if session:
+            child = self.assign(child["id"], session)
+        return child
+
+    def record_occurrence(self, task_id, day, child_id=None, session=None,
+                          focusmate=None, note=None):
+        """只记本体 ``repeat.occurrences[日期]``，**不动本体自己的 session**。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        def apply(task):
+            rep = task.get("repeat") or {}
+            occ = rep.setdefault("occurrences", {})
+            rec = dict(occ.get(iso) or {})
+            if child_id is not None:
+                rec["child_id"] = int(child_id)
+            if session is not None:
+                rec["session"] = dict(session or {})
+            if focusmate is not None:
+                rec["focusmate"] = dict(focusmate or {})
+            if note:
+                rec["note"] = str(note)
+            rec["updated_at"] = _now()
+            occ[iso] = rec
+            rep["occurrences"] = occ
+            task["repeat"] = rep
+        return self._mutate(task_id, apply)
 
     def attach_occurrence(self, task_id, day, session, focusmate=None):
         """记下一次重复的落点（本地 session + Focusmate 侧 task id）。"""
@@ -1215,9 +1630,14 @@ class TaskStore(object):
                     n += 1
                     if task["id"] not in matched:
                         matched.append(task["id"])
-            # 每周重复：每次落点的 Focusmate task 是独立实体，单独对一次
+            # 重复任务：每次落点的 Focusmate task 是独立实体，单独对一次。
+            # 新模型里 occurrence 只是本体的账本，真正的任务条是 child_id
+            # 指向的子任务 —— 它已经在上面的主循环里归档过了，别再拿本体
+            # 的 occurrence 重复归档一份。
             occ = ((task.get("repeat") or {}).get("occurrences") or {})
             for day, rec in sorted(occ.items()):
+                if rec.get("child_id"):
+                    continue
                 ofm = rec.get("focusmate") or {}
                 orid = ofm.get("task_id") or ofm.get("id")
                 if not orid:
