@@ -312,6 +312,24 @@ TASK_SHORT_FLAGS = (
 #: ``pending_import["suffix"]``，等用户答完再落到真正导入的任务上。
 IMPORT_PENDING = object()
 
+
+class ImportBatch(list):
+    """一次导入建出来的**全部**任务（顺序 = 剪贴板/粘贴顺序；单条时不用它）。
+
+    为什么不是「返回最后一条」：`task import -a 3` / `task import -f end` 这类
+    后缀要落到**每一条**上。多选 5 条 OmniFocus 任务再 `-f end`，用户要的是五条
+    各自排进当天最后一段，不是只有最后一条进了面板 —— 所以 `cmd_task` 看见
+    `ImportBatch` 就把后缀按条套一遍，最后返回最后一条当选中项。
+    """
+
+    @property
+    def last(self):
+        return self[-1] if self else None
+
+    def task_ids(self):
+        return [t.get("id") for t in self if isinstance(t, dict) and t.get("id")]
+
+
 # 手动状态标记：`task 3 -m complete` / `task 3 --mark discard`。
 # 这是**账本动作**，不是「完成/放弃」那套外部联动：
 #   complete = 本地 completed + 归档（不勾 Focusmate、不当场写 OmniFocus）
@@ -1220,8 +1238,10 @@ def _hint_task(parts):
         return repl_kit.Hint("参数", ("（不写）", "[标题](omnifocus:///task/PK)", "-a 3",
                                       "-st"),
                              note="不写参数 = 读剪贴板（⌘V 到终端只剩标题，这条不会丢链接）；"
+                                  "OmniFocus 里多选几条一起 ⌘C 就是一次导入多条（标题/时长"
+                                  "按 pk 去 OmniFocus 查），后缀 -a/-f 对整批生效；"
                                   "OmniFocus 里是重复任务时会先问要不要复制重复设置；"
-                                  "-st/--single-task = 只导入这一条，不问也不建 repeat")
+                                  "-st/--single-task = 只导入这一次，不问也不建 repeat")
     if action in ("link", "关联"):
         return repl_kit.Hint("参数", ("（不写）", "omnifocus:///task/PK", "PK"),
                              note="不给链接 = 读剪贴板")
@@ -4056,6 +4076,15 @@ class Warden(object):
             }
             self.pending_import = pending
             return None
+        if isinstance(result, ImportBatch):
+            # 一次导入多条：后缀按条套一遍（`-a 3` = 整批都挂到 #3，
+            # `-f end` = 五条各自排进当天最后一段），最后那个当选中项。
+            for one in result:
+                self._apply_suffix_chain(
+                    one, action, note_text=note_text, assign_to=assign_to,
+                    mark_status=mark_status, trigger_spec=trigger_spec,
+                    formatter_spec=formatter_spec)
+            return result.last
         if note_text is not None:
             self._apply_note(result, note_text, action)
         if assign_to is not None:
@@ -4618,7 +4647,9 @@ class Warden(object):
         if action == "duplicate" or action in ("dup", "copy", "复制"):
             return self.cmd_task_duplicate(rest)
         if action == "import" or action in ("粘贴", "导入"):
-            return self.cmd_task_import(rest)
+            # 后缀（-a / -n / -m / -t / -f）由 cmd_task 在这之后统一套，而且会
+            # **逐条**套到整批上；这里再套一遍就是双份（`-a` 会重复挂一场）。
+            return self.cmd_task_import(rest, apply_suffix=False)
         if action == "create":
             return self.cmd_task_create(rest)
         if action in ("drop", "放弃"):
@@ -5006,28 +5037,56 @@ class Warden(object):
         self.invalidate()
         return True
 
+    def _apply_suffix_chain(self, task, action, note_text=None, assign_to=None,
+                            mark_status=None, trigger_spec=None,
+                            formatter_spec=None):
+        """按固定顺序把一条任务的后缀跑完：note → assign → mark → trigger → formatter。
+
+        这是 `cmd_task` 和 `task import` 共用的那一段；一次导入多条时由
+        :meth:`_apply_import_suffix` 对**每一条**各跑一遍。
+        """
+        if note_text is not None:
+            self._apply_note(task, note_text, action)
+        if assign_to is not None:
+            task = self._apply_assign(task, assign_to, action) or task
+        if mark_status is not None:
+            task = self._apply_mark(task, mark_status, action) or task
+        if trigger_spec is not None:
+            task = self._apply_trigger(task, trigger_spec, action) or task
+        if formatter_spec is not None:
+            task = self._apply_formatter(task, formatter_spec, action) or task
+        return task
+
     def _apply_import_suffix(self, task, suffix):
         """把 `task import` 后面挂的 -n / -a / -m / -t / -f 落到**真正导入的任务**上。
 
-        和 :meth:`cmd_task` 的后缀顺序保持一致：note → assign → mark → trigger →
-        formatter。重复任务本体会在这些动作里被导向当天的 occurrence 子任务
-        （见 :meth:`_assign_task` / :meth:`_apply_formatter`），所以 ``task import
-        -ac`` 不会把模板本身挂到 session 上。
+        ``task`` 可以是单条任务，也可以是 :class:`ImportBatch`（一次导入多条）——
+        后一种情况后缀逐条套，不是只套最后一条。重复任务本体会在这些动作里被导向
+        当天的 occurrence 子任务（见 :meth:`_assign_task` /
+        :meth:`_apply_formatter`），所以 ``task import -ac`` 不会把模板本身挂到
+        session 上。
         """
+        suffix = suffix if isinstance(suffix, dict) else {}
+        if isinstance(task, ImportBatch):
+            targets = [one for one in task
+                       if isinstance(one, dict) and one.get("id") is not None]
+            last = None
+            for one in targets:
+                last = self._apply_suffix_chain(
+                    one, "import", note_text=suffix.get("note_text"),
+                    assign_to=suffix.get("assign_to"),
+                    mark_status=suffix.get("mark_status"),
+                    trigger_spec=suffix.get("trigger_spec"),
+                    formatter_spec=suffix.get("formatter_spec"))
+            return last if last is not None else task.last
         if not isinstance(task, dict) or task.get("id") is None:
             return task
-        suffix = suffix if isinstance(suffix, dict) else {}
-        if suffix.get("note_text") is not None:
-            self._apply_note(task, suffix["note_text"], "import")
-        if suffix.get("assign_to") is not None:
-            self._apply_assign(task, suffix["assign_to"], "import")
-        if suffix.get("mark_status") is not None:
-            self._apply_mark(task, suffix["mark_status"], "import")
-        if suffix.get("trigger_spec") is not None:
-            self._apply_trigger(task, suffix["trigger_spec"], "import")
-        if suffix.get("formatter_spec") is not None:
-            self._apply_formatter(task, suffix["formatter_spec"], "import")
-        return task
+        return self._apply_suffix_chain(
+            task, "import", note_text=suffix.get("note_text"),
+            assign_to=suffix.get("assign_to"),
+            mark_status=suffix.get("mark_status"),
+            trigger_spec=suffix.get("trigger_spec"),
+            formatter_spec=suffix.get("formatter_spec"))
 
     def _finish_task_import(self, items, copy_repeat=False, repeats=None,
                             warnings=None):
@@ -5046,10 +5105,15 @@ class Warden(object):
             # OmniFocus 的 estimatedMinutes 就是「这条活要多久」；导入时落到
             # fields.duration，formatter end 才有东西可排（不像 repeat.duration
             # 只是找 session 的锚点）。用户已经手写过就不覆盖。
-            try:
-                minutes = int(plan.get("duration"))
-            except (TypeError, ValueError):
-                minutes = None
+            # 来源顺序：重复任务 plan 里的时长 → OmniFocus 查回来的 estimated_minutes。
+            minutes = None
+            for raw_minutes in (plan.get("duration"), item.get("estimated_minutes")):
+                try:
+                    minutes = int(raw_minutes)
+                except (TypeError, ValueError):
+                    minutes = None
+                if minutes and minutes > 0:
+                    break
             if minutes and minutes > 0:
                 fields["duration"] = str(minutes)
             omnifocus = None
@@ -5064,10 +5128,14 @@ class Warden(object):
                                           source=source)
             made.append(task)
             if item.get("id"):
+                notes = []
+                if item.get("title_from_omnifocus"):
+                    notes.append("标题是去 OmniFocus 查的")
+                if item.get("from_clipboard"):
+                    notes.append("链接是从剪贴板读的")
                 self.say("✅ 导入任务 %s「%s」→ OmniFocus %s%s"
                          % (self.task_label(task), title, item["id"],
-                            "（链接是从剪贴板读的）" if item.get("from_clipboard") else ""),
-                         "ok")
+                            "（%s）" % "；".join(notes) if notes else ""), "ok")
             else:
                 self.say("✅ 导入任务 %s「%s」（只有标题：认不出 OmniFocus primary key，"
                          "所以**没有关联**）" % (self.task_label(task), title), "warn")
@@ -5105,9 +5173,20 @@ class Warden(object):
                 self.say("   %s" % plan["note"], "info")
         if made:
             self.selected_task_id = made[-1]["id"]
+        if len(made) > 1:
+            linked = [t for t in made if ts.TaskStore.omnifocus_id(t)]
+            copied = [t for t in made if t.get("repeat")]
+            self.say("📥 这一批导入 %d 条：关联 OmniFocus %d 条、无关联 %d 条%s"
+                     % (len(made), len(linked), len(made) - len(linked),
+                        "；复制了重复设置 %d 条" % len(copied) if copied else ""), "ok")
+            rl.log_event("omnifocus", "import_batch", count=len(made),
+                         linked=len(linked), repeats=len(copied),
+                         task_ids=[t.get("id") for t in made],
+                         omnifocus_ids=[ts.TaskStore.omnifocus_id(t) for t in made])
+            return ImportBatch(made)
         return made[-1] if made else None
 
-    def cmd_task_import(self, args):
+    def cmd_task_import(self, args, apply_suffix=True):
         """``task import [--assign N] [粘贴文本|链接]`` —— 从**剪贴板**导入任务。
 
         需求（第 4 条）：在 OmniFocus 里复制一条任务（剪贴板里自带 primary key 的
@@ -5132,6 +5211,13 @@ class Warden(object):
         如果剪贴板那条在 OmniFocus 里带 repetitionRule（每周三之类），**先不建**：
         把候选挂到 ``pending_import``，由打断栏位问「复制重复设置吗？」；用户答
         ``y`` 才把可表达的规则写成本地 ``repeat``，答 ``n`` 只导入这一次。
+
+        **一次导入多条**：在 OmniFocus 里多选几条 ⌘C，剪贴板里就是多条链接。
+        这里对每一条都做「关联 + 标题 + 时长」，返回 :class:`ImportBatch`
+        （单条时还是那一条任务），``cmd_task`` 的 ``-a`` / ``-f`` 等后缀因此会落到
+        整批上。剪贴板给的 flavor 可能只给链接不给标题（多选时 RTF 与纯文本是两份
+        互不相干的东西），所以有 pk 没标题的条目会去 OmniFocus 按 pk 查真名
+        （顺便带上 ``estimated_minutes`` → ``fields.duration``），补完再按标题去重。
         """
         toks = []
         assign_to = None
@@ -5165,6 +5251,19 @@ class Warden(object):
             if not any(item and item.get("id") for item in items):
                 # 粘进来的只有标题 → 去剪贴板对同名的那条（同一次 ⌘C 的两半）
                 items = self._task_import_match_clipboard(items, of.clipboard_links())
+
+        # 剪贴板这条路的 flavor 可能只给出「id」不给标题（OmniFocus 多选时 RTF 和
+        # 纯文本是两份互不相干的东西），所以先补标题/时长，再把抄了两遍的裸标题去掉。
+        items = self._task_import_resolve(items)
+        # 「已经导入过」只在**批量**里跳过：一次选十条里混着上个月的旧条目才是误伤；
+        # 单条导入是「我就要这条」的明确动作（再来一条同名关联是合法用法，例如
+        # 先按普通任务导入、再导一次复制成重复任务）。
+        if len(items) > 1:
+            items, skipped = self._task_import_skip_known(items)
+            if not items:
+                raise ValueError("这一批都已经导入过了（%s）；没有新建任何任务。"
+                                 % "、".join("%s → 任务 %s" % (pk, tid)
+                                            for pk, tid in skipped))
 
         repeats = {}
         warnings = []
@@ -5207,10 +5306,107 @@ class Warden(object):
 
         task = self._finish_task_import(items, copy_repeat=False, repeats={},
                                         warnings=warnings)
-        # 直接调本方法（不带 cmd_task 的后缀管线）时，-a 也要生效。
-        self._apply_import_suffix(task, {"assign_to": assign_to}
-                                  if assign_to is not None else {})
+        # 直接调本方法（不带 cmd_task 的后缀管线）时，-a 也要生效；走 cmd_task 时
+        # 由 cmd_task 统一把**全部**后缀逐条套到整批上（这里再套就是双份）。
+        if apply_suffix and assign_to is not None:
+            self._apply_import_suffix(task, {"assign_to": assign_to})
         return task
+
+    def _task_import_omnifocus_rows(self, items):
+        """这一批 pk → OmniFocus 的行（一次 list，client 里 20 秒缓存）；读不到 None。
+
+        只在 import 里用。读不到不是错误：标题退回剪贴板给的（可能为空），时长就
+        不补 —— 导入本身照常进行。
+        """
+        pks = {str(item.get("id")) for item in items or () if item.get("id")}
+        if not pks:
+            return {}
+        try:
+            enabled = self.omnifocus_enabled()
+        except Exception:                          # noqa: BLE001 - 替身/坏设置都不该挡住导入
+            enabled = False
+        if not enabled:
+            if any(item.get("id") and not str(item.get("title") or "").strip()
+                   for item in items or ()):
+                self.say("📴 没在读 OmniFocus：剪贴板没给标题的那几条先拿 primary key "
+                         "当标题，时长也补不上。", "info")
+            return None
+        try:
+            rows = self.omnifocus.list_tasks()
+        except Exception as e:                      # noqa: BLE001 - 读失败不该挡住导入
+            self.say("⚠ 读 OmniFocus 失败（%s）：标题按剪贴板给的用，时长不补。" % e,
+                     "warn")
+            return None
+        out = {}
+        for row in rows or ():
+            pk = str(row.get("id") or "")
+            if pk and pk in pks:
+                out[pk] = row
+        return out
+
+    def _task_import_resolve(self, items):
+        """补齐标题/时长，并把「另一份 flavor 抄了一遍」的裸标题去掉。
+
+        多选 ⌘C 时剪贴板里其实是两份东西：RTF/HTML 给「链接 + 标题」，纯文本把
+        那一串标题**再抄一遍**。所以：
+
+        1. 有 pk 但没标题（RTF 只给链接、或 HTML flavor 缺）→ 去 OmniFocus 按 pk
+           查真名（``name``），顺手把 ``estimated_minutes`` 带上（导入时落成
+           ``fields.duration``，``-f end`` 才有东西可排）；
+        2. 标题比 OmniFocus 里的短（flavor 截断，真实反馈过「语法高频 30 个」只给
+           「30」）→ 用长的那个；一样长就保留剪贴板的（flavor 优先）；
+        3. 补完标题再按「完全相同」去重：纯文本那份裸标题会被清掉，不会 3 条变 6 条。
+        """
+        items = [item for item in (items or []) if item]
+        if not items:
+            return []
+        rows = self._task_import_omnifocus_rows(items)
+        if rows:
+            for item in items:
+                pk = item.get("id")
+                if not pk:
+                    continue
+                row = rows.get(str(pk))
+                if not row:
+                    continue
+                name = str(row.get("name") or "").strip()
+                old = str(item.get("title") or "").strip()
+                if name and len(name) > len(old):
+                    item["title"] = name
+                    item["title_from_omnifocus"] = True
+                minutes = row.get("estimated_minutes")
+                if minutes not in (None, "", 0, "0"):
+                    item["estimated_minutes"] = minutes
+        return of.drop_duplicate_titles(items)
+
+    def _task_import_skip_known(self, items):
+        """去掉「这个 pk 已经和本地某条任务关联过」的条目。
+
+        多选很容易把上个月导入过的那几条再选一遍；重复建任务（同一个 pk 两条本地
+        记录）会让两边的写回互相打脸。所以跳过并明说，不静默。返回
+        ``(要导入的, [(pk, 已有任务 id), ...])``。
+
+        **只在批量导入里用**（``len(items) > 1``）：单条导入是用户明确要的东西。
+        """
+        known = {}
+        for task in self.task_store.list():
+            pk = ts.TaskStore.omnifocus_id(task)
+            if pk:
+                known.setdefault(str(pk), task)
+        kept, skipped = [], []
+        for item in items or ():
+            pk = str(item.get("id") or "")
+            hit = known.get(pk) if pk else None
+            if hit is not None:
+                skipped.append((pk, hit.get("id")))
+                continue
+            kept.append(item)
+        if skipped:
+            self.say("⏭ 跳过 %d 条已经导入过的：%s（想再来一条就 `task <序号> duplicate`）"
+                     % (len(skipped),
+                        "、".join("OmniFocus %s → 任务 %s" % pair for pair in skipped)),
+                     "warn")
+        return kept, skipped
 
     @staticmethod
     def _task_import_match_clipboard(items, clip_items):

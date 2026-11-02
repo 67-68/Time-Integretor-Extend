@@ -628,6 +628,8 @@ _real_repetition_info = wd.omnifocus.repetition_info
 # 普通导入用例不要因为本机装了 OmniFocus 就真的去跑 osascript：明确回答
 # 「不是重复任务」。专门测复制 repeat 的那一段再换掉这个替身。
 wd.omnifocus.repetition_info = lambda pk: {"repeated": False, "id": pk}
+# 导入会按 pk 去 OmniFocus 核对真标题/预估时长；测试里绝不能真跑 osascript。
+wd.omnifocus.list_tasks = lambda refresh=False, fields=None, timeout=None: []
 w.of.clipboard_links = lambda: [dict(x) for x in CLIP]
 wd.messages = []
 check("task import（不带参数）就受理", wd.handle("task import"), True)
@@ -897,6 +899,96 @@ _match = w.task_repeat_plan_from_omnifocus({
 }, sessions_for_day=lambda day: [{"start": "10:45", "duration": 25}])
 check_true("排期能对上时用真实 session 核对", "排期里对上了" in _match["note"])
 
+print("== task import：多选 OmniFocus 任务，一次导入 3 条（不变成 6 条）==")
+# 多选 ⌘C 的真实形状：RTF 里 3 个 HYPERLINK（只给链接不给标题），纯文本把同样的
+# 3 个标题再抄一遍。以前 RTF 的 \uNNNN 解不出来 → 标题全空 → 那 3 条裸标题被当成
+# 「认不出 primary key 的任务」又建一遍，3 条变 6 条。
+_BATCH = [("pk-a", "词汇题 A", 25), ("pk-b", "语法 B", 50), ("pk-c", "数学 C", 25)]
+
+
+def _batch_clip():
+    out = [{"id": pk, "url": "omnifocus:///task/%s" % pk, "title": None,
+            "has_id": True, "raw": "omnifocus:///task/%s" % pk}
+           for pk, _name, _minutes in _BATCH]
+    out += [{"id": None, "url": None, "title": name, "has_id": False, "raw": name}
+            for _pk, name, _minutes in _BATCH]
+    return out
+
+
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
+w.of.clipboard_links = _batch_clip
+wd.omnifocus.list_tasks = lambda refresh=False, fields=None, timeout=None: [
+    {"id": pk, "name": name, "estimated_minutes": minutes, "completed": False}
+    for pk, name, minutes in _BATCH]
+wd.messages = []
+check("task import 一次导入多条受理", wd.handle("task import"), True)
+made = [t for t in wd.task_store.list() if ts.TaskStore.omnifocus_id(t)]
+check("3 条链接就是 3 条任务（不是 6 条）", len(made), 3)
+check("没标题的那几条按 pk 去 OmniFocus 补了真名",
+      [(ts.TaskStore.omnifocus_id(t), t["fields"]["title"]) for t in made],
+      [("pk-a", "词汇题 A"), ("pk-b", "语法 B"), ("pk-c", "数学 C")])
+check("预估时长也带过来了（estimated_minutes → fields.duration）",
+      [t["fields"].get("duration") for t in made], ["25", "50", "25"])
+check_true("最后报总账：这一批导入 3 条",
+           any("这一批导入 3 条" in m[2] for m in wd.messages))
+
+# -a 是**整批**的后缀：3 条都挂到同一场（一场 session 本来就能有多条一起干）
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
+wd.messages = []
+check("task import -a 1（3 条一起）受理", wd.handle("task import -a 1"), True)
+made = [t for t in wd.task_store.list() if ts.TaskStore.omnifocus_id(t)]
+check("3 条都建出来了", len(made), 3)
+check("3 条都挂到了 #1 那一场（不是只有最后一条）",
+      {(t.get("session") or {}).get("start") for t in made},
+      {wd.rows[0]["startLabel"]})
+
+# -f end 也是整批：每条各自找一段，不会两条挤在同一场
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
+wd.messages = []
+check("task import -f end（3 条一起）受理", wd.handle("task import -f end"), True)
+made = [t for t in wd.task_store.list() if ts.TaskStore.omnifocus_id(t)]
+check("3 条都建出来了", len(made), 3)
+_res = [(t.get("formatter") or {}).get("reservation") or {} for t in made]
+check("3 条都跑过 formatter end",
+      [(t.get("formatter") or {}).get("name") for t in made], ["end"] * 3)
+check("3 条各占一段（前一条的 reservation 挡住了后一条）",
+      len({(r.get("date"), r.get("start")) for r in _res}), 3)
+
+# 同一批再来一次：全都导入过 → 全部跳过，一条都不新建
+_before = len(wd.task_store.list())
+wd.messages = []
+check("同一批再来一次也受理", wd.handle("task import"), True)
+check("一条都没新建", len(wd.task_store.list()), _before)
+check_true("明说这一批都已经导入过了",
+           any("都已经导入过了" in m[2] for m in wd.messages))
+
+# 但**单条**导入不跳过：先按普通任务导入、再导一次复制成重复任务是合法用法
+w.of.clipboard_links = lambda: [_batch_clip()[0]]
+wd.messages = []
+check("单条再导一次受理", wd.handle("task import"), True)
+check("同一个 pk 现在有两条本地记录（单条不跳过）",
+      len([t for t in wd.task_store.list()
+           if ts.TaskStore.omnifocus_id(t) == "pk-a"]), 2)
+
+# 粘贴这条路：终端把多行压成一行，一行里 3 条链接也要都认（不然只导入第一条）
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
+w.of.clipboard_links = lambda: []
+wd.messages = []
+check("一行里塞 3 条链接也受理",
+      wd.handle("task import [甲](omnifocus:///task/pk-x) "
+                "[乙](omnifocus:///task/pk-y) [丙](omnifocus:///task/pk-z)"), True)
+made = [t for t in wd.task_store.list() if ts.TaskStore.omnifocus_id(t)]
+check("3 条都建出来了（不是只建第一条）",
+      [(ts.TaskStore.omnifocus_id(t), t["fields"]["title"]) for t in made],
+      [("pk-x", "甲"), ("pk-y", "乙"), ("pk-z", "丙")])
+
+for t in list(wd.task_store.list()):
+    wd.handle("task delete %d" % t["id"])
+wd.omnifocus.list_tasks = lambda refresh=False, fields=None, timeout=None: []
 wd.omnifocus.repetition_info = _real_repetition_info
 w.of.clipboard_links = _real_clip
 for t in list(wd.task_store.list()):

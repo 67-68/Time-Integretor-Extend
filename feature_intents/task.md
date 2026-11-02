@@ -145,7 +145,7 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task <序号> -m discard`（`--mark discard`） | **手动记账**：本地 dropped；完全不动 Focusmate / OmniFocus |
 | `task -m complete` / `task -m discard` | 不写序号 = 标记当前选中的任务；`-m` 与 `--mark`、后缀位置都等价 |
 | `task <序号> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
-| `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus，可一次多行；如果 OmniFocus 里是重复任务，会先问要不要复制重复设置 |
+| `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus；OmniFocus 里**多选 ⌘C** 就是一次导入多条，`-a` / `-f` 等后缀对**整批**生效；如果 OmniFocus 里是重复任务，会先问要不要复制重复设置 |
 | `task import -st`（`--single-task`） | 只导入这一条：不查重复设置、不问、不建本地 `repeat` |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
 | `task <序号> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |
@@ -295,6 +295,35 @@ OmniFocus 的 `repetitionRule` 不在 `omnifocus_tasks.py list` 的公开字段�
 `语法高频` + `30 个` 是折行，不是两条。剪贴板里有多条链接时按行保留标题，
 并按「同一条链接 + 一个标题是另一个的子串」合并，避免把 `语法高频 30 个`
 拆成 `30` + 全文两条。
+
+### 一次导入多条
+
+在 OmniFocus 里多选几条任务 ⌘C，剪贴板里就是多条链接 —— `task import` 一次全导入，
+`-a` / `-f` 等后缀落到**每一条**上（`task import -f end` = 几条各自排进当天最后
+一段，不是只有最后一条进了面板）。`cmd_task_import()` 多条时返回 `ImportBatch`
+（`list` 子类，单条时还是那一条任务），`cmd_task` 看见它就按条套一遍后缀。
+
+坑在两份 flavor 会**互相不认**：
+
+- 多选时 `URL` flavor 只剩其中一条；链接全不全看 `HTML` / `RTF`；
+- OmniFocus 的中文标题在 RTF 里是 `\uNNNN` 码点（`\uc0\u25968 \u23398 …`），
+  **必须解码**。以前把它当控制词删掉，标题就空了；
+- 纯文本 flavor 又把那一串标题**原样抄一遍**。
+
+标题空 + 裸标题没去重 = 3 条链接进、6 条任务出（3 条标题是 pk、3 条没关联）。
+所以导入分三步，顺序不能换：
+
+1. **补标题/时长**：有 pk 没标题（或标题比 OmniFocus 里的短，即被 flavor 截断）
+   → 用 `omnifocus.Client.list_tasks()` 按 pk 查真名，顺手取
+   `estimated_minutes` 落成 `fields.duration`（`-f end` 才有东西可排）；
+2. **按标题去重**：补完之后，和某条带 id 的条目**同标题**的裸条目一律丢掉
+   （`omnifocus.drop_duplicate_titles`）；
+3. **按 pk 去重**：这个 pk 已经和本地某条任务关联过 → 跳过并明说「之前导入过
+   （任务 #x）」。**只在批量里跳过**：单条导入是「我就要这条」的明确动作
+   （先按普通任务导入、再导一次复制成重复任务，是合法用法）。
+
+OmniFocus 读不到（设置里关了 / 没权限 / 没装）不算错误：标题退回剪贴板给的，
+时长不补，导入照常 —— 宁可少两个字段，也不让读失败挡住导入。
 
 ### 为什么 `task import` 必须自己读剪贴板
 

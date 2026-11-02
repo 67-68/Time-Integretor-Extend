@@ -147,6 +147,42 @@ check("RTF 里抓出链接", [(i["id"], i["title"]) for i in rtf_items],
 check("RTF 兜底：整段里扫链接",
       [i["id"] for i in of.rtf_links("x omnifocus:///task/abc y")], ["abc"])
 
+# OmniFocus 拷带中文的任务时，RTF 里的标题是 \uNNNN 码点（实测形状）：
+#   {\fldrslt \n\f0\fs24 \cf0 \uc0\u25968 \u23398 \u26131 \u38169 \u20462 \u27491 }
+# 以前把 \u25968 当控制词整段删掉 → 标题空 → 多选时 3 条变 6 条。
+check("RTF 的 \\uNNNN 码点解回中文",
+      of._rtf_unescape(r"\f0\fs24 \cf0 \uc0\u25968 \u23398 \u26131 \u38169 \u20462 \u27491 "),
+      "数学易错修正")
+check("\\ucN 指定的 fallback 字符会跳过", of._rtf_unescape(r"\uc1\u25968?\u23398?"), "数学")
+check("别的小转义照旧（单字节 / 花括号 / 双反斜杠）",
+      of._rtf_unescape("\\'3a" + "\\{" + "\\\\"), ":{" + chr(92))
+_multi_rtf = ('{\\rtf1{\\field{\\*\\fldinst{HYPERLINK "omnifocus:///task/AAA"}}'
+              '{\\fldrslt \\uc0\\u20219 \\u21153 \\u19968 }}'
+              '{\\field{\\*\\fldinst{HYPERLINK "omnifocus:///task/BBB"}}'
+              '{\\fldrslt \\uc0\\u20219 \\u21153 \\u20108 }}}')
+check("多选时 RTF 自己就能给出「链接 + 标题」成对",
+      [(i["id"], i["title"]) for i in of.rtf_links(_multi_rtf)],
+      [("AAA", "任务一"), ("BBB", "任务二")])
+check("一行里挤了 3 条 Markdown 链接 → 拆成 3 条（终端会把换行压成空格）",
+      [(i["id"], i["title"]) for i in of.parse_links(
+          "[甲](omnifocus:///task/pk-a) [乙](omnifocus:///task/pk-b) "
+          "[丙](omnifocus:///task/pk-c)")],
+      [("pk-a", "甲"), ("pk-b", "乙"), ("pk-c", "丙")])
+check("一行里挤了 2 条裸链接 → 也拆（标题空着，由导入方去 OmniFocus 查）",
+      [i["id"] for i in of.parse_links(
+          "omnifocus:///task/pk-a omnifocus:///task/pk-b")], ["pk-a", "pk-b"])
+check("只有一条链接时那一行原样保留（标题不会被拆散）",
+      [(i["id"], i["title"]) for i in of.parse_links(
+          "[语法高频](omnifocus:///task/pk-a) 30 个")], [("pk-a", "语法高频")])
+check("没有链接的行照旧（折行仍合成一条）",
+      [(i["id"], i["title"]) for i in of.parse_links("语法高频" + chr(10) + "30 个")],
+      [(None, "语法高频 30 个")])
+check("裸标题和某条带 id 的标题一模一样 → 去掉（那是同一份剪贴板的另一半）",
+      [(i.get("id"), i.get("title")) for i in of.drop_duplicate_titles(
+          [{"id": "a", "title": "甲"}, {"id": None, "title": "甲"},
+           {"id": None, "title": "手写的"}])],
+      [("a", "甲"), (None, "手写的")])
+
 # 各 flavor 全部喂给 clipboard_links（真的按 flavor 读，不是 pbpaste 一刀切）
 _real_flavor = of.clipboard_flavor
 of.clipboard_flavor = lambda which: {

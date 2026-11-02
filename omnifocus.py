@@ -183,8 +183,32 @@ def parse_link(text):
     }
 
 
+def split_line_links(line):
+    """一行里挤了好几条链接 → 按链接边界拆开。
+
+    单独一行只认第一条链接（:func:`parse_link` 用 ``search``）。终端会把多行
+    粘贴压成一行（``[甲](pk-a) [乙](pk-b)``），于是「一次导入多条」在粘贴这条路上
+    退化成「只导入第一条」。所以**这一行里明确出现两条以上** omnifocus 链接时拆开：
+
+    * Markdown 链接 ``[标题](omnifocus:///task/PK)`` → 每条各成一个条目（标题还有）；
+    * 裸链接 ``omnifocus:///task/PK`` → 每条各成一个条目（标题空着，由调用方去
+      OmniFocus 查）；
+    * 只有一条链接 / 一条都没有 → 原样返回这一行（标题里的字不会被拆散。
+      「语法高频 30 个」这种折行靠的是 ``merge_bare`` 那条规则）。
+    """
+    found = [m.group(0) for m in MD_RE.finditer(line)]
+    if len(found) < 2:
+        found = ["omnifocus:///task/%s" % _clean_id(m.group(0))
+                 for m in re.finditer(r"omnifocus:///task/[^\s\"'<>]+", line)]
+        if len(found) < 2:
+            return [line]
+    return found
+
+
 def parse_links(text, merge_bare=True):
     """把一段（可能多行的）粘贴拆成若干条链接，一次一行地认。
+
+    一行里挤了好几条链接（终端把换行压成空格）也认，见 :func:`split_line_links`。
 
     ``merge_bare=True`` 时，**没有一条带 primary key** 的整段只当一条任务：
     纯文本里换行分不清「两条任务」和「一条任务被折行」（真实反馈：``语法高频
@@ -194,9 +218,10 @@ def parse_links(text, merge_bare=True):
     """
     out = []
     for line in str(text or "").splitlines():
-        item = parse_link(line)
-        if item and (item["id"] or item["title"]):
-            out.append(item)
+        for chunk in split_line_links(line):
+            item = parse_link(chunk)
+            if item and (item["id"] or item["title"]):
+                out.append(item)
     if merge_bare and len(out) > 1 and not any(item.get("id") for item in out):
         merged = " ".join((item.get("title") or "").strip()
                           for item in out if (item.get("title") or "").strip())
@@ -266,14 +291,72 @@ def rtf_links(markup):
 
 
 def _rtf_unescape(text):
-    """RTF 里的小转义：``\\'3a`` → ``:``、``\\{`` → ``{``，多余的换行去掉。"""
-    raw = str(text or "")
-    raw = re.sub(r"\\'([0-9A-Fa-f]{2})",
-                 lambda m: bytes([int(m.group(1), 16)]).decode("cp1252", "replace"), raw)
-    raw = raw.replace("\\\\", "\\").replace("\\{", "{").replace("\\}", "}")
-    raw = re.sub(r"\\[a-zA-Z]+-?\d*\s?", "", raw)
-    raw = raw.replace("\r", " ").replace("\n", " ")
-    return re.sub(r"\s+", " ", raw).strip()
+    """RTF 片段 → 纯文本。
+
+    认三种转义，别的控制词一律丢掉：
+
+    * ``\\'3a``             单字节（cp1252）
+    * ``\\\\`` / ``\\{`` / ``\\}``  字面反斜杠 / 花括号
+    * ``\\u25968``           Unicode 码点（**中文标题全靠它**）
+
+    OmniFocus 拷一条带中文的任务时，RTF 里的标题就是 ``\\uc0\\u25968 \\u23398 …``。
+    以前这里用 ``re.sub(r"\\[a-zA-Z]+-?\\d*", "", raw)`` 当控制词整段删掉，
+    结果「数学易错修正」变成空串 —— 多选时标题全空，于是纯文本那串标题被当成
+    「认不出 primary key 的任务」又建一遍（3 条变 6 条）。
+
+    ``\\uN`` 后面还可能跟 ``\\ucN`` 指定个数的 fallback 字符（给不认 Unicode 的
+    阅读器看的），一并跳过。
+    """
+    raw = text if isinstance(text, str) else str(text or "")
+    out = []
+    i, size = 0, len(raw)
+    fallback = 0                      # \ucN：\uN 之后要跳过几个 fallback 字符
+    while i < size:
+        ch = raw[i]
+        if ch != "\\":
+            out.append(" " if ch in "\r\n\t" else ch)
+            i += 1
+            continue
+        nxt = raw[i + 1:i + 2]
+        if nxt == "'":                                  # \'3a → 单字节
+            try:
+                out.append(bytes([int(raw[i + 2:i + 4], 16)]).decode("cp1252", "replace"))
+            except ValueError:
+                pass
+            i += 4
+            continue
+        if nxt in ("\\", "{", "}"):                     # \\ \{ \} → 字面字符
+            out.append(nxt)
+            i += 2
+            continue
+        match = re.match(r"\\uc(-?\d+)\s?", raw[i:])      # \ucN
+        if match:
+            fallback = max(0, int(match.group(1)))
+            i += match.end()
+            continue
+        match = re.match(r"\\u(-?\d+)", raw[i:])          # \u25968 → Unicode
+        if match:
+            code = int(match.group(1))
+            if code < 0:
+                code += 65536
+            try:
+                out.append(chr(code))
+            except ValueError:
+                pass
+            i += match.end()
+            if raw[i:i + 1] == " ":                     # 控制词的分隔空格
+                i += 1
+            skipped = 0
+            while skipped < fallback and i < size and raw[i] not in "\\{}":
+                i += 1
+                skipped += 1
+            continue
+        match = re.match(r"\\[a-zA-Z]+-?\d*\s?", raw[i:])  # \f0 \fs24 \pard …
+        if match:
+            i += match.end()
+            continue
+        i += 1                                          # 落单的反斜杠
+    return re.sub(r"\s+", " ", "".join(out)).strip()
 
 
 # 剪贴板 flavor 读取 -------------------------------------------------------
@@ -376,6 +459,38 @@ def clipboard_text(prefer=None):
     return clipboard_flavor("text")
 
 
+def _norm_title(text):
+    """标题归一（比大小写/空白用）：合并空白、去首尾、转小写。"""
+    return " ".join(str(text if text is not None else "").split()).strip().lower()
+
+
+def drop_duplicate_titles(items):
+    """去掉「标题和某条有 id 的条目一模一样」的**裸标题**条目。
+
+    多选 ⌘C 时纯文本 flavor 会把那一串标题原样再给一遍（RTF/HTML 已经给了
+    「pk + 标题」）。有 pk 却没标题的条目补完标题（去 OmniFocus 查真名）之后，
+    必须再跑一次这个去重：不然那串裸标题会被当成「认不出 primary key 的任务」
+    又建一遍 —— 3 条变 6 条。
+
+    只按**完全相同**的标题去重，不做模糊匹配：宁可多一条无关联的任务，也不把
+    两条不同的活并成一条。
+    """
+    known = set()
+    for item in items or ():
+        if item and item.get("id"):
+            key = _norm_title(item.get("title"))
+            if key:
+                known.add(key)
+    out = []
+    for item in items or ():
+        if not item:
+            continue
+        if not item.get("id") and _norm_title(item.get("title")) in known:
+            continue
+        out.append(item)
+    return out
+
+
 def clipboard_links():
     """剪贴板 → 链接列表（按 id 合并，标题优先取 HTML）。
 
@@ -443,8 +558,7 @@ def clipboard_links():
     # 剪贴板里只有这一条链接。标题可能被 flavor 截断（真实反馈：``语法高频
     # 30 个`` 的 HTML/RTF 只给出 ``30``），所以「一个标题是另一个的子串」也认，
     # 并保留更长的那份。
-    def norm(text):
-        return " ".join(str(text or "").split()).strip().lower()
+    norm = _norm_title
 
     ids = [x for x in found if x.get("id")]
     bare = [x for x in found if not x.get("id")]
