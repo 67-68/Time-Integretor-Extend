@@ -442,6 +442,21 @@ check("今天面板里有「昨天问过、还开着」的（它还没做完）"
 check("今天面板里没有昨天放弃的那条（今天没它的事）", a_id in today_ids, False)
 check("今天面板里没有更早完成的老账", c_id in today_ids, False)
 
+# 已排到明天的任务属于明天：今天面板里不能出现它
+tomorrow_iso = (TODAY + datetime.timedelta(days=1)).isoformat()
+tomorrow_id = _new_task("明天才做的")
+wd.task_store.assign(tomorrow_id, {
+    "date": tomorrow_iso, "start": "11:00", "end": "11:50",
+    "duration": 50, "focusmate_session_id": "sess-tomorrow",
+})
+wd.day_offset = 0
+check("今天面板里没有明天排期的任务",
+      tomorrow_id in [t["id"] for t in wd.task_panel_tasks()], False)
+wd.day_offset = 1
+check("切到明天才看得到它",
+      tomorrow_id in [t["id"] for t in wd.task_panel_tasks()], True)
+wd.day_offset = 0
+
 wd.day_offset = -1
 yday_ids = [t["id"] for t in wd.task_panel_tasks()]
 check("昨天面板固化：只剩那天处理过的", a_id in yday_ids, True)
@@ -763,6 +778,57 @@ check("回答 q 取消", wd.handle("q"), True)
 check("取消后没建任务", len(wd.task_store.list()), before)
 check("待确认清掉了", wd.pending_import, None)
 
+# 导入时问过 y/n/q，**之前带的 -a 也不能丢**：-a 要落到今天的子任务上
+DAILY_TODAY_INFO = dict(REPEATED_INFO, rule_string="FREQ=DAILY",
+                        due="%sT11:10:00" % ISO, next="%sT11:10:00" % ISO,
+                        planned=None, estimated_minutes=25)
+wd.omnifocus.repetition_info = lambda pk: dict(DAILY_TODAY_INFO)
+wd.messages = []
+check("重复任务 import -a 1：先进入询问", wd.handle("task import -a 1"), True)
+check("询问时还没有建任务", bool(wd.pending_import), True)
+check("回答 y 后继续导入", wd.handle("y"), True)
+assigned_parent = [t for t in wd.task_store.list()
+                   if ts.TaskStore.is_repeat_template(t)
+                   and (t.get("omnifocus") or {}).get("id") == "i5BKXC5uNk0"][-1]
+assigned_child = wd.task_store.occurrence_for(assigned_parent["id"], TODAY)
+check("本体仍然不挂 session", assigned_parent.get("session"), None)
+check("之前的 -a 落到了今天生成的子任务上", bool(assigned_child), True)
+check("子任务挂的是表格 #1 那一场",
+      (assigned_child.get("session") or {}).get("start"),
+      wd.rows[0].get("startLabel"))
+check("导入时 formatter 也没被写进本体",
+      assigned_parent.get("formatter"), None)
+
+# 紧凑写法 -ac 也必须活到回答 y 之后（用户报的就是这个）
+_real_current_session = wd.current_session
+wd.current_session = lambda: (1, wd.rows[0])
+wd.omnifocus.repetition_info = lambda pk: dict(DAILY_TODAY_INFO)
+check("重复任务 import -ac：先进入询问", wd.handle("task import -ac"), True)
+check("回答 y", wd.handle("y"), True)
+ac_parent = [t for t in wd.task_store.list()
+             if ts.TaskStore.is_repeat_template(t)
+             and (t.get("omnifocus") or {}).get("id") == "i5BKXC5uNk0"][-1]
+ac_child = wd.task_store.occurrence_for(ac_parent["id"], TODAY)
+check("-ac 没有挂到本体上", ac_parent.get("session"), None)
+check("-ac 落到了今天的子任务上", bool(ac_child), True)
+check("-ac 挂的就是「当前这一场」",
+      (ac_child.get("session") or {}).get("start"), wd.rows[0].get("startLabel"))
+wd.current_session = _real_current_session
+
+# -st / --single-task：只导入这一条，不问重复设置、不建本地 repeat
+wd.omnifocus.repetition_info = lambda pk: dict(DAILY_TODAY_INFO)
+before = len(wd.task_store.list())
+wd.messages = []
+check("task import -st 受理", wd.handle("task import -st"), True)
+check("-st 不挂起询问", wd.pending_import, None)
+check("-st 只多建一条", len(wd.task_store.list()), before + 1)
+single = wd.task_store.get(wd.selected_task_id)
+check("-st 不复制 repeat", single.get("repeat"), None)
+check("-st 仍然关联 OmniFocus", (single.get("omnifocus") or {}).get("id"),
+      "i5BKXC5uNk0")
+check_true("-st 明说了只导入一次",
+           any("single-task" in m[2] or "只导入这一条" in m[2] for m in wd.messages))
+
 # FREQ=DAILY 现在也照原规则复制（不再退化成「只能每周」）
 wd.omnifocus.repetition_info = lambda pk: dict(
     REPEATED_INFO, rule_string="FREQ=DAILY", estimated_minutes=25)
@@ -1012,8 +1078,9 @@ wd4 = fresh_warden()
 _shell = wd4.shell
 check("task 后面能 Tab 到紧凑写法",
       [c for c in _shell.complete("task ") if c.startswith("-")],
-      ["-an", "-ac", "-m", "-t", "-f", "--assign", "-a", "--note", "-n", "--from",
-       "-s", "--mark", "--trigger", "--formatter", "--repeat"])
+      ["-an", "-ac", "-m", "-t", "-f", "-st", "--assign", "-a", "--note", "-n",
+       "--from", "-s", "--mark", "--trigger", "--formatter", "--repeat",
+       "--single-task"])
 check("task 后面 Tab 补的是**面板序号**（1..N 连续，不是内部 id）",
       [c for c in _shell.complete("task ") if c.isdigit()],
       [str(i) for i in range(1, len(wd4.task_panel_order()) + 1)])

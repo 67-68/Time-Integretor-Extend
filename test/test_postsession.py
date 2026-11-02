@@ -86,6 +86,10 @@ check("只有标题的粘贴：**没有** primary key", (item["id"], item["has_i
 check("空字符串 → None", of.parse_link("   "), None)
 check("多行粘贴拆成多条", len(of.parse_links(
     "[甲](omnifocus:///task/pk1)\n[乙](omnifocus:///task/pk2)")), 2)
+check("没有链接的多行只当一条任务（折行不是两条）",
+      [i["title"] for i in of.parse_links("语法高频\n30 个")], ["语法高频 30 个"])
+check("多行裸标题也可以显式不合并（剪贴板多选要用）",
+      [i["title"] for i in of.parse_links("甲\n乙", merge_bare=False)], ["甲", "乙"])
 check("is_link 只认有 id 的", (of.is_link("title: x"), of.is_link("omnifocus:///task/pk1")),
       (False, True))
 html = '<a href="omnifocus:///task/kc-9">数学 &amp; 易错</a>'
@@ -167,6 +171,44 @@ of.clipboard_flavor = lambda which: {
 items = of.clipboard_links()
 check("多选拷贝 → 两条都在（URL flavor 只剩最后一条也补得上）",
       [(i["id"], i["title"]) for i in items], [("a", "甲"), ("b", "乙")])
+
+# 一条链接 + 被 flavor 截断的标题：HTML 只给 "30"，纯文本才是全标题
+of.clipboard_flavor = lambda which: {
+    "url": "omnifocus:///task/pk-grammar",
+    "html": '<a href="omnifocus:///task/pk-grammar">30</a>',
+    "rtf": "",
+    "text": "语法高频 30 个\n",
+}.get(which, "")
+items = of.clipboard_links()
+check("标题被截断时保留更长的那份（不会多建一条 30）",
+      [(i.get("id"), i.get("title")) for i in items],
+      [("pk-grammar", "语法高频 30 个")])
+
+# 没有纯文本，只有 HTML 短标题 + RTF 全标题：同一个 id 也要取长的
+_rtf_full = ('{\\rtf1\\ansi{\\field{\\*\\fldinst{HYPERLINK '
+             '"omnifocus:///task/pk-grammar"}}{\\fldrslt 语法高频 30 个}}}')
+of.clipboard_flavor = lambda which: {
+    "url": "omnifocus:///task/pk-grammar",
+    "html": '<a href="omnifocus:///task/pk-grammar">30</a>',
+    "rtf": _rtf_full,
+    "text": "",
+}.get(which, "")
+items = of.clipboard_links()
+check("同一 id 的短标题会被 RTF 全标题升级",
+      [(i.get("id"), i.get("title")) for i in items],
+      [("pk-grammar", "语法高频 30 个")])
+
+# 一条链接 + 纯文本被折成两行：合回一条任务
+of.clipboard_flavor = lambda which: {
+    "url": "omnifocus:///task/pk-grammar",
+    "html": "",
+    "rtf": "",
+    "text": "语法高频\n30 个\n",
+}.get(which, "")
+items = of.clipboard_links()
+check("纯文本折行也合回一条任务",
+      [(i.get("id"), i.get("title")) for i in items],
+      [("pk-grammar", "语法高频 30 个")])
 
 # 只有 URL + 纯文本标题（OmniFocus 拷一条任务的真实剪贴板）
 of.clipboard_flavor = lambda which: {

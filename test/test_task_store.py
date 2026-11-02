@@ -266,6 +266,36 @@ check("本体 occurrence 记 child_id / focusmate",
       (child["id"], "ft-child"))
 check("本体仍然没有 session（不被 occurrence 污染）", parent2.get("session"), None)
 
+print("== formatter：本体只留模板，子任务才带 reservation ==")
+store2.set_hook(parent["id"], "formatter", {
+    "name": "end", "kind": "formatter", "params": [], "args": {},
+    "result": {"name": "end"}, "reservation": {"date": iso, "start": "10:45"},
+    "applied_at": "2026-11-04T10:00:00",
+})
+parent3 = store2.get(parent["id"])
+check("本体 formatter 只剩规则模板", parent3["formatter"].get("name"), "end")
+check("本体 formatter 没有 reservation", parent3["formatter"].get("reservation"), None)
+check("本体 formatter 没有 result", parent3["formatter"].get("result"), None)
+# 本体没有 session 时，旧 assign 留下的 due/due_source 要清掉；用户自己写的 due 不动
+store2.modify(parent["id"], "due", "2026-11-03T11:50:00")
+store2.modify(parent["id"], "due_source", "session")
+parent3 = store2.get(parent["id"])
+check("本体过期的 session due 被清掉", parent3["fields"].get("due"), None)
+check("本体过期的 due_source 被清掉", parent3["fields"].get("due_source"), None)
+child3 = store2.create_repeat_occurrence(parent["id"], day + datetime.timedelta(days=1))
+check("子任务继承 formatter 模板", (child3.get("formatter") or {}).get("name"), "end")
+check("子任务继承时不带本体的运行时账",
+      (child3.get("formatter") or {}).get("reservation"), None)
+store2.set_hook(child3["id"], "formatter", {
+    "name": "end", "kind": "formatter", "params": [], "args": {},
+    "reservation": {"date": child3["repeat_date"], "start": "10:45"},
+    "applied_at": "2026-11-05T10:00:00",
+})
+child3 = store2.get(child3["id"])
+check("子任务可以有自己的 reservation",
+      (child3["formatter"].get("reservation") or {}).get("date"),
+      child3["repeat_date"])
+
 print("== 坏 JSON 不炸 ==")
 with open(TASKS, "w", encoding="utf-8") as f:
     f.write("{not json")

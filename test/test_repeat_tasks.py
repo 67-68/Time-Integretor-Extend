@@ -387,6 +387,101 @@ wd.handle("task create title=明日时间安排 --repeat %s@22:15" % WD)
 wd.refresh_warnings(force=True)
 check("建好之后就没事了", [x for x in wd.warnings if x.source == "重复任务"], [])
 
+print("== formatter 属于子任务：本体只留模板，今天/明天的子任务被排好 ==")
+TOMORROW = TODAY + datetime.timedelta(days=1)
+WD2 = sch.weekday_of_day(TOMORROW)
+sp.save_download({"version": 1, "generated_at": "x", "start_date": ISO, "days": 8,
+                  "profiles": ["工作", "空闲"], "events": [],
+                  "periods": [
+                      {"id": "T1", "date": ISO, "start": "22:15", "end": "23:15",
+                       "type": "空闲", "name": "晚间", "calendar": "空闲", "title": "晚间"},
+                      {"id": "T2", "date": TOMORROW.isoformat(), "start": "22:15",
+                       "end": "23:15", "type": "空闲", "name": "晚间", "calendar": "空闲",
+                       "title": "晚间"},
+                  ]})
+write_csv(["# test", "%s,22:15,50" % WD, "%s,22:15,50" % WD2])
+refresh_plan(mkwarden())
+reset_tasks()
+wd = mkwarden()
+wd.handle("task create title=闪卡复习 duration=25 --repeat %s@22:15" % WD)
+parent = wd.task_store.list()[0]
+# 这个用例要「每天」：改用 OmniFocus 那种原生 RRULE，今天+明天都是规则日。
+wd.task_store.set_repeat(parent["id"], WD, "22:15", 50,
+                         rule="FREQ=DAILY", rule_anchor="%sT22:15:00" % ISO,
+                         source="omnifocus")
+parent = wd.task_store.get(parent["id"])
+parent_no = wd.task_no(parent)
+check("本体在面板上有序号", bool(parent_no), True)
+check("给本体挂 formatter end", wd.handle("task %d -f end" % parent_no), True)
+parent = wd.task_store.get(parent["id"])
+check("本体自己仍然没有 session", parent.get("session"), None)
+fmt = parent.get("formatter") or {}
+check("本体只留 formatter 模板", fmt.get("name"), "end")
+check("本体不带 reservation", fmt.get("reservation"), None)
+check("本体不带 result", fmt.get("result"), None)
+check_true("本体在任务面板里不画 ⏱（那是子任务的记号）",
+           "⏱" not in wd.task_index_title(parent))
+child_today = wd.task_store.occurrence_for(parent["id"], TODAY)
+child_tomorrow = wd.task_store.occurrence_for(parent["id"], TOMORROW)
+check("今天生成了子任务", bool(child_today), True)
+check("明天也提前生成了子任务", bool(child_tomorrow), True)
+check("今天子任务继承了 formatter 并跑过",
+      ((child_today.get("formatter") or {}).get("reservation") or {}).get("date"),
+      ISO)
+check("明天子任务也继承了 formatter 并跑过",
+      ((child_tomorrow.get("formatter") or {}).get("reservation") or {}).get("date"),
+      TOMORROW.isoformat())
+check_true("今天子任务挂到了 session（T1 可能被上一节拆成 25+25）",
+           ((child_today.get("session") or {}).get("start")) in ("22:15", "22:45"))
+check("明天子任务挂到了 session",
+      ((child_tomorrow.get("session") or {}).get("start")), "22:15")
+check_true("契约表 task 列会把明天的子任务画上 ⏱",
+           "⏱" in wd.task_cell_text([child_tomorrow]))
+check_true("本体不在契约表 task 列里",
+           all(t.get("id") != parent["id"] for t in wd.rows[0].get("tasks") or []))
+# 切到明天：契约表能看到那条被 format 的子任务
+wd.day_offset = 1
+wd.reload_entries()
+wd.rebuild_rows()
+row = next((r for r in wd.rows if r.get("startLabel") == "22:15"), None)
+check("切到明天有 22:15 那一行", bool(row), True)
+check_true("明天的行里是子任务 + ⏱",
+           row and ("⏱" in row.get("task_text", ""))
+           and (child_tomorrow["id"] in [t["id"] for t in row.get("tasks") or []]))
+# 本体不能被当成一次可完成的活
+try:
+    wd.cmd_task_done([str(wd.task_no(parent))])
+    _blocked = False
+except ValueError as e:
+    _blocked = "重复任务" in str(e) and "本体" in str(e)
+check("本体 task done 被拒（子任务才能完成）", _blocked, True)
+try:
+    wd._apply_mark(parent, ts.STATUS_COMPLETED, "hook")
+    _mark_blocked = False
+except ValueError:
+    _mark_blocked = True
+check("本体 -m complete 也被拒", _mark_blocked, True)
+
+# 旧数据自愈：本体身上如果还挂着 session（以前的 -f end 排过），转给当天子任务
+legacy = wd.task_store.create({"title": "旧重复任务", "duration": 25})
+wd.task_store.set_repeat(legacy["id"], WD, "22:15", 50,
+                         rule="FREQ=DAILY", rule_anchor="%sT22:15:00" % ISO,
+                         source="omnifocus")
+legacy_sess = {"index": 1, "date": ISO, "start": "22:15", "end": "23:05",
+               "duration": 50, "focusmate_session_id": "sess-legacy"}
+wd.task_store.assign(legacy["id"], legacy_sess)
+wd.task_store.attach_focusmate(legacy["id"],
+                               {"task_id": "ft-legacy", "session_id": "sess-legacy"},
+                               session=legacy_sess)
+legacy_parent = wd.task_store.get(legacy["id"])
+legacy_parent = wd._adopt_template_session(legacy_parent)
+legacy_child = wd.task_store.occurrence_for(legacy["id"], TODAY)
+check("旧本体被下架", legacy_parent.get("session"), None)
+check("旧本体的 session 转给子任务",
+      (legacy_child.get("session") or {}).get("start"), "22:15")
+check("旧本体的 Focusmate task 也转给子任务",
+      (legacy_child.get("focusmate") or {}).get("task_id"), "ft-legacy")
+
 shutil.rmtree(TMP, ignore_errors=True)
 
 print()

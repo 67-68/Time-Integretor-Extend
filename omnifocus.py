@@ -183,13 +183,25 @@ def parse_link(text):
     }
 
 
-def parse_links(text):
-    """把一段（可能多行的）粘贴拆成若干条链接，一次一行地认。"""
+def parse_links(text, merge_bare=True):
+    """把一段（可能多行的）粘贴拆成若干条链接，一次一行地认。
+
+    ``merge_bare=True`` 时，**没有一条带 primary key** 的整段只当一条任务：
+    纯文本里换行分不清「两条任务」和「一条任务被折行」（真实反馈：``语法高频
+    30 个`` 被拆成 ``语法高频`` + ``30 个``）。要多条任务就得有链接，链接里
+    才有身份。剪贴板那条路会传 ``False``（HTML 已经给了全部 id 时，纯文本的
+    多行是**真的**多条标题）。
+    """
     out = []
     for line in str(text or "").splitlines():
         item = parse_link(line)
         if item and (item["id"] or item["title"]):
             out.append(item)
+    if merge_bare and len(out) > 1 and not any(item.get("id") for item in out):
+        merged = " ".join((item.get("title") or "").strip()
+                          for item in out if (item.get("title") or "").strip())
+        merged = re.sub(r"\s+", " ", merged).strip()
+        return [parse_link(merged)] if merged else []
     return out
 
 
@@ -383,8 +395,12 @@ def clipboard_links():
             return
         if pk in by_id:
             old = by_id[pk]
-            if not old.get("title") and item.get("title"):
-                old["title"] = item["title"]
+            # 同一个 id 可能被不同 flavor 给出长度不同的标题（HTML/RTF 偶尔只给
+            # 数字片段）；保留更长的那个，别让先读到的短标题把全文盖掉。
+            old_title = str(old.get("title") or "").strip()
+            new_title = str(item.get("title") or "").strip()
+            if new_title and len(new_title) > len(old_title):
+                old["title"] = new_title
             return
         by_id[pk] = item
         found.append(item)
@@ -397,7 +413,7 @@ def clipboard_links():
     if url_item and url_item.get("id"):
         add(url_item)
 
-    for item in parse_links(clipboard_flavor("text")):
+    for item in parse_links(clipboard_flavor("text"), merge_bare=False):
         if item.get("id"):
             add(item)
             continue
@@ -408,15 +424,50 @@ def clipboard_links():
             continue
         found.append(item)
 
-    # 「一条有 id 没标题 + 一条只有标题」= OmniFocus 拷一条任务的典型剪贴板
-    # （URL flavor 给链接、纯文本给标题，两边其实是同一条）。这时配对是**读出来
-    # 的事实**，不是拿标题猜身份 —— 猜的是「标题属于这条链接」，而剪贴板里只有
-    # 这一条链接、这一个标题。
+    # 纯文本把一个标题折成好几行、而剪贴板里只有**一条**链接时，合回去：
+    # ``语法高频`` + ``30 个`` → ``语法高频 30 个``。有多条链接时不猜（每条
+    # 标题各自对应哪条链接是未知的），只按完全同名去重。
+    ids_now = [x for x in found if x.get("id")]
+    bare_now = [x for x in found if not x.get("id")]
+    if len(ids_now) == 1 and len(bare_now) > 1:
+        merged_title = re.sub(r"\s+", " ", " ".join(
+            (x.get("title") or "").strip() for x in bare_now)).strip()
+        for item in bare_now:
+            found.remove(item)
+        if merged_title:
+            found.append(parse_link(merged_title))
+
+    # 「一条有 id + 一条只有标题」= OmniFocus 拷一条任务的典型剪贴板
+    # （URL flavor 给链接、纯文本/HTML 给标题，两边其实是同一条）。这时配对是
+    # **读出来的事实**，不是拿标题猜身份 —— 猜的是「标题属于这条链接」，而
+    # 剪贴板里只有这一条链接。标题可能被 flavor 截断（真实反馈：``语法高频
+    # 30 个`` 的 HTML/RTF 只给出 ``30``），所以「一个标题是另一个的子串」也认，
+    # 并保留更长的那份。
+    def norm(text):
+        return " ".join(str(text or "").split()).strip().lower()
+
     ids = [x for x in found if x.get("id")]
     bare = [x for x in found if not x.get("id")]
-    if len(ids) == 1 and not ids[0].get("title") and len(bare) == 1:
-        ids[0]["title"] = (bare[0].get("title") or "").strip() or None
-        found.remove(bare[0])
+    if len(ids) == 1 and bare:
+        id_title = norm(ids[0].get("title"))
+        candidates = []
+        for item in bare:
+            title = norm(item.get("title"))
+            if not title:
+                continue
+            if not id_title or id_title in title or title in id_title:
+                candidates.append(item)
+        chosen = None
+        if len(bare) == 1:
+            chosen = bare[0]
+        elif len(candidates) == 1 and id_title:
+            chosen = candidates[0]
+        if chosen is not None:
+            chosen_title = (chosen.get("title") or "").strip()
+            if chosen_title and (not id_title
+                                 or len(norm(chosen_title)) >= len(id_title)):
+                ids[0]["title"] = chosen_title
+            found.remove(chosen)
     return found
 
 

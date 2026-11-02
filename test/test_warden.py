@@ -68,6 +68,10 @@ os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
 # 更糟的是重复任务会在 refresh 里被 materialize，那是会**写**真库的。
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
 os.environ["TI_TASK_ARCHIVE"] = os.path.join(TMP, "task-archive.json")
+# 收尾队列也必须关进临时目录：真实 temp/keep_session-postsession.json 里只要有
+# 一场待收尾，paint() 就会自己弹消息，把「消息区只显示最近 3 条」这类断言挤红
+# （时间相关，平时看不出来，跑在整点后必现）。
+os.environ["TI_POSTSESSION_FILE"] = os.path.join(TMP, "postsession.json")
 ks.STATE_FILE = os.path.join(TMP, "state.json")
 # 改排布会取 daemon 那一轮的 round lock、并写「我取消的」挂号单 —— 别落到真目录里
 ks.LOCK_FILE = os.path.join(os.path.dirname(ks.STATE_FILE), "keep_session.lock")
@@ -722,6 +726,10 @@ for width in (40, 120):
               "重复任务本体" in compact and "repeat_parent" in compact, True)
         check("width=%d help 里有 🔁 / 🔗 来源记号" % width,
               "🔁" in compact and "🔗" in compact, True)
+        check("width=%d help 里有 -st/--single-task" % width,
+              "single-task" in compact, True)
+        check("width=%d help 里说 formatter 转嫁给子任务" % width,
+              "转嫁" in compact, True)
 
 # 已匹配标记必须真的渲染出来（Text.append 不解析 markup，踩过）
 buf = io.StringIO()

@@ -302,7 +302,15 @@ TASK_SHORT_FLAGS = (
     # `--formatter end`，后面的参数（key=value）照常跟着。
     repl_kit.ShortFlag("-t", ("--trigger",), note="trigger 预设函数"),
     repl_kit.ShortFlag("-f", ("--formatter",), note="formatter 预设函数"),
+    # `task import -st` ≡ `--single-task`：只导入这一条，就算 OmniFocus 里是
+    # 重复任务也不问「复制重复设置」、不建本地 repeat。
+    repl_kit.ShortFlag("-st", ("--single-task",), note="只导入一次，不建重复任务"),
 )
+
+#: `cmd_task_import` 挂起等待 y/n/q 时返回的哨兵：`cmd_task` 看见它就别再把
+#: 后缀（-a / -n / -m / -t / -f）套到「上一次选中的任务」上，而是存进
+#: ``pending_import["suffix"]``，等用户答完再落到真正导入的任务上。
+IMPORT_PENDING = object()
 
 # 手动状态标记：`task 3 -m complete` / `task 3 --mark discard`。
 # 这是**账本动作**，不是「完成/放弃」那套外部联动：
@@ -864,7 +872,7 @@ def _task_command(w):
         # 紧凑短选项（-an/-ac/-m/-t/-f）由 task_completer 的 short 表补，不要
         # 在 options 里再写一遍 —— 否则 Tab 菜单里会出现两个一模一样的候选。
         options=("--assign", "-a", "--note", "-n", "--from", "-s", "--mark", "--trigger",
-                 "--formatter", "--repeat",
+                 "--formatter", "--repeat", "--single-task",
                  "create", "import", "delete", "modify", "note", "assign", "select",
                  "swap", "repeat", "sync", "archive", "inspect-due"),
         values=_TaskCompletionValues({"--mark": TASK_MARK_WORDS,
@@ -1209,9 +1217,11 @@ def _hint_task(parts):
         head = head[1:]
     action = head[0] if head else ""
     if action in ("import", "粘贴", "导入"):
-        return repl_kit.Hint("参数", ("（不写）", "[标题](omnifocus:///task/PK)", "-a 3"),
+        return repl_kit.Hint("参数", ("（不写）", "[标题](omnifocus:///task/PK)", "-a 3",
+                                      "-st"),
                              note="不写参数 = 读剪贴板（⌘V 到终端只剩标题，这条不会丢链接）；"
-                                  "OmniFocus 里是重复任务时会先问要不要复制重复设置")
+                                  "OmniFocus 里是重复任务时会先问要不要复制重复设置；"
+                                  "-st/--single-task = 只导入这一条，不问也不建 repeat")
     if action in ("link", "关联"):
         return repl_kit.Hint("参数", ("（不写）", "omnifocus:///task/PK", "PK"),
                              note="不给链接 = 读剪贴板")
@@ -1897,6 +1907,8 @@ class TaskView(View):
             fmt_txt = str(fmt.get("name") or "—")
             if fmt.get("reservation"):
                 fmt_txt += "@" + str(fmt["reservation"].get("start") or "?")
+            elif fmt and ts.TaskStore.is_repeat_template(task):
+                fmt_txt += "（模板）"
             status_txt = "%s %s" % (w.task_mark(task) or "·", status)
             tags = task.get("tags") or []
             t.add_row(str(w.task_no(task) or "—"),
@@ -2433,7 +2445,8 @@ class Warden(object):
                 continue
             title = self.task_store.focusmate_title(task, max_len=TASK_CELL_TITLE_MAX)
             prefix = self.task_mark(task) + ts.TaskStore.origin_marks(task)
-            if task.get("formatter"):
+            # 本体的 formatter 只是模板，不能被画成「已经排过」（⏱ 属于子任务）。
+            if task.get("formatter") and not ts.TaskStore.is_repeat_template(task):
                 prefix += "⏱"
             no = self.task_no(task)
             parts.append("%s%d: %s" % (prefix, no, title) if no else
@@ -2458,8 +2471,13 @@ class Warden(object):
     def task_panel_tasks(self, day=None):
         """这一天任务面板里该出现哪些任务 —— 用户定的两条规矩。
 
-        * **今天（以及以后）**：所有没做完的 + 今天被处理过的。
+        * **今天（以及以后）**：没挂 session 的、以及**挂在这一天**的没做完任务；
+          再加上今天被处理过的。
         * **过去那天**：固化，只剩「那一天的 session 里被处理过的」。
+
+        关键一条：**已挂到别的日期的任务属于那一天，不属于今天**。明天 22:15 的
+        任务今天不出现在面板里（切到 `day +1` 才出现）—— 否则今天的序号里混着
+        明天的活，按面板序号敲命令就会打到错的账上。
 
         「被处理过」不挑结果：放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / 跳过
         都算一笔，痕迹记在 ``task["history"]``（``TaskStore.mark_processed``）。
@@ -2477,9 +2495,13 @@ class Warden(object):
         for task in self.task_store.list():
             records = self.task_store.processed_on(task, iso)
             sess = task.get("session") or {}
-            attached_today = (sess.get("date") or "") == iso
+            sess_day = sess.get("date") or ""
+            attached_today = sess_day == iso
             if self.task_store.is_open(task):
-                # 没做完的一律挂在「今天」的面板上；过去那天只有「问过但没收掉」才留
+                # 已经排到某一天的任务只在那一天的面板里出现（除非那天处理过它，
+                # 那是历史账）。没挂 session 的才是「随时可干」的待办。
+                if sess_day and not attached_today and not records:
+                    continue
                 if is_today_or_later or records or attached_today:
                     open_tasks.append(task)
             elif records or attached_today:
@@ -2601,7 +2623,8 @@ class Warden(object):
         """任务面板里那一格的字：状态 + 来源记号 + 裁过的标题。"""
         title = self.task_store.focusmate_title(task, max_len=TASK_CELL_TITLE_MAX)
         prefix = self.task_mark(task) + ts.TaskStore.origin_marks(task)
-        if task.get("formatter"):
+        # 本体的 formatter 是给子任务的模板；⏱ 只画在真正排过的子任务上。
+        if task.get("formatter") and not ts.TaskStore.is_repeat_template(task):
             prefix += "⏱"
         return prefix + title
 
@@ -2633,8 +2656,9 @@ class Warden(object):
     def render_task_index(self):
         """契约视图里那块「任务面板」：编号+任务 并排，列数看屏幕宽度。
 
-        内容按天决定（见 :meth:`task_panel_tasks`）：今天 = 没做完的 + 今天处理过的，
-        过去那天 = 只有那天处理过的。**顺序**见 :meth:`task_panel_order`：先按状态
+        内容按天决定（见 :meth:`task_panel_tasks`）：今天 = 没挂 session 的 +
+        挂今天 session 的 + 今天处理过的（排到明天的今天不出现），过去那天 =
+        只有那天处理过的。**顺序**见 :meth:`task_panel_order`：先按状态
         分段（进行中 → 完成 → 放弃），段内未挂 session 最前、之后一场一段、段内按编号。
         还是这一张表，只是同类的连号挨在一起；格子是**一行一行**填的，所以一行
         从左读到右编号是递增的。配色见文件头那段「配色」。
@@ -2662,7 +2686,7 @@ class Warden(object):
         for task in tasks:
             counts[ts.TaskStore.status_of(task)] = counts.get(
                 ts.TaskStore.status_of(task), 0) + 1
-        scope = ("今天 = 没做完的 + 今天处理过的"
+        scope = ("今天 = 没挂 session 的 + 挂今天的 + 今天处理过的"
                  if self.sel_date >= datetime.date.today()
                  else "%s = 那天处理过的（过去就固化）" % self.sel_date.isoformat())
         t.caption = ("%d 条：%d 进行中 · %d 完成 · %d 放弃 "
@@ -4002,6 +4026,21 @@ class Warden(object):
             # `task -m complete` / `task -f end`：作用于当前选中的任务。
             action = "hook" if (trigger_spec or formatter_spec) and mark_status is None else "mark"
             result = None
+        if result is IMPORT_PENDING:
+            # 重复任务导入在等 y/n/q，**还没有**建出任务。这时 -a / -n / -m /
+            # -t / -f 绝不能落到「上一次选中的任务」上（用户反馈：task import
+            # -ac 的 -ac 不生效，反而把旧任务挂到了当前这一场）。先存起来，
+            # 等 _answer_pending_import() 真正建完再按同样顺序套上去。
+            pending = self.pending_import or {}
+            pending["suffix"] = {
+                "assign_to": assign_to,
+                "note_text": note_text,
+                "mark_status": mark_status,
+                "trigger_spec": trigger_spec,
+                "formatter_spec": formatter_spec,
+            }
+            self.pending_import = pending
+            return None
         if note_text is not None:
             self._apply_note(result, note_text, action)
         if assign_to is not None:
@@ -4265,21 +4304,123 @@ class Warden(object):
     def _apply_formatter(self, result, spec, action):
         """``-f/--formatter`` 的收尾：记下 preset，并**当场调用它**。
 
-        ``end`` 会返回一个 reservation；这里负责：
-          1. 按任务 duration 选出 session（算法在 :mod:`task_hooks`）；
-          2. 把任务挂到那个 session（``assign_task_to``，能建 Focusmate 就建）；
-          3. 把 ``formatter.reservation`` 写回任务 —— 之后别的 formatter 看到
-             这段就不会再用。
-
-        自动 runner 必须传 ``allow_today=False``（见 ``task_hooks.resolve_target_day``）；
-        用户手敲这条命令是手动操作，所以这里允许今天。
+        普通任务当场排；**重复任务本体**不排自己，而是把 formatter 记成模板，
+        再转嫁给它的 occurrence 子任务（今天 + 明天 / 下一个规则日）。本体永远
+        不挂 session —— 用户在契约表里看到、能完成的是子任务。
         """
         if action in self.NO_TASK_ACTIONS:
             self.say("`-f/--formatter` 对 %s 没意义（它不产出任务），忽略。" % action, "warn")
             return None
         task = self._hook_task(result, "formatter", action)
+        if ts.TaskStore.is_repeat_template(task):
+            return self._apply_formatter_to_repeat_template(task, spec)
+        return self._apply_formatter_to_task(task, spec, action=action)
+
+    def _apply_formatter_to_repeat_template(self, task, spec):
+        """把 formatter 记在重复任务**本体**上，再落到子任务上。
+
+        本体只保存规则模板（``ts.TaskStore.hook_template`` 会摘掉 reservation /
+        result / applied_at）。随后为「今天 / 明天 / 下一个规则日」生成 occurrence
+        子任务，并在每个子任务上真的跑一遍 formatter —— 这样 ``task <本体> -f
+        end`` 的产出是子任务，本体自己仍然没有 session。
+        """
         day = th.resolve_target_day(self.sel_date, datetime.datetime.now(),
                                     spec.get("args") or {}, allow_today=True)
+        today = datetime.date.today()
+        if day < today:
+            raise ValueError("formatter 不能排到过去（%s）。先切到那一天或指定 date=。"
+                             % day.isoformat())
+        template = ts.TaskStore.hook_template(spec)
+        task = self.task_store.set_hook(task["id"], "formatter", template)
+        # 旧数据可能把本体当普通任务排过（带 session / focusmate）；能落到规则日
+        # 就把那一场**转给**子任务，本体下架。不能落就留着让用户手动处理，
+        # 至少不再把 formatter 写在本体的 reservation 上。
+        task = self._adopt_template_session(task)
+        days = self._repeat_prepare_days(task, day, limit=2, horizon=7)
+        if not days:
+            self.say("🔁 任务 %s 的 formatter %s 已记在本体上；从 %s 起 7 天里"
+                     "没有它的规则日，所以还没有子任务可排。"
+                     % (self.task_label(task), (template or {}).get("name") or "?",
+                        day.isoformat()), "warn")
+            self.rebuild_rows()
+            return task
+        made = []
+        for probe in days:
+            self.ensure_repeat_occurrences(probe, force_formatters=True)
+            child = self.task_store.occurrence_for(task["id"], probe)
+            if child is not None:
+                made.append(child)
+        if made:
+            self.selected_task_id = made[-1]["id"]
+        names = "、".join("%s %s" % ((c.get("repeat_date") or "?"),
+                                    (c.get("session") or {}).get("start") or "没排上")
+                         for c in made)
+        self.say("🔁 本体 %s 的 formatter %s 已转嫁给 %d 条子任务：%s"
+                 % (self.task_label(task), (template or {}).get("name") or "?",
+                    len(made), names or "（没生成）"), "ok")
+        self.rebuild_rows()
+        return task
+
+    @staticmethod
+    def _repeat_prepare_days(parent, start, limit=2, horizon=7):
+        """从 ``start`` 起找这个重复任务接下来要准备的规则日（最多 ``limit`` 个）。"""
+        days = []
+        probe = start
+        for _ in range(max(1, int(horizon))):
+            if ts.TaskStore.repeat_due_on(parent, probe):
+                days.append(probe)
+                if len(days) >= max(1, int(limit)):
+                    break
+            probe += datetime.timedelta(days=1)
+        return days
+
+    def _adopt_template_session(self, parent):
+        """把旧数据里重复任务**本体**身上的 session 转给当天的子任务。
+
+        新模型里本体永远不挂 session；以前 `-f end` 会把本体排进某一场。这里
+        只在「那天确实是规则日」时搬过去：子任务接过 session / Focusmate task，
+        本体下架。搬不了就原样留着（宁可不猜），但界面上仍然不会把本体当任务列。
+        """
+        if not ts.TaskStore.is_repeat_template(parent):
+            return parent
+        sess = parent.get("session") or {}
+        iso = str(sess.get("date") or "").strip()
+        if not iso:
+            return parent
+        try:
+            day = datetime.date.fromisoformat(iso)
+        except ValueError:
+            return parent
+        if not ts.TaskStore.repeat_due_on(parent, day):
+            return parent
+        child = self.task_store.occurrence_for(parent["id"], day)
+        if child is None:
+            child = self.task_store.create_repeat_occurrence(
+                parent["id"], day, session=sess)
+        elif not (child.get("session") or {}):
+            child = self.task_store.assign(child["id"], sess)
+        fm = parent.get("focusmate") or {}
+        if fm.get("task_id") or fm.get("id"):
+            self.task_store.attach_focusmate(
+                child["id"],
+                {k: fm.get(k) for k in ("task_id", "id", "session_id", "attached_at",
+                                        "title", "via") if fm.get(k) is not None},
+                session=sess)
+        parent = self.task_store.unassign(parent["id"], reason="repeat-template-adopt")
+        self.say("🔁 重复任务本体 %s 原来挂在 %s %s，已转给子任务 %s（本体不占 session）"
+                 % (self.task_label(parent), iso, sess.get("start") or "?",
+                    self.task_label(child)), "warn")
+        return parent
+
+    def _apply_formatter_to_task(self, task, spec, action="hook", day=None, quiet=False):
+        """在**一条具体任务**（通常是 occurrence 子任务）上执行 formatter。
+
+        ``day`` 给了就排那一天（重复任务转嫁时按子任务的 repeat_date 排）；
+        没给就按 ``-f`` 的 date= / 当前选中那天解析。
+        """
+        if day is None:
+            day = th.resolve_target_day(self.sel_date, datetime.datetime.now(),
+                                        spec.get("args") or {}, allow_today=True)
         today = datetime.date.today()
         if day < today:
             raise ValueError("formatter 不能排到过去（%s）。先切到那一天或指定 date=。"
@@ -4333,15 +4474,16 @@ class Warden(object):
         spec["reservation"] = reservation
         spec["applied_at"] = ts._now()
         task = self.task_store.set_hook(task["id"], "formatter", spec)
-        self.say("✅ 任务 %s「%s」已由 formatter %s 排到 %s %s–%s"
-                 "（session %s 分钟，任务 %s 分钟 + %s 分钟休息；占用 %s–%s）%s"
-                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
-                    spec.get("name"), reservation.get("date"), reservation.get("start"),
-                    reservation.get("end"), reservation.get("session_duration"),
-                    reservation.get("duration"), reservation.get("break_minutes"),
-                    reservation.get("start"), reservation.get("end"),
-                    ("；" + note) if note else ""), "ok")
-        self.selected_task_id = task["id"]
+        if not quiet:
+            self.say("✅ 任务 %s「%s」已由 formatter %s 排到 %s %s–%s"
+                     "（session %s 分钟，任务 %s 分钟 + %s 分钟休息；占用 %s–%s）%s"
+                     % (self.task_label(task), self.task_store.focusmate_title(task, 40),
+                        spec.get("name"), reservation.get("date"), reservation.get("start"),
+                        reservation.get("end"), reservation.get("session_duration"),
+                        reservation.get("duration"), reservation.get("break_minutes"),
+                        reservation.get("start"), reservation.get("end"),
+                        ("；" + note) if note else ""), "ok")
+            self.selected_task_id = task["id"]
         self.rebuild_rows()
         return task
 
@@ -4414,6 +4556,12 @@ class Warden(object):
             raise ValueError("`-m/--mark` 要跟一条任务：`task 3 -m complete` / "
                              "`task -m discard 3`（没有选中的任务可标）")
         task_id = task["id"]
+        if status == ts.STATUS_COMPLETED and ts.TaskStore.is_repeat_template(task):
+            raise ValueError("任务 %s 是重复任务**本体**，不能标记完成；完成的是它生成的"
+                             "子任务。要结束这套重复：`task repeat %s off` 或 "
+                             "`task %s drop`（手动放弃）。"
+                             % (self.task_label(task), self.task_label(task),
+                                self.task_label(task)))
         current = self.task_store.status_of(task)
         if current == status:
             self.say("任务 %s 已经是「%s」，没有改。"
@@ -4722,11 +4870,13 @@ class Warden(object):
         if not toks:
             raise ValueError("用法：task <任务序号> drop [--local]")
         task = self.resolve_task(toks[0])
+        template = ts.TaskStore.is_repeat_template(task)
         note = "" if local_only else self.omni_drop(task)
         task = self.task_store.set_status(task["id"], ts.STATUS_DROPPED, reason="cmd-drop")
-        self.say("✗ 任务 %s「%s」已放弃%s"
+        self.say("✗ 任务 %s「%s」已放弃%s%s"
                  % (self.task_label(task), self.task_store.focusmate_title(task, 40),
-                    ("；" + note) if note else "（只改了本地）"), "ok")
+                    ("；" + note) if note else "（只改了本地）",
+                    "；这是重复任务本体，之后不再生成子任务" if template else ""), "ok")
         return task
 
     def cmd_task_done(self, args):
@@ -4738,6 +4888,12 @@ class Warden(object):
         if not toks:
             raise ValueError("用法：task <任务序号> done [实际分钟数]")
         task = self.resolve_task(toks[0])
+        if ts.TaskStore.is_repeat_template(task):
+            raise ValueError("任务 %s 是重复任务**本体**，不能当成一次 session 的活来完成；"
+                             "它能生成的子任务才是能完成的。要结束这套重复："
+                             "`task repeat %s off`（保留任务）或 `task %s drop`（手动放弃）。"
+                             % (self.task_label(task), self.task_label(task),
+                                self.task_label(task)))
         minutes = None
         if len(toks) > 1:
             try:
@@ -4815,13 +4971,13 @@ class Warden(object):
 
         pending, self.pending_import = self.pending_import, None
         try:
-            self._finish_task_import(
+            task = self._finish_task_import(
                 pending.get("items") or [],
-                pending.get("assign_to"),
                 copy_repeat=(text in yes),
                 repeats=pending.get("repeats") or {},
                 warnings=pending.get("warnings") or [],
             )
+            self._apply_import_suffix(task, pending.get("suffix"))
         except ValueError as e:
             self.had_error = True
             self.say(str(e), "warn")
@@ -4835,8 +4991,31 @@ class Warden(object):
         self.invalidate()
         return True
 
-    def _finish_task_import(self, items, assign_to=None, copy_repeat=False,
-                            repeats=None, warnings=None):
+    def _apply_import_suffix(self, task, suffix):
+        """把 `task import` 后面挂的 -n / -a / -m / -t / -f 落到**真正导入的任务**上。
+
+        和 :meth:`cmd_task` 的后缀顺序保持一致：note → assign → mark → trigger →
+        formatter。重复任务本体会在这些动作里被导向当天的 occurrence 子任务
+        （见 :meth:`_assign_task` / :meth:`_apply_formatter`），所以 ``task import
+        -ac`` 不会把模板本身挂到 session 上。
+        """
+        if not isinstance(task, dict) or task.get("id") is None:
+            return task
+        suffix = suffix if isinstance(suffix, dict) else {}
+        if suffix.get("note_text") is not None:
+            self._apply_note(task, suffix["note_text"], "import")
+        if suffix.get("assign_to") is not None:
+            self._apply_assign(task, suffix["assign_to"], "import")
+        if suffix.get("mark_status") is not None:
+            self._apply_mark(task, suffix["mark_status"], "import")
+        if suffix.get("trigger_spec") is not None:
+            self._apply_trigger(task, suffix["trigger_spec"], "import")
+        if suffix.get("formatter_spec") is not None:
+            self._apply_formatter(task, suffix["formatter_spec"], "import")
+        return task
+
+    def _finish_task_import(self, items, copy_repeat=False, repeats=None,
+                            warnings=None):
         """把（已经问过重复设置的）候选真正写进本地任务库。"""
         repeats = repeats or {}
         for warning in warnings or []:
@@ -4846,6 +5025,18 @@ class Warden(object):
             if not item:
                 continue
             title = item.get("title") or (item.get("id") or "（无标题）")
+            rec = repeats.get(index) or {}
+            plan = rec.get("plan") or {}
+            fields = {"title": title}
+            # OmniFocus 的 estimatedMinutes 就是「这条活要多久」；导入时落到
+            # fields.duration，formatter end 才有东西可排（不像 repeat.duration
+            # 只是找 session 的锚点）。用户已经手写过就不覆盖。
+            try:
+                minutes = int(plan.get("duration"))
+            except (TypeError, ValueError):
+                minutes = None
+            if minutes and minutes > 0:
+                fields["duration"] = str(minutes)
             omnifocus = None
             if item.get("id"):
                 omnifocus = {"id": item["id"], "url": item.get("url"),
@@ -4854,7 +5045,7 @@ class Warden(object):
                        "url": item.get("url") or "omnifocus:///task/%s" % item["id"],
                        "title": item.get("title")}
                       if item.get("id") else None)
-            task = self.task_store.create({"title": title}, omnifocus=omnifocus,
+            task = self.task_store.create(fields, omnifocus=omnifocus,
                                           source=source)
             made.append(task)
             if item.get("id"):
@@ -4869,8 +5060,6 @@ class Warden(object):
                          "再敲 `task %s link`（不带参数就是读剪贴板）。"
                          % self.task_no(task), "info")
 
-            rec = repeats.get(index) or {}
-            plan = rec.get("plan") or {}
             if not copy_repeat or not rec:
                 continue
             if not plan.get("supported"):
@@ -4901,8 +5090,6 @@ class Warden(object):
                 self.say("   %s" % plan["note"], "info")
         if made:
             self.selected_task_id = made[-1]["id"]
-        if made and assign_to:
-            self._assign_task(made[-1], assign_to)
         return made[-1] if made else None
 
     def cmd_task_import(self, args):
@@ -4915,6 +5102,7 @@ class Warden(object):
 
             task import                 ← 读剪贴板（默认动作，不需要 flag）
             task import -a 3            ← 同上，顺手分流/挂到表格 #3
+            task import -st             ← 只导入这一条，不问重复设置、不建 repeat
             task import [标题](omnifocus:///task/PK)   ← 手动给链接
 
         为什么不靠粘贴：从 OmniFocus ⌘C 再往终端 ⌘V，粘出来的**只有标题** ——
@@ -4932,15 +5120,18 @@ class Warden(object):
         """
         toks = []
         assign_to = None
+        single_task = False
         raw = [str(a).strip() for a in args]
         i = 0
         while i < len(raw):
             tok, low = raw[i], str(raw[i]).lower()
-            if low in ("--assign", "-a") and i + 1 < len(raw):
+            if low in ("--single-task", "-st"):
+                single_task = True
+            elif low in ("--assign", "-a") and i + 1 < len(raw):
                 assign_to = raw[i + 1]
                 i += 2
                 continue
-            if low.startswith("--assign="):
+            elif low.startswith("--assign="):
                 assign_to = tok.split("=", 1)[1]
             elif tok:
                 toks.append(tok)
@@ -4962,7 +5153,10 @@ class Warden(object):
 
         repeats = {}
         warnings = []
-        checker = getattr(self.omnifocus, "repetition_info", None)
+        checker = None if single_task else getattr(self.omnifocus, "repetition_info", None)
+        if single_task:
+            self.say("📥 按 -st/--single-task 只导入这一条；不去核对重复设置，"
+                     "也不会建本地 repeat。", "cmd")
         for index, item in enumerate(items):
             if not item or not item.get("id") or checker is None:
                 continue
@@ -4980,10 +5174,12 @@ class Warden(object):
         if repeats:
             self.pending_import = {
                 "items": items,
-                "assign_to": assign_to,
                 "repeats": repeats,
                 # warnings 已经在这里说过了；别再存一份，否则答完 y/n 又重复一遍
                 "warnings": [],
+                # 直接调 cmd_task_import 时也能保住 -a；走 cmd_task 时会被
+                # 包含全部后缀（-n/-m/-t/-f）的那份覆盖。
+                "suffix": {"assign_to": assign_to} if assign_to is not None else {},
             }
             titles = "、".join((items[i] or {}).get("title") or (items[i] or {}).get("id")
                                or "?" for i in sorted(repeats))
@@ -4992,10 +5188,14 @@ class Warden(object):
             for warning in warnings:
                 self.say(warning, "warn")
             self.invalidate()
-            return None
+            return IMPORT_PENDING
 
-        return self._finish_task_import(items, assign_to=assign_to,
-                                        copy_repeat=False, repeats={}, warnings=warnings)
+        task = self._finish_task_import(items, copy_repeat=False, repeats={},
+                                        warnings=warnings)
+        # 直接调本方法（不带 cmd_task 的后缀管线）时，-a 也要生效。
+        self._apply_import_suffix(task, {"assign_to": assign_to}
+                                  if assign_to is not None else {})
+        return task
 
     @staticmethod
     def _task_import_match_clipboard(items, clip_items):
@@ -5284,6 +5484,12 @@ class Warden(object):
                         row.get("startLabel"), row.get("phase") or ""), "info")
         if row is None:
             # `-a none`：下架。它不是一个「场次」，所以不走下面那套建 task 的流程。
+            if ts.TaskStore.is_repeat_template(task):
+                self.say("🔁 任务 %s 是重复任务本体，本来就不占 session；要结束这套重复："
+                         "`task repeat %s off`（保留任务）或 `task %s drop`（手动放弃）。"
+                         % (self.task_label(task), self.task_label(task),
+                            self.task_label(task)), "info")
+                return task
             self.selected_task_id = task["id"]
             task = self._task_detach(task, reason="cmd-assign-none")
             self.rebuild_rows()
@@ -5292,6 +5498,23 @@ class Warden(object):
             raise ValueError("session #%d 还没有 Focusmate session id（没订上/快照），"
                              "不能挂 task。先 refresh 成功一次。" % session_idx)
         date_iso = row.get("date") or self.sel_date.isoformat()
+        if ts.TaskStore.is_repeat_template(task):
+            # 本体不能进 session；-a/-ac 指到哪一天，就挂/生成那一天的子任务。
+            probe = datetime.date.fromisoformat(date_iso)
+            if not ts.TaskStore.repeat_due_on(task, probe):
+                raise ValueError("任务 %s 是重复任务本体，而这个 session 在 %s，"
+                                 "不是它的规则日；本体不占 session。切到它的规则日再挂，"
+                                 "或者直接 `task %s -f end` 让 formatter 排子任务。"
+                                 % (self.task_label(task), date_iso,
+                                    self.task_label(task)))
+            self.ensure_repeat_occurrences(probe, apply_formatters=True)
+            child = self.task_store.occurrence_for(task["id"], probe)
+            if child is None:
+                raise ValueError("任务 %s 的 %s 子任务没生成出来（先看 task sync 的错误）。"
+                                 % (self.task_label(task), date_iso))
+            self.say("🔁 本体 %s 不占 session；这次挂的是它 %s 的子任务 %s。"
+                     % (self.task_label(task), date_iso, self.task_label(child)), "info")
+            task = child
         session = {
             "index": session_idx,
             "date": date_iso,
@@ -5389,20 +5612,61 @@ class Warden(object):
             return best, "nearest"
         return None, "no-session"
 
-    def ensure_repeat_occurrences(self, day=None):
-        """生成 ``day`` 这一天该有的重复子任务（本地，不碰 Focusmate）。
+    def _repeat_formatter_done(self, child, day):
+        """子任务在 ``day`` 上是不是已经跑过 formatter（有当天的 reservation）。"""
+        fmt = (child or {}).get("formatter") or {}
+        reservation = fmt.get("reservation") or {}
+        return reservation.get("date") == day.isoformat()
+
+    def _format_repeat_child(self, parent, child, day, quiet=True):
+        """把本体上的 formatter 模板落到一条子任务上；失败只警告、不掀 TUI。"""
+        template = ts.TaskStore.hook_template(parent.get("formatter"))
+        if not template:
+            return child
+        current = ts.TaskStore.hook_template(child.get("formatter"))
+        if current != template:
+            child = self.task_store.set_hook(child["id"], "formatter", template)
+        try:
+            return self._apply_formatter_to_task(
+                child, template, action="repeat", day=day, quiet=quiet)
+        except Exception as e:                          # noqa: BLE001 - 一条排不上不该挡别的
+            self.had_error = True
+            self.say("⚠ 重复任务子任务 %s 的 formatter %s 没排上：%s"
+                     % (self.task_label(child), template.get("name") or "?", e), "warn")
+            return self.task_store.get(child["id"])
+
+    def ensure_repeat_occurrences(self, day=None, apply_formatters=True,
+                                  force_formatters=False, only_formatted=False):
+        """生成 ``day`` 这一天该有的重复子任务（本地；formatter 可能碰 Focusmate）。
 
         本体（带 ``repeat``、没有 ``repeat_parent``）永远不挂 session；每到一个
         规则日就生成一条子任务（``repeat_parent`` + ``repeat_date``），并把
         ``repeat.occurrences[日期]`` 记到本体上。子任务能挂到当天 session 就挂，
         挂不到也照建 —— 晚点用户手动 assign 或 task sync 再补。
+
+        本体挂了 formatter 时，子任务创建后自动继承并**当场排一遍**（``days``
+        只看今天/以后）。``force_formatters=True`` 用于用户刚改了本体的 formatter，
+        要求连已经排过的子任务也重排。``only_formatted=True`` 只处理挂了 formatter
+        的本体（TUI 每天会顺手把明天那条也准备好，让用户今天就能看到）。
         """
         day = day or self.sel_date
         iso = day.isoformat()
         sessions = self.sessions_for_day_plan(day)
+        # 旧数据里的本体可能带着 session：先把那一场转给当天的子任务。
+        for candidate in self.task_store.repeated_tasks():
+            if not ts.TaskStore.is_repeat_template(candidate):
+                continue
+            if ((candidate.get("session") or {}).get("date") or "") == iso:
+                self._adopt_template_session(candidate)
         changed = []
+        today = datetime.date.today()
         for parent in self.task_store.repeated_tasks():
             if not ts.TaskStore.is_repeat_template(parent):
+                continue
+            if not self.task_store.is_open(parent):
+                # 本体被手动放弃/完成（结束这套重复）后就不再生成子任务。
+                continue
+            if only_formatted and not parent.get("formatter"):
                 continue
             if not ts.TaskStore.repeat_due_on(parent, day):
                 continue
@@ -5417,11 +5681,25 @@ class Warden(object):
                 # 不覆盖用户手动挪到别的场次）。
                 child = self.task_store.assign(child["id"], session)
                 changed.append(child)
+            # formatter 属于**子任务**：本体只留模板。今天及以后自动排；
+            # 过去那天不补排（formatter 不允许排到过去）。
+            if (apply_formatters and day >= today and parent.get("formatter")
+                    and (force_formatters or not self._repeat_formatter_done(child, day))):
+                before = child.get("formatter") or {}
+                child = self._format_repeat_child(parent, child, day, quiet=True)
+                if (child.get("formatter") or {}) != before:
+                    changed.append(child)
             occ = ((parent.get("repeat") or {}).get("occurrences") or {}).get(iso) or {}
             target = child.get("session") or session
-            if occ.get("child_id") != child["id"] or (target and occ.get("session") != target):
+            fm = child.get("focusmate") or {}
+            fm_id = fm.get("task_id") or fm.get("id")
+            occ_fm = (occ.get("focusmate") or {}).get("task_id")
+            if (occ.get("child_id") != child["id"]
+                    or (target and occ.get("session") != target)
+                    or (fm_id and occ_fm != fm_id)):
                 self.task_store.record_occurrence(
-                    parent["id"], day, child_id=child["id"], session=target, note=why)
+                    parent["id"], day, child_id=child["id"], session=target,
+                    focusmate=fm or None, note=why)
         return changed
 
     def maybe_generate_repeat_occurrences(self):
@@ -5435,6 +5713,16 @@ class Warden(object):
         self._repeat_gen_at = now
         try:
             created = self.ensure_repeat_occurrences(today)
+            # 挂了 formatter 的本体：顺手把明天那条也生成/排好，用户今天就能在
+            # `day +1` 里看到「明天会被 format 成什么样」。没挂 formatter 的
+            # 本体不提前生成（仍然等到那天）。
+            has_formatter = any(
+                ts.TaskStore.is_repeat_template(t) and t.get("formatter")
+                and self.task_store.is_open(t)
+                for t in self.task_store.repeated_tasks())
+            if has_formatter:
+                created += self.ensure_repeat_occurrences(
+                    today + datetime.timedelta(days=1), only_formatted=True)
         except Exception as e:                          # noqa: BLE001 - 生成失败不该拖死看板
             self.had_error = True
             self.say("重复任务生成失败：%s" % e, "warn")
@@ -5843,6 +6131,9 @@ class Warden(object):
                 by_id[str(row["id"])] = row
         out = {}
         for task in self.task_store.list():
+            if ts.TaskStore.is_repeat_template(task):
+                # 本体不是一次可完成的活；同一条 OmniFocus 的完成状态只对齐到子任务。
+                continue
             pk = ts.TaskStore.omnifocus_id(task)
             if pk and str(pk) in by_id:
                 out[task["id"]] = by_id[str(pk)]
@@ -5873,6 +6164,9 @@ class Warden(object):
                          reason="disabled_or_unavailable")
             return done
         for task in (tasks if tasks is not None else self.task_store.list()):
+            if ts.TaskStore.is_repeat_template(task):
+                # 本体不可完成；它的子任务共享同一条 OmniFocus 链接，写回由子任务做。
+                continue
             if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
                 continue
             if not ts.TaskStore.omnifocus_id(task):
@@ -6051,6 +6345,8 @@ class Warden(object):
             try:
                 task = self.task_store.get(task_id)
             except ValueError:
+                continue
+            if ts.TaskStore.is_repeat_template(task):
                 continue
             if self.task_store.is_open(task):
                 self.task_store.set_status(task_id, ts.STATUS_COMPLETED,
@@ -7508,24 +7804,29 @@ class Warden(object):
                                                   "OmniFocus 导入的规则会保留原 RRULE，"
                                                   "task repeat <id> 直接看原规则"),
             ("重复任务本体", "带 repeat 的任务（source 指向 OmniFocus）。它只当模板，"
-                              "不在【契约】表的 task 列显示；task 视图里还能管理它"),
+                              "不在【契约】表的 task 列显示、永远不挂 session，也**不能**"
+                              "被 done / -m complete；要结束这套重复用 task repeat off "
+                              "或 task <id> drop（手动）"),
             ("重复任务子任务", "到了规则日自动生成一条：repeat_parent 指向本体，"
                                 "复制标题/字段/O-F 关联，真正挂 session、显示在契约表里，"
-                                "带 🔁"),
+                                "带 🔁；只有它能被完成"),
             ("重复任务日期", "本体 repeat.rule 是 OmniFocus 原 RRULE（DAILY / 多个 BYDAY / "
                               "INTERVAL / COUNT / UNTIL …），日期由 dateutil 展开；"
                               "start/duration 只决定优先挂当天哪一场"),
             ("契约表来源记号", "🔁 = 重复任务子任务 · 🔗 = 有 OmniFocus 关联 · "
                                 "🔁🔗 = 两者都有 · ⏱ = 挂了 formatter"),
             ("task import", "读剪贴板导入 OmniFocus 任务；如果是重复任务（例如每周三），"
-                            "会先问要不要把重复设置也复制到本地"),
+                            "会先问要不要把重复设置也复制到本地；-st / --single-task "
+                            "= 只导入这一条，不问也不建 repeat"),
             ("task -t  /  --trigger", "列出 trigger（创建触发）预设；现在是空列表 —— "
                                         "框架已就位，注册函数后才有名字"),
             ("task <id> -t <preset> [参数...]", "挂创建触发：只有在预设条件成立时才建任务；"
                                                   "当前只记本地，runner 还没实现"),
             ("task -f  /  --formatter", "列出 formatter（排期算法）预设；现在有 end"),
             ("task <id> -f end", "按任务 duration 找当天最后一段可用时间，截出尾部并自动挂 session；"
-                                  "例如 25min 任务占 11:30–12:00（25 + 5min 休息）"),
+                                  "例如 25min 任务占 11:30–12:00（25 + 5min 休息）。"
+                                  "挂在重复任务**本体**上时，formatter 会转嫁给今天/明天的"
+                                  "子任务，本体自己不排"),
             ("task archive [N]", "看完成归档（data/task-archive.json，只增不改）"),
             ("task sync", "GET /v1/tasks，把 completedAt 连同 session 写进完成归档"),
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
@@ -7557,6 +7858,10 @@ class Warden(object):
             "自动生成一条 occurrence 子任务：repeat_parent 指向本体、继承字段和 OmniFocus 关联；"
             "子任务才去挂当天 session（同起点优先，否则取最近一场；当天没 session 也先生成，"
             "之后手动 assign 或 task sync 再补）。子任务的 session 终点仍会写成 due。\n"
+            "本体的 formatter 只是**模板**：task <本体> -f end 会先为今天/明天/下一个规则日"
+            "生成子任务，再在每条子任务上跑 formatter（子任务带 ⏱ 和它自己的 reservation）；"
+            "本体自己永远没有 reservation、也不占 session。切换 day +1 就能看到明天那条已经"
+            "排好的子任务。只有子任务能被完成；本体要结束只能手动 task repeat off 或 drop。\n"
             "契约表 task 列来源记号：🔁=重复任务子任务，🔗=有 OmniFocus 关联，"
             "两个都有就是 🔁🔗；⏱=挂了 formatter。本体在 task 视图里只显示 🔗。\n"
             "任务视图：task 命令在任何视图都能敲；任务字段不校验，JSON 存在 data/tasks.json。\n"

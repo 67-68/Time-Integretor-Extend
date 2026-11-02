@@ -90,8 +90,9 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
 - **`history`**：「这条任务在哪一天的 session 里被处理过」。收尾/查账的每个动作
   （放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / **跳过**）都留一笔，
   `(day, start)` 相同只留最后一条，最多 `HISTORY_KEEP` 条。
-  契约视图下面那块**任务面板按天取值**就靠它：今天 = 没做完的 + 今天处理过的，
-  过去那天固化 = 只剩当时处理过的。读写入口是 `mark_processed()` / `processed_on()`；
+  契约视图下面那块**任务面板按天取值**就靠它：今天 = 没挂 session 的 + 挂今天
+  session 的 + 今天处理过的（**排到明天的任务今天不出现**）；过去那天固化 =
+  只剩当时处理过的。读写入口是 `mark_processed()` / `processed_on()`；
   老数据没有痕迹时 `processed_on()` 用 `status_at`（或 `focusmate.completed_at`）
   兜底，否则升级当天「过去几天」会整片空白。
 
@@ -145,6 +146,7 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task -m complete` / `task -m discard` | 不写序号 = 标记当前选中的任务；`-m` 与 `--mark`、后缀位置都等价 |
 | `task <序号> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
 | `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus，可一次多行；如果 OmniFocus 里是重复任务，会先问要不要复制重复设置 |
+| `task import -st`（`--single-task`） | 只导入这一条：不查重复设置、不问、不建本地 `repeat` |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
 | `task <序号> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |
 | `task <序号> -a current`（`-ac`） | 挂到**当前这一场**（进行中优先，其次最近一场） |
@@ -278,6 +280,21 @@ OmniFocus 的 `repetitionRule` 不在 `omnifocus_tasks.py list` 的公开字段�
 - 只有 RRULE 本身解析不了（例如 `BYDAY=XX`）才拒绝复制，仍然可以只导入这一次；
 - 消息会显示「每天 10:45（25 min）」「每周一、三 22:15（50 min）」这种摘要，
   同时 `task repeat <序号>` 会打印原 RRULE 和锚点。
+- `-st` / `--single-task` 跳过第 2–4 步：只导入这一条，不查询、不询问、不建
+  `repeat`。剪贴板里是重复任务、但这次只想留一条时用它。
+
+**导入后缀必须等导入真正完成之后再套**：`task import` 可能先挂起等 `y/n/q`，
+这时 `cmd_task()` 不能把 `-a` / `-n` / `-m` / `-t` / `-f` 套到「上一次选中的
+任务」上。实现上 `cmd_task_import()` 返回 `IMPORT_PENDING` 哨兵，`cmd_task()`
+把这些后缀存进 `pending_import["suffix"]`，等用户回答后由
+`_apply_import_suffix()` 按 note → assign → mark → trigger → formatter 的顺序
+落到真正导入的任务上。`task import -ac` 因此会挂到今天的 occurrence 子任务
+（本体不占 session），而不是把旧任务挂上去。
+
+纯文本粘贴里**没有链接**的多行只当一条任务（`parse_links(..., merge_bare=True)`）：
+`语法高频` + `30 个` 是折行，不是两条。剪贴板里有多条链接时按行保留标题，
+并按「同一条链接 + 一个标题是另一个的子串」合并，避免把 `语法高频 30 个`
+拆成 `30` + 全文两条。
 
 ### 为什么 `task import` 必须自己读剪贴板
 
@@ -372,6 +389,29 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
   - `⏱` = 挂了 formatter
 - 本体在 task 视图里仍可见（可以改规则 / 删除 / 看 RRULE），只是不进契约表的
   task 列；`task repeat <本体序号>` 会打印 rule / anchor / 已生成次数。
+
+### formatter 属于子任务，本体只存模板
+
+`task <本体序号> -f end` **不排本体**：
+
+- 本体只保存去掉运行时账（`reservation` / `result` / `applied_at`）的 formatter
+  模板；旧数据里 `due_source=session` 留下的过期 `due` 也会在读入时清掉；
+- 依次为今天、明天（最多两个）或 7 天内下一个规则日生成 occurrence 子任务；
+- 在每条子任务上真的执行 formatter：子任务带自己的 `formatter.reservation`
+  和 session/⏱ 记号；
+- 切到 `day +1` 就能在契约表和任务面板看到明天那条已经排好的子任务；
+- 以后每天生成子任务时，`ensure_repeat_occurrences()` 会自动继承本体的
+  formatter 模板并排当天；改过本体 formatter 后用 `-f` 会强制重排已知子任务。
+
+### 本体不能完成，只能手动结束
+
+重复任务本体不是「一次 session 的活」：
+
+- `task <本体> done`、`task <本体> -m complete` 都会被拒绝；
+- 从 Focusmate / OmniFocus 同步完成状态时，本体被排除（子任务才写回）；
+- `task <本体> -a` / `-ac` 会转到那一天的子任务（那一天不是规则日就明说）；
+- 要结束这套重复：`task repeat <本体> off`（保留任务）或
+  `task <本体> drop`（手动放弃，之后不再生成子任务）。
 
 ## trigger / formatter（任务扩展点）
 
@@ -496,6 +536,8 @@ session 结束 15 秒后 daemon 把 warden 拉到前台，逐个问没做完的�
   （见 `session_plan.md`；清掉的是绑定，不是任务）。
 - 契约表格下面那块任务面板：`number | task | number | task …`；已 assign 到
   session 的染红，没挂的深蓝（当前选中的再 reverse）。
+- **任务属于它被排的那一天**：已挂到明天 session 的任务只出现在 `day +1` 的面板，
+  今天的面板里没有它（否则今天的序号会混进明天的活，按序号敲命令就打偏）。
 
 ### 面板里的顺序：先按状态分段，段内按位置连号
 

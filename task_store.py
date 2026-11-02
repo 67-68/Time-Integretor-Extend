@@ -119,6 +119,20 @@ def _empty_store():
     return {"version": 1, "next_id": 1, "tasks": []}
 
 
+#: formatter / trigger 里有几个键是**某一次执行**的账，不属于规则本身：
+#: ``reservation`` / ``result`` / ``applied_at``。重复任务**本体**只保存规则模板，
+#: 这些运行时字段必须留在子任务上；否则本体看起来像「已经被排到某一天」。
+HOOK_RUNTIME_KEYS = ("result", "reservation", "applied_at")
+
+
+def _hook_template(spec):
+    """把 formatter/trigger 的运行时账摘掉，只留规则模板（本体用）。"""
+    if not isinstance(spec, dict):
+        return None
+    out = {k: v for k, v in spec.items() if k not in HOOK_RUNTIME_KEYS}
+    return out or None
+
+
 def _coerce_task(raw, fallback_id=None):
     """把一条可能来自旧版本/手改的 JSON 修成可用形状。"""
     if not isinstance(raw, dict):
@@ -168,6 +182,20 @@ def _coerce_task(raw, fallback_id=None):
         task["repeat_date"] = repeat_date
     else:
         task.pop("repeat_date", None)
+    # 重复任务**本体**只是模板：formatter 记规则，不记「排到哪一天」。旧数据里
+    # 本体曾经被当成普通任务排过（带 reservation / result），读进来就先把运行时
+    # 账摘掉，避免界面把本体画成一个已排期的任务。
+    if task["repeat"] and not task.get("repeat_parent"):
+        template = _hook_template(task.get("formatter"))
+        if template:
+            task["formatter"] = template
+        else:
+            task.pop("formatter", None)
+        # 本体不挂 session，所以旧的 assign() 留下的 due / due_source 是过期账：
+        # 只有 due_source == "session" 才清（用户自己写的 due 保留）。
+        if not task.get("session") and task["fields"].get("due_source") == "session":
+            task["fields"].pop("due", None)
+            task["fields"].pop("due_source", None)
     # 老数据没有 status：有 Focusmate 完成时间的就是「已完成」，否则「进行中」。
     status = str(task.get("status") or "").strip().lower()
     if status not in STATUSES:
@@ -1285,6 +1313,11 @@ class TaskStore(object):
         return bool((task or {}).get("repeat_parent"))
 
     @staticmethod
+    def hook_template(spec):
+        """formatter / trigger 的规则模板（去掉 reservation / result / applied_at）。"""
+        return _hook_template(spec)
+
+    @staticmethod
     def origin_marks(task):
         """契约表格 / 面板用的来源记号：🔁 重复子任务，🔗 OmniFocus 关联。"""
         marks = ""
@@ -1348,6 +1381,7 @@ class TaskStore(object):
         - 子任务复制本体的 fields / tags / OmniFocus 关联；
         - ``repeat_parent`` 指向本体，``repeat_date`` 是这一天；
         - ``source`` 写成 ``{"kind": "repeat", "parent": ...}``；
+        - **继承 formatter 规则模板**（不带本体上的 reservation / result）；
         - 先不复制本体的 ``repeat``：子任务本身不再是一套规则。
         """
         parent = self.get(parent_id)
@@ -1368,6 +1402,9 @@ class TaskStore(object):
             source={"kind": "repeat", "parent": parent["id"], "date": iso},
             repeat_parent=parent["id"], repeat_date=iso,
         )
+        template = self.hook_template(parent.get("formatter"))
+        if template:
+            child = self._mutate(child["id"], lambda t: t.update({"formatter": dict(template)}))
         if session:
             child = self.assign(child["id"], session)
         return child
