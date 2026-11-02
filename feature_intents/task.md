@@ -386,13 +386,14 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
   - `🔁` = 重复任务 occurrence 子任务
   - `🔗` = 有 OmniFocus 关联（复制或继承）
   - `🔁🔗` = 两者都有
-  - `⏱` = 挂了 formatter
-- 本体在 task 视图里仍可见（可以改规则 / 删除 / 看 RRULE），只是不进契约表的
-  task 列；`task repeat <本体序号>` 会打印 rule / anchor / 已生成次数。
+  - `⏱` = 挂了 formatter（**不是**「重复任务」的意思）
+- 本体只是模板：不进契约任务面板、不进契约表 task 列，因此在契约视图里没有
+  面板序号。它在 task 视图里仍可见（number 列写 `id:N`，可以改规则 / 删除 /
+  看 RRULE），用 `task id:N ...` / `task repeat id:N` 操作。
 
 ### formatter 属于子任务，本体只存模板
 
-`task <本体序号> -f end` **不排本体**：
+`task id:<本体> -f end` **不排本体**：
 
 - 本体只保存去掉运行时账（`reservation` / `result` / `applied_at`）的 formatter
   模板；旧数据里 `due_source=session` 留下的过期 `due` 也会在读入时清掉；

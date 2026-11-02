@@ -1441,6 +1441,37 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-02T16:20:12",
+      "task_id": 78,
+      "fields": {
+        "title": "词汇题多 40 个",
+        "due": "2026-11-02T16:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-11-02",
+        "start": "15:15",
+        "end": "16:05",
+        "duration": 50,
+        "focusmate_session_id": "a98fe03a-6d57-49b1-8c5f-8971fee2b036",
+        "previous_due": "2026-11-03T11:50:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "35bc03c7-b206-4164-bcb1-e22d29b14118",
+        "title": "词汇题多 40 个",
+        "description": "",
+        "completed_at": "2026-11-02T08:06:34.447172+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "a98fe03a-6d57-49b1-8c5f-8971fee2b036"
+          }
+        ]
+      }
     }
   ]
 }

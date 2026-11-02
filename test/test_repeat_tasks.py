@@ -410,9 +410,9 @@ wd.task_store.set_repeat(parent["id"], WD, "22:15", 50,
                          rule="FREQ=DAILY", rule_anchor="%sT22:15:00" % ISO,
                          source="omnifocus")
 parent = wd.task_store.get(parent["id"])
-parent_no = wd.task_no(parent)
-check("本体在面板上有序号", bool(parent_no), True)
-check("给本体挂 formatter end", wd.handle("task %d -f end" % parent_no), True)
+check("本体不进契约任务面板", wd.task_no(parent), None)
+check("给本体挂 formatter end（用 id:N）",
+      wd.handle("task id:%d -f end" % parent["id"]), True)
 parent = wd.task_store.get(parent["id"])
 check("本体自己仍然没有 session", parent.get("session"), None)
 fmt = parent.get("formatter") or {}
@@ -425,6 +425,10 @@ child_today = wd.task_store.occurrence_for(parent["id"], TODAY)
 child_tomorrow = wd.task_store.occurrence_for(parent["id"], TOMORROW)
 check("今天生成了子任务", bool(child_today), True)
 check("明天也提前生成了子任务", bool(child_tomorrow), True)
+check("今天子任务在今天面板里",
+      child_today["id"] in [t["id"] for t in wd.task_panel_tasks()], True)
+check("明天的子任务不在今天面板里",
+      child_tomorrow["id"] in [t["id"] for t in wd.task_panel_tasks()], False)
 check("今天子任务继承了 formatter 并跑过",
       ((child_today.get("formatter") or {}).get("reservation") or {}).get("date"),
       ISO)
@@ -450,7 +454,7 @@ check_true("明天的行里是子任务 + ⏱",
            and (child_tomorrow["id"] in [t["id"] for t in row.get("tasks") or []]))
 # 本体不能被当成一次可完成的活
 try:
-    wd.cmd_task_done([str(wd.task_no(parent))])
+    wd.cmd_task_done(["id:%d" % parent["id"]])
     _blocked = False
 except ValueError as e:
     _blocked = "重复任务" in str(e) and "本体" in str(e)

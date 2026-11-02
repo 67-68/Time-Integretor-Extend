@@ -1911,7 +1911,15 @@ class TaskView(View):
                 fmt_txt += "（模板）"
             status_txt = "%s %s" % (w.task_mark(task) or "·", status)
             tags = task.get("tags") or []
-            t.add_row(str(w.task_no(task) or "—"),
+            panel_no = w.task_no(task)
+            if panel_no:
+                num_txt = str(panel_no)
+            elif ts.TaskStore.is_repeat_template(task):
+                # 本体不在契约面板上；任务视图里直接把可敲的写法摆出来。
+                num_txt = "id:%s" % task["id"]
+            else:
+                num_txt = "—"
+            t.add_row(num_txt,
                       str(task["id"]),
                       Text(status_txt, style=status_style.get(status, "")),
                       Text(rep_txt, style="magenta" if rep else STYLE_MUTED),
@@ -2475,9 +2483,12 @@ class Warden(object):
           再加上今天被处理过的。
         * **过去那天**：固化，只剩「那一天的 session 里被处理过的」。
 
-        关键一条：**已挂到别的日期的任务属于那一天，不属于今天**。明天 22:15 的
-        任务今天不出现在面板里（切到 `day +1` 才出现）—— 否则今天的序号里混着
-        明天的活，按面板序号敲命令就会打到错的账上。
+        关键两条：
+          * **重复任务本体只是模板**，不进【契约】的任务面板（也不进 task 列）；
+            它只在「任务」视图里用 `id:N` 管理。
+          * **已挂到别的日期的任务属于那一天，不属于今天**。明天 22:15 的任务
+            今天不出现在面板里（切到 `day +1` 才出现）—— 否则今天的序号里混着
+            明天的活，按面板序号敲命令就会打到错的账上。
 
         「被处理过」不挑结果：放弃 / 完成 / 补录 / 重议 / 推后 / 转移走 / 跳过
         都算一笔，痕迹记在 ``task["history"]``（``TaskStore.mark_processed``）。
@@ -2493,6 +2504,10 @@ class Warden(object):
         open_tasks = []
         touched = []
         for task in self.task_store.list():
+            # 重复任务**本体**只是模板：它不出现在【契约】的任务面板 / task 列，
+            # 只在「任务」视图里用 id:N 管理（选它没有意义：它不是一次活）。
+            if ts.TaskStore.is_repeat_template(task):
+                continue
             records = self.task_store.processed_on(task, iso)
             sess = task.get("session") or {}
             sess_day = sess.get("date") or ""
@@ -7804,9 +7819,9 @@ class Warden(object):
                                                   "OmniFocus 导入的规则会保留原 RRULE，"
                                                   "task repeat <id> 直接看原规则"),
             ("重复任务本体", "带 repeat 的任务（source 指向 OmniFocus）。它只当模板，"
-                              "不在【契约】表的 task 列显示、永远不挂 session，也**不能**"
-                              "被 done / -m complete；要结束这套重复用 task repeat off "
-                              "或 task <id> drop（手动）"),
+                              "不在【契约】的任务面板 / task 列显示、永远不挂 session，也"
+                              "**不能**被 done / -m complete；任务视图里显示成 id:N，"
+                              "要结束这套重复用 task repeat off 或 task <id> drop（手动）"),
             ("重复任务子任务", "到了规则日自动生成一条：repeat_parent 指向本体，"
                                 "复制标题/字段/O-F 关联，真正挂 session、显示在契约表里，"
                                 "带 🔁；只有它能被完成"),
@@ -7863,7 +7878,8 @@ class Warden(object):
             "本体自己永远没有 reservation、也不占 session。切换 day +1 就能看到明天那条已经"
             "排好的子任务。只有子任务能被完成；本体要结束只能手动 task repeat off 或 drop。\n"
             "契约表 task 列来源记号：🔁=重复任务子任务，🔗=有 OmniFocus 关联，"
-            "两个都有就是 🔁🔗；⏱=挂了 formatter。本体在 task 视图里只显示 🔗。\n"
+            "两个都有就是 🔁🔗；⏱=挂了 formatter（不是「重复」的意思）。"
+            "本体不进契约面板，只在 task 视图里显示为 id:N、来源记号只有 🔗。\n"
             "任务视图：task 命令在任何视图都能敲；任务字段不校验，JSON 存在 data/tasks.json。\n"
             "设置视图：列出所有设置项和解释；set <id> <value> 改，"
             "edit-tomorrow / tomorrow-plan 见那里的说明。\n"
