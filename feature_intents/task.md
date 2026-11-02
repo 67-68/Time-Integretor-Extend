@@ -30,6 +30,11 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
                   "writeback": {"completed": "..."}},
     "duplicate_of": null,                // 从哪条复制来的
     "actual_minutes": null,              // 「缺漏完成补充」手填的实际耗时
+    "trigger": {"name": "...", "params": [], "args": {}, "set_at": "..."},
+    "formatter": {"name": "end", "params": [], "args": {}, "set_at": "...",
+                  "reservation": {"date": "...", "start": "17:30", "end": "18:00",
+                                  "session_start": "17:30", "session_duration": 25,
+                                  "duration": 25, "break_minutes": 5}},
     "history": [                         // 哪一天的哪一场「处理」过它（见下）
       {"day": "2026-10-27", "start": "11:00", "action": "skip", "at": "..."}
     ],
@@ -110,6 +115,10 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task assign [<序号>] <session ID>` | 先挂 Focusmate，成功后落本地；成功即刻重排表格（task 列马上有内容） |
 | `task repeat <序号> <周几@HH:MM\|off>` | 设置 / 取消每周重复 |
 | `task create ... --repeat 周几@HH:MM` | 一步建「每周重复任务」 |
+| `task -t` / `task --trigger` | 列出 trigger 预设（框架默认是**空列表**） |
+| `task <序号> -t <preset> [参数...]` | 给任务挂一个 trigger（只记账；runner 执行） |
+| `task -f` / `task --formatter` | 列出 formatter 预设（现在有 `end`） |
+| `task <序号> -f end` | 按任务 `duration` 找当天最后一段可用时间，截出尾部并自动 assign |
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
 | `task archive [N]` | 看归档：按完成日期分组、最近 N 条（默认 5） |
 | `task <任何动作> ... --assign <N>` | 跑完顺手把产出的任务挂到表格 #N（`-a` / `--assign=N` 同义） |
@@ -159,16 +168,20 @@ task select 4 --assign 3        # 等价于 task assign 4 3（也等价于 task 
 所以 `import` / `link` **不需要任何 flag 就已经在读剪贴板了**，`-a` 永远只表示
 「分流到哪一场」（`--assign` 的简写），不兼职第二个意思。
 
-### 三个后缀：`-a` 分流、`-n` 备注、`-s` 批量
+### 后缀：`-a` 分流、`-n` 备注、`-s` 批量、`-t` trigger、`-f` formatter
 
-`cmd_task()` 入口依次摘掉三个后缀（顺序固定：`-a` → `-s` → `-n`），剩下的第一个词
-才是动作。所以它们能和任何动作组合，也能单独出现（`-s` 本身就是批量动作）：
+`cmd_task()` 入口依次摘掉后缀（顺序固定：`-a` → `-s` → `-n` → `-m` → `-t` →
+`-f`），剩下的第一个词才是动作。所以它们能和任何动作组合，也能单独出现
+（`-s` 本身就是批量动作）：
 
 | 后缀 | 含义 | 取值 |
 |---|---|---|
 | `-a` / `--assign` | 分流：把这条任务挂到哪一场 | 表格编号 / `none` / `current` |
 | `-s` / `--from` | 批量：**源** session（那一场上的全部任务） | 表格编号 |
 | `-n` / `--note` | 顺手写备注（可塞网址） | 自由文本，吃到下一个 `--flag` 为止 |
+| `-m` / `--mark` | 手动改本地状态 | `complete` / `discard` |
+| `-t` / `--trigger` | 挂创建触发预设 | 预设名 + `key=value` / 位置参数 |
+| `-f` / `--formatter` | 挂排期算法并当场执行 | 预设名 + `key=value` / 位置参数 |
 
 `-a` 的两个特殊取值不是「场次编号」，而是两件事：
 
@@ -281,6 +294,50 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 - `task sync` 会把落上的那一场挂到 Focusmate（`add_task` 复核成功才写本地），
   并把 `occurrences[日期]` 记下来；完成时间同样从 `completedAt` 归档。
 - 界面上这一行的 task 列会带 `🔁` 前缀（说明它是重复任务自动挂上的，不是手 assign 的）。
+
+## trigger / formatter（任务扩展点）
+
+任务库只存数据；「什么时候创建任务」和「创建后怎么排期」在
+[`task_hooks.py`](../task_hooks.py) 里做成**具名预设函数**：
+
+```text
+task <序号> -t <trigger>   [参数...]    # 挂创建触发（默认没有注册任何函数）
+task <序号> -f <formatter> [参数...]    # 挂排期算法，并当场执行
+task -t / task -f                      # 只看预设列表，不动任务
+```
+
+两条规矩：
+
+1. **只认已注册的函数**。命令里存的是
+   `{"name": ..., "params": [...], "args": {...}}`；函数不存在就报错并列出
+   当前可用名单，绝不悄悄忽略。trigger 注册用
+   `task_hooks.register_trigger("name", params=("p1",), help="...")`，
+   formatter 用 `register_formatter(...)`。
+2. **自动排期只排明天及以后**。`task_hooks.resolve_target_day(..., allow_today=False)`
+   会把今天/过去推到明天；用户手敲 `task 3 -f end` 属于手动操作，允许今天。
+   这样「昨天（晚上）把明天的任务排好、第二天绝不临时加任务」是一条调用约定，
+   而不是散在各处的 `if`。
+
+### `task -f end`
+
+`end` 是唯一内置 formatter。它按任务 `fields.duration`（也认
+`duration_minutes` / `estimated_minutes` / `minutes` / `时长` / `预计时长`）排期：
+
+1. 取**当天最后一个还有空位的时段**（这就是 `end`：每天的结束时间不同，
+   不写死 22:15）；
+2. 在这个时段里找能装下任务时长的**最小 session**；同样大小时取更靠后的那场；
+3. 在窗口尾部截出 `任务时长 + break_minutes`（默认 5 分钟），写进
+   `formatter.reservation`；
+4. 自动把任务 assign 到那场 session（`assign_task_to`：能建 Focusmate task 就建，
+   未来还没订上就只记本地）。
+
+例子：T4 = 11:00–12:00，排成 `25 + 25`；任务 `duration=25` → 选 11:30 那场，
+占用 `11:30–12:00`（25 分钟 session + 5 分钟休息）。之后别的 formatter
+通过 `task_hooks.collect_reservations()` 看到这段被占，**不会再用**。
+
+- 没有 `duration` → 明确警告，不落 `formatter`；
+- 所有 session 都装不下 → 明确报错；
+- 可选参数：`break_minutes=5`、`date=YYYY-MM-DD|today|tomorrow`。
 
 ## 截止时间 = 它被分配的那场 session 的终点
 

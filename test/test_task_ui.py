@@ -839,8 +839,8 @@ wd4 = fresh_warden()
 _shell = wd4.shell
 check("task 后面能 Tab 到紧凑写法",
       [c for c in _shell.complete("task ") if c.startswith("-")],
-      ["-an", "-ac", "-m", "--assign", "-a", "--note", "-n", "--from", "-s",
-       "--mark", "--repeat"])
+      ["-an", "-ac", "-m", "-t", "-f", "--assign", "-a", "--note", "-n", "--from",
+       "-s", "--mark", "--trigger", "--formatter", "--repeat"])
 check("task 后面 Tab 补的是**面板序号**（1..N 连续，不是内部 id）",
       [c for c in _shell.complete("task ") if c.isdigit()],
       [str(i) for i in range(1, len(wd4.task_panel_order()) + 1)])
@@ -1415,6 +1415,120 @@ finally:
     w.run_keep_session = _orig_run_ks
     wd3.bridge.sessions = plan_sessions(wd3)
     wd3.refresh(quiet=True)
+
+print("== task -t / -f end：trigger 框架 + formatter 把任务排到当天最后一段 ==")
+wdh = fresh_warden()
+# 加一个真正排在当天最后的时段 T4（17:00–18:00，25+25），用来验「end 取最后」。
+_data = sp.load_download()
+_data["periods"] = [p for p in (_data.get("periods") or []) if p.get("id") != "T4"]
+_data["periods"].append({
+    "id": "T4", "date": ISO, "start": "17:00", "end": "18:00",
+    "type": "工作", "name": "闪卡", "calendar": "工作", "title": "闪卡"})
+sp.save_download(_data)
+wdh.reload_periods()
+check("T4 排成 25 + 25", wdh.handle("period T4 25 25"), True)
+wdh.reload_entries()
+wdh.bridge.sessions = plan_sessions(wdh)
+wdh.api_rows = []
+wdh.rows_source = "bridge"
+wdh.rebuild_rows()
+
+# 1) trigger 框架：默认是空列表；Tab 也必须是空，而不是退化成「所有 flag」。
+wdh.messages = []
+check("task -t 受理", wdh.handle("task -t"), True)
+check_true("trigger 列表明确写「0 个 / 空列表」",
+           any("0 个" in m[2] and "空列表" in m[2] for m in wdh.messages))
+check("task -t 后面 Tab 是空列表（框架在、函数还没注册）",
+      wdh.shell.complete("task -t "), [])
+wdh.messages = []
+check("task -f 受理", wdh.handle("task -f"), True)
+check_true("formatter 列表里有 end",
+           any("end" in m[2] for m in wdh.messages))
+check("task -f 后面 Tab 补 end", wdh.shell.complete("task -f "), ["end"])
+check("task --formatter 后面 Tab 也补 end",
+      wdh.shell.complete("task --formatter "), ["end"])
+check_true("提示行认得 -f：说的是排期/end",
+           "end" in wdh.shell.hint_line("task 3 -f"))
+
+# 2) task -f end：按 duration 找 session，在当天最后一段时间窗尾部截出
+#    「25 + 5」并自动 assign。T4 是最后时段、25+25 排布 → 应拿 17:30–18:00。
+wdh.messages = []
+wdh.bridge.calls = []
+check("task create title=闪卡 duration=25 受理",
+      wdh.handle("task create title=闪卡 duration=25"), True)
+flash = [t for t in wdh.task_store.list() if t["fields"].get("title") == "闪卡"][0]
+flash_no = tno(wdh, flash)
+check("task <序号> -f end 受理", wdh.handle("task %d -f end" % flash_no), True)
+flash = wdh.task_store.get(flash["id"])
+fmt = flash.get("formatter") or {}
+check("formatter 记成 end", fmt.get("name"), "end")
+res = fmt.get("reservation") or {}
+check("end 取的是当天最后的时段 T4", res.get("period_id"), "T4")
+check("任务劫走 17:30–18:00（25 分钟 + 5 分钟休息）",
+      [res.get("start"), res.get("end")], ["17:30", "18:00"])
+check("自动 assign 的是那场 25 分钟 session",
+      [flash["session"]["start"], flash["session"]["duration"]], ["17:30", 25])
+check("截止时间 = 那场 session 的终点",
+      flash["fields"].get("due"), "%sT17:55:00" % ISO)
+add = [c for c in wdh.bridge.calls if c[0] == "add_task"]
+check("Focusmate 也只挂了一次，而且挂对场次",
+      [(c[1].get("meetingId")) for c in add], ["sess-17:30"])
+
+# 3) 第二个人不能再用这一段：formatter 会把 reservation 当占用，退到 17:00 那场。
+wdh.messages = []
+wdh.bridge.calls = []
+check("第二条 duration=25 -f end 受理",
+      wdh.handle("task create title=闪卡2 duration=25 -f end"), True)
+flash2 = [t for t in wdh.task_store.list() if t["fields"].get("title") == "闪卡2"][0]
+res2 = (flash2.get("formatter") or {}).get("reservation") or {}
+check("第二条不会重复占 17:30 那段",
+      [res2.get("start"), res2.get("end")], ["17:00", "17:30"])
+check("第二条自动挂到 17:00 那场",
+      flash2["session"]["start"], "17:00")
+
+# 4) 没有 duration：明确警告，formatter 不落账。
+wdh.messages = []
+check("无 duration 带 -f end 受理（错误进消息区）",
+      wdh.handle("task create title=没时长 -f end"), True)
+check_true("明确警告没有持续时间",
+           any("持续时间" in m[2] and "duration" in m[2] for m in wdh.messages))
+nodur = [t for t in wdh.task_store.list() if t["fields"].get("title") == "没时长"][0]
+check("没时长不会偷偷挂 formatter", nodur.get("formatter"), None)
+
+# 5) trigger 框架可以用：注册一个 demo 之后，task -t 能列出来、能挂到任务上。
+@w.th.register_trigger("demo_after_task", params=("task_id",), help="测试用 trigger")
+def _demo_trigger(ctx, task_id):
+    return {"ctx": ctx, "task_id": task_id}
+
+wdh.messages = []
+check("注册后 task -t 列出 demo_after_task", wdh.handle("task -t"), True)
+check_true("列表里有 demo_after_task",
+           any("demo_after_task" in m[2] for m in wdh.messages))
+trig_task = wdh.task_store.create({"title": "带 trigger 的任务"})
+check("task <id> -t demo_after_task 42 受理",
+      wdh.handle("task id:%d -t demo_after_task 42" % trig_task["id"]), True)
+trig_task = wdh.task_store.get(trig_task["id"])
+check("trigger preset 名字落库",
+      (trig_task.get("trigger") or {}).get("name"), "demo_after_task")
+check("位置参数按参数名绑定",
+      ((trig_task.get("trigger") or {}).get("args") or {}).get("task_id"), "42")
+check("trigger 只记账、不执行（没有外部调用）",
+      [c for c in wdh.bridge.calls if c[0] not in ("snapshot", "add_task")], [])
+wdh.messages = []
+check("不存在的 trigger 会被拒绝（不是静默忽略）",
+      wdh.handle("task id:%d -t no_such_trigger" % trig_task["id"]), True)
+check_true("报错里列出当前可用 trigger",
+           any("没有 trigger 预设" in m[2] and "demo_after_task" in m[2]
+               for m in wdh.messages))
+
+# 6) 原则：自动排期只能排明天及以后；手动调用才允许今天。
+check("自动模式（allow_today=False）把今天推到明天",
+      w.th.resolve_target_day(TODAY, dt.datetime.combine(TODAY, dt.time(22, 0)),
+                              {}, allow_today=False),
+      TODAY + datetime.timedelta(days=1))
+check("手动模式仍然可以排今天",
+      w.th.resolve_target_day(TODAY, dt.datetime.combine(TODAY, dt.time(22, 0)),
+                              {}, allow_today=True), TODAY)
 
 print("== TUI 在场证明（daemon 靠它判断「人叫得回来吗」）==")
 info = wd.write_tui_state()

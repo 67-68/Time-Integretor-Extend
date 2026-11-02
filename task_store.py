@@ -40,7 +40,7 @@ DEFAULT_ARCHIVE_FILE = os.path.join(DATA_DIR, "task-archive.json")
 # 这些键是本地簿记，不属于用户字段。用户仍然可以随便写别的字段。
 RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate", "repeat",
             "status", "status_at", "tags", "omnifocus", "duplicate_of", "actual_minutes",
-            "history"}
+            "history", "trigger", "formatter"}
 
 #: 「这条任务在哪一天的 session 里被处理过」的痕迹（见 :meth:`TaskStore.mark_processed`）。
 #: 任务是按天固化的：今天的任务面板 = 所有没做完的 + 今天处理过的；过去那天只剩
@@ -138,6 +138,10 @@ def _coerce_task(raw, fallback_id=None):
         task["session"] = None
     if not isinstance(task.get("focusmate"), dict):
         task["focusmate"] = {}
+    # trigger / formatter 是「具名 preset + 参数」的小 dict；坏数据当没挂。
+    for hook in ("trigger", "formatter"):
+        if hook in task and not isinstance(task.get(hook), dict):
+            task[hook] = None
     task["repeat"] = _coerce_repeat(task.get("repeat"))
     task["omnifocus"] = _coerce_omnifocus(task.get("omnifocus"))
     task["tags"] = _coerce_tags(task.get("tags"))
@@ -594,6 +598,30 @@ class TaskStore(object):
     def set_due(self, task_id, due):
         """写 ``fields.due``（session 时间就是截止时间，见 :meth:`assign`）。"""
         return self.modify(task_id, "due", due)
+
+    def set_hook(self, task_id, kind, spec):
+        """挂 / 清一个 trigger 或 formatter 预设。
+
+        ``spec`` 的形状由 :mod:`task_hooks` 的 ``build_spec`` 决定：
+        ``{"name": "end", "params": [...], "args": {...}, ...}``。
+        传 ``None`` = 摘掉这个钩子。**只改本地任务库**，不碰 Focusmate。
+        """
+        kind = str(kind or "").strip().lower()
+        if kind not in ("trigger", "formatter"):
+            raise ValueError("钩子类型只能是 trigger / formatter；你给的是 %r" % kind)
+        if spec is not None and not isinstance(spec, dict):
+            raise ValueError("%s 必须是一个 dict（用 task_hooks.build_spec 生成）" % kind)
+
+        def apply(task):
+            if spec is None:
+                task.pop(kind, None)
+            else:
+                task[kind] = dict(spec)
+        return self._mutate(task_id, apply)
+
+    def clear_hook(self, task_id, kind):
+        """摘掉 trigger / formatter。"""
+        return self.set_hook(task_id, kind, None)
 
     def duplicate(self, task_id, session=None, fields=None, note=None):
         """复制一条任务：同样的字段 + 同样的 OmniFocus 关联，**新的**本地 ID。

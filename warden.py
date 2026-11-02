@@ -29,7 +29,10 @@
    + OmniFocus 单向联动。
    `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync`；
    `task <序号> -m complete|discard` 是**只改本地账本**的手动状态标记（不碰外部）；
-   `task assign` 成功后才写本地，Focusmate 侧 task id / completedAt 都会记回来。
+   `task <序号> -t <trigger>` / `-f <formatter>` 是具名预设函数框架
+   （trigger 默认为空，formatter 有 `end`：按 duration 排到当天最后一段并自动
+   assign）；`task assign` 成功后才写本地，Focusmate 侧 task id / completedAt
+   都会记回来。
    `--repeat 周几@HH:MM` 让任务每周重复：只在「同一星期几、同一时刻、同一时长」的
    那场 session 上落地；排布被改过（例如 50 拆成 25+25）时这一周就不落，但 repeat
    设置本身不变。
@@ -245,6 +248,7 @@ import keep_session as ks  # noqa: E402  只用来读 daemon 状态 / 起停 dae
 import schedule as sch  # noqa: E402  data.csv 的解析与编辑（唯一实现）
 import session_plan as sp  # noqa: E402  日历下载层 / 时段 layout / 精确日期 csv
 import task_store as ts  # noqa: E402  本地任务库 + Focusmate 完成归档
+import task_hooks as th  # noqa: E402  任务的 trigger / formatter 预设函数框架
 import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + 算数字 + 缓存
 import settings_store as cfg  # noqa: E402  设置项注册表 + data/settings.json
 import omnifocus as of  # noqa: E402  OmniFocus：链接解析 + 读写（osascript 子进程）
@@ -294,6 +298,10 @@ TASK_SHORT_FLAGS = (
     # `-m` 展开成 `--mark`，后面那个词（complete / discard）照常跟着：
     # `task 3 -m complete` ≡ `task 3 --mark complete`。
     repl_kit.ShortFlag("-m", ("--mark",), note="手动标记 complete/discard"),
+    # trigger / formatter 预设：`-t end` ≡ `--trigger end`、`-f end` ≡
+    # `--formatter end`，后面的参数（key=value）照常跟着。
+    repl_kit.ShortFlag("-t", ("--trigger",), note="trigger 预设函数"),
+    repl_kit.ShortFlag("-f", ("--formatter",), note="formatter 预设函数"),
 )
 
 # 手动状态标记：`task 3 -m complete` / `task 3 --mark discard`。
@@ -314,6 +322,15 @@ TASK_MARK_STATES = {
     "dropped": ts.STATUS_DROPPED,
     "放弃": ts.STATUS_DROPPED,
 }
+
+# trigger / formatter：两个后缀共用一套「具名 preset + 参数」的解析与提示。
+# trigger 默认是空的（框架先留出来，等真的需要再注册）；formatter 现在有 end。
+TASK_HOOK_KINDS = ("trigger", "formatter")
+TASK_HOOK_FLAGS = {
+    "trigger": ("--trigger", "-t"),
+    "formatter": ("--formatter", "-f"),
+}
+TASK_HOOK_LABELS = {"trigger": "trigger（创建触发）", "formatter": "formatter（排期算法）"}
 
 # ---------------------------------------------------------------- 配色
 # 终端背景**一定是深色**的（用户反馈："有些字根本看不见"）。所以这里只有三条规矩：
@@ -805,6 +822,28 @@ def _hint_cancel(parts):
     return repl_kit.Hint("参数", ("<n>",), note="执行区要敲宣言")
 
 
+class _TaskCompletionValues(dict):
+    """``task`` 的 flag→候选 表；trigger/formatter 的候选**动态**从注册表读。
+
+    必须是 Mapping 而不是普通 dict：``-t`` 在 trigger 注册表为空时要明确返回
+    「没有候选」，而不是让 shell 落到「把全部 flag 当候选」那条兜底分支 ——
+    否则 `task -t <Tab>` 会莫名其妙列出一堆选项。以后注册了 trigger，Tab 立刻
+    就能看到，不需要重启 Warden 或重建 Command。
+    """
+
+    def __contains__(self, key):
+        if key in TASK_HOOK_FLAGS["trigger"] or key in TASK_HOOK_FLAGS["formatter"]:
+            return True
+        return super().__contains__(key)
+
+    def __getitem__(self, key):
+        if key in TASK_HOOK_FLAGS["trigger"]:
+            return th.preset_names("trigger")
+        if key in TASK_HOOK_FLAGS["formatter"]:
+            return th.preset_names("formatter")
+        return super().__getitem__(key)
+
+
 def _task_command(w):
     """``task`` 那一条命令：动作、后缀、紧凑短选项、补全都写在一个地方。
 
@@ -814,18 +853,22 @@ def _task_command(w):
     return repl_kit.Command(
         name="task",
         handler=w.cmd_task,
-        summary="任务 CRUD / 挂到 session / 手动标记状态 / 同步完成时间（任何视图都能敲）",
+        summary="任务 CRUD / 挂到 session / 手动标记状态 / trigger + formatter / 同步完成时间",
         aliases=(),
         section="通用",
         usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
               " ... [-a <编号|none|current>] [-s <编号>] [-n 备注]"
-              " [-m complete|discard]",
+              " [-m complete|discard] [-t <trigger> [参数...]] [-f <formatter> [参数...]]",
         # 把 flag 放在 action 词前面：补全列表有 20 项上限，flag 被挤到后面
         # 就等于「有这个选项但 Tab 永远看不到」。
-        options=("--assign", "-a", "--note", "-n", "--from", "-s", "--mark", "--repeat",
+        # 紧凑短选项（-an/-ac/-m/-t/-f）由 task_completer 的 short 表补，不要
+        # 在 options 里再写一遍 —— 否则 Tab 菜单里会出现两个一模一样的候选。
+        options=("--assign", "-a", "--note", "-n", "--from", "-s", "--mark", "--trigger",
+                 "--formatter", "--repeat",
                  "create", "import", "delete", "modify", "note", "assign", "select",
                  "swap", "repeat", "sync", "archive", "inspect-due"),
-        values={"--mark": TASK_MARK_WORDS, "-m": TASK_MARK_WORDS},
+        values=_TaskCompletionValues({"--mark": TASK_MARK_WORDS,
+                                      "-m": TASK_MARK_WORDS}),
         short=TASK_SHORT_FLAGS,
         completer=lambda prior: task_completer(w, prior),
         hint=_hint_task,
@@ -850,6 +893,11 @@ def task_completer(w, prior):
         return [str(i) for i in range(1, len(w.rows) + 1)] + ["none", "current"]
     if words and words[-1] in ("--from", "-s"):
         return [str(i) for i in range(1, len(w.rows) + 1)]
+    if words and words[-1] in TASK_HOOK_FLAGS["trigger"]:
+        # 默认没有 trigger —— 返回空列表就是「空的 function 列表」。
+        return list(th.preset_names("trigger"))
+    if words and words[-1] in TASK_HOOK_FLAGS["formatter"]:
+        return list(th.preset_names("formatter"))
     return []
 
 
@@ -943,6 +991,26 @@ def _hint_task(parts):
         return repl_kit.Hint("取值", TASK_MARK_WORDS,
                              note="手动改本地状态：complete = 完成并归档（不勾 Focusmate）"
                                   "· discard = 放弃（不动外部）")
+    for kind in TASK_HOOK_KINDS:
+        flags = TASK_HOOK_FLAGS[kind]
+        if not any(tok in words for tok in flags):
+            continue
+        names = th.preset_names(kind)
+        if words and words[-1] in flags:
+            note = ("当前没有注册任何 %s 预设（框架已就位，列表为空）" % kind
+                    if not names else
+                    "选中预设后再跟 key=value 参数；Tab 会补可用名字")
+            return repl_kit.Hint("预设", names or ("（空列表）",), note=note)
+        if kind == "formatter":
+            return repl_kit.Hint(
+                "参数", names or ("（空列表）",),
+                note="end = 用任务 duration 找能装下它的最小 session，"
+                     "在当天可用时间窗尾部截出「时长 + 5 分钟休息」并自动挂上；"
+                     "可带 date=YYYY-MM-DD / tomorrow / today、break_minutes=5")
+        return repl_kit.Hint(
+            "参数", names or ("（空列表）",),
+            note="trigger 预设先注册函数才会有名字；"
+                 "用法：task <序号> -t <函数> [参数...]")
     if any(tok in words for tok in ("-an", "-ac")):
         return repl_kit.Hint("参数", ("（不用再跟东西）",),
                              note="-an ≡ -a none（下架）· -ac ≡ -a current（当前这一场）")
@@ -961,10 +1029,10 @@ def _hint_task(parts):
     if head and (head[0].isdigit() or head[0].startswith("id:")):
         if len(head) == 1:
             return repl_kit.Hint("动作", ("swap", "duplicate", "drop", "done", "link",
-                                          "-m complete|discard", "-a <编号>"),
+                                          "-m complete|discard", "-f end", "-a <编号>"),
                                  note="数字是面板序号（swap 5 = 和第 5 条换位置）"
-                                      " · -m 手动标状态 · -a none 下架"
-                                      " · -a current 挂到当前这一场")
+                                      " · -m 手动标状态 · -f end 排到当天最后一段"
+                                      " · -a none 下架 · -a current 挂到当前这一场")
         head = head[1:]
     action = head[0] if head else ""
     if action in ("import", "粘贴", "导入"):
@@ -997,7 +1065,8 @@ def _hint_task(parts):
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
     return repl_kit.Hint("参数", TASK_ACTION_WORDS,
                          note="任何动作都能带 -a <编号|none|current> / -n 备注"
-                              " / -m complete|discard；-s <编号> 是批量（那一场的全部任务）")
+                              " / -m complete|discard / -t trigger / -f formatter；"
+                              "-s <编号> 是批量（那一场的全部任务）")
 
 
 class View(object):
@@ -1502,6 +1571,8 @@ class TaskView(View):
         task -s 5 -a 6                      # 把 #5 上的全部任务转移到 #6
         task -s 5 -a none                   # 把 #5 上的全部任务下架
         task repeat <id> <周几@HH:MM|off>   # 每周重复（只影响那一天的那一场）
+        task -t                             # 列 trigger 预设（默认空列表）
+        task 3 -f end                       # formatter：排到当天最后一段并自动挂上
         task sync                           # GET /v1/tasks → 把 completedAt 归档
         task archive [N]                    # 看归档（data/task-archive.json）
 
@@ -1533,9 +1604,11 @@ class TaskView(View):
     def idle_hint(self):
         return repl_kit.Hint(
             "命令", ("task create", "task 3 -a 1", "task 3 -an", "task 3 -ac",
-                     "task 3 swap 5", "task -s 5 -a 6", "inspect-due", "review"),
+                     "task 3 swap 5", "task -s 5 -a 6", "task 3 -f end",
+                     "task -f", "inspect-due", "review"),
             note="数字 = 面板上的序号（1 起连续）· task 3 ≡ task select 3"
-                 " · -an 下架 / -ac 当前这一场 · 面板外的用 id:N · Tab 切视图",
+                 " · -an 下架 / -ac 当前这一场 · -f end 排到当天最后一段"
+                 " · 面板外的用 id:N · Tab 切视图",
         )
 
     def status_line(self):
@@ -1543,10 +1616,10 @@ class TaskView(View):
 
     def unknown_hint(self):
         return ("「任务」视图认 task create/delete/modify/assign/select/duplicate/"
-                "drop/done/link/import/sync/swap、review、inspect-due"
+                "drop/done/link/import/sync/swap、trigger/formatter、review、inspect-due"
                 "（也可以直接写序号，如 task 3 -a 1 / task 3 -an / "
-                "task 3 swap 5 / task -s 5 -a 6；序号 = 面板上的第几条，"
-                "面板外的任务用 id:N）；Shift+Tab 切回去再干别的。")
+                "task 3 swap 5 / task 3 -f end / task -s 5 -a 6；"
+                "序号 = 面板上的第几条，面板外的任务用 id:N）；Shift+Tab 切回去再干别的。")
 
     def commands(self):
         w = self.w
@@ -1583,6 +1656,9 @@ class TaskView(View):
                      "  task 3 -a 2                          ← 同上（裸 ID = select）\n"
                      "  task create title=明日时间安排 --repeat mon@22:15"
                      "   ← 每周一 22:15 那场自动挂上\n"
+                     "  task create title=闪卡 duration=25 -f end"
+                     "   ← 排到当天最后一段（25 分钟 + 5 分钟休息）\n"
+                     "  task -t / task -f                    ← 看 trigger / formatter 预设\n"
                      "  inspect-due                          ← 主动看「过期还没做完」的任务",
                      style="dim"),
                 title="[bold]Task · 任务[/]", border_style="magenta", box=box.ROUNDED)
@@ -1602,6 +1678,8 @@ class TaskView(View):
         t.add_column("id", justify="right", style=STYLE_MUTED, no_wrap=True)
         t.add_column("状态", no_wrap=True)
         t.add_column("重复", no_wrap=True)
+        t.add_column("trigger", no_wrap=True)
+        t.add_column("formatter", no_wrap=True)
         t.add_column("session", no_wrap=True)
         t.add_column("截止", no_wrap=True)
         t.add_column("Focusmate", no_wrap=True)
@@ -1639,12 +1717,20 @@ class TaskView(View):
             rep = task.get("repeat") or {}
             rep_txt = ("🔁 %s@%s" % (rep.get("weekday_label"), rep.get("start"))
                        if rep else "—")
+            trig = task.get("trigger") or {}
+            fmt = task.get("formatter") or {}
+            trig_txt = str(trig.get("name") or "—")
+            fmt_txt = str(fmt.get("name") or "—")
+            if fmt.get("reservation"):
+                fmt_txt += "@" + str(fmt["reservation"].get("start") or "?")
             status_txt = "%s %s" % (w.task_mark(task) or "·", status)
             tags = task.get("tags") or []
             t.add_row(str(w.task_no(task) or "—"),
                       str(task["id"]),
                       Text(status_txt, style=status_style.get(status, "")),
                       Text(rep_txt, style="magenta" if rep else STYLE_MUTED),
+                      Text(trig_txt, style="cyan" if trig else STYLE_MUTED),
+                      Text(fmt_txt, style="green" if fmt else STYLE_MUTED),
                       Text(sess_txt, style=style),
                       Text(due_txt, style=STYLE_MUTED if due else style),
                       Text(fm_txt, style=style),
@@ -2168,6 +2254,8 @@ class Warden(object):
             prefix = self.task_mark(task)
             if task.get("repeat"):
                 prefix += "🔁"
+            if task.get("formatter"):
+                prefix += "⏱"
             no = self.task_no(task)
             parts.append("%s%d: %s" % (prefix, no, title) if no else
                          "%s%s" % (prefix, title))
@@ -2336,6 +2424,8 @@ class Warden(object):
         prefix = self.task_mark(task)
         if task.get("repeat"):
             prefix += "🔁"
+        if task.get("formatter"):
+            prefix += "⏱"
         return prefix + title
 
     def task_index_layout(self, tasks, width=None):
@@ -3649,6 +3739,8 @@ class Warden(object):
           ``--note <备注>``（``-n`` 同义）= 顺手写备注（可以塞网址）
           ``--mark complete|discard``（``-m`` 同义）= 手动改本地状态
           ``--from <session ID>``（``-s`` 同义）= 批量：那一场上的**全部**任务
+          ``--trigger <预设> [参数...]``（``-t`` 同义）= 挂创建触发（框架；默认空）
+          ``--formatter <预设> [参数...]``（``-f`` 同义）= 挂排期算法并当场执行
 
         ``-m/--mark`` 是**账本动作**，不代替 ``done`` / ``drop`` 的外部联动：
           - ``complete`` = 本地 completed + 归档；不勾 Focusmate，不当场写 OmniFocus
@@ -3669,6 +3761,10 @@ class Warden(object):
             task 8 -ac                  ← 挂到当前这一场（≡ task 8 -a current）
             task 3 -m complete          ← 只把本地 #3 标成完成（并归档）
             task -m discard 3           ← 只把本地 #3 标成放弃（外头都不动）
+            task -t                    ← 列 trigger 预设（默认是空列表）
+            task -f                    ← 列 formatter 预设（现在有 end）
+            task 3 -f end              ← 按 duration 排到当天最后一段并自动 assign
+            task create title=闪卡 duration=25 -f end
             task 32 swap 21             ← 两条任务互换位置
             task -s 5 -a 6              ← 把 #5 上的全部任务转移到 #6
             task -s 5 -a none           ← 把 #5 上的全部任务下架
@@ -3690,25 +3786,45 @@ class Warden(object):
         source, kept = self._split_source(kept)
         note_text, kept = self._split_note(kept)
         mark_status, kept = self._split_mark(kept)
+        trigger_tokens, kept = self._split_hook(kept, "trigger")
+        formatter_tokens, kept = self._split_hook(kept, "formatter")
+
+        # `task -t` / `task -f` 后面什么都没跟 = 列预设，不是「挂一个空函数」。
+        bare_hooks = [kind for kind, tokens in
+                      (("trigger", trigger_tokens), ("formatter", formatter_tokens))
+                      if tokens is not None and not tokens]
+        if bare_hooks:
+            self._list_hooks(bare_hooks)
+            return True
+
+        trigger_spec = (th.build_spec("trigger", trigger_tokens)
+                        if trigger_tokens else None)
+        formatter_spec = (th.build_spec("formatter", formatter_tokens)
+                          if formatter_tokens else None)
+
         if source is not None:
             if mark_status is not None:
                 raise ValueError("`-m/--mark` 是单条任务的状态标记，不能和 `-s/--from` 批量一起用；"
                                  "先切到那天再逐条标。")
+            if trigger_spec is not None or formatter_spec is not None:
+                raise ValueError("`-t/--trigger`、`-f/--formatter` 都是单条任务的钩子，"
+                                 "不能和 `-s/--from` 批量一起用；先切到那天再逐条挂。")
             # `-s` 本身就是动作（批量），后面不该再有子命令：``task -s 5 -a 6``。
             if kept:
                 raise ValueError("`-s/--from` 是批量后缀，后面不要再跟动作（%s）；"
                                  "写成 `task -s 5 -a 6` 这样。" % kept[0])
             return self._apply_bulk(source, assign_to)
-        if not kept and mark_status is None:
+        if not kept and mark_status is None and trigger_spec is None \
+                and formatter_spec is None:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
-                             "或后缀 -m/--mark")
+                             "或后缀 -m/--mark / -t/--trigger / -f/--formatter")
         if kept:
             action = kept[0].lower()
             rest = kept[1:]
             result = self._dispatch_task(action, rest)
         else:
-            # `task -m complete`：标记当前选中的任务。
-            action = "mark"
+            # `task -m complete` / `task -f end`：作用于当前选中的任务。
+            action = "hook" if (trigger_spec or formatter_spec) and mark_status is None else "mark"
             result = None
         if note_text is not None:
             self._apply_note(result, note_text, action)
@@ -3716,6 +3832,10 @@ class Warden(object):
             self._apply_assign(result, assign_to, action)
         if mark_status is not None:
             result = self._apply_mark(result, mark_status, action)
+        if trigger_spec is not None:
+            result = self._apply_trigger(result, trigger_spec, action)
+        if formatter_spec is not None:
+            result = self._apply_formatter(result, formatter_spec, action)
         return result
 
     @staticmethod
@@ -3848,6 +3968,206 @@ class Warden(object):
                 raise ValueError("`-m/--mark` 一次只能给一个状态（complete / discard）。")
             status = want
         return status, kept
+
+    @staticmethod
+    def _split_hook(toks, kind):
+        """把 ``--formatter end [参数...]`` / ``-f end`` 从参数里摘出来。
+
+        返回 ``(tokens, kept)``：
+
+        * 没出现这个 flag → ``(None, kept)``；
+        * 出现了但后面没有词 → ``([], kept)`` —— 调用方据此**列预设**；
+        * 出现了且后面有词 → ``(["end", ...], kept)``。
+
+        参数一路吃到下一个 ``-`` 开头的 flag 为止，所以
+        ``task 3 -f end -a 2`` 里 ``-a 2`` 仍然归 ``--assign``。
+        预设名字/参数不能以 ``-`` 开头（key=value 的参数值可以）。
+        """
+        flags = TASK_HOOK_FLAGS.get(kind)
+        if not flags:
+            raise ValueError("未知钩子类型 %r" % (kind,))
+        found = False
+        parts = []
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = str(toks[i])
+            low = tok.lower()
+            if low in flags or low.startswith(flags[0] + "=") or low.startswith(flags[1] + "="):
+                if found:
+                    raise ValueError("`%s` 一次只能给一个（%s）；不能同时挂两个 %s。"
+                                     % (flags[0], " / ".join(flags), kind))
+                found = True
+                if "=" in tok:
+                    # --formatter=end / -f=end：第一个词在等号右边。
+                    first = tok.split("=", 1)[1]
+                    if first:
+                        parts.append(first)
+                    i += 1
+                else:
+                    i += 1
+                while i < len(toks) and not str(toks[i]).startswith("-"):
+                    parts.append(str(toks[i]))
+                    i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return (parts if found else None), kept
+
+    def _list_hooks(self, kinds):
+        """``task -t`` / ``task -f``：把预设函数列出来（trigger 默认是空列表）。"""
+        for kind in kinds:
+            rows = th.describe_presets(kind)
+            label = TASK_HOOK_LABELS.get(kind, kind)
+            if not rows:
+                self.say("%s：0 个（空列表 —— 框架已就位，还没有注册任何函数）" % label,
+                         "info")
+                continue
+            self.say("%s：%d 个" % (label, len(rows)), "info")
+            for name, params, help_text in rows:
+                tail = ("（参数：%s）" % "、".join(params)) if params else "（无参数）"
+                self.say("   %s %s%s" % (name, tail, (" —— " + help_text) if help_text else ""),
+                         "info")
+
+    def _hook_task(self, result, kind, action):
+        """给 ``-t`` / ``-f`` 找任务：刚产出的优先，其次当前选中的。"""
+        task = result if isinstance(result, dict) and result.get("id") is not None else None
+        if task is None and self.selected_task_id is not None:
+            try:
+                task = self.task_store.get(self.selected_task_id)
+            except ValueError:
+                task = None
+        if task is None:
+            raise ValueError("`-%s/--%s` 要跟一条任务：`task 3 -%s ...`，"
+                             "或先 `task select 3`。"
+                             % (kind[0], kind, kind[0]))
+        return task
+
+    def _apply_trigger(self, result, spec, action):
+        """``-t/--trigger`` 的收尾：把 preset 记在任务上（**不执行**）。
+
+        trigger 的执行属于未来的 runner；这里只负责「挂上去、看得见、可校验」。
+        """
+        if action in self.NO_TASK_ACTIONS:
+            self.say("`-t/--trigger` 对 %s 没意义（它不产出任务），忽略。" % action, "warn")
+            return None
+        task = self._hook_task(result, "trigger", action)
+        task = self.task_store.set_hook(task["id"], "trigger", spec)
+        params = " ".join(spec.get("params") or ())
+        self.say("✅ 任务 %s「%s」已挂 trigger %s%s（只记本地；runner 还没实现）"
+                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
+                    spec.get("name"), (" " + params) if params else ""), "ok")
+        self.selected_task_id = task["id"]
+        return task
+
+    def _formatter_sessions(self, day):
+        """formatter 的候选 session：先走日历下载层 + layout，再回退到 data.csv。"""
+        sessions = []
+        try:
+            sessions = [dict(s) for s in self.sessions_for_day_plan(day)]
+        except Exception:                     # noqa: BLE001 - 下载层坏了不该挡住 csv
+            sessions = []
+        if sessions:
+            return sessions
+        try:
+            self.reload_entries()
+            for slot in sch.day_slots(self.entries, day):
+                start = slot["start"]
+                duration = int(slot["duration"])
+                hour, minute = map(int, start.split(":"))
+                total = hour * 60 + minute + duration
+                sessions.append({
+                    "date": day.isoformat(), "start": start,
+                    "end": "%02d:%02d" % ((total // 60) % 24, total % 60),
+                    "start_min": hour * 60 + minute, "end_min": total,
+                    "duration": duration, "period_id": None,
+                })
+        except Exception:                     # noqa: BLE001 - csv 也坏了就没有候选
+            sessions = []
+        return sessions
+
+    def _apply_formatter(self, result, spec, action):
+        """``-f/--formatter`` 的收尾：记下 preset，并**当场调用它**。
+
+        ``end`` 会返回一个 reservation；这里负责：
+          1. 按任务 duration 选出 session（算法在 :mod:`task_hooks`）；
+          2. 把任务挂到那个 session（``assign_task_to``，能建 Focusmate 就建）；
+          3. 把 ``formatter.reservation`` 写回任务 —— 之后别的 formatter 看到
+             这段就不会再用。
+
+        自动 runner 必须传 ``allow_today=False``（见 ``task_hooks.resolve_target_day``）；
+        用户手敲这条命令是手动操作，所以这里允许今天。
+        """
+        if action in self.NO_TASK_ACTIONS:
+            self.say("`-f/--formatter` 对 %s 没意义（它不产出任务），忽略。" % action, "warn")
+            return None
+        task = self._hook_task(result, "formatter", action)
+        day = th.resolve_target_day(self.sel_date, datetime.datetime.now(),
+                                    spec.get("args") or {}, allow_today=True)
+        today = datetime.date.today()
+        if day < today:
+            raise ValueError("formatter 不能排到过去（%s）。先切到那一天或指定 date=。"
+                             % day.isoformat())
+        sessions = self._formatter_sessions(day)
+        ctx = {
+            "task": task,
+            "task_id": task["id"],
+            "date": day.isoformat(),
+            "sessions": sessions,
+            "periods": self.periods_for_day(day),
+            "reservations": th.collect_reservations(self.task_store.list(), day.isoformat()),
+        }
+        try:
+            out = th.call_preset("formatter", spec, ctx)
+        except th.HookError as exc:
+            # 算法层不知道「面板序号」这套编号；把报错里的内部 id 换成用户
+            # 眼前那个序号（例如 `task modify 3 duration 25` -> `task modify 2 ...`）。
+            text = str(exc)
+            panel_no = self.task_no(task)
+            if panel_no:
+                text = text.replace("task modify %s duration" % task.get("id"),
+                                    "task modify %s duration" % panel_no)
+            raise th.HookError(text) from None
+        chosen = out.get("session") or {}
+        reservation = out.get("reservation") or {}
+        if not chosen.get("start"):
+            raise th.HookError("formatter %s 没有返回 session" % spec.get("name"))
+
+        # 选中 session 的 Focusmate 身份：未来那天可能已经订好了，也可能还没有。
+        hour, minute = map(int, chosen["start"].split(":"))
+        slot = {"start": chosen["start"], "duration": int(chosen.get("duration") or 0),
+                "hour": hour, "minute": minute}
+        session_info = self.session_info_for(day, slot)
+        previous = task.get("session") or {}
+        moved = bool(previous) and ((previous.get("date"), previous.get("start"))
+                                    != (session_info.get("date"), session_info.get("start")))
+        if moved:
+            self.say("任务 %s 原来在 %s %s；formatter 要先下架旧位置再挂新位置。"
+                     % (self.task_label(task), previous.get("date"), previous.get("start")),
+                     "warn")
+            task = self._task_detach(task, reason="formatter-move")
+        if moved or not previous:
+            note = self.assign_task_to(task, session_info)
+            task = self.task_store.get(task["id"])
+        else:
+            note = "已经在这场，不重复建 Focusmate task"
+
+        spec = dict(spec)
+        spec["result"] = out
+        spec["reservation"] = reservation
+        spec["applied_at"] = ts._now()
+        task = self.task_store.set_hook(task["id"], "formatter", spec)
+        self.say("✅ 任务 %s「%s」已由 formatter %s 排到 %s %s–%s"
+                 "（session %s 分钟，任务 %s 分钟 + %s 分钟休息；占用 %s–%s）%s"
+                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
+                    spec.get("name"), reservation.get("date"), reservation.get("start"),
+                    reservation.get("end"), reservation.get("session_duration"),
+                    reservation.get("duration"), reservation.get("break_minutes"),
+                    reservation.get("start"), reservation.get("end"),
+                    ("；" + note) if note else ""), "ok")
+        self.selected_task_id = task["id"]
+        self.rebuild_rows()
+        return task
 
     NO_TASK_ACTIONS = ("delete", "sync", "refresh", "reconcile", "archive", "history",
                        "归档", "list", "ls", "show", "done", "complete", "完成",
