@@ -127,7 +127,10 @@ warden 只提供内容。
        ├── 子进程 ──> keep_session.py check | daemon start | stop（薄封装，不重写业务）
        ├── 子进程 ──> omnifocus.py → omnifocus_tasks.py → osascript → OmniFocus
        │              （读状态 / 写回完成与截止时间；**单向**，见 docs/omnifocus.md）
-       └── stats.py ──> 只读公开 API（/v1/me + /v1/sessions 分块拉全量历史）→ 统计视图
+       ├── stats.py ──> 只读公开 API（/v1/me + /v1/sessions 分块拉全量历史）→ 统计视图
+       └── 网络队列 repl_kit.jobs（单 worker 串行）：读操作异步、写操作乐观。
+           面板挂在看板（Recent）**下面**：进度条在标题里、日志只留三行，干完消失；
+           失败 → 回滚本地 + 警告 + 记进 data/failed-actions.json，`re-action` 重放。
 
 - 写操作（mute / title / cancel）全部走 bridge（内部 API，见 docs/…-notes.md）。
 - daemon 的启停、`session` 之后的立刻下单，都走 keep_session.py 子进程
@@ -271,6 +274,21 @@ SIN_BEEP_LIMIT = 3
 # 内部再多留几条（MESSAGE_KEEP），好让「敲错被记账」这类过程还能被测试和排查看到。
 MESSAGE_SHOW = 3
 MESSAGE_KEEP = 12
+
+# 网络操作全走后台队列（repl_kit.jobs）。失败的行动记在这儿 ——
+# 一条 = 名字 + 参数 + 为什么 + 什么时候；`re-action` 原样重放一遍。
+# 落盘是为了跨进程：warden 关掉再开，昨天断网那几条还等着补。
+FAILED_ACTIONS_FILE = (os.environ.get("TI_FAILED_ACTIONS")
+                       or os.path.join(HERE, "data", "failed-actions.json"))
+
+# 读操作的「新鲜度」：状态框里那行「这份数据是什么时候来的」。
+# 新鲜 = 灰的、不吵你；过期 = 红色加粗 —— 表格里的 session 是几分钟前的，
+# 和「现在几点了」是两件事，别让你拿旧账做决定。
+FRESH_SESSION = 5 * 60
+FRESH_TASK = 15 * 60
+
+#: focusmate 里「乐观预测、还没落地」的标记（任务库里的一个字段）
+FM_PENDING = "pending"
 
 # 契约表格 task 列里的每条任务：「1: 任务… | 3: 任务…」。
 # 每条标题单独裁到 TASK_CELL_TITLE_MAX 个字（后面的内容 trim 掉），
@@ -1371,7 +1389,8 @@ class View(object):
                  options=("on", "off"),
                  hint=_hint_actions("on", "off", note="不写就是取反")),
             _task_command(w),
-        ]
+        # say 用 lambda 晚绑定：换 console（测试、--exec）时输出跟着走
+        ] + repl_kit.job_commands(w.jobs, say=lambda text: w.console.print(text))
 
     def build_registry(self):
         w = self.w
@@ -2228,7 +2247,8 @@ class WardenShell(repl_kit.ReplShell):
 
 
 class Warden(object):
-    def __init__(self, console, bridge, no_clear=False, offline=False, day_offset=0):
+    def __init__(self, console, bridge, no_clear=False, offline=False, day_offset=0,
+                 net_async=None):
         # no_clear 只是个历史参数：擦除/重画已经归 repl_kit，这里不再使用。
         self.console = console
         self.bridge = bridge
@@ -2298,6 +2318,23 @@ class Warden(object):
         # 重算 data.csv 时被"计划里没有"冲掉的行（例如手写的旧契约）：
         # 记下来当警告显示，别让人以为契约凭空消失了。
         self.csv_dropped = []
+        # ── 网络队列 ──────────────────────────────────────────────────
+        # 读也异步、写乐观：所有碰网络的东西都交给 repl_kit.jobs 的单 worker
+        # 串行队列，主线程只在 drain_net() 里应用结果（回滚也在那儿做）。
+        # 测试 / --exec / --status 用同步模式：同一条代码路径，没有时序。
+        self.net_async = (bool(net_async) if net_async is not None else
+                          bool(repl_kit.PROMPT_TOOLKIT and not offline
+                               and sys.stdin.isatty()))
+        self.jobs = repl_kit.JobRunner(
+            sync=not self.net_async,
+            store=FAILED_ACTIONS_FILE,
+            title="网络",
+            on_change=self._net_touched,
+        )
+        self._net_dirty = False
+        #: 每份数据是什么时候拿到的：{"session": epoch, "task": epoch, "stat": epoch}
+        self.read_at = {}
+        self._register_net_actions()
         # 提示行 / 补全 / 视图切换 / 状态行的定时刷新 / 帧的擦除重画，
         # 全部交给 repl_kit（prompt_toolkit 按单元格 diff，只写变化的那几格）。
         shell_kwargs = dict(
@@ -2321,6 +2358,9 @@ class Warden(object):
             interrogate=self.render_interrogate,
             # 底部状态栏（repl_kit 的 footer）：视图栏在打断栏位**下面**、提示行上面。
             footer=self.render_view_bar,
+            # 进度栏位（repl_kit 的 progress）：后台在干活时，看板（Recent 之后）
+            # 下面多一块「在做什么」；干完它自己消失，一次一行都不占。
+            progress=self.jobs,
         )
         # 看板自己就是最下面那块内容；补全菜单浮在它上面，不再在输入行
         # 下面留 8 行空白（留了就会把看板/提示挤出屏幕）。
@@ -2365,6 +2405,458 @@ class Warden(object):
             (review.pending_task or {}).get("id"),
         )
 
+    # -- 网络：读也异步、写乐观（repl_kit.jobs）-------------------------
+    #
+    #     主线程                          worker 线程
+    #     ────────                        ───────────
+    #     乐观改本地（立刻看见）──submit──> bridge.call(...)   ← 真网络
+    #     drain_net() ←──── outcome ─────  成功 / 失败
+    #       ├ 成功：填上真 id / 真结果
+    #       └ 失败：restore() 回滚 + 警告 + 记进失败账（re-action 重放）
+    #
+    # 三条规矩：
+    #   1. **worker 只碰 bridge 和 rep**，任务库 / data.csv / 画面一律在主线程改；
+    #   2. 每个动作都有 `名字 + 参数 + 怎么干 + 本地那半件事(apply)`，
+    #      所以失败之后换个进程也能重放（re-action）；
+    #   3. **多步事务不拆**：时段剪断、收尾、布局重写这些一次改好几场的内部写
+    #      仍然同步 —— 中途失败回滚一半比不回滚更糟。
+
+    def _net_touched(self):
+        """worker 线程只说一句「画面脏了」。业务状态一律留给主线程。"""
+        self._net_dirty = True
+
+    def drain_net(self):
+        """每帧一次：把后台跑完的网络操作搬回主线程（成功/失败回调都在这里跑）。"""
+        outcomes = self.jobs.drain()
+        if outcomes or self._net_dirty:
+            self._net_dirty = False
+            self.invalidate()
+        return outcomes
+
+    def _register_net_actions(self):
+        """给队列登记「名字 → 怎么干 / 本地怎么落」（re-action 靠这两半重放）。"""
+        self.jobs.register("session.snapshot", self.net_snapshot,
+                           apply=self._apply_snapshot)
+        self.jobs.register("task.pull", self.net_task_pull,
+                           apply=self._apply_task_pull)
+        self.jobs.register("stat.history", self.net_stat_history,
+                           apply=self._apply_stat_history)
+        self.jobs.register("task.assign", self.net_task_assign,
+                           apply=self._apply_task_assign)
+        self.jobs.register("task.detach", self.net_task_detach,
+                           apply=self._apply_task_detach)
+        self.jobs.register("task.complete", self.net_task_complete,
+                           apply=self._apply_task_complete)
+        self.jobs.register("session.cancel", self.net_session_cancel,
+                           apply=self._apply_session_cancel)
+        self.jobs.register("session.mute", self.net_session_mute,
+                           apply=self._apply_session_mute)
+        self.jobs.register("session.title", self.net_session_title,
+                           apply=self._apply_session_title)
+        # 重放的时候没有当初那个闭包了 —— 失败仍然要有人说话
+        self.jobs.on_failure = self._net_action_failed
+
+    # -- worker 侧：只有 bridge 调用 + rep（日志/进度）------------------
+
+    def net_snapshot(self, args, rep):
+        """拉某一天的 session 列表。**读**操作：只回数据，不预测。"""
+        day_iso = str(args.get("date") or self.sel_date.isoformat())
+        rep.label("拉 session %s" % day_iso[5:])
+        rep.progress(0.05)
+        res = self.bridge.call("snapshot", timeout=int(args.get("timeout") or 180),
+                               date=day_iso)
+        rep.progress(1.0)
+        rep.log("%s 拉到 %d 场" % (day_iso[5:], len(res.get("sessions") or [])), "ok")
+        return {"date": day_iso, "res": res}
+
+    def net_task_pull(self, args, rep):
+        """拉 Focusmate task（完成状态）。**读**操作。"""
+        rep.label("拉 Focusmate task")
+        rep.progress(0.05)
+        res = self.bridge.call("tasks", timeout=180)
+        remote = res.get("tasks") if isinstance(res, dict) else res
+        rep.progress(1.0)
+        rep.log("Focusmate task %d 条" % len(remote or []), "ok")
+        return {"remote": remote or []}
+
+    def net_stat_history(self, args, rep):
+        """拉生涯统计历史（只读公开 API，分块）。**读**操作。"""
+        rep.label("拉生涯统计")
+        rep.progress(0.05)
+        history, note = st.load(force=bool(args.get("force")), full=bool(args.get("full")))
+        rep.progress(1.0)
+        try:
+            count = len((history or {}).get("sessions") or [])
+        except AttributeError:
+            count = 0
+        rep.log("生涯统计：%d 场（%s）" % (count, note), "ok")
+        return {"history": history, "note": note}
+
+    def net_task_assign(self, args, rep):
+        """把任务挂到 Focusmate 那一场（**写**操作，乐观之后在后台跑的就是它）。"""
+        rep.label("挂任务 #%s 到 %s" % (args.get("task_id"), args.get("start") or "?"))
+        rep.progress(0.05)
+        res = self.bridge.call("add_task", timeout=240, startMs=args.get("startMs"),
+                               meetingId=args.get("meeting_id"),
+                               title=args.get("title") or "",
+                               notes=args.get("notes") or "")
+        if not res.get("verified"):
+            raise ValueError("Focusmate 里没能确认 task 已挂上（本地已回滚）")
+        fm_id = res.get("taskId") or (res.get("task") or {}).get("id")
+        if not fm_id:
+            raise ValueError("Focusmate 说挂上了，但没给 task id")
+        rep.progress(1.0)
+        rep.log("任务 #%s 挂上了（Focusmate task %s）"
+                % (args.get("task_id"), str(fm_id)[:8]), "ok")
+        return {"task_id": fm_id, "via": res.get("via"),
+                "existingCount": res.get("existingCount")}
+
+    def net_task_detach(self, args, rep):
+        """删掉 Focusmate 上那条 task（下架 / 转移）。**写**操作。"""
+        fm_id = args.get("focusmate_task_id")
+        if not fm_id:
+            raise ValueError("这条任务没有 Focusmate task id，删不了")
+        rep.label("删 Focusmate task %s" % str(fm_id)[:8])
+        rep.progress(0.05)
+        res = self.bridge.call("delete_task", timeout=180, taskId=fm_id)
+        if not res.get("verified"):
+            still = (res.get("stillThere") or {}).get("title") or ""
+            raise ValueError("Focusmate 说删了，但复核还在%s"
+                             % (("：" + still) if still else ""))
+        rep.progress(1.0)
+        rep.log("Focusmate task %s 已删除" % str(fm_id)[:8], "ok")
+        return {"deleted": fm_id}
+
+    def net_task_complete(self, args, rep):
+        """把 Focusmate 那条 task 勾完成。**写**操作。"""
+        fm_id = args.get("focusmate_task_id")
+        if not fm_id:
+            raise ValueError("这条任务没有 Focusmate task id，勾不了")
+        rep.label("勾完成 #%s" % args.get("task_id"))
+        rep.progress(0.05)
+        res = self.bridge.call("complete_task", timeout=180, taskId=fm_id)
+        if not res.get("verified"):
+            raise ValueError("Focusmate 没确认勾上")
+        rep.progress(1.0)
+        rep.log("Focusmate task %s 已勾完成" % str(fm_id)[:8], "ok")
+        return {"completed_at": res.get("completedAt") or ts._now(),
+                "already": bool(res.get("already"))}
+
+    def net_session_cancel(self, args, rep):
+        """取消一场 session。**写**操作。"""
+        rep.label("取消 %s %s" % (str(args.get("date") or "")[5:], args.get("start") or "?"))
+        rep.progress(0.05)
+        res = self.bridge.call("cancel", startMs=args.get("startMs"),
+                               meetingId=args.get("meeting_id"))
+        if not res.get("verified"):
+            raise ValueError("取消后复核：该 session 还在")
+        rep.progress(1.0)
+        rep.log("%s 那场已取消" % (args.get("start") or "?"), "ok")
+        return {"cancelled": args.get("meeting_id")}
+
+    def net_session_mute(self, args, rep):
+        """改 quiet mode。**写**操作。"""
+        want = bool(args.get("quiet"))
+        rep.label("%s quiet %s" % (args.get("start") or "?", "ON" if want else "off"))
+        rep.progress(0.05)
+        res = self.bridge.call("mute", startMs=args.get("startMs"),
+                               meetingId=args.get("meeting_id"), quiet=want)
+        if not res.get("verified"):
+            raise ValueError("改完复核不一致：现在是 %s" % (res.get("quiet"),))
+        rep.progress(1.0)
+        rep.log("%s quiet = %s" % (args.get("start") or "?", "ON" if want else "off"), "ok")
+        return {"quiet": bool(res.get("quiet"))}
+
+    def net_session_title(self, args, rep):
+        """写 session 标题。**写**操作。"""
+        rep.label("写标题 %s" % (args.get("start") or "?"))
+        rep.progress(0.05)
+        res = self.bridge.call("title", startMs=args.get("startMs"),
+                               meetingId=args.get("meeting_id"),
+                               title=args.get("title") or "")
+        if not res.get("verified"):
+            raise ValueError("写完复核不一致：现在是 %r" % (res.get("actual"),))
+        rep.progress(1.0)
+        rep.log("%s 标题已写入" % (args.get("start") or "?"), "ok")
+        return {"title": args.get("title") or ""}
+
+    # -- 主线程侧：成功之后把本地落定（apply）--------------------------
+
+    def _apply_snapshot(self, payload, args):
+        """session 列表到了：换成真数据（读操作，没有回滚这回事）。"""
+        payload = payload or {}
+        res = payload.get("res") or {}
+        now_ms = res.get("now") or int(time.time() * 1000)
+        api_rows = []
+        for sess in res.get("sessions") or []:
+            row = dict(sess)
+            row["phase"] = self.phase_of(sess["startMs"], sess["endMs"], now_ms)
+            api_rows.append(row)
+        self.api_rows = api_rows
+        self.rows_source = "bridge"
+        self.rows_note = ""
+        self.rows_at = time.time()
+        self.read_at["session"] = self.rows_at
+        self.rebuild_rows(now_ms)
+        self.invalidate()
+        return len(self.rows)
+
+    def _apply_task_pull(self, payload, args):
+        """Focusmate task 到了：对账完成状态（本地写 + 写回 OmniFocus）。"""
+        remote = (payload or {}).get("remote") or []
+        started = time.monotonic()
+        before = len(self.task_store.load_archive().get("records") or [])
+        try:
+            archived, matched = self.task_store.reconcile(remote)
+        except Exception as e:                     # noqa: BLE001 - 对账坏了别掀 TUI
+            self.had_error = True
+            self.say("Focusmate task 对账失败：%s" % e, "error")
+            return 0
+        self.task_sync_at = time.time()
+        self.read_at["task"] = self.task_sync_at
+        summary = self._focusmate_task_summary(remote)
+        summary.update({
+            "source": "net.task_pull",
+            "matched": matched,
+            "archived": archived,
+            "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+        })
+        rl.log_event("focusmate", "task_pull_result", **summary)
+        if archived:
+            self.announce_completions(before)
+        self.writeback_completions()
+        self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
+                 % (len(matched), archived), "ok")
+        self.invalidate()
+        return archived
+
+    def _apply_stat_history(self, payload, args):
+        """统计历史到了：算数字（纯本地 CPU，放主线程没关系）。"""
+        payload = payload or {}
+        history, note = payload.get("history"), payload.get("note") or ""
+        try:
+            self.stat = st.compute_stats(history)
+        except Exception as e:                      # noqa: BLE001 - 数据变形的兜底
+            self.had_error = True
+            self.stat_note = "数据没法算：%s" % e
+            self.say("生涯统计算不动：%s" % e, "error")
+            return 0
+        self.stat_note = note
+        self.stat_at = datetime.datetime.now()
+        self.read_at["stat"] = time.time()
+        self.say("生涯统计：%s（完成 %d 场 / %d 天）"
+                 % (note, self.stat["total_completed"], self.stat["days"]),
+                 "ok" if history else "warn")
+        self.invalidate()
+        return 1
+
+    def _apply_task_assign(self, payload, args):
+        """挂上了：把乐观的「在途」换成真 task id（重放时同样走这里）。"""
+        payload = payload or {}
+        task_id = args.get("task_id")
+        session = dict(args.get("session") or {})
+        fm_id = payload.get("task_id")
+        try:
+            task = self.task_store.get(task_id)
+        except (ValueError, TypeError):
+            return None
+        session["task_id"] = fm_id
+        current = task.get("session") or {}
+        same = (current.get("date") == session.get("date")
+                and current.get("start") == session.get("start"))
+        if current and not same:
+            # 排进队列之后这条任务又被挪到别处了：这次落地不许把它拽回来
+            self.jobs._log_line("任务 %s 已经挂到 %s %s，这次落地跳过"
+                                % (self.task_label(task), current.get("date"),
+                                   current.get("start")), "warn")
+            return task["id"]
+        # 已经是同一场就别再 assign 一次：assign 会整体覆盖 session 字典，
+        # 把 previous_due / previous_session 这些留档冲掉。
+        if not same:
+            self.task_store.assign(task["id"], session)
+        self.task_store.attach_focusmate(task["id"], {
+            "task_id": fm_id,
+            "session_id": args.get("meeting_id"),
+            "attached_at": ts._now(),
+            "title": args.get("title"),
+            "via": payload.get("via"),
+        }, session=None)
+        self.task_store.settle_focusmate(task["id"], FM_PENDING)   # 落地了：撤掉在途标记
+        self.selected_task_id = task["id"]
+        self.rebuild_rows()
+        remote_had = payload.get("existingCount")
+        total = (remote_had if isinstance(remote_had, int) else 0) + 1
+        extra = ("（这场现在共 %d 个任务，表格里会一起列出来）" % total) if total > 1 else ""
+        via = payload.get("via")
+        self.say("✅ 任务 %s 已挂上；Focusmate task id=%s%s%s"
+                 % (self.task_label(task), fm_id,
+                    "（via %s）" % via if via else "", extra), "ok")
+        self.invalidate()
+        return task["id"]
+
+    def _apply_task_detach(self, payload, args):
+        """删掉了：本地断绑定（重放时同样走这里）。"""
+        task_id = args.get("task_id")
+        try:
+            task = self.task_store.get(task_id)
+        except (ValueError, TypeError):
+            return None
+        current = task.get("session") or {}
+        if current and (current.get("date") != args.get("date")
+                        or current.get("start") != args.get("start")):
+            # 排进队列之后它又挂到别处去了：这次「下架」不该动新位置
+            self.jobs._log_line("任务 %s 已经挂到 %s %s，这次下架跳过"
+                                % (self.task_label(task), current.get("date"),
+                                   current.get("start")), "warn")
+            return task_id
+        try:
+            task = self.task_store.unassign(task_id, reason=args.get("reason") or "net-detach")
+        except (ValueError, TypeError):
+            return None
+        self.rebuild_rows()
+        self.say("⏏ 任务 %s 已从 %s %s 下架"
+                 % (self.task_label(task), (args.get("date") or "?"),
+                    args.get("start") or "?"), "ok")
+        self.invalidate()
+        return task["id"]
+
+    def _apply_task_complete(self, payload, args):
+        """勾上了：本地记 completed_at。"""
+        payload = payload or {}
+        try:
+            task = self.task_store.get(args.get("task_id"))
+        except (ValueError, TypeError):
+            return None
+        self.task_store.attach_focusmate(task["id"], {
+            "completed_at": payload.get("completed_at") or ts._now()})
+        self.task_store.settle_focusmate(task["id"], FM_PENDING)
+        self.invalidate()
+        return task["id"]
+
+    def _apply_session_cancel(self, payload, args):
+        """取消了：那一行从表格里消失（乐观时已经先拿掉；重放时在这儿拿掉）。"""
+        self._forget_api_row(args.get("meeting_id"))
+        self.rebuild_rows()
+        self.invalidate()
+        return True
+
+    def _apply_session_mute(self, payload, args):
+        self._patch_api_row(args.get("meeting_id"), quiet=bool((payload or {})
+                                                              .get("quiet")))
+        self.rebuild_rows()
+        self.invalidate()
+        return True
+
+    def _apply_session_title(self, payload, args):
+        self._patch_api_row(args.get("meeting_id"),
+                            title=(payload or {}).get("title") or "")
+        self.rebuild_rows()
+        self.invalidate()
+        return True
+
+    def _net_action_failed(self, action, error):
+        """没有专属失败钩子的失败（重放时的就是这种）：说话 + 记账就够了。"""
+        self.had_error = True
+        self.say("❌ %s 失败：%s（已记进失败账，re-action 可以重放）"
+                 % (action.label, error), "error")
+        self.invalidate()
+
+    # -- 小工具：乐观写操作的「本地那半件事」和它的反面 ----------------
+
+    def _patch_api_row(self, meeting_id, **fields):
+        """改表格里那一行的本地字段（不动 data.csv，等 refresh 覆盖）。"""
+        if not meeting_id:
+            return None
+        for row in self.api_rows:
+            if row.get("id") == meeting_id:
+                row.update(fields)
+                return row
+        return None
+
+    def _forget_api_row(self, meeting_id):
+        """把一行从本地表格里拿掉（取消的乐观预测）。返回被拿掉的那行和位置。"""
+        if not meeting_id:
+            return None
+        for index, row in enumerate(self.api_rows):
+            if row.get("id") == meeting_id:
+                return index, self.api_rows.pop(index)
+        return None
+
+    def _restore_api_row(self, before_row, index=None):
+        """把一行（或它原来的位置）放回本地表格 —— 乐观行操作的失败回滚。"""
+        if not before_row:
+            return None
+        meeting_id = before_row.get("id")
+        existing = self._patch_api_row(meeting_id, **dict(before_row)) if meeting_id else None
+        if existing is None:
+            if index is None or index > len(self.api_rows):
+                self.api_rows.append(dict(before_row))
+            else:
+                self.api_rows.insert(index, dict(before_row))
+        self.rebuild_rows()
+        self.invalidate()
+        return before_row
+
+    def _row_op_failed(self, what, before_row, error, index=None):
+        """行级乐观操作失败：把那一行放回原样，说清楚，记账照旧。"""
+        self._restore_api_row(before_row, index=index)
+        self.had_error = True
+        self.say("↩ 回滚：%s 没成功（%s）；表格已经退回操作前。" % (what, error), "warn")
+
+    @staticmethod
+    def _fm_pending(task):
+        """这条任务的 Focusmate 挂载是不是「乐观预测、还没落地」。"""
+        return ((task or {}).get("focusmate") or {}).get(FM_PENDING) or None
+
+    def _revert_task(self, task_id, snapshot, why):
+        """把一条任务整体放回操作前的快照，并且说实话。"""
+        try:
+            self.task_store.restore(task_id, snapshot)
+        except (ValueError, TypeError):
+            pass
+        self.rebuild_rows()
+        self.invalidate()
+        self.had_error = True
+        self.say("↩ 回滚：%s（本地已经退回操作前）" % why, "warn")
+
+    # -- 新鲜度：这份数据是什么时候来的 --------------------------------
+
+    def _age_text(self, stamp, limit_ok=True):
+        """epoch → 「12 秒前」/「6 分钟前」/「还没拉过」。"""
+        if not stamp:
+            return "还没拉过"
+        seconds = max(0, int(time.time() - stamp))
+        if seconds < 90:
+            return "%d 秒前" % seconds
+        if seconds < 5400:
+            return "%d 分钟前" % int(seconds / 60)
+        return "%d 小时前" % int(seconds / 3600)
+
+    def freshness_rows(self):
+        """状态框里的「数据是什么时候来的」。
+
+        用户要求：**最近的就不吵**（灰的），**不是最近的红色 + 加粗** ——
+        「这份 session 列表是 8 分钟前的」必须一眼看得出来，不然你会拿旧账
+        去做「现在几点了」的决定。
+        """
+        now = time.time()
+        pieces = []
+        stale = []
+        for label, key, limit in (("session", "session", FRESH_SESSION),
+                                  ("task", "task", FRESH_TASK)):
+            stamp = self.read_at.get(key) or 0
+            text = self._age_text(stamp)
+            pieces.append("%s %s" % (label, text))
+            if not stamp or (now - stamp) > limit:
+                stale.append(label)
+        if "session" not in self.read_at and self.rows_source == "snapshot":
+            return [("数据：session 列表来自 state.json 快照（不是真数据）→ refresh",
+                     "bold red")]
+        if stale:
+            return [("数据（⚠ %s 不是最近的）：%s" % ("、".join(stale), " · ".join(pieces)),
+                     "bold red")]
+        return [("数据：%s" % " · ".join(pieces), "dim")]
+
     def frame_signature(self):
         """画帧缓存要看的那些「便宜的事实」（贵的东西留在 key 之外）。
 
@@ -2389,6 +2881,8 @@ class Warden(object):
             self.review_signature(), pending_sig,
             self.sel_date.isoformat(), self.day_offset,
             id(getattr(self, "stat", None)),
+            # 队列一动（进度条、日志、失败账）画面就得重排版
+            self.jobs.signature(),
         )
 
     # -- 选中的那一天
@@ -2690,6 +3184,9 @@ class Warden(object):
             prefix += "⏱"
         if th.is_exclusive(task) and not ts.TaskStore.is_repeat_template(task):
             prefix += "🔒"
+        if self._fm_pending(task):
+            # 乐观挂载还在后台跑：⏳ 就是「这条还没落地，别当它是事实」
+            prefix += "⏳"
         return prefix + title
 
     def task_index_layout(self, tasks, width=None):
@@ -2809,6 +3306,8 @@ class Warden(object):
 
     def frame(self):
         """当前视图的整块看板。repl_kit 每帧调它一次，按单元格 diff 上屏。"""
+        # 后台跑完的网络操作在这儿搬回主线程（成功落定 / 失败回滚）
+        self.drain_net()
         # 每次画之前重读 data.csv：契约可能在别处被人手改了（这就是控制面）
         self.reload_entries()
         self.maybe_generate_repeat_occurrences()
@@ -2829,6 +3328,7 @@ class Warden(object):
         交互模式下不走这里，走 repl_kit 的 chrome（框架会把「状态」框和看板
         一起拼出来）。这里手动补上同一块框，保证 --status 看到的和交互时一样。
         """
+        self.drain_net()
         box = self.shell.status_box()
         if box is not None:
             self.console.print(box.renderable())
@@ -2912,32 +3412,29 @@ class Warden(object):
                     self.say("任务完成时间同步失败（不影响本地任务）：%s" % e, "warn")
 
     def cmd_stat(self, force=False, full=False):
-        """拉生涯统计：stats.load 走缓存 + 增量刷新；失败不掀 TUI。
+        """拉生涯统计（**读**操作，后台跑）：stats.load 走缓存 + 增量刷新。
 
         - 默认：TTL 内直接用缓存，不打网络；过期只拉缺口 + 最近几天。
-        - force：立刻增量刷新（`stat refresh`）。
-        - full：丢掉缓存全量重拉（`stat refresh full`，很少需要）。
+        - force：立刻增量刷新（``stat refresh``）。
+        - full：丢掉缓存全量重拉（``stat refresh full``，很少需要）。
+
+        拿到历史之后算数字在主线程做（纯 CPU，见 :meth:`_apply_stat_history`）。
         """
-        try:
-            history, note = st.load(force=force, full=full)
-        except Exception as e:
-            self.had_error = True
-            self.stat_note = "拉取失败：%s: %s" % (type(e).__name__, e)
-            self.say("生涯统计拉取失败：%s" % e, "error")
-            return False
-        try:
-            self.stat = st.compute_stats(history)
-        except Exception as e:                      # 数据变形的兜底
-            self.had_error = True
-            self.stat_note = "数据没法算：%s" % e
-            self.say("生涯统计算不动：%s" % e, "error")
-            return False
-        self.stat_note = note
-        self.stat_at = datetime.datetime.now()
-        self.say("生涯统计：%s（完成 %d 场 / %d 天）"
-                 % (note, self.stat["total_completed"], self.stat["days"]),
-                 "ok" if history else "warn")
+        action = repl_kit.Action("stat.history", "拉生涯统计",
+                                 {"force": bool(force), "full": bool(full)})
+        job = self.jobs.submit(action, persist=False,
+                               on_fail=lambda error: self._stat_failed(error))
+        if self.jobs.sync:
+            return bool(job.outcome is not None and job.outcome.ok)
+        if self.stat is None:
+            self.stat_note = "正在后台拉（进度看面板）…"
+            self.say("生涯统计在后台拉（进度看面板）；拉完数字会自己出来。", "cmd")
         return True
+
+    def _stat_failed(self, error):
+        self.had_error = True
+        self.stat_note = "拉取失败：%s" % error
+        self.say("生涯统计拉取失败：%s" % error, "error")
 
     def cycle_focus_mode(self):
         """Shift+Tab：只在专注视图生效，循环模式。返回新模式 key 或 None。"""
@@ -3017,11 +3514,13 @@ class Warden(object):
         self._log_tail_memo = (sig, tail)
         return tail
 
-    def refresh(self, quiet=False, timeout=180):
+    def refresh(self, quiet=False, timeout=180, wait=False):
         """拉一次**选中那一天**的 session，并和 data.csv 的契约合并成表格行。
 
-        失败时**不要**拿退化快照去覆盖已有好数据 —— 快照里没有 session id，
-        覆盖了后面 mute/title/cancel 全都做不了，还会让人困惑。
+        **读**操作：不预测，拿到真数据才换表格（失败时不要拿退化快照去覆盖
+        已有的好数据 —— 快照里没有 session id，覆盖了后面 mute/title/cancel
+        全都做不了）。默认**不阻塞**：网络丢进后台队列，进度和日志在面板里；
+        ``wait=True`` 是给「必须先有真数据」的命令用的（``refresh --check``）。
         """
         self.reload_entries()
         day = self.sel_date
@@ -3029,33 +3528,46 @@ class Warden(object):
             if not self.rows:
                 self._fallback_rows("离线模式")
             return False
-        try:
-            with self.console.status("[yellow]问 Focusmate 要 %s 的 session…[/]" % day.isoformat(),
-                                     spinner="dots"):
-                res = self.bridge.call("snapshot", timeout=timeout, date=day.isoformat())
-        except BridgeError as e:
-            self.had_error = True
-            if self.rows and self.rows_source == "bridge":
-                self.say("拉列表失败（表格保持上一次的结果）：%s" % e, "error")
-            else:
-                self._fallback_rows("bridge 出错")
-                self.say("拉列表失败：%s" % e, "error")
-            return False
-
-        now_ms = res.get("now") or int(time.time() * 1000)
-        api_rows = []
-        for s in res.get("sessions") or []:
-            row = dict(s)
-            row["phase"] = self.phase_of(s["startMs"], s["endMs"], now_ms)
-            api_rows.append(row)
-        self.api_rows = api_rows
-        self.rows_source = "bridge"
-        self.rows_note = ""
-        self.rows_at = time.time()
-        self.rebuild_rows(now_ms)
+        action = repl_kit.Action("session.snapshot",
+                                 "拉 session %s" % day.strftime("%m-%d"),
+                                 {"date": day.isoformat(), "timeout": int(timeout)})
+        job = self.jobs.submit(
+            action, persist=False,
+            on_ok=lambda payload: self._snapshot_arrived(payload, quiet=quiet),
+            on_fail=lambda error: self._snapshot_failed(error, quiet=quiet))
+        if wait:
+            self.wait_net(timeout + 30)
+        if self.jobs.sync or wait:
+            return bool(job.outcome is not None and job.outcome.ok)
         if not quiet:
-            self.say("拉到 %d 场（%s）" % (len(self.rows), res.get("date")))
+            self.say("正在拉 %s 的 session（后台，进度看面板）" % day.isoformat(), "cmd")
         return True
+
+    def _snapshot_arrived(self, payload, quiet=False):
+        count = self._apply_snapshot(payload, {})
+        if not quiet:
+            self.say("拉到 %d 场（%s）" % (count, (payload or {}).get("date") or ""), "info")
+
+    def _snapshot_failed(self, error, quiet=False):
+        self.had_error = True
+        if self.rows and self.rows_source == "bridge":
+            self.say("拉列表失败（表格保持上一次的结果）：%s" % error, "error")
+        else:
+            self._fallback_rows("bridge 出错")
+            self.say("拉列表失败：%s" % error, "error")
+
+    def wait_net(self, timeout=240.0):
+        """等后台那一批跑完再往下走（`refresh --check` 这种要真数据的命令用）。
+
+        这是**故意**阻塞的：一条「对账」命令必须拿着刚拉的账去对，
+        不然它会对着一份旧表说「一场不缺」。
+        """
+        if self.jobs.sync:
+            self.drain_net()
+            return True
+        done = self.jobs.wait(timeout)
+        self.drain_net()
+        return done
 
     # -- 表格行：契约（data.csv）和 API 上真实存在的 session 合并
 
@@ -3539,6 +4051,7 @@ class Warden(object):
                          "、".join("%s→%s" % (r.get("relocated_from") or "?",
                                               r["startLabel"]) for r in relocated),
                          "magenta"))
+        rows.extend(self.freshness_rows())
         rows.append((sch.data_csv_path(), "dim"))
         return rows
 
@@ -3612,6 +4125,16 @@ class Warden(object):
                 % (len(overdue), first.get("id"), title),
                 level="warn", source="task",
                 hint="敲 inspect-due 逐个过一遍（A 延期 / B 放弃 / C 重议 / D 补录 / E 推后）"))
+        # 3.6) 网络操作失败账：有它就告诉你，而且告诉你下一步敲什么
+        failures = self.jobs.failures
+        if failures:
+            first = failures[0]
+            more = (" 等 %d 条" % len(failures)) if len(failures) > 1 else ""
+            out.append(repl_kit.Warning(
+                "%d 条网络操作失败（%s：%s%s）" % (len(failures), first.action.label,
+                                                first.error, more),
+                level="error", source="网络",
+                hint="re-action 重放全部（re-action --list 先看清单，--clear 清空）"))
         # 4) 重复任务：今天该不该有 occurrence（日期对上就算；挂不挂得上 session
         # 是另一回事，不再用「同起点同时长」否定整条规则）
         today = datetime.date.today()
@@ -3783,16 +4306,28 @@ class Warden(object):
         if row.get("id") is None:
             raise ValueError("这场是从 state.json 快照来的，没有 session id，改不了。先 refresh 成功一次。")
         verb = "开" if want else "关"
-        self.say("#%d %s–%s quiet %s…" % (idx, row["startLabel"], row.get("endLabel") or "?",
-                                          verb), "cmd")
-        with self.console.status("[yellow]改 quiet mode…[/]", spinner="dots"):
-            res = self.bridge.call("mute", startMs=row["startMs"], meetingId=row["id"], quiet=want)
-        if res.get("verified"):
-            self.say("✅ #%d quiet = %s（API 复核一致）" % (idx, "ON" if res["quiet"] else "off"), "ok")
-        else:
-            self.had_error = True
-            self.say("❌ #%d 改完复核不一致：现在是 %s" % (idx, res.get("quiet")), "error")
-        self.refresh(quiet=True)
+        self.say("#%d %s–%s quiet %s（乐观：表格先改，Focusmate 在后台）…"
+                 % (idx, row["startLabel"], row.get("endLabel") or "?", verb), "cmd")
+        before_row = dict(row)
+        self._patch_api_row(row["id"], quiet=want)
+        self.rebuild_rows()
+        self.invalidate()
+        action = repl_kit.Action("session.mute",
+                                 "quiet %s %s" % (row["startLabel"], "ON" if want else "off"),
+                                 {"date": self.sel_date.isoformat(),
+                                  "start": row["startLabel"],
+                                  "startMs": row.get("startMs"),
+                                  "meeting_id": row["id"], "quiet": bool(want)})
+        job = self.jobs.submit(action, on_fail=lambda error: self._row_op_failed(
+            "#%d quiet %s" % (idx, verb), before_row, error))
+        if self.jobs.sync:
+            if job.outcome is not None and job.outcome.ok:
+                self.say("✅ #%d quiet = %s（API 复核一致）"
+                         % (idx, "ON" if want else "off"), "ok")
+                self.refresh(quiet=True)
+            return True
+        self.say("✅ #%d quiet = %s（已记上；Focusmate 复核回来我再说话）"
+                 % (idx, "ON" if want else "off"), "ok")
         return True
 
     def cmd_title(self, args):
@@ -3804,15 +4339,25 @@ class Warden(object):
             raise ValueError("这场是从 state.json 快照来的，没有 session id，改不了。先 refresh 成功一次。")
         if len(title) > 100:
             raise ValueError("标题最长 100 字符，现在 %d" % len(title))
-        self.say("#%d 改标题为 %r…" % (idx, title), "cmd")
-        with self.console.status("[yellow]写标题…[/]", spinner="dots"):
-            res = self.bridge.call("title", startMs=row["startMs"], meetingId=row["id"], title=title)
-        if res.get("verified"):
-            self.say("✅ #%d 标题已写入（API 复核一致）" % idx, "ok")
-        else:
-            self.had_error = True
-            self.say("❌ #%d 写完复核不一致：现在是 %r" % (idx, res.get("actual")), "error")
-        self.refresh(quiet=True)
+        self.say("#%d 改标题为 %r（乐观：表格先改，Focusmate 在后台）…" % (idx, title), "cmd")
+        before_row = dict(row)
+        self._patch_api_row(row["id"], title=title)
+        self.rebuild_rows()
+        self.invalidate()
+        action = repl_kit.Action("session.title",
+                                 "写标题 %s %r" % (row["startLabel"], title[:20]),
+                                 {"date": self.sel_date.isoformat(),
+                                  "start": row["startLabel"],
+                                  "startMs": row.get("startMs"),
+                                  "meeting_id": row["id"], "title": title})
+        job = self.jobs.submit(action, on_fail=lambda error: self._row_op_failed(
+            "#%d 写标题" % idx, before_row, error))
+        if self.jobs.sync:
+            if job.outcome is not None and job.outcome.ok:
+                self.say("✅ #%d 标题已写入（API 复核一致）" % idx, "ok")
+                self.refresh(quiet=True)
+            return True
+        self.say("✅ #%d 标题已记上（Focusmate 复核回来我再说话）" % idx, "ok")
         return True
 
     def cmd_cancel(self, args):
@@ -3857,14 +4402,30 @@ class Warden(object):
             self.refresh(quiet=True)
             return True
 
-        self.say("#%d 取消中…（%s）" % (idx, row["startLabel"]), "cmd")
-        with self.console.status("[red]取消中…[/]", spinner="dots"):
-            res = self.bridge.call("cancel", startMs=row["startMs"], meetingId=row["id"])
-        if res.get("verified"):
-            self.say("✅ #%d %s 已取消（API 复核：该时段已消失）" % (idx, row["startLabel"]), "ok")
-        else:
-            self.had_error = True
-            self.say("❌ #%d 取消后复核：该 session 还在" % idx, "error")
+        self.say("#%d 取消中…（%s；乐观：表格先拿掉，Focusmate 在后台）"
+                 % (idx, row["startLabel"]), "cmd")
+        before_row = dict(row)
+        removed = self._forget_api_row(row["id"])
+        removed_at = removed[0] if removed else None
+        self.rebuild_rows()
+        self.invalidate()
+        action = repl_kit.Action("session.cancel",
+                                 "取消 %s %s" % (self.sel_date.isoformat(), row["startLabel"]),
+                                 {"date": self.sel_date.isoformat(),
+                                  "start": row["startLabel"],
+                                  "startMs": row.get("startMs"),
+                                  "meeting_id": row["id"]})
+        job = self.jobs.submit(action, on_fail=lambda error: self._row_op_failed(
+            "#%d 取消 %s" % (idx, row["startLabel"]), before_row, error,
+            index=removed_at))
+        if self.jobs.sync:
+            if job.outcome is not None and job.outcome.ok:
+                self.say("✅ #%d %s 已取消（API 复核：该时段已消失）"
+                         % (idx, row["startLabel"]), "ok")
+                self.refresh(quiet=True)
+            return True
+        self.say("✅ #%d %s 已取消（Focusmate 复核回来我再说话）"
+                 % (idx, row["startLabel"]), "ok")
         self.refresh(quiet=True)
         return True
 
@@ -5896,13 +6457,16 @@ class Warden(object):
             self.say("任务 %s 本来就没挂 session（也没 Focusmate task），不用下架。"
                      % self.task_label(task), "info")
             return task
-        note = self.fm_delete_task(task)
-        task = self.task_store.unassign(task["id"], reason=reason)
-        self.say("⏏ 任务 %s「%s」已从 %s %s 下架%s"
-                 % (self.task_label(task), self.task_store.focusmate_title(task, 40),
-                    sess.get("date") or "（没有日期）", sess.get("start") or "",
-                    "；%s" % note if note else ""), "ok")
-        return task
+        if self.offline or not (fm.get("task_id") or fm.get("id")):
+            # 离线 / 本来就没有 Focusmate task：只改本地，不进队列
+            note = "" if self.offline else "（没有 Focusmate task，只断了本地）"
+            task = self.task_store.unassign(task["id"], reason=reason)
+            self.say("⏏ 任务 %s「%s」已从 %s %s 下架%s"
+                     % (self.task_label(task), self.task_store.focusmate_title(task, 40),
+                        sess.get("date") or "（没有日期）", sess.get("start") or "",
+                        "；" + note if note else ""), "ok")
+            return task
+        return self.op_task_detach(task, reason=reason)
 
     def cmd_task_swap(self, args):
         """``task <id> swap <id>`` —— 两条任务**互换位置**（位置 = 那一场 session）。
@@ -6150,41 +6714,98 @@ class Warden(object):
                  % (self.task_label(task), title, session_idx, date_iso,
                     row.get("startLabel"),
                     "（这场已有 %d 个任务，再去挂一个）" % len(already) if already else ""), "cmd")
-        res = self.bridge.call("add_task", timeout=240,
-                               startMs=row["startMs"], meetingId=row["id"],
-                               title=title, notes=notes)
-        if not res.get("verified"):
-            self.had_error = True
-            raise ValueError("Focusmate 里没能确认 task 已挂上；本地任务没改，避免假成功。")
-        # Focusmate 成功之后才落本地。
-        self.task_store.assign(task["id"], session)
-        self.task_store.attach_focusmate(task["id"], {
-            "task_id": res.get("taskId") or (res.get("task") or {}).get("id"),
-            "session_id": row["id"],
-            "attached_at": ts._now(),
+        return self._op_task_assign(task, session, session_idx, date_iso, title, notes,
+                                    refresh=refresh, already=len(already),
+                                    start_ms=row.get("startMs"))
+
+    def _op_task_assign(self, task, session, session_idx, date_iso, title, notes,
+                        refresh=True, already=0, start_ms=None):
+        """**乐观**挂任务：本地立刻记上（打 pending 标记），网络丢进后台。
+
+        用户要的就是这个：点完就有反应，别等浏览器。成功了把 pending 换成真
+        task id；失败了把整条任务放回操作前的快照，并且记进失败账（re-action）。
+        """
+        before = copy.deepcopy(task)
+        task_id = task["id"]
+        self.task_store.assign(task_id, session)
+        self.task_store.attach_focusmate(task_id, {
+            FM_PENDING: {"at": ts._now(), "via": "optimistic",
+                         "op": "task.assign"},
+            "session_id": session.get("focusmate_session_id"),
             "title": title,
-            "via": res.get("via"),
         }, session=session)
-        self.selected_task_id = task["id"]
-        session["task_id"] = res.get("taskId") or (res.get("task") or {}).get("id")
-        # 表格里那一行的 task 列是 rebuild_rows 时算出来的：不重排就还是旧的
-        # （用户看到的正是「assign 成功但 task 列空着」）。先本地重排，再尽量刷新。
+        self.selected_task_id = task_id
         self.rebuild_rows()
+        self.invalidate()
+        action = repl_kit.Action("task.assign",
+                                 "挂任务 %s 到 %s %s" % (self.task_label(task), date_iso,
+                                                        session.get("start") or "?"),
+                                 {"task_id": task_id, "date": date_iso,
+                                  "start": session.get("start"),
+                                  "duration": session.get("duration"),
+                                  "meeting_id": session.get("focusmate_session_id"),
+                                  # startMs 不在 session 字典里（那是界面用的行字段），
+                                  # 必须作为参数存下来：重放的时候只剩这份参数了
+                                  "startMs": start_ms,
+                                  "title": title, "notes": notes,
+                                  "session": dict(session)})
+        job = self.jobs.submit(action, on_fail=lambda error: self._assign_failed(
+            task_id, before, title, error))
         if refresh and not self.offline:
             try:
                 self.refresh(quiet=True)
-            except Exception:                       # noqa: BLE001 - 刷新失败不影响已完成的挂载
+            except Exception:                       # noqa: BLE001 - 刷新失败不影响已挂上的
                 pass
-        remote_had = res.get("existingCount")
-        total = (remote_had if isinstance(remote_had, int) else len(already)) + 1
-        extra = ""
-        if total > 1:
-            extra = "（这场现在共 %d 个任务，表格里会一起列出来）" % total
-        via = res.get("via")
-        self.say("✅ 任务 %s 已挂到 session #%d；Focusmate task id=%s%s%s"
-                 % (self.task_label(task), session_idx, res.get("taskId") or "?",
-                    "（via %s）" % via if via else "", extra), "ok")
+        if self.jobs.sync:
+            if job.outcome is not None and not job.outcome.ok:
+                raise ValueError("Focusmate 里没能确认 task 已挂上；本地已经回滚（%s）"
+                                 % job.outcome.error)
+            return True
+        self.say("⏳ 任务 %s「%s」已经记到 session #%d 上（Focusmate 那边在后台挂，"
+                 "进度看面板）；挂了我会说，没挂上会回滚并记账。"
+                 % (self.task_label(task), title, session_idx), "cmd")
         return True
+
+    def _assign_failed(self, task_id, before, title, error):
+        """挂失败：回滚到操作前，并且说实话（下一步敲什么也一起说）。"""
+        self._revert_task(task_id, before,
+                          "任务「%s」没挂到 Focusmate：%s" % (title, error))
+        self.say("  下一步：re-action 重放，或者 task %s -a <session> 再挂一次。"
+                 % self.task_label(before), "warn")
+
+    def op_task_detach(self, task, reason="net-detach"):
+        """**乐观**下架：本地先断绑定，Focusmate 那条 task 在后台删。
+
+        顺序仍然按老规矩办事（先删 Focusmate、再断本地），只是「删」变成了
+        后台的一件事：本地先断，失败就整体放回快照（＝那条 task 其实还在）。
+        """
+        sess = task.get("session") or {}
+        fm = task.get("focusmate") or {}
+        fm_id = fm.get("task_id") or fm.get("id")
+        before = copy.deepcopy(task)
+        task_id = task["id"]
+        self.task_store.unassign(task_id, reason=reason)
+        self.rebuild_rows()
+        self.invalidate()
+        action = repl_kit.Action("task.detach",
+                                 "下架任务 %s" % self.task_label(task),
+                                 {"task_id": task_id, "focusmate_task_id": fm_id,
+                                  "date": sess.get("date"), "start": sess.get("start"),
+                                  "reason": reason})
+        job = self.jobs.submit(action, on_fail=lambda error: self._detach_failed(
+            task_id, before, error))
+        if self.jobs.sync:
+            if job.outcome is not None and not job.outcome.ok:
+                return self.task_store.get(task_id)
+            return self.task_store.get(task_id)
+        self.say("⏏ 任务 %s 已经从 %s %s 下架（Focusmate 那边在后台删这条 task）"
+                 % (self.task_label(task), sess.get("date") or "?",
+                    sess.get("start") or "?"), "ok")
+        return self.task_store.get(task_id)
+
+    def _detach_failed(self, task_id, before, error):
+        """删失败：把绑定放回去（那条 task 还在 Focusmate 上，账不能先断）。"""
+        self._revert_task(task_id, before, "Focusmate task 没删掉：%s" % error)
 
     @staticmethod
     def _hhmm_distance(a, b):
@@ -6438,46 +7059,23 @@ class Warden(object):
         }
 
     def sync_task_completions(self, quiet=True):
-        """``GET /v1/tasks`` → 对齐完成状态（`refresh` / `task sync` 都走它）。
+        """``GET /v1/tasks`` → 对齐完成状态（**读**操作，后台跑）。
 
-        和 :meth:`cmd_task_sync` 的区别只有一件事：这里不往 Focusmate 写 —— 不把
-        「每周重复」落到焦点场次上（那会真的在 Focusmate 建 task）。``refresh`` 要能
-        随时敲，不能敲一下就在外面多出一条任务。
+        ``refresh`` / ``task sync`` / 收尾都走它。和 :meth:`cmd_task_sync` 的区别
+        只有一件事：这里不往 Focusmate 写 —— 不把「每周重复」落到焦点场次上
+        （那会真的在 Focusmate 建 task）。``refresh`` 要能随时敲，不能敲一下
+        就在外面多出一条任务。
 
-        **但 OmniFocus 的完成写回会做。** 「在 Focusmate 勾掉了」是一条已经发生的
-        事实，不是 warden 的新决定：本地跟着打 ✓ 的同时，OmniFocus 那条也得完成。
-        以前这一步只挂在 `task sync` / 收尾 / `refresh --check` 上，于是「Focusmate
-        勾掉了 → 本地 ✓（收尾就不会再问它了）→ OmniFocus 一直没动」——用户反馈的
-        就是这个：**没有任何命令会再想起这条任务**。
+        **但 OmniFocus 的完成写回会做**（在 :meth:`_apply_task_pull` 里，主线程）。
+        「在 Focusmate 勾掉了」是一条已经发生的事实，不是 warden 的新决定：
+        本地跟着打 ✓ 的同时，OmniFocus 那条也得完成（幂等，写过的记在 writeback）。
         """
-        started = time.monotonic()
-        rl.log_event("focusmate", "task_pull_start", source="sync_task_completions")
-        try:
-            res = self.bridge.call("tasks", timeout=180)
-        except Exception as e:  # noqa: BLE001 - 先记日志，再按原样抛给上层
-            rl.log_event("focusmate", "task_pull_error", source="sync_task_completions",
-                         elapsed_ms=round((time.monotonic() - started) * 1000, 1),
-                         error="%s: %s" % (type(e).__name__, e))
-            raise
-        remote = res.get("tasks") if isinstance(res, dict) else res
-        before = len(self.task_store.load_archive().get("records") or [])
-        n, matched = self.task_store.reconcile(remote or [])
-        self.task_sync_at = time.time()
-        summary = self._focusmate_task_summary(remote or [])
-        summary.update({
-            "source": "sync_task_completions",
-            "matched": matched,
-            "archived": n,
-            "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
-        })
-        rl.log_event("focusmate", "task_pull_result", **summary)
-        if n:
-            self.announce_completions(before)
-        # Focusmate 说完成的，OmniFocus 那边补上（幂等：写过的记在 writeback 上）
-        self.writeback_completions()
-        if not quiet:
-            self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
-                     % (len(matched), n), "ok")
+        # 注：这里**不**看 self.offline —— 「离线」只挡 refresh 那种自己发起的拉取；
+        # 用户显式敲 `task sync` 就是要求去对一次账（测试也靠这条路径）。
+        action = repl_kit.Action("task.pull", "拉 Focusmate task", {})
+        job = self.jobs.submit(action, persist=False)
+        if self.jobs.sync:
+            return bool(job.outcome is not None and job.outcome.ok)
         return True
 
     def report_omnifocus_links(self):
@@ -6706,39 +7304,38 @@ class Warden(object):
     def fm_complete(self, task):
         """Focusmate：把这条 task 勾完成（走 bridge 的内部 API，GET 复核 completedAt）。"""
         fm = task.get("focusmate") or {}
-        task_id = fm.get("task_id")
-        if not task_id:
+        fm_task_id = fm.get("task_id")
+        if not fm_task_id:
             return ""
         if self.offline:
             rl.log_event("focusmate", "complete_skipped", task_id=task["id"],
-                         focusmate_task_id=task_id, reason="offline")
+                         focusmate_task_id=fm_task_id, reason="offline")
             return "离线模式：没去勾 Focusmate"
-        started = time.monotonic()
-        rl.log_event("focusmate", "complete_start", task_id=task["id"],
-                     focusmate_task_id=task_id,
-                     title=self.task_store.focusmate_title(task, 120))
+        # **乐观**：本地立刻记「已勾」（打 pending 标记），网络丢进后台。
+        # 勾失败就把这个字段放回去，并且记账（re-action 重放）。
+        before = copy.deepcopy(task)
+        local_id = task["id"]
         try:
-            res = self.bridge.call("complete_task", timeout=180, taskId=task_id)
-        except BridgeError as e:
-            self.had_error = True
-            rl.log_event("focusmate", "complete_error", task_id=task["id"],
-                         focusmate_task_id=task_id, error=str(e),
-                         elapsed_ms=round((time.monotonic() - started) * 1000, 1))
-            return "Focusmate 勾完成失败：%s" % e
-        rl.log_event(
-            "focusmate", "complete_result", task_id=task["id"],
-            focusmate_task_id=task_id, verified=bool(res.get("verified")),
-            already=bool(res.get("already")), via=res.get("via"),
-            completedAt=res.get("completedAt"), attempts=res.get("attempts") or [],
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1))
-        if not res.get("verified"):
-            return "Focusmate 没确认勾上（可以手动点一下）"
-        stamp = res.get("completedAt") or ts._now()
-        try:
-            self.task_store.attach_focusmate(task["id"], {"completed_at": stamp})
+            self.task_store.attach_focusmate(local_id, {
+                FM_PENDING: {"at": ts._now(), "via": "optimistic", "op": "task.complete"},
+                "completed_at": ts._now(),
+            })
         except ValueError:
             pass
-        return "Focusmate 已勾完成"
+        action = repl_kit.Action("task.complete",
+                                 "勾完成 %s" % self.task_label(task),
+                                 {"task_id": local_id, "focusmate_task_id": fm_task_id})
+        job = self.jobs.submit(action, on_fail=lambda error: self._complete_failed(
+            local_id, before, error))
+        if self.jobs.sync:
+            if job.outcome is not None and not job.outcome.ok:
+                return "Focusmate 勾完成失败：%s" % job.outcome.error
+            return "Focusmate 已勾完成"
+        return "Focusmate 勾完成丢后台了（进度看面板）"
+
+    def _complete_failed(self, task_id, before, error):
+        """勾失败：把 completed_at 放回去（本地别先替 Focusmate 宣布完成）。"""
+        self._revert_task(task_id, before, "Focusmate 没勾上：%s" % error)
 
     def fm_delete_task(self, task):
         """Focusmate：删掉这条任务在 Task Manager 里那条 task（收尾「转移」时用）。
@@ -8155,7 +8752,10 @@ class Warden(object):
         """
         self.forget_caches()
         pulled = self.refresh()
+        # 「再对一次账」必须拿着刚拉回来的账：后台模式下这里等它落地
+        self.wait_net()
         self.refresh_task_state()
+        self.wait_net()
         self.refresh_stat_state()
         self.refresh_review_state()
         self.forget_caches()
@@ -8357,6 +8957,8 @@ class Warden(object):
                 continue
             if not self.task_store.is_open(task):
                 continue
+            if self._fm_pending(task):
+                continue                       # 乐观挂载还在后台跑，别重复挂
             verdict = self._attachment_verdict(task, remote)
             if verdict:
                 bad.append((task, verdict))
@@ -8895,11 +9497,18 @@ class Warden(object):
         if not exec_lines:
             self.write_tui_state()
         self.emit("[dim]起 bridge、拉 session…[/]")
+        # 启动这一批：session 列表 + Focusmate task 完成状态。
+        # 后台模式下 TUI 立刻出来，这两件事在面板里跑（干完面板自己消失，
+        # 结果进 Recent）；同步模式（--exec / 测试）当场跑完。
+        self.jobs.begin(1 if self.offline else 2)
         try:
             self.refresh()
+            self.sync_task_completions(quiet=True)
         except Exception as e:
             self.say("首次拉列表失败：%s" % e, "error")
             self.had_error = True
+        if exec_lines:
+            self.wait_net()
 
         # 一进来就有未认罪的罪 → 先把话说明白
         if self.lockdown_reason():
@@ -8931,6 +9540,9 @@ class Warden(object):
         try:
             self.shell.run()
         finally:
+            # 后台线程是 daemon：退出前给它一次机会把手上那件事做完，
+            # 别让「刚点了取消」这种操作停在半路（超时就照旧退）。
+            self.jobs.wait(5.0)
             self.clear_tui_state()
             self.emit("[dim]收工。[/]")
         return 0 if not self.had_error else 1
@@ -9106,8 +9718,11 @@ def main(argv=None):
 
     bridge = Bridge(console, headed=args.headed, idle_ms=args.idle_ms,
                     profile_dir=args.profile_dir)
+    # --status / --exec / --offline 一律同步跑（脚本要的是确定的结果，
+    # 不是「后台还在拉」）。交互模式才异步 + 乐观。
     warden = Warden(console, bridge, no_clear=no_clear, offline=args.offline,
-                    day_offset=args.day)
+                    day_offset=args.day,
+                    net_async=False if (args.status or args.exec_ or args.offline) else None)
 
     if args.status:
         # 只画一次：不连浏览器，用 state.json 的快照/本地文件

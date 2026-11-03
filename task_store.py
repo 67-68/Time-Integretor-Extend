@@ -817,6 +817,35 @@ class TaskStore(object):
         self.save(store)
         return found
 
+    def settle_focusmate(self, task_id, pending_key="pending"):
+        """撤掉「在途」标记 —— 乐观写操作落地之后由调用方调一次。
+
+        乐观操作会先往 ``focusmate`` 里塞一个 ``pending`` 标记（界面上看得出来
+        「这条还在后台跑」）；真结果回来之后这个标记就该消失，不然它会一直挂在
+        账本里，下次读的人会以为还有件事没落地。
+        """
+        return self._mutate(
+            task_id,
+            lambda task: (task.get("focusmate") or {}).pop(pending_key, None))
+
+    def restore(self, task_id, snapshot):
+        """把一条任务**整体**放回一份快照 —— 乐观操作的失败回滚用。
+
+        和 :meth:`modify` 的区别：这里是「当这件事没发生过」，所以字段
+        整体覆盖（不是合并），多余的新字段也被抹掉。传进来的 ``snapshot``
+        一般是操作之前 ``copy.deepcopy(task)`` 拿到的那份。
+        """
+        import copy as _copy
+
+        if not isinstance(snapshot, dict) or not snapshot:
+            raise ValueError("restore 需要一份任务快照（dict）")
+
+        def put_back(task):
+            task.clear()
+            task.update(_copy.deepcopy(snapshot))
+
+        return self._mutate(task_id, put_back)
+
     @staticmethod
     def omnifocus_id(task):
         """这条任务关联的 OmniFocus primary key（没关联就是 None）。"""
