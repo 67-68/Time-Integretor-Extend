@@ -134,7 +134,8 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task -t` / `task --trigger` | 列出 trigger 预设（框架默认是**空列表**） |
 | `task <序号> -t <preset> [参数...]` | 给任务挂一个 trigger（只记账；runner 执行） |
 | `task -f` / `task --formatter` | 列出 formatter 预设（现在有 `end`） |
-| `task <序号> -f end` | 按任务 `duration` 找当天最后一段可用时间，截出尾部并自动 assign |
+| `task <序号> -f end` | 按任务 `duration` 在当天最后一段的**尾巴上切一场**（11:30–11:55 那种）、写进排期并自动 assign；排出来的任务自动独占 |
+| `task <序号> -e true`（`--exclusive true`） | **独占**：这一场 session 只能有它一条任务（裸写 `-e` = true，`-e false` 取消） |
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
 | `task archive [N]` | 看归档：按完成日期分组、最近 N 条（默认 5） |
 | `task <任何动作> ... --assign <N>` | 跑完顺手把产出的任务挂到表格 #N（`-a` / `--assign=N` 同义） |
@@ -154,7 +155,8 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task -s 5 -a 6` | 把 session #5 上的**全部**任务转移到 #6 |
 | `task -s 5 -a none` | 把 session #5 上的全部任务下架 |
 | `task -s 5` | 只列 #5 上现在挂着谁（只看不动） |
-| `refresh --check`（`-c`） | 重拉 session **+ 对账**：该订没订上、该挂没挂上 → 修 |
+| `refresh --check` 的独占对账 | 一场挤了两条任务（其中有独占的）→ **全部下架** + 警告 |
+| `refresh --check`（`-c`） | 重拉 session **+ 对账**：该订没订上、该挂没挂上、一场挤两条（独占）→ 修 |
 
 `-m/--mark` 也是任何 task 动作都能带的后缀，但它和 `done` / `drop` 的分工要说清：
 
@@ -187,8 +189,8 @@ task select 4 --assign 3        # 等价于 task assign 4 3（也等价于 task 
 
 ### 后缀：`-a` 分流、`-n` 备注、`-s` 批量、`-t` trigger、`-f` formatter
 
-`cmd_task()` 入口依次摘掉后缀（顺序固定：`-a` → `-s` → `-n` → `-m` → `-t` →
-`-f`），剩下的第一个词才是动作。所以它们能和任何动作组合，也能单独出现
+`cmd_task()` 入口依次摘掉后缀（顺序固定：`-a` → `-s` → `-n` → `-e` → `-m` →
+`-t` → `-f`），剩下的第一个词才是动作。所以它们能和任何动作组合，也能单独出现
 （`-s` 本身就是批量动作）：
 
 | 后缀 | 含义 | 取值 |
@@ -196,6 +198,7 @@ task select 4 --assign 3        # 等价于 task assign 4 3（也等价于 task 
 | `-a` / `--assign` | 分流：把这条任务挂到哪一场 | 表格编号 / `none` / `current` |
 | `-s` / `--from` | 批量：**源** session（那一场上的全部任务） | 表格编号 |
 | `-n` / `--note` | 顺手写备注（可塞网址） | 自由文本，吃到下一个 `--flag` 为止 |
+| `-e` / `--exclusive` | 独占：这一场只能有它一条任务 | `true` / `false`（裸写 `-e` = true） |
 | `-m` / `--mark` | 手动改本地状态 | `complete` / `discard` |
 | `-t` / `--trigger` | 挂创建触发预设 | 预设名 + `key=value` / 位置参数 |
 | `-f` / `--formatter` | 挂排期算法并当场执行 | 预设名 + `key=value` / 位置参数 |
@@ -473,18 +476,48 @@ task -t / task -f                      # 只看预设列表，不动任务
 
 1. 取**当天最后一个还有空位的时段**（这就是 `end`：每天的结束时间不同，
    不写死 22:15）；
-2. 在这个时段里找能装下任务时长的**最小 session**；同样大小时取更靠后的那场；
-3. 在窗口尾部截出 `任务时长 + break_minutes`（默认 5 分钟），写进
-   `formatter.reservation`；
-4. 自动把任务 assign 到那场 session（`assign_task_to`：能建 Focusmate task 就建，
-   未来还没订上就只记本地）。
+2. 在这个时段的**尾巴上切一场任务大小的 session**（不是塞进时段里那场现成的
+   session —— 见下面「切割」）；
+3. 切出来的这一场当天没有的话，作为**额外的一场一次性 session** 写进
+   `temp/session-extras.json` 并重算 `data.csv`；
+4. 把「任务时长 + `break_minutes`（默认 5 分钟）」写进 `formatter.reservation`；
+5. 自动 assign 到那场 session（`assign_task_to`：能建 Focusmate task 就建，
+   未来还没订上就只记本地），并把这**条任务自动设成独占**（见下一节）。
 
-例子：T4 = 11:00–12:00，排成 `25 + 25`；任务 `duration=25` → 选 11:30 那场，
-占用 `11:30–12:00`（25 分钟 session + 5 分钟休息）。之后别的 formatter
-通过 `task_hooks.collect_reservations()` 看到这段被占，**不会再用**。
+#### 切割：25 分钟的任务不该占掉一整场 50 分钟
+
+用户原话：「11:00–12:00 有时间段，那么他应该切割 11:30–12:00 做一个 25 分钟
+的时间段，而不是放入 11:00–11:50 的五十分钟时间段。」
+
+所以从 2026-11-03 起，`end` 的产出是**一场新切出来的 session**：
+
+```
+时段       11:00 ───────────────────────────── 12:00
+原来那场    [========== 50 分钟 session =====]      ← 11:00–11:50（时段默认排布）
+end 切出来                  [= 25 分钟 =]│休息│     ← 11:30–11:55，占用写到 12:00
+```
+
+切法：
+
+- **时长**取 Focusmate 真能订的 `25 / 50 / 75` 里最小能装下任务的那个
+  （`task_hooks.fit_session_duration()`；30 分钟任务 → 50 分钟那一档，
+  超过 75 就往上取 15 的整数倍）。`fields.duration` 仍然是任务自己的时长，
+  session 只是「这一档」；
+- **起点往下取整到 15 分钟整点**（`:00/:15/:30/:45`）—— Focusmate 只认这个，
+  `sp.add_extra()` 也会拒掉别的时间。所以跨午夜那种 `23:15–00:05` 的时段，
+  25 分钟任务切出来是 `23:30–23:55`（占用 `23:30–00:00`），不是 `23:35`；
+- 切出来那场**同起点已经有 session** → 复用它，不重复造一场
+  （`format_end()` 返回 `new_session=False`，写进 `formatter.result` 里
+  `session.existing=true`）。本来就是 `25 + 25` 的排布就落在这条路上；
+- 切出来那场和原来那场时间上**重叠**时，消息里点名提醒怎么清掉：
+  `period T1 25` 重排这个时段，或 `cancel <表格行号>` 取消已订的那场。
+
+同一天**更早的场次**不受影响：任务从那一场的**起点**开始占「时长 + 休息」，
+绝不越过它去抢下一场的时间 —— 一场一个任务，不是两条挤一场。之后别的
+formatter 通过 `task_hooks.collect_reservations()` 看到这段被占，**不会再用**。
 
 - 没有 `duration` → 明确警告，不落 `formatter`；
-- 所有 session 都装不下 → 明确报错；
+- 所有位置都被占 / 装不下 → 明确报错；
 - 可选参数：`break_minutes=5`、`date=YYYY-MM-DD|today|tomorrow`。
 
 **跨午夜的时段要按「同一根时间轴」比。** 一天最后那段常常是 `23:15–00:05`
@@ -492,13 +525,52 @@ task -t / task -f                      # 只看预设列表，不动任务
 `22:15` 那一段还小 —— `end` 于是永远排不进真正的最后一段（2026-11-02 的
 T6 就是这么被跳过的）。所以区间一律经 `task_hooks._range_of()` 归一：终点
 早于起点就 +24h（`23:15–00:05` → `1395–1445`），`24:05` 这种写法也认。
-`formatter.reservation` 里的 `start` / `end` 仍然是 `HH:MM`（会写成 `23:35` /
-`00:05`），`fields.due` 由 `task_store.session_due()` 用「起点 + 时长」算，
-自然落到第二天（`2026-11-03T00:05:00`）。
+`formatter.reservation` 里的 `start` / `end` 仍然是 `HH:MM`，
+`fields.due` 由 `task_store.session_due()` 用「起点 + 时长」算 ——
+切出来的是 `23:30–23:55`，所以截止时间是 `23:55`；原来那场
+`23:15–00:05` 才会算到第二天 `00:05`。
 
 老记录里 `formatter.reservation` 可能只剩 `{date, start}`（没有 `end`）。
 `task_hooks.reservation_range()` 会退回这条任务自己的 session、再不行用
 「start + 任务时长」——不然它就不占时间，下一条任务会被排到同一场上。
+
+## 独占（exclusive）：一场 session 只能有一条任务
+
+```text
+task 3 -e true          # ≡ task 3 --exclusive true（裸写 -e 也是 true）
+task 3 -e false         # 取消独占（这一场又能并别的任务）
+task create title=写论文 duration=25 -e true
+task create title=写论文 duration=25 -f end     # end 排出来的**自动**独占
+```
+
+- 字段就一个：`fields.exclusive`（任务库不校验字段，`-e` 只是写它的短写法）。
+  任务面板里独占任务标题前面画 `🔒`；消息里也会说「这一场 session 只能有它
+  一条任务」。
+- **它占的是整场，不是自己那 25 分钟**：`task_hooks.collect_reservations()`
+  会把独占任务的占用跟**它挂着的那一场**求并（`exclusive_block()`），所以
+  50 分钟的场里放了一条 25 分钟的独占任务，剩下 25 分钟也不会再排第二条进去。
+  只跟自己那一场求并，不蔓延到前后相邻的场次 —— 一场的身份是「哪一天 + 几点
+  开始」，15:00 那场和 15:30 那场是两场，各放一条完全合法。
+- **三道闸门**（都在 `warden.py`）：
+
+  | 时机 | 行为 |
+  |---|---|
+  | `-a` / `-ac` 挂载（`_assign_task`） | 目标场里有独占任务 → 抛 `ValueError` 说清是谁挡住、怎么办，**本地账本一个字节都不动** |
+  | formatter / 收尾流程挂载（`assign_task_to`） | 同上，但只返回一句警告、不挂（收尾面板不能因为撞车就崩） |
+  | `-f end` 排期 | 候选窗口被独占任务盖住 → 换下一个窗口；真撞上 → `HookError`，不写 `formatter` |
+
+- **对账**（`refresh --check` → `check_exclusive_sessions()`）：同一场里挂了两条
+  以上未收工的任务、且其中有独占的 → **那一场的任务全部下架**（先删 Focusmate
+  那条 task，再断本地绑定）并警告：
+
+  ```text
+  ⚠ 2026-11-03 11:00 那场挤了 2 条任务，其中 🔒 独占的只能独占一场 → 全部下架：3「词汇题」、5「语法」
+     下架后它们还在任务表里（未挂 session，🟦）。重新排：`task <序号> -f end`，或 `task <序号> -a <session>` 自己挑一场。
+  ```
+
+  这条对账放在 `check_bookings` / `check_task_attachments` **之前**：先拆干净，
+  否则后面的「重挂」会把它又挂回去。两条都不独占的场次一律不动（并排干活是
+  合法的，那是 `exclusive` 的默认值）。
 
 ## 截止时间 = 它被分配的那场 session 的终点
 

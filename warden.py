@@ -30,9 +30,11 @@
    `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync`；
    `task <序号> -m complete|discard` 是**只改本地账本**的手动状态标记（不碰外部）；
    `task <序号> -t <trigger>` / `-f <formatter>` 是具名预设函数框架
-   （trigger 默认为空，formatter 有 `end`：按 duration 排到当天最后一段并自动
-   assign）；`task assign` 成功后才写本地，Focusmate 侧 task id / completedAt
-   都会记回来。
+   （trigger 默认为空，formatter 有 `end`：在当天最后一段的尾巴上**切一场**
+   任务大小的 session、写进排期并自动 assign，见 `task_hooks.format_end`）；
+   `task assign` 成功后才写本地，Focusmate 侧 task id / completedAt 都会记回来。
+   `task <序号> -e true` 是**独占**：这一场 session 只能有它一条任务
+   （`end` 排出来的自动独占；`refresh --check` 发现一场挤了两条就全部下架）。
    `--repeat 周几@HH:MM` 让任务每周重复：只在「同一星期几、同一时刻、同一时长」的
    那场 session 上落地；排布被改过（例如 50 拆成 25+25）时这一周就不落，但 repeat
    设置本身不变。
@@ -305,7 +307,23 @@ TASK_SHORT_FLAGS = (
     # `task import -st` ≡ `--single-task`：只导入这一条，就算 OmniFocus 里是
     # 重复任务也不问「复制重复设置」、不建本地 repeat。
     repl_kit.ShortFlag("-st", ("--single-task",), note="只导入一次，不建重复任务"),
+    # `task 3 -e true` ≡ `--exclusive true`：这条独占一整场 session。
+    repl_kit.ShortFlag("-e", ("--exclusive",), note="独占：这一场只能有这一条任务"),
 )
+
+#: `-e/--exclusive` 的真值写法（``true`` 也可以省略：裸写 ``-e`` 就是 true）。
+TASK_TRUE_WORDS = ("true", "1", "yes", "y", "on", "t", "是", "开", "真", "独占")
+TASK_FALSE_WORDS = ("false", "0", "no", "n", "off", "f", "否", "关", "假", "共享")
+
+
+def _task_bool_word(word):
+    """``true / 是 / 1`` → True，``false / 否 / 0`` → False，其它 → None。"""
+    text = str(word or "").strip().lower()
+    if text in TASK_TRUE_WORDS:
+        return True
+    if text in TASK_FALSE_WORDS:
+        return False
+    return None
 
 #: `cmd_task_import` 挂起等待 y/n/q 时返回的哨兵：`cmd_task` 看见它就别再把
 #: 后缀（-a / -n / -m / -t / -f）套到「上一次选中的任务」上，而是存进
@@ -883,13 +901,14 @@ def _task_command(w):
         aliases=(),
         section="通用",
         usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
-              " ... [-a <编号|none|current>] [-s <编号>] [-n 备注]"
+              " ... [-a <编号|none|current>] [-s <编号>] [-n 备注] [-e true|false]"
               " [-m complete|discard] [-t <trigger> [参数...]] [-f <formatter> [参数...]]",
         # 把 flag 放在 action 词前面：补全列表有 20 项上限，flag 被挤到后面
         # 就等于「有这个选项但 Tab 永远看不到」。
         # 紧凑短选项（-an/-ac/-m/-t/-f）由 task_completer 的 short 表补，不要
         # 在 options 里再写一遍 —— 否则 Tab 菜单里会出现两个一模一样的候选。
-        options=("--assign", "-a", "--note", "-n", "--from", "-s", "--mark", "--trigger",
+        options=("--assign", "-a", "--note", "-n", "--from", "-s", "--exclusive", "-e",
+                 "--mark", "--trigger",
                  "--formatter", "--repeat", "--single-task",
                  "create", "import", "delete", "modify", "note", "assign", "select",
                  "swap", "repeat", "sync", "archive", "inspect-due"),
@@ -1185,7 +1204,7 @@ def _hint_task(parts):
     if not words:
         return repl_kit.Hint("动作", TASK_ACTION_WORDS,
                              note="后缀：-a <编号|none|current> · -s <编号> 批量 · -n 备注"
-                                  " · -m complete|discard · 字段随便写")
+                                  " · -e true|false 独占 · -m complete|discard · 字段随便写")
     if any(tok in words for tok in ("--mark", "-m")):
         return repl_kit.Hint("取值", TASK_MARK_WORDS,
                              note="手动改本地状态：complete = 完成并归档（不勾 Focusmate）"
@@ -1203,13 +1222,17 @@ def _hint_task(parts):
         if kind == "formatter":
             return repl_kit.Hint(
                 "参数", names or ("（空列表）",),
-                note="end = 用任务 duration 找能装下它的最小 session，"
-                     "在当天可用时间窗尾部截出「时长 + 5 分钟休息」并自动挂上；"
+                note="end = 在当天最后一段的尾巴上切一场任务大小的 session"
+                     "（11:30–11:55 那种，时长取 25/50/75）并自动挂上；"
                      "可带 date=YYYY-MM-DD / tomorrow / today、break_minutes=5")
         return repl_kit.Hint(
             "参数", names or ("（空列表）",),
             note="trigger 预设先注册函数才会有名字；"
                  "用法：task <序号> -t <函数> [参数...]")
+    if any(tok in words for tok in ("--exclusive", "-e")):
+        return repl_kit.Hint("取值", ("true", "false"),
+                             note="独占 = 这一场 session 只能有它一条任务"
+                                  "（end formatter 排出来的任务自动独占；裸写 -e 就是 true）")
     if any(tok in words for tok in ("-an", "-ac")):
         return repl_kit.Hint("参数", ("（不用再跟东西）",),
                              note="-an ≡ -a none（下架）· -ac ≡ -a current（当前这一场）")
@@ -1228,10 +1251,12 @@ def _hint_task(parts):
     if head and (head[0].isdigit() or head[0].startswith("id:")):
         if len(head) == 1:
             return repl_kit.Hint("动作", ("swap", "duplicate", "drop", "done", "link",
-                                          "-m complete|discard", "-f end", "-a <编号>"),
+                                          "-m complete|discard", "-f end", "-e true",
+                                          "-a <编号>"),
                                  note="数字是面板序号（swap 5 = 和第 5 条换位置）"
                                       " · -m 手动标状态 · -f end 排到当天最后一段"
-                                      " · -a none 下架 · -a current 挂到当前这一场")
+                                      " · -e true 独占一整场 · -a none 下架"
+                                      " · -a current 挂到当前这一场")
         head = head[1:]
     action = head[0] if head else ""
     if action in ("import", "粘贴", "导入"):
@@ -1270,7 +1295,8 @@ def _hint_task(parts):
                              note="默认挂当前选中的任务；也可 assign <任务ID> <sessionID>")
     return repl_kit.Hint("参数", TASK_ACTION_WORDS,
                          note="任何动作都能带 -a <编号|none|current> / -n 备注"
-                              " / -m complete|discard / -t trigger / -f formatter；"
+                              " / -e true|false 独占 / -m complete|discard"
+                              " / -t trigger / -f formatter；"
                               "-s <编号> 是批量（那一场的全部任务）")
 
 
@@ -2661,6 +2687,8 @@ class Warden(object):
         # 本体的 formatter 是给子任务的模板；⏱ 只画在真正排过的子任务上。
         if task.get("formatter") and not ts.TaskStore.is_repeat_template(task):
             prefix += "⏱"
+        if th.is_exclusive(task) and not ts.TaskStore.is_repeat_template(task):
+            prefix += "🔒"
         return prefix + title
 
     def task_index_layout(self, tasks, width=None):
@@ -3999,6 +4027,8 @@ class Warden(object):
             task -t                    ← 列 trigger 预设（默认是空列表）
             task -f                    ← 列 formatter 预设（现在有 end）
             task 3 -f end              ← 按 duration 排到当天最后一段并自动 assign
+            task 3 -e true             ← 这条独占一整场（同一场不能再放第二条任务）
+            task create title=写论文 duration=25 -e true -f end
             task create title=闪卡 duration=25 -f end
             task 32 swap 21             ← 两条任务互换位置
             task -s 5 -a 6              ← 把 #5 上的全部任务转移到 #6
@@ -4020,6 +4050,7 @@ class Warden(object):
         assign_to, kept = self._split_assign(toks)
         source, kept = self._split_source(kept)
         note_text, kept = self._split_note(kept)
+        exclusive, kept = self._split_exclusive(kept)
         mark_status, kept = self._split_mark(kept)
         trigger_tokens, kept = self._split_hook(kept, "trigger")
         formatter_tokens, kept = self._split_hook(kept, "formatter")
@@ -4050,9 +4081,10 @@ class Warden(object):
                                  "写成 `task -s 5 -a 6` 这样。" % kept[0])
             return self._apply_bulk(source, assign_to)
         if not kept and mark_status is None and trigger_spec is None \
-                and formatter_spec is None:
+                and formatter_spec is None and exclusive is None:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
-                             "或后缀 -m/--mark / -t/--trigger / -f/--formatter")
+                             "或后缀 -e/--exclusive / -m/--mark / -t/--trigger"
+                             " / -f/--formatter")
         if kept:
             action = kept[0].lower()
             rest = kept[1:]
@@ -4070,6 +4102,7 @@ class Warden(object):
             pending["suffix"] = {
                 "assign_to": assign_to,
                 "note_text": note_text,
+                "exclusive": exclusive,
                 "mark_status": mark_status,
                 "trigger_spec": trigger_spec,
                 "formatter_spec": formatter_spec,
@@ -4082,11 +4115,13 @@ class Warden(object):
             for one in result:
                 self._apply_suffix_chain(
                     one, action, note_text=note_text, assign_to=assign_to,
-                    mark_status=mark_status, trigger_spec=trigger_spec,
-                    formatter_spec=formatter_spec)
+                    exclusive=exclusive, mark_status=mark_status,
+                    trigger_spec=trigger_spec, formatter_spec=formatter_spec)
             return result.last
         if note_text is not None:
             self._apply_note(result, note_text, action)
+        if exclusive is not None:
+            result = self._apply_exclusive(result, exclusive, action) or result
         if assign_to is not None:
             self._apply_assign(result, assign_to, action)
         if mark_status is not None:
@@ -4190,6 +4225,49 @@ class Warden(object):
             kept.append(tok)
             i += 1
         return note, kept
+
+    @staticmethod
+    def _split_exclusive(toks):
+        """把 ``--exclusive true`` / ``-e true`` / ``-e=false`` 摘出来。
+
+        独占 = **这一场 session 只能有它一条任务**。和 ``-a`` / ``-n`` 一样是后缀，
+        位置随便：
+
+            task 3 -e true              # 只改这一条的账本字段
+            task create title=写论文 duration=25 -e true
+            task 3 -f end               # formatter end 排出来的任务**自动**独占
+            task 3 -e false             # 取消独占（这一场又可以放第二条了）
+
+        裸写 ``-e``（后面不是 true/false）就是 true：``task 3 -e`` ≡ ``task 3 -e true``。
+        """
+        value = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = str(toks[i])
+            low = tok.lower()
+            if low in ("--exclusive", "-e"):
+                nxt = str(toks[i + 1]).strip().lower() if i + 1 < len(toks) else ""
+                got = _task_bool_word(nxt)
+                if got is None:
+                    value = True                 # 裸写 -e：就是「独占」
+                    i += 1
+                else:
+                    value = got
+                    i += 2
+                continue
+            if low.startswith("--exclusive=") or low.startswith("-e="):
+                word = tok.split("=", 1)[1].strip().lower()
+                got = _task_bool_word(word)
+                if got is None:
+                    raise ValueError("`-e/--exclusive` 只认 true / false；你给的是 %r"
+                                     % tok.split("=", 1)[1])
+                value = got
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return value, kept
 
     @staticmethod
     def _split_mark(toks):
@@ -4345,6 +4423,81 @@ class Warden(object):
             sessions = []
         return sessions
 
+    def _exclusive_blockers(self, date_iso, start, task=None):
+        """这一场里「不许再塞人」的任务；没有就是空列表。
+
+        规则只有一条：**一场 session 里只要有独占任务，就别再往里放第二条** ——
+        不管是把独占任务放进已经有人的场，还是往有独占任务的场里再塞一条。
+        """
+        if not date_iso or not start:
+            return []
+        others = [t for t in self.task_store.tasks_for_session(date_iso, start)
+                  if task is None or t.get("id") != task.get("id")]
+        others = [t for t in others if self.task_store.is_open(t)]
+        if not others:
+            return []
+        exclusive_others = [t for t in others if th.is_exclusive(t)]
+        if exclusive_others:
+            return exclusive_others
+        return others if th.is_exclusive(task or {}) else []
+
+    def _exclusive_guard(self, task, date_iso, start):
+        """挂之前先看这一场：有独占任务就别再塞第二条（抛 ValueError 给人话）。
+
+        ``_exclusive_blockers`` 只说「谁挡着」，这里负责把它翻译成用户能照着做的
+        一句话 —— 换一场，或者先 ``task <序号> -e false``。
+        """
+        blockers = self._exclusive_blockers(date_iso, start, task)
+        if not blockers:
+            return
+        names = "、".join(
+            "%s「%s」" % (self.task_label(t),
+                         self.task_store.focusmate_title(t, 20) or "?")
+            for t in blockers)
+        if th.is_exclusive(task or {}):
+            raise ValueError(
+                "任务 %s 是 🔒 独占的，而 %s %s 这一场已经有 %s 了 —— 一场只能有一条任务。"
+                "换一场，或先 `task %s -e false` 放开独占。"
+                % (self.task_label(task), date_iso, start, names,
+                   self.task_label(task)))
+        raise ValueError(
+            "%s %s 这一场已经有 🔒 独占任务 %s —— 一场只能有一条任务。"
+            "换一场，或先 `task <序号> -e false` 放开那条的独占。"
+            % (date_iso, start, names))
+
+    def _ensure_carved_session(self, day, chosen, task=None):
+        """把 formatter **切出来的那一场**写进当天排期（一次性 session）。
+
+        ``end`` 现在会在「当天最后一段」的尾巴上切一场任务大小的 session
+        （11:00–12:00 的时段 + 25 分钟任务 → 11:30–11:55）。这一场必须真的落进
+        ``temp/session-extras.json`` + data.csv：否则任务挂不上（没有 session id）、
+        daemon 也不会去订它，第二天那段时间就白白空着。
+
+        返回 None（没造/不需要）或一句话（造了什么）。
+        """
+        day = day if hasattr(day, "isoformat") else self.sel_date
+        start = str(chosen.get("start") or "").strip()
+        duration = int(chosen.get("duration") or 0)
+        if not start or duration <= 0:
+            return None
+        already = [s for s in self.sessions_for_day_plan(day) if s.get("start") == start]
+        if already:
+            return None                        # 同起点那场已经有了，复用，不重复造
+        note = "formatter end 切的（任务 %s）" % (
+            self.task_label(task) if task is not None else "?")
+        try:
+            sp.add_extra(day, start, duration, note=note)
+        except ValueError as exc:
+            self.say("⚠ 没能把切出来的 %s %dmin 写进当天排期：%s（任务照样挂，"
+                     "只是这一场没有计划）" % (start, duration, exc), "warn")
+            return None
+        if self.rewrite_data_csv_from_plan():
+            self.say("➕ 当天额外排了一场：%s %s %dmin（切出来的，已写进 data.csv）"
+                     % (day.isoformat(), start, duration), "ok")
+        else:
+            self.reload_entries()
+        return "切出来的 %s %dmin 这一场已经写进当天排期" % (start, duration)
+
     def _apply_formatter(self, result, spec, action):
         """``-f/--formatter`` 的收尾：记下 preset，并**当场调用它**。
 
@@ -4476,7 +4629,8 @@ class Warden(object):
             "date": day.isoformat(),
             "sessions": sessions,
             "periods": self.periods_for_day(day),
-            "reservations": th.collect_reservations(self.task_store.list(), day.isoformat()),
+            "reservations": th.collect_reservations(self.task_store.list(),
+                                                    day.isoformat()),
         }
         try:
             out = th.call_preset("formatter", spec, ctx)
@@ -4493,6 +4647,26 @@ class Warden(object):
         reservation = out.get("reservation") or {}
         if not chosen.get("start"):
             raise th.HookError("formatter %s 没有返回 session" % spec.get("name"))
+
+        # 先看这一场是不是已经有 🔒 独占任务：撞上了就什么都别写（不然会留下
+        # 一场没人用的排期 + 一条排了但挂不上的任务）。
+        blocked = self._exclusive_blockers(day.isoformat(), chosen.get("start"), task)
+        if blocked:
+            names = "、".join(self.task_label(t) for t in blocked)
+            raise th.HookError(
+                "formatter %s 没排：%s %s 那场已经有 🔒 独占任务 %s —— 一场只能有一条任务。"
+                "换一天 / 换一场，或先 `task <序号> -e false` 放开那条的独占。"
+                % (spec.get("name"), day.isoformat(), chosen.get("start"), names))
+
+        # `end` 会把「当天最后一段」的尾巴**切一场任务大小的 session** 出来
+        # （11:00–12:00 的时段 + 25 分钟任务 → 11:30–11:55）。切出来的这一场当天
+        # 可能还不存在（时段本来那场是 50 分钟的），先把它写进排期，任务才挂得上、
+        # daemon 才会去订它。
+        carved_note = None
+        if chosen.get("carved") and not chosen.get("existing"):
+            carved_note = self._ensure_carved_session(day, chosen, task=task)
+            if carved_note:
+                sessions = self._formatter_sessions(day)
 
         # 选中 session 的 Focusmate 身份：未来那天可能已经订好了，也可能还没有。
         hour, minute = map(int, chosen["start"].split(":"))
@@ -4518,15 +4692,29 @@ class Warden(object):
         spec["reservation"] = reservation
         spec["applied_at"] = ts._now()
         task = self.task_store.set_hook(task["id"], "formatter", spec)
+        # `end` 排出来的任务**自动独占**：一场 Focusmate 里塞两条任务等于两个专注块
+        # 被切成四段。想放开就 `task <序号> -e false`。
+        if spec.get("name") == "end" and not th.is_exclusive(task):
+            task = self.task_store.modify(task["id"], "exclusive", True)
         if not quiet:
+            notes = ""
+            if carved_note:
+                notes += "；" + carved_note
+            conflicts = [str(s) for s in (out.get("conflicts") or []) if s]
+            if conflicts:
+                notes += ("；⚠ 你原来排的 %s 那场还在，跟这一场时间上重叠了 —— "
+                          "不想留它：`period %s 25` 重排这个时段，"
+                          "或 `cancel <表格行号>` 取消已订的那场"
+                          % ("、".join(conflicts),
+                             (reservation.get("period_id") or "T?")))
             self.say("✅ 任务 %s「%s」已由 formatter %s 排到 %s %s–%s"
-                     "（session %s 分钟，任务 %s 分钟 + %s 分钟休息；占用 %s–%s）%s"
+                     "（session %s 分钟，任务 %s 分钟 + %s 分钟休息；占用 %s–%s；🔒 独占）%s"
                      % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                         spec.get("name"), reservation.get("date"), reservation.get("start"),
                         reservation.get("end"), reservation.get("session_duration"),
                         reservation.get("duration"), reservation.get("break_minutes"),
                         reservation.get("start"), reservation.get("end"),
-                        ("；" + note) if note else ""), "ok")
+                        notes + (("；" + note) if note else "")), "ok")
             self.selected_task_id = task["id"]
         self.rebuild_rows()
         return task
@@ -4557,6 +4745,39 @@ class Warden(object):
             return None
         self.say("✅ 任务 %s 备注：%s"
                  % (self.task_label(task), self.task_store.notes(task) or "（空）"), "ok")
+        return task
+
+    def _apply_exclusive(self, result, value, action):
+        """``-e/--exclusive`` 的收尾：把「这一场只能有它一条任务」记进账本。
+
+        独占只落在 ``fields.exclusive``（任务库不校验字段），真正起作用的是两处：
+
+        * **formatter 排期**：独占任务的占用扩展成**整场** session，同一场剩下的
+          时间不会再被下一条任务排进去（见 :func:`task_hooks.collect_reservations`）；
+        * **refresh --check**：发现一场里挤了两条（其中有独占的）→ 全部下架 + 警告。
+
+        ``end`` 排出来的任务**自动**独占，所以这里多半是手动给导入 / 手工任务补上。
+        """
+        if action in self.NO_TASK_ACTIONS:
+            self.say("`-e/--exclusive` 对 %s 没意义（它不产出任务），忽略。" % action, "warn")
+            return None
+        task = result if isinstance(result, dict) and result.get("id") is not None else None
+        if task is None and self.selected_task_id is not None:
+            try:
+                task = self.task_store.get(self.selected_task_id)
+            except ValueError:
+                task = None
+        if task is None:
+            raise ValueError("`-e/--exclusive` 要跟一条任务：`task 3 -e true` / "
+                             "`task create title=写论文 -e true`")
+        want = bool(value)
+        task = self.task_store.modify(task["id"], "exclusive", want)
+        if want:
+            self.say("🔒 任务 %s 设为独占：这一场 session 只能有它一条任务。"
+                     % self.task_label(task), "ok")
+        else:
+            self.say("🔓 任务 %s 取消独占：这一场又能并别的任务了。"
+                     % self.task_label(task), "ok")
         return task
 
     def _apply_assign(self, result, session_token, action):
@@ -5038,15 +5259,18 @@ class Warden(object):
         return True
 
     def _apply_suffix_chain(self, task, action, note_text=None, assign_to=None,
-                            mark_status=None, trigger_spec=None,
+                            exclusive=None, mark_status=None, trigger_spec=None,
                             formatter_spec=None):
-        """按固定顺序把一条任务的后缀跑完：note → assign → mark → trigger → formatter。
+        """按固定顺序把一条任务的后缀跑完：
+        note → exclusive → assign → mark → trigger → formatter。
 
         这是 `cmd_task` 和 `task import` 共用的那一段；一次导入多条时由
         :meth:`_apply_import_suffix` 对**每一条**各跑一遍。
         """
         if note_text is not None:
             self._apply_note(task, note_text, action)
+        if exclusive is not None:
+            task = self._apply_exclusive(task, exclusive, action) or task
         if assign_to is not None:
             task = self._apply_assign(task, assign_to, action) or task
         if mark_status is not None:
@@ -5075,6 +5299,7 @@ class Warden(object):
                 last = self._apply_suffix_chain(
                     one, "import", note_text=suffix.get("note_text"),
                     assign_to=suffix.get("assign_to"),
+                    exclusive=suffix.get("exclusive"),
                     mark_status=suffix.get("mark_status"),
                     trigger_spec=suffix.get("trigger_spec"),
                     formatter_spec=suffix.get("formatter_spec"))
@@ -5084,6 +5309,7 @@ class Warden(object):
         return self._apply_suffix_chain(
             task, "import", note_text=suffix.get("note_text"),
             assign_to=suffix.get("assign_to"),
+            exclusive=suffix.get("exclusive"),
             mark_status=suffix.get("mark_status"),
             trigger_spec=suffix.get("trigger_spec"),
             formatter_spec=suffix.get("formatter_spec"))
@@ -5726,6 +5952,7 @@ class Warden(object):
             self.say("🔁 本体 %s 不占 session；这次挂的是它 %s 的子任务 %s。"
                      % (self.task_label(task), date_iso, self.task_label(child)), "info")
             task = child
+        self._exclusive_guard(task, date_iso, row.get("startLabel"))
         session = {
             "index": session_idx,
             "date": date_iso,
@@ -6519,8 +6746,18 @@ class Warden(object):
         return info
 
     def assign_task_to(self, task, session):
-        """把任务挂到一场 session：Focusmate 建 task（能建就建）+ 本地落账。返回一句人话。"""
+        """把任务挂到一场 session：Focusmate 建 task（能建就建）+ 本地落账。返回一句人话。
+
+        这一场已经有 🔒 独占任务（或这条自己独占、而场里已经有人）时**不挂**，
+        只返回一句警告 —— 「一场 session 只能有一条任务」这条规矩在这里也必须成立，
+        不能因为调用方是 formatter / 收尾流程就绕过去。
+        """
         date_iso = session.get("date") or self.sel_date.isoformat()
+        blockers = self._exclusive_blockers(date_iso, session.get("start"), task)
+        if blockers:
+            names = "、".join(self.task_label(t) for t in blockers)
+            return ("⚠ %s %s 那场已经有 🔒 独占任务 %s，没挂上去（换一场或先放开独占）"
+                    % (date_iso, session.get("start") or "?", names))
         sid = session.get("focusmate_session_id") or session.get("id")
         start_ms = session.get("startMs")
         title = self.task_store.focusmate_title(task)
@@ -7696,7 +7933,11 @@ class Warden(object):
            的 task 列表里那条 task 没有指向那场的 attachment（手动删过、
            或者上次只做了半截）→ 重新挂。**已完成的 task 不重挂**。
         3. **已完成但还没写回 OmniFocus 的 task**：补写「完成 + 截止时间」。
-        4. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
+        4. **一场挤了两条任务、其中有 🔒 独占的**：那一场的任务**全部下架**并警告
+           （见 :meth:`check_exclusive_sessions`；它排在最前面，先拆干净再谈重挂）。
+        5. **那场当时还没订上、现在订上了的任务**：补挂（formatter 切出来的场次
+           就落在这一条上，不然任务永远不会出现在 Focusmate 的 Task Manager 里）。
+        6. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
 
         不带 ``--check`` 的 ``refresh`` **不在外面新造东西**（不订场、不在 Focusmate
         建 task、不改 data.csv），但它不是只管一行数：它把看板上每块组件的状态都
@@ -7808,6 +8049,8 @@ class Warden(object):
             return False
         self.say("refresh --check：对账 —— 该订的 session、该挂的 task、该写回的完成…", "cmd")
         fixed = 0
+        # 独占先查：一场挤了两条任务时**先**拆掉，否则后面的「重挂」会把它又挂回去。
+        fixed += self.check_exclusive_sessions()
         fixed += self.check_bookings()
         fixed += self.check_task_attachments()
         # 保险起见再扫一遍「本地已完成但还没写回」的：上面的重挂可能刚把一条任务
@@ -7833,6 +8076,61 @@ class Warden(object):
         else:
             self.say("✅ 对账完成：没有发现要修的（session 都订上了、任务都挂对了）。", "ok")
         return True
+
+    def check_exclusive_sessions(self):
+        """``refresh --check`` 的独占对账：一场挤了两条任务就**全部下架** + 警告。
+
+        规则（用户原话）：「如果不对就直接那个 session 的任务全部下下来 + 警告用户」。
+        判据只有一条 —— **同一场**里有 ≥2 条**未收工**的任务，而且其中有 🔒 独占的。
+        「同一场」优先按 ``session.focusmate_session_id`` 认（那才是 Focusmate 眼里
+        的一场：两条任务挂在同一个 meetingId 上就是挤在一起，哪怕本地记的起点不同，
+        切割出来的 11:30 和原来那场 11:00 就可能是同一个 meetingId）；没订上（没有
+        id）才退回「同一天 + 同一时刻」。下架走 :meth:`_task_detach`（先删 Focusmate
+        那条 task 再断本地），所以 Focusmate 上也不会留下两条打架的 task。
+
+        返回处理了几条任务。
+        """
+        day = self.sel_date.isoformat()
+        groups = {}
+        for task in self.task_store.list():
+            sess = task.get("session") or {}
+            if (sess.get("date") or "") != day:
+                continue
+            if not self.task_store.is_open(task):
+                continue
+            # 「一场 session」的身份：有 Focusmate session id 就按它认（那才是最硬的
+            # 身份 —— 两条任务挂在同一个 meetingId 上就是挤在同一场，哪怕本地记的
+            # 起点不一样）；没订上就退回「日期 + 起点」。
+            key = str(sess.get("focusmate_session_id") or "") or \
+                "start:%s" % (sess.get("start") or "")
+            groups.setdefault(key, []).append(task)
+        fixed = 0
+        for key in sorted(groups):
+            tasks = groups[key]
+            if len(tasks) < 2:
+                continue
+            exclusive = [t for t in tasks if th.is_exclusive(t)]
+            if not exclusive:
+                continue
+            where = "、".join(sorted({str((t.get("session") or {}).get("start") or "?")
+                                     for t in tasks}))
+            names = "、".join("%s「%s」" % (self.task_label(t),
+                                          self.task_store.focusmate_title(t, 20) or "?")
+                              for t in tasks)
+            self.say("⚠ %s %s 那场挤了 %d 条任务，其中 🔒 独占的只能独占一场 → 全部下架：%s"
+                     % (day, where, len(tasks), names), "warn")
+            for task in tasks:
+                try:
+                    self._task_detach(task, reason="exclusive-conflict")
+                    fixed += 1
+                except Exception as e:              # noqa: BLE001 - 一条失败不挡其余
+                    self.had_error = True
+                    self.say("   ❌ 下架 %s 失败：%s" % (self.task_label(task), e), "error")
+        if fixed:
+            self.say("   下架后它们还在任务表里（未挂 session，🟦）。重新排："
+                     "`task <序号> -f end`，或 `task <序号> -a <session>` 自己挑一场。",
+                     "warn")
+        return fixed
 
     def check_bookings(self):
         """该订没订上的 session → 让 daemon 补一轮。返回修了几场。"""
@@ -7862,13 +8160,20 @@ class Warden(object):
         判据只有一条，而且来自 Focusmate 自己：``GET /v1/tasks`` 里那条 task 的
         ``attachments`` 里有没有这一场的 session id。本地账本说「挂了」不算数 ——
         手动在 Task Manager 删过、或上次调 API 只做了半截，账本都会照旧留着。
+
+        两类都要修：
+
+        1. **本地说挂着、Focusmate 说没挂上** → 重挂；
+        2. **本地挂着「那场当时还没订上」**（formatter 切出来的场次就是这样：
+           ``assign_task_to`` 只会记本地）→ 现在场次订上了就**补挂**，否则那条
+           任务永远不会出现在 Focusmate 的 Task Manager 里。
         """
         remote = self._remote_tasks()
         if remote is None:
             self.say("⚠ 拉不到 GET /v1/tasks（bridge 不在？），任务挂载这一项跳过。", "warn")
             return 0
         day = self.sel_date.isoformat()
-        bad = []
+        bad, late = [], []
         for task in self.task_store.list():
             sess = task.get("session") or {}
             if (sess.get("date") or "") != day:
@@ -7878,9 +8183,29 @@ class Warden(object):
             verdict = self._attachment_verdict(task, remote)
             if verdict:
                 bad.append((task, verdict))
-        if not bad:
-            return 0
+                continue
+            if sess.get("focusmate_session_id"):
+                continue
+            fm = task.get("focusmate") or {}
+            if fm.get("task_id") or fm.get("id"):
+                continue                       # 已经有 Focusmate task，别再造一条
+            idx, row = self._row_for_session(sess)
+            if row is None or row.get("id") is None:
+                continue
+            late.append((task, idx))
         fixed = 0
+        for task, idx in late:
+            sess = task.get("session") or {}
+            self.say("⚠ 任务 %s「%s」挂的 %s %s 那场已经订上了，但 Focusmate 里还没有"
+                     "这条 task —— 补挂…"
+                     % (self.task_label(task), self.task_store.focusmate_title(task, 30),
+                        sess.get("date") or "?", sess.get("start") or "?"), "warn")
+            try:
+                self._assign_task(task, str(idx), refresh=False)
+                fixed += 1
+            except Exception as e:                  # noqa: BLE001 - 一条失败不挡其余
+                self.had_error = True
+                self.say("   ❌ 补挂失败：%s" % e, "error")
         for task, verdict in bad:
             sess = task.get("session") or {}
             self.say("⚠ 任务 %s「%s」%s（本地记着挂在 %s %s）—— 重挂…"

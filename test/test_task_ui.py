@@ -1042,8 +1042,8 @@ wd.rebuild_rows()
 t1_rows = [r for r in wd.rows if r.get("period_id") == "T1"]
 check("T1 的行都标了「时段静音」", [r.get("period_muted") for r in t1_rows],
       [True, True])
-check("T2 的行没标", [r.get("period_muted") for r in wd.rows
-                      if r.get("period_id") == "T2"], [False])
+check("T2 的行没标", sorted({r.get("period_muted") for r in wd.rows
+                              if r.get("period_id") == "T2"}), [False])
 targets = wd.mute_targets()
 check("要静音的就是这两场", [r["startLabel"] for r in targets], ["11:00", "12:00"])
 wd.offline = False
@@ -1170,18 +1170,23 @@ wd4 = fresh_warden()
 _shell = wd4.shell
 check("task 后面能 Tab 到紧凑写法",
       [c for c in _shell.complete("task ") if c.startswith("-")],
-      ["-an", "-ac", "-m", "-t", "-f", "-st", "--assign", "-a", "--note", "-n",
-       "--from", "-s", "--mark", "--trigger", "--formatter", "--repeat",
-       "--single-task"])
+      ["-an", "-ac", "-m", "-t", "-f", "-st", "-e", "--assign", "-a", "--note",
+       "-n", "--from", "-s", "--exclusive", "-e", "--mark", "--trigger",
+       "--formatter", "--repeat", "--single-task"])
 check("task 后面 Tab 补的是**面板序号**（1..N 连续，不是内部 id）",
       [c for c in _shell.complete("task ") if c.isdigit()],
       [str(i) for i in range(1, len(wd4.task_panel_order()) + 1)])
 check("敲了 -a 之后 Tab 补的是紧凑写法",
       [c for c in _shell.complete("task -a") if c.startswith("-") and c != "-a"],
       ["-an", "-ac"])
+# 行数不写死：`-f end` 会在「当天最后一段」的尾巴上切一场新 session
+# （见后面的「切割」一节），data.csv 因此可能多一行。
 check("-a 后面补「编号 + none + current」（不再混进一堆动作词）",
-      _shell.complete("task -a "), ["1", "2", "3", "none", "current"])
-check("-s 后面只补编号", _shell.complete("task -s "), ["1", "2", "3"])
+      _shell.complete("task -a "),
+      [str(i) for i in range(1, len(wd4.rows) + 1)] + ["none", "current"])
+check("-s 后面只补编号",
+      _shell.complete("task -s "), [str(i) for i in range(1, len(wd4.rows) + 1)])
+check("-e 也在列表里（独占）", "-e" in _shell.complete("task "), True)
 check("-m 后面补「complete / discard」",
       _shell.complete("task -m "), ["complete", "discard"])
 check("--mark 后面也补「complete / discard」",
@@ -1719,6 +1724,28 @@ try:
     check("也同样重挂了一遍",
           [c[1]["meetingId"] for c in wd3.bridge.calls if c[0] == "add_task"], ["sess-11:00"])
 
+    # (3.5) 「那场当时还没订上」→ 现在订上了要补挂。
+    #       formatter 切出来的场次就是这条路：`assign_task_to` 当场只记本地，
+    #       daemon 订上之后必须有人把 Focusmate 那条 task 建出来。
+    carving = wd3.task_store.create({"title": "切割补挂", "duration": 25})
+    wd3.task_store.assign(carving["id"], {"date": ISO, "start": "11:00",
+                                         "duration": 25})
+    check("这条本地没有 focusmate_session_id",
+          (wd3.task_store.get(carving["id"])["session"] or {}).get(
+              "focusmate_session_id"), None)
+    wd3.bridge.calls = []
+    check("「场次当时没订上」时 --check 受理", wd3.handle("refresh --check"), True)
+    check("把 Focusmate 里缺的那条 task 补上了",
+          [c[1]["meetingId"] for c in wd3.bridge.calls if c[0] == "add_task"],
+          ["sess-11:00"])
+    check("补挂后本地记下了那场的 session id",
+          wd3.task_store.get(carving["id"])["session"].get("focusmate_session_id"),
+          "sess-11:00")
+    wd3.bridge.calls = []
+    wd3.handle("refresh --check")
+    check("再查一次不会重复补挂（幂等）",
+          [c for c in wd3.bridge.calls if c[0] == "add_task"], [])
+
     # (4) 执行区里有契约、API 里没有 → 叫 daemon 补一轮
     #     只有执行区里的「缺」才值得补（草稿区本来就还没轮它），所以把区域判据
     #     钉成 execute：否则这条用例会随当前钟点变红。
@@ -1875,13 +1902,18 @@ check("task create title=深夜闪卡 duration=25 -f end 受理",
 night = [t for t in wdh.task_store.list() if t["fields"].get("title") == "深夜闪卡"][0]
 nres = (night.get("formatter") or {}).get("reservation") or {}
 check("end 认出了跨午夜那段 T9（不是倒数第二段 T4）", nres.get("period_id"), "T9")
-check("在 23:15–00:05 那场的尾部截出 25 分钟 + 5 分钟休息",
-      [nres.get("start"), nres.get("end")], ["23:35", "00:05"])
-check("挂的是 23:15 那场 50 分钟 session",
-      [night["session"]["start"], night["session"]["duration"]], ["23:15", 50])
-check("截止时间跨到第二天 00:05",
-      night["fields"].get("due"),
-      "%sT00:05:00" % (TODAY + datetime.timedelta(days=1)).isoformat())
+# 「切割」：不是在 23:15–00:05 那场里找个位置塞进去，而是在时段尾巴上**切一场
+# 25 分钟的**（起点必须落在 15 分钟整点 → 23:30，05:00 才不是整点）。
+check("在 23:15–00:05 的尾巴上切出 25 分钟 + 5 分钟休息",
+      [nres.get("start"), nres.get("end")], ["23:30", "00:00"])
+check("挂的是切出来的那场 25 分钟 session（不是原来 50 分钟那场）",
+      [night["session"]["start"], night["session"]["duration"]], ["23:30", 25])
+check("切出来的那场真的写进排期（一次性 session）",
+      ["23:30" for _ in [1] if ("23:30", 25) in
+       [(r["start"], int(r["duration"])) for r in sp.load_extras()["dates"].get(ISO, [])]],
+      ["23:30"])
+check("截止时间 = 那场 session 的终点",
+      night["fields"].get("due"), "%sT23:55:00" % ISO)
 
 # 这一段被占了以后，下一条要退回「第二晚」那段，而不是又排进 T9 或排到过去。
 wdh.messages = []
@@ -1892,6 +1924,195 @@ nres2 = (night2.get("formatter") or {}).get("reservation") or {}
 check_true("第二条不再占 T9", nres2.get("period_id") != "T9")
 check_true("第二条的占用区间是合法的正区间",
            w.th._range_of(nres2)[1] - w.th._range_of(nres2)[0] > 0)
+
+# ---------------------------------------------------------------- 独占（exclusive）
+#
+# 需求（用户原话）：
+#   「给 task 添加一个 exclusive flag，如果是，那么一个 session 不能有两个任务」
+#   「exclusive 语法类似 task --exclusive true / -e true。同时 end formatter 创建
+#     的任务自动 exclusive」
+#   「如果不对就直接那个 session 的任务全部下下来 + 警告用户」
+print("== formatter end 切割：25 分钟任务不该塞进时段里那场 50 分钟的 ==")
+# 用户原话：「11:00–12:00 有时间段，那么他应该切割 11:30–12:00 做一个 25 分钟的
+# 时间段，而不是放入 11:00–11:50 的五十分钟时间段。」
+_carve_ctx = {"task": {"id": 1, "fields": {"duration": 25}}, "task_id": 1, "date": ISO,
+              "sessions": [{"date": ISO, "period_id": "H1", "start": "11:00",
+                            "end": "11:50", "duration": 50}],
+              "periods": [{"id": "H1", "start": "11:00", "end": "12:00"}],
+              "reservations": []}
+_carve = w.th.format_end(_carve_ctx)
+check("在时段尾巴上切出 11:30–11:55（不是塞进 11:00–11:50 那场）",
+      [_carve["session"]["start"], _carve["session"]["duration"]], ["11:30", 25])
+check("占用写到 12:00（25 分钟任务 + 5 分钟休息）",
+      [_carve["reservation"]["start"], _carve["reservation"]["end"]],
+      ["11:30", "12:00"])
+check("切出来的是一场**新** session（要写进当天排期）", _carve["new_session"], True)
+check("并且说清它跟原来那场重叠了", _carve["conflicts"], ["11:00"])
+check("起点必须落在 15 分钟整点上（Focusmate 只认这个）",
+      int(_carve["session"]["start"].split(":")[1]) % 15, 0)
+check("同起点那场本来就有 → 复用，不重复造一场",
+      w.th.format_end(dict(_carve_ctx, sessions=[
+          {"date": ISO, "period_id": "H1", "start": "11:30", "end": "11:55",
+           "duration": 25}]))["new_session"], False)
+check("50 分钟任务切出来正好是那场 50 分钟（不用新建）",
+      (lambda o: ([o["session"]["start"], o["session"]["duration"]], o["new_session"]))(
+          w.th.format_end(dict(_carve_ctx,
+                               task={"id": 1, "fields": {"duration": 50}}))),
+      (["11:00", 50], False))
+check("30 分钟任务取 50 分钟那一档（Focusmate 没有 30）",
+      w.th.fit_session_duration(30), 50)
+check("超过 75 就往 15 的整数倍取整", w.th.fit_session_duration(80), 90)
+check("is_exclusive：fields.exclusive=True", w.th.is_exclusive(
+    {"fields": {"exclusive": True}}), True)
+check("is_exclusive：字符串 false 也是 False", w.th.is_exclusive(
+    {"fields": {"exclusive": "false"}}), False)
+check("is_exclusive：没写就是 False", w.th.is_exclusive({"fields": {}}), False)
+
+
+print("== 独占（exclusive）：一场 session 只能有一条任务 ==")
+wdx = fresh_warden()
+wdx.bridge.sessions = plan_sessions(wdx)
+wdx.messages = []
+check("task create ... -e true 受理",
+      wdx.handle("task create title=独占甲 duration=25 -e true"), True)
+excl = [t for t in wdx.task_store.list()
+        if (t.get("fields") or {}).get("title") == "独占甲"][0]
+check("exclusive 落在 fields.exclusive 上", excl["fields"].get("exclusive"), True)
+check_true("消息里说清了它是什么意思",
+           any("独占" in m[2] and "只能有它一条任务" in m[2] for m in wdx.messages))
+check("裸写 -e 也算 true（≡ -e true）",
+      wdx.handle("task id:%d -e" % excl["id"]), True)
+check("--exclusive true 一样认",
+      wdx.handle("task id:%d --exclusive true" % excl["id"]), True)
+check("-e=false 能取消",
+      wdx.handle("task id:%d -e=false" % excl["id"]), True)
+check("取消之后是 False",
+      wdx.task_store.get(excl["id"])["fields"].get("exclusive"), False)
+check("-e 是（中文真值）也认",
+      wdx.handle("task id:%d -e 是" % excl["id"]), True)
+check("又变回 True",
+      wdx.task_store.get(excl["id"])["fields"].get("exclusive"), True)
+
+# formatter end 排出来的任务自动独占
+wdx.messages = []
+check("task create title=自动独占 duration=25 -f end 受理",
+      wdx.handle("task create title=自动独占 duration=25 -f end"), True)
+auto = [t for t in wdx.task_store.list()
+        if (t.get("fields") or {}).get("title") == "自动独占"][0]
+check("formatter end 排出来的任务**自动**独占",
+      auto["fields"].get("exclusive"), True)
+check_true("消息里带 🔒 独占", any("🔒" in m[2] for m in wdx.messages))
+check("切出来的那场真的写进了当天排期（一次性 session）",
+      (auto["session"]["start"], auto["session"]["duration"]) in
+      [(s["start"], int(s["duration"])) for s in sp.sessions_for_day(
+          sp.load_download(), sp.load_layouts(), TODAY)],
+      True)
+
+# 纯函数层：独占任务占掉的是**整场**，不是只有自己那 25 分钟。
+_owner = {"id": 991, "status": "active",
+          "fields": {"duration": 25, "exclusive": True},
+          "formatter": {"name": "end",
+                        "reservation": {"date": ISO, "start": "11:30",
+                                        "end": "11:55",
+                                        "start_min": 690, "end_min": 715}},
+          "session": {"date": ISO, "start": "11:00", "end": "11:50",
+                      "duration": 50}}
+check("独占任务的占用盖满它那一整场（11:00–11:55）",
+      [(r["start_min"], r["end_min"], r["exclusive"])
+       for r in w.th.collect_reservations([_owner], ISO)], [(660, 715, True)])
+_shared_owner = dict(_owner, fields={"duration": 25})
+check("不独占就只算自己那 25 + 5 分钟",
+      [(r["start_min"], r["end_min"], r["exclusive"])
+       for r in w.th.collect_reservations([_shared_owner], ISO)], [(690, 715, False)])
+
+# 真挂一场：独占之后同一场不许再塞第二条。
+row_1100 = [r for r in wdx.rows if r.get("startLabel") == "11:00"][0]
+idx_1100 = wdx.rows.index(row_1100) + 1
+wdx.messages = []
+check("独占甲挂到 11:00 那场", wdx.handle("task id:%d -a %d" % (excl["id"], idx_1100)), True)
+check("真挂上了", wdx.task_store.get(excl["id"])["session"]["start"], "11:00")
+squeeze = wdx.task_store.create({"title": "想挤进同一场", "duration": 25})
+check("这场现在是「有独占任务」的",
+      [t["id"] for t in wdx._exclusive_blockers(ISO, "11:00", squeeze)], [excl["id"]])
+check("旁边那场不受影响", wdx._exclusive_blockers(ISO, "12:00", squeeze), [])
+try:
+    wdx.cmd_task_assign([str(tno(wdx, squeeze)), str(idx_1100)])
+    _squeezed = False
+except ValueError as e:
+    _squeezed = "独占" in str(e) and "只能有一条任务" in str(e)
+check("往有独占任务的场里再塞一条会被拒", _squeezed, True)
+check("被拒之后它仍然没挂 session",
+      wdx.task_store.get(squeeze["id"]).get("session"), None)
+check("assign_task_to（formatter/收尾走这条）也只会返回警告、不挂",
+      "独占" in wdx.assign_task_to(
+          squeeze, {"date": ISO, "start": "11:00", "duration": 50,
+                    "focusmate_session_id": "sess-11:00", "startMs": 1}), True)
+wdx.handle("task id:%d -e false" % excl["id"])
+check("取消独占后同一场就没有这条规矩了",
+      wdx._exclusive_blockers(ISO, "11:00", squeeze), [])
+wdx.handle("task id:%d -e true" % excl["id"])
+
+# `task import -e true` 的后缀要落到**每一条**导入出来的任务上
+_imported = wdx.task_store.create({"title": "导入后缀独占", "duration": 25})
+wdx._apply_import_suffix(_imported, {"exclusive": True})
+check("task import -e true 的独占落到导入的任务上",
+      wdx.task_store.get(_imported["id"])["fields"].get("exclusive"), True)
+
+print("== refresh --check：一场挤了两条任务（其中独占）→ 全部下架 + 警告 ==")
+wdc = fresh_warden()
+wdc.bridge.sessions = plan_sessions(wdc)
+row_1100 = [r for r in wdc.rows if r.get("startLabel") == "11:00"][0]
+idx_1100 = wdc.rows.index(row_1100) + 1
+one = wdc.task_store.create({"title": "冲突甲", "duration": 25})
+two = wdc.task_store.create({"title": "冲突乙", "duration": 25})
+# 先两条都挂上（当时还没人独占：手工 / 导入都可能造成这种脏数据）
+wdc.handle("task id:%d -a %d" % (one["id"], idx_1100))
+wdc.handle("task id:%d -a %d" % (two["id"], idx_1100))
+check("两条真的挤在同一场",
+      [t["id"] for t in wdc.task_store.tasks_for_session(ISO, "11:00")
+       if t["id"] in (one["id"], two["id"])], [one["id"], two["id"]])
+wdc.handle("task id:%d -e true" % one["id"])
+wdc.messages = []
+_fixed = wdc.check_exclusive_sessions()
+check("两条都被下架", _fixed, 2)
+check("甲已经没有 session 了", wdc.task_store.get(one["id"]).get("session"), None)
+check("乙也没有了", wdc.task_store.get(two["id"]).get("session"), None)
+check_true("警告里说清那场挤了几条、都是谁",
+           any("挤了 2 条任务" in m[2] and "冲突甲" in m[2] and "冲突乙" in m[2]
+               for m in wdc.messages))
+check_true("警告里给了重新排的办法",
+           any("-f end" in m[2] for m in wdc.messages))
+check("再查一次没有可修的了（幂等）", wdc.check_exclusive_sessions(), 0)
+
+# 「一场」的身份优先认 Focusmate session id：本地记的起点不一样也算同一场
+# （切割出来的 11:30 和原来那场 11:00 可能就在同一个 meetingId 上）。
+wee = fresh_warden()
+same_one = wee.task_store.create({"title": "同场甲", "duration": 25})
+same_two = wee.task_store.create({"title": "同场乙", "duration": 25, "exclusive": "true"})
+wee.task_store.assign(same_one["id"], {"date": ISO, "start": "11:00", "duration": 25,
+                                       "focusmate_session_id": "sess-11:00"})
+wee.task_store.assign(same_two["id"], {"date": ISO, "start": "11:30", "duration": 25,
+                                       "focusmate_session_id": "sess-11:00"})
+wee.messages = []
+check("两条挂在同一个 Focusmate session id 上也算挤了一场",
+      wee.check_exclusive_sessions(), 2)
+check_true("警告里两个起点都点名了",
+           any("11:00" in m[2] and "11:30" in m[2] for m in wee.messages))
+
+# 两条都不独占：不归这条规矩管，一条都不许动
+wdd = fresh_warden()
+wdd.bridge.sessions = plan_sessions(wdd)
+row_1100 = [r for r in wdd.rows if r.get("startLabel") == "11:00"][0]
+idx_1100 = wdd.rows.index(row_1100) + 1
+p = wdd.task_store.create({"title": "并肩甲", "duration": 25})
+q = wdd.task_store.create({"title": "并肩乙", "duration": 25})
+wdd.handle("task id:%d -a %d" % (p["id"], idx_1100))
+wdd.handle("task id:%d -a %d" % (q["id"], idx_1100))
+check("都不独占 → refresh --check 不动它们", wdd.check_exclusive_sessions(), 0)
+check("两条都还在场上",
+      [t["id"] for t in wdd.task_store.tasks_for_session(ISO, "11:00")
+       if t["id"] in (p["id"], q["id"])], [p["id"], q["id"]])
+
 
 # 5) trigger 框架可以用：注册一个 demo 之后，task -t 能列出来、能挂到任务上。
 @w.th.register_trigger("demo_after_task", params=("task_id",), help="测试用 trigger")

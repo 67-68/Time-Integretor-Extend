@@ -437,8 +437,12 @@ check("明天子任务也继承了 formatter 并跑过",
       TOMORROW.isoformat())
 check_true("今天子任务挂到了 session（T1 可能被上一节拆成 25+25）",
            ((child_today.get("session") or {}).get("start")) in ("22:15", "22:45"))
-check("明天子任务挂到了 session",
-      ((child_tomorrow.get("session") or {}).get("start")), "22:15")
+# formatter end 现在是**切割**：22:15–23:15 的时段里那场 50 分钟 session 太大，
+# 就在时段尾巴上切一场 25 分钟的 → 22:45–23:10（占用 22:45–23:15）。
+check("明天子任务挂到了 session（切出来的 22:45）",
+      ((child_tomorrow.get("session") or {}).get("start")), "22:45")
+check("切出来的那场也写进排期了",
+      ((child_tomorrow.get("session") or {}).get("duration")), 25)
 check_true("契约表 task 列会把明天的子任务画上 ⏱",
            "⏱" in wd.task_cell_text([child_tomorrow]))
 check_true("本体不在契约表 task 列里",
@@ -447,8 +451,9 @@ check_true("本体不在契约表 task 列里",
 wd.day_offset = 1
 wd.reload_entries()
 wd.rebuild_rows()
-row = next((r for r in wd.rows if r.get("startLabel") == "22:15"), None)
-check("切到明天有 22:15 那一行", bool(row), True)
+_want = (child_tomorrow.get("session") or {}).get("start")
+row = next((r for r in wd.rows if r.get("startLabel") == _want), None)
+check("切到明天有子任务那一行（%s）" % _want, bool(row), True)
 check_true("明天的行里是子任务 + ⏱",
            row and ("⏱" in row.get("task_text", ""))
            and (child_tomorrow["id"] in [t["id"] for t in row.get("tasks") or []]))
