@@ -68,6 +68,17 @@ OPTIONS = (
     ("e", "快捷推后", "和延期一样，但复制品由系统建好、直接塞进下一场"),
 )
 
+#: **count 达标**的那条才多出来的动作（用户需求：「问是否需要额外的 count 或者直接完成」）。
+#:
+#:     f        这一场就把它记满 → 直接完成（勾 Focusmate + 写回 OmniFocus）
+#:     f 2      再要 2 个 count：上限抬到「已投入 + 2」，任务留着继续干
+#:
+#: 为什么要有它：session 结束后 count **不会**自动算进任务并完成 —— 达标只是一次
+#: 「它够数了」的预报，得你说一句「收工」才算数（用户需求原话）。
+COUNT_OPTION = ("f", "count 完成", "这一场就记满 → 直接完成（勾 Focusmate + 写回 OmniFocus）")
+COUNT_HINT = ("f 直接完成 · f 2 再要 2 个 count（上限抬到已投入+2，任务留着继续干）"
+              " · s 跳过（先不记账完成）")
+
 #: 选项的别名（认中文、认数字、认大写）
 OPTION_ALIASES = {
     "a": "a", "延期": "a", "推后": "a", "1": "a",
@@ -136,6 +147,27 @@ def session_key(day, start):
     """一场 session 的身份：``2026-10-27T11:00``（和 schedule.key_of 同构）。"""
     iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
     return "%sT%s" % (iso, str(start))
+
+
+def session_minutes(entry):
+    """一场 session 有多长（分钟）—— 就是 count 记账的分母（时长 / 25）。
+
+    先认 ``duration``，没有再拿起终点算（daemon 队列里塞进来的老记录可能只有
+    ``start`` / ``end``）。都认不出来就是 ``None``（那就这一场不记 count）。
+    """
+    entry = entry or {}
+    got = ts.parse_minutes(entry.get("duration"))
+    if got:
+        return got
+    try:
+        start = datetime.datetime.strptime(str(entry.get("start") or ""), "%H:%M")
+        end = datetime.datetime.strptime(str(entry.get("end") or ""), "%H:%M")
+    except (TypeError, ValueError):
+        return None
+    minutes = int((end - start).total_seconds() // 60)
+    if minutes <= 0:
+        minutes += 24 * 60
+    return minutes or None
 
 
 def mark_pending(session, now=None, path=None, extra=None):
@@ -448,7 +480,8 @@ class Review(object):
     MINUTES = "minutes"
     DONE = "done"
 
-    def __init__(self, store, session, tasks, hooks=None, now=None, index=0):
+    def __init__(self, store, session, tasks, hooks=None, now=None, index=0,
+                 counts=None):
         self.store = store
         self.session = dict(session or {})
         self.tasks = [t for t in (tasks or [])]
@@ -460,6 +493,9 @@ class Review(object):
         self.skipped = []
         self.closed = False
         self.pending_task = None      # 处于「等你的转移命令」/「等分钟数」的那条
+        # count 的进度账（``{task_id: {...}}``）：谁在这一场涨了几个、够数了没有。
+        # 由 warden 在 begin_review 里**记完账**之后递进来 —— 这里只负责问人。
+        self.counts = dict(counts or {})
 
     # -- 小工具 -------------------------------------------------------
     def say(self, text, kind="info"):
@@ -569,7 +605,48 @@ class Review(object):
                     "敲 `b` 直接放弃、`s` 跳过。" % self._task_label())
         if self.stage == self.MINUTES:
             return "大概花了多少分钟？（填个整数就行，例如 35）"
-        return "A 延期 · B 放弃 · C 重议 · D 缺漏完成 · E 快捷推后 · s 跳过 · q 结束收尾"
+        hint = "A 延期 · B 放弃 · C 重议 · D 缺漏完成 · E 快捷推后 · s 跳过 · q 结束收尾"
+        if self.at_cap(self.current()):
+            hint = "F 直接完成 / f 2 再要 2 个 count · " + hint
+        return hint
+
+    # -- count（最高进度 / 这一场涨多少）------------------------------
+    def count_state(self, task):
+        """``{cap, invested, delta, maxed, credited}``；这条没设 count 就是 ``None``。
+
+        ``invested`` 是**记完这一场的账之后**的数（warden 在 begin_review 里记的），
+        ``delta`` 是这一场本该涨多少。两件事分开摆，才看得出「涨了没涨」。
+        """
+        if not task:
+            return None
+        cap = ts.task_count(task)
+        state = dict(self.counts.get(task.get("id")) or {})
+        if state.get("cap") is None:
+            state["cap"] = cap
+        if state.get("invested") is None:
+            state["invested"] = ts.task_count_invested(task)
+        if state.get("delta") is None:
+            state["delta"] = ts.minutes_to_count(session_minutes(self.session)) or 0
+        state["maxed"] = bool(state["cap"] is not None
+                              and state["invested"] >= state["cap"])
+        return state if state["cap"] is not None else None
+
+    def at_cap(self, task):
+        """这条任务的 count 够数了没（够数就该问「额外 count 还是直接完成」）。"""
+        state = self.count_state(task)
+        return bool(state and state.get("maxed"))
+
+    def count_line(self, state):
+        """收尾面板里那行 count：``count 达标：(3/3) 这一场记了 +2 —— f 直接完成…``。"""
+        cap = state.get("cap")
+        invested = state.get("invested") or 0
+        delta = state.get("delta") or 0
+        if state.get("maxed"):
+            return ("count 达标：(%d/%d)%s —— %s"
+                    % (invested, cap, ("，这一场记了 +%d" % delta) if delta else "",
+                       COUNT_HINT))
+        return ("count：%d/%d%s（这一场记了 %d 个）"
+                % (invested, cap, "" if cap else "", delta))
 
     def label_of(self, task):
         """给用户看的任务编号：warden 那边给的是**面板序号**（``#3``）。
@@ -629,6 +706,10 @@ class Review(object):
             bits.append("没关联 OmniFocus")
         if bits:
             out.append(("  " + " · ".join(bits), "dim"))
+        state = self.count_state(task)
+        if state:
+            out.append(("  " + self.count_line(state),
+                        "bold yellow" if state.get("maxed") else "dim"))
         if self.stage == self.ASK:
             for key, name, desc in OPTIONS:
                 out.append(("  %s  %-6s %s" % (key.upper(), name, desc), ""))
@@ -689,12 +770,84 @@ class Review(object):
             for key, name, desc in OPTIONS:
                 self.say("%s %s：%s" % (key.upper(), name, desc), "info")
             return {"action": "handled"}
+        count_choice = self._parse_count_choice(raw)
+        if count_choice is not None:
+            task = self.current()
+            if not self.at_cap(task):
+                self.say("`f` 只给「这一场就够数」的那条任务用（它的 count 还没到上限）；"
+                         "别的照旧 A/B/C/D/E。", "warn")
+                return {"action": "handled"}
+            if count_choice <= 0:
+                return self._complete_by_count(task)
+            return self._extend_count(task, count_choice)
         choice = OPTION_ALIASES.get(low)
         if choice is None:
             self.say("认不出 %r；A 延期 / B 放弃 / C 重议 / D 缺漏完成 / E 快捷推后 / s 跳过 / q 结束"
                      % raw, "warn")
             return {"action": "handled"}
         return self._choose(choice)
+
+    @staticmethod
+    def _parse_count_choice(raw):
+        """``f`` / ``f 2`` / ``+2`` / ``count 2`` → ``0``（直接完成）或正整数（额外 count）。
+
+        认不出来就是 ``None``（交给 A/B/C/D/E 那套去解析）。
+        """
+        text = str(raw or "").strip().lower()
+        if not text:
+            return None
+        head, _sep, tail = text.partition(" ")
+        tail = tail.strip()
+        if head in ("f", "count", "记count", "counts"):
+            if not tail:
+                return 0
+            got = ts.parse_count(tail)
+            return got if got and got > 0 else 0
+        if head.startswith("+"):
+            got = ts.parse_count(head)
+            return got if got and got > 0 else None
+        return None
+
+    def _complete_by_count(self, task):
+        """count 够数 → 直接完成（和缺漏完成同一条路，只是不用再填分钟数）。"""
+        due = self._hook("due_of", task)
+        self.mark_processed(task, "count-complete")
+        self.store.complete(task["id"], reason="review-count")
+        fresh = self.store.get(task["id"])
+        self.store.archive_local(fresh, reason="review-count")
+        note_fm = self._hook("complete_focusmate", task)
+        note_of = self._hook("complete_omnifocus", task, None)
+        extra = "；".join(x for x in (note_fm, note_of) if x)
+        state = self.count_state(task) or {}
+        self.say("✓ 任务 %s「%s」count 到位（%d/%d）→ 直接完成%s%s"
+                 % (self.label_of(task), self.title_of(task),
+                    state.get("invested") or 0, state.get("cap") or 0,
+                    ("，截止 %s" % due) if due else "",
+                    ("；" + extra) if extra else ""), "ok")
+        return self._advance()
+
+    def _extend_count(self, task, extra):
+        """「额外 count」= **抬高上限**：count = 已投入 + extra，任务留着继续干。
+
+        这是用户选的那种语义（另一种「加已投入」会在超过上限时立刻收工，等于没得选）。
+        """
+        state = self.count_state(task) or {}
+        invested = state.get("invested")
+        if invested is None:
+            invested = ts.task_count_invested(task)
+        cap = int(invested) + int(extra)
+        setter = self.hooks.get("set_count")
+        if setter:
+            setter(task, cap)
+        else:
+            self.store.set_count(task["id"], cap)
+        self.mark_processed(task, "count-extend")
+        self.counts[task.get("id")] = dict(state, cap=cap, invested=invested,
+                                           maxed=False)
+        self.say("➕ 任务 %s「%s」的 count 上限抬到 %d（已投入 %d，还剩 %d 个）—— 继续干。"
+                 % (self.label_of(task), self.title_of(task), cap, invested,
+                    cap - int(invested)), "ok")
+        return self._advance()
 
     def _choose(self, choice):
         task = self.current()

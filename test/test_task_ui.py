@@ -1170,9 +1170,9 @@ wd4 = fresh_warden()
 _shell = wd4.shell
 check("task 后面能 Tab 到紧凑写法",
       [c for c in _shell.complete("task ") if c.startswith("-")],
-      ["-an", "-ac", "-m", "-t", "-f", "-st", "-e", "--assign", "-a", "--note",
-       "-n", "--from", "-s", "--exclusive", "-e", "--mark", "--trigger",
-       "--formatter", "--repeat", "--single-task"])
+      ["-an", "-ac", "-m", "-t", "-f", "-st", "-e", "-c", "--assign", "-a",
+       "--note", "-n", "--from", "-s", "--exclusive", "-e", "--mark", "--count",
+       "--trigger", "--formatter"])
 check("task 后面 Tab 补的是**面板序号**（1..N 连续，不是内部 id）",
       [c for c in _shell.complete("task ") if c.isdigit()],
       [str(i) for i in range(1, len(wd4.task_panel_order()) + 1)])

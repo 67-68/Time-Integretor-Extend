@@ -40,9 +40,12 @@ DEFAULT_TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
 DEFAULT_ARCHIVE_FILE = os.path.join(DATA_DIR, "task-archive.json")
 
 # 这些键是本地簿记，不属于用户字段。用户仍然可以随便写别的字段。
+# ``count_credits`` 是「哪一场 session 已经给这条记过 count」的台账（幂等用），
+# 它跟 ``history`` 一样是界面/账本用的痕迹，不许当字段改。
 RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate", "repeat",
             "status", "status_at", "tags", "omnifocus", "duplicate_of", "actual_minutes",
-            "history", "trigger", "formatter", "source", "repeat_parent", "repeat_date"}
+            "history", "trigger", "formatter", "source", "repeat_parent", "repeat_date",
+            "count_credits"}
 
 #: 「这条任务在哪一天的 session 里被处理过」的痕迹（见 :meth:`TaskStore.mark_processed`）。
 #: 任务是按天固化的：今天的任务面板 = 所有没做完的 + 今天处理过的；过去那天只剩
@@ -64,6 +67,32 @@ STATUS_MARKS = {STATUS_ACTIVE: "·", STATUS_COMPLETED: "✓", STATUS_DROPPED: "�
 #: 「延期 / 快捷推后」给旧任务打的那个本地标签。只在本地，OmniFocus 一个字节都不动。
 TRANSFER_TAG = "未完成转移"
 
+# ---------------------------------------------------------------- 时长 ↔ count
+#
+# 一个任务「要多久」有两副面孔，**必须永远是同一个事实**：
+#
+#   count            要花几个 25 分钟的块（最高进度）
+#   fields.duration  分钟数
+#
+# 换算只有一个方向是精确的：count × 25 = 分钟；反过来的 分钟 → count **往上取整**
+# （30 分钟的任务 = 2 个 count，不是 1.2 个）。所以「改 count = 改时长、改时长 =
+# 改 count」这件事只在 :func:`link_count_fields` 里写一遍，别在调用方各写一份。
+#
+# ``count_invested`` 是「这条已经用掉几个 count」，只由两种事情推进：
+#   * 用户手敲 ``task 3 -c +2``（见 warden 的 ``_apply_count``）
+#   * 一场 session 收尾时**自动记账**（session 时长 / 25，见 warden.begin_review）
+# 记账是**幂等**的：``count_credits`` 里按 session key 记一笔，同一场收尾重开
+# 多少次都只加一次 —— 否则「收尾到一半退出、再进一次」就会白送 count。
+MINUTES_PER_COUNT = 25
+COUNT_KEY = "count"
+COUNT_INVESTED_KEY = "count_invested"
+COUNT_CREDITS_KEY = "count_credits"
+
+#: 任务持续时间的字段别名。第一个是推荐写法，其余是为了兼容手写数据。
+#: ``task_hooks`` 直接 import 这个名字，别再复制一份。
+DURATION_KEYS = ("duration", "duration_minutes", "estimated_minutes",
+                 "estimated_duration", "minutes", "时长", "预计时长")
+
 # 「备注」：一个普通字段（不是保留字段，字段仍然不校验），但有一套固定别名，
 # 因为它是**有意设计**的：可以往里面塞网址，任务完成后照着去对应地方把活干完。
 NOTES_KEYS = ("notes", "note", "备注")
@@ -83,6 +112,150 @@ def _norm_fields(fields):
     for k, v in (fields or {}).items():
         out[_field_name(k)] = v
     return out
+
+
+# -- 时长 / count 换算（本模块是唯一口径，task_hooks 也从这儿拿） -----------
+
+def parse_minutes(value):
+    """从 ``25`` / ``"25"`` / ``"25min"`` / ``"25 分钟"`` 里取分钟数。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        out = int(value)
+        return out if out > 0 else None
+    match = re.search(r"\d+", str(value))
+    if not match:
+        return None
+    out = int(match.group(0))
+    return out if out > 0 else None
+
+
+def parse_count(value):
+    """``5`` / ``"5"`` / ``"+5"`` / ``"2 个"`` → 整数；认不出来 → ``None``。
+
+    负数**也认**（``-c -1`` 是「退一格进度」），语义由调用方决定。
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    match = re.search(r"[+-]?\d+", str(value))
+    if not match:
+        return None
+    return int(match.group(0))
+
+
+def minutes_to_count(minutes, per=MINUTES_PER_COUNT):
+    """分钟 → count，**往上取整**（30 分钟 = 2 个 count）；认不出/<=0 → ``None``。"""
+    got = parse_minutes(minutes)
+    if got is None:
+        return None
+    per = int(per or MINUTES_PER_COUNT)
+    return -(-got // per)
+
+
+def count_to_minutes(count, per=MINUTES_PER_COUNT):
+    """count → 分钟（``5`` → ``125``）；认不出/<=0 → ``None``。"""
+    got = parse_count(count)
+    if got is None or got <= 0:
+        return None
+    return got * int(per or MINUTES_PER_COUNT)
+
+
+def task_minutes(task):
+    """任务的持续时间（分钟）；没写 / 写坏了就是 ``None``。"""
+    fields = (task or {}).get("fields") or {}
+    for key in DURATION_KEYS:
+        if key in fields:
+            got = parse_minutes(fields.get(key))
+            if got is not None:
+                return got
+    return None
+
+
+def task_count(task):
+    """任务的**最高** count；没设就是 ``None``（不是 0 —— 「没设上限」不是「上限 0」）。"""
+    fields = (task or {}).get("fields") or {}
+    got = parse_count(fields.get(COUNT_KEY))
+    if got is None or got <= 0:
+        return None
+    return got
+
+
+def task_count_invested(task):
+    """已经用掉多少 count（没记过就是 0）。"""
+    fields = (task or {}).get("fields") or {}
+    got = parse_count(fields.get(COUNT_INVESTED_KEY))
+    return got if got is not None and got > 0 else 0
+
+
+def count_text(task, delta=0):
+    """界面上的 ``(1+2/5)``：已投入 + 这一场会涨的 / 最高；没设 count 就是 ``""``。
+
+    ``delta`` 只在「挂在某一场 session 上」时有意义 = 那一场时长 / 25（往上取整）
+    —— 它是**预报**，不是事实：真正记账发生在收尾的时候（见 warden.begin_review）。
+    """
+    cap = task_count(task)
+    invested = task_count_invested(task)
+    try:
+        extra = int(delta or 0)
+    except (TypeError, ValueError):
+        extra = 0
+    if cap is None:
+        if not invested:
+            return ""
+        return "(%d)" % invested
+    if not invested and not extra and str((task or {}).get("status") or STATUS_ACTIVE) != STATUS_ACTIVE:
+        # 收工/放弃的任务、一格都没记过：`(0/1)` 只会让人以为「你 1 个都没干」。
+        # 有进度的照样显示（那才是「这条当时干了多少块」）。
+        return ""
+    if extra > 0:
+        return "(%d+%d/%d)" % (invested, extra, cap)
+    return "(%d/%d)" % (invested, cap)
+
+
+def link_count_fields(fields, changed=None):
+    """让 ``count`` 和 ``duration`` 永远说的是同一件事（原地改 ``fields``）。
+
+    ``changed`` 指**用户这次动的是哪一边** —— 两边的关系不是对称的：
+
+        "count"     用户设了 count → duration = 25 × count（改 count 就是改时长）
+        "duration"  用户改了时长 → count = ceil(时长/25)，**时长原样留着**
+                    （「45 分钟」是用户说的实话，不能悄悄改成 50）
+        "both"      新建任务 → 两条都写了以 count 为准，只写一条就推另一条
+        None        读盘 → 只补缺的那一边（两边都有说明是用户/旧版本写的，不动）
+
+    两边都没写就什么都不做 —— 不是每条任务都得有 count，只有估得出几块的才有。
+    """
+    fields = fields if isinstance(fields, dict) else {}
+    has_count = COUNT_KEY in fields
+    has_duration = any(key in fields for key in DURATION_KEYS)
+    takes_count = (changed == COUNT_KEY
+                   or (changed == "both" and has_count))
+    if takes_count:
+        cap = parse_count(fields.get(COUNT_KEY))
+        if cap is None or cap <= 0:
+            fields.pop(COUNT_KEY, None)
+            return fields
+        fields[COUNT_KEY] = cap
+        fields[DURATION_KEYS[0]] = count_to_minutes(cap)
+        return fields
+    wants_count = (changed in DURATION_KEYS
+                   or changed == "both"
+                   or (changed is None and has_duration and not has_count))
+    if wants_count:
+        minutes = task_minutes({"fields": fields})
+        if minutes is None:
+            return fields
+        fields[COUNT_KEY] = minutes_to_count(minutes)
+        return fields
+    if changed is None and has_count and not has_duration:
+        # 只有 count、没有时长：补 duration（唯一能补的方向）
+        cap = parse_count(fields.get(COUNT_KEY))
+        if cap is not None and cap > 0:
+            fields[DURATION_KEYS[0]] = count_to_minutes(cap)
+    return fields
+
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -235,9 +408,36 @@ def _coerce_task(raw, fallback_id=None):
         task[HISTORY_KEY] = history
     else:
         task.pop(HISTORY_KEY, None)
+    credits = _coerce_credits(task.get(COUNT_CREDITS_KEY))
+    if credits:
+        task[COUNT_CREDITS_KEY] = credits
+    else:
+        task.pop(COUNT_CREDITS_KEY, None)
+    # 时长 ↔ count 的账：手改过 JSON 的人可能只写了一个。count 是硬上限，
+    # 所以「有 count 以 count 为准」，两边都没写就什么都不做。
+    link_count_fields(task["fields"], changed=None)
+    invested = parse_count(task["fields"].get(COUNT_INVESTED_KEY))
+    cap = task_count(task)
+    if invested is None or invested <= 0:
+        task["fields"].pop(COUNT_INVESTED_KEY, None)
+    else:
+        task["fields"][COUNT_INVESTED_KEY] = min(invested, cap) if cap else invested
     task.setdefault("created_at", _now())
     task.setdefault("updated_at", task["created_at"])
     return task
+
+
+def _coerce_credits(raw):
+    """``count_credits``：``{session_key: count}``，坏数据当没有。"""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, value in raw.items():
+        got = parse_count(value)
+        text = str(key or "").strip()
+        if text and got is not None:
+            out[text] = got
+    return out
 
 
 def _coerce_tags(raw):
@@ -747,7 +947,9 @@ class TaskStore(object):
         stamp = _now()
         task = {
             "id": nid,
-            "fields": _norm_fields(fields),
+            # 建的时候就对齐 count ↔ duration：`task create ... duration=50` 顺手得到
+            # count=2，`count=3` 顺手得到 duration=75（见 link_count_fields）。
+            "fields": link_count_fields(_norm_fields(fields), changed="both"),
             "created_at": stamp,
             "updated_at": stamp,
             "session": None,
@@ -781,7 +983,13 @@ class TaskStore(object):
         return task
 
     def modify(self, task_id, field, value):
-        """改一个字段。field 不做白名单校验（用户要任意字段）。"""
+        """改一个字段。field 不做白名单校验（用户要任意字段）。
+
+        两个字段是**同一件事的两副面孔**，写完立刻对齐（见 :func:`link_count_fields`）：
+
+            task modify 3 duration 50    → count 也跟着变成 2
+            task modify 3 count 5        → duration 也跟着变成 125
+        """
         field = _field_name(field)
         if not field:
             raise ValueError("字段名不能为空")
@@ -796,9 +1004,112 @@ class TaskStore(object):
         if found is None:
             raise ValueError("没有任务 %s" % task_id)
         found["fields"][field] = value
+        if field == COUNT_KEY or field in DURATION_KEYS:
+            link_count_fields(found["fields"], changed=field)
         found["updated_at"] = _now()
         self.save(store)
         return found
+
+    # -- count（最高进度 / 已投入）-------------------------------------
+
+    def set_count(self, task_id, count):
+        """设定最高 count（duration 跟着变成 25 × count）；``None``/0 = 取消上限。
+
+        返回 ``(task, 旧值, 新值)``。
+        """
+        cap = parse_count(count)
+        before = None
+
+        def apply(task):
+            nonlocal before
+            before = task_count(task)
+            fields = task.setdefault("fields", {})
+            if cap is None or cap <= 0:
+                fields.pop(COUNT_KEY, None)
+                return
+            fields[COUNT_KEY] = cap
+            fields[DURATION_KEYS[0]] = count_to_minutes(cap)
+            # 上限降到了已投入以下：进度也跟着压到上限（进度不许超过最高进度）
+            invested = task_count_invested(task)
+            if invested > cap:
+                fields[COUNT_INVESTED_KEY] = cap
+
+        task = self._mutate(task_id, apply)
+        return task, before, task_count(task)
+
+    def add_count(self, task_id, delta):
+        """推进（或退回）已投入的 count —— ``-c +2`` / ``-c -1`` 就是它。
+
+        规则（用户原话）：加完不能超过最高进度；**加完正好/超过上限 = 达标**，
+        达标由调用方去走「完成任务」那条路（这里只记账，不碰状态）。
+
+        返回 ``{"before", "after", "cap", "maxed", "capped", "task"}``。
+        """
+        step = parse_count(delta) or 0
+        out = {"before": 0, "after": 0, "cap": None, "maxed": False,
+               "capped": False, "task": None}
+
+        def apply(task):
+            fields = task.setdefault("fields", {})
+            cap = task_count(task)
+            invested = task_count_invested(task)
+            after = invested + step
+            if after < 0:
+                after = 0
+            capped = cap is not None and after > cap
+            if capped:
+                after = cap                     # 进度不许超过最高进度
+            fields[COUNT_INVESTED_KEY] = after
+            if after <= 0:
+                fields.pop(COUNT_INVESTED_KEY, None)
+            out.update(before=invested, after=after, cap=cap, capped=capped,
+                       maxed=bool(cap is not None and after >= cap))
+
+        task = self._mutate(task_id, apply)
+        out["task"] = task
+        return out
+
+    def credit_count(self, task_id, key, delta):
+        """一场 session 收尾时给任务记 count（**幂等**：同一个 key 只记一次）。
+
+        ``key`` 是那一场的标识（``postsession.session_key``）；``delta`` 是
+        session 时长 / 25。记过就返回 ``None``（调用方据此知道「这次不算新账」）。
+        进度同样不会超过最高 count。
+        """
+        key = str(key or "").strip()
+        if not key:
+            raise ValueError("记 count 必须带一个场次 key（否则没法去重）")
+        step = parse_count(delta) or 0
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if task["id"] == int(task_id):
+                found = task
+                break
+        if found is None:
+            raise ValueError("没有任务 %s" % task_id)
+        credits = found.setdefault(COUNT_CREDITS_KEY, {})
+        if key in credits:
+            # 这一场已经记过了（收尾重开第 N 次）：什么都不写，连 updated_at 都不动。
+            return None
+        fields = found.setdefault("fields", {})
+        cap = task_count(found)
+        invested = task_count_invested(found)
+        after = invested + step
+        if after < 0:
+            after = 0
+        capped = cap is not None and after > cap
+        if capped:
+            after = cap
+        if after > 0:
+            fields[COUNT_INVESTED_KEY] = after
+        else:
+            fields.pop(COUNT_INVESTED_KEY, None)
+        credits[key] = step
+        found["updated_at"] = _now()
+        self.save(store)
+        return {"before": invested, "after": after, "cap": cap, "capped": capped,
+                "maxed": bool(cap is not None and after >= cap), "task": found}
 
     # -- 状态 / 标签 / OmniFocus 关联 ----------------------------------
 

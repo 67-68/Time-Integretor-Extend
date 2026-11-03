@@ -342,6 +342,9 @@ TASK_SHORT_FLAGS = (
     repl_kit.ShortFlag("-st", ("--single-task",), note="只导入一次，不建重复任务"),
     # `task 3 -e true` ≡ `--exclusive true`：这条独占一整场 session。
     repl_kit.ShortFlag("-e", ("--exclusive",), note="独占：这一场只能有这一条任务"),
+    # `task 3 -c +2` ≡ `--count +2`：count 进度（1 count = 25 分钟）。
+    # 纯数字 = 设定最高 count（duration 跟着变），`+n` / `-n` = 加减已投入。
+    repl_kit.ShortFlag("-c", ("--count",), note="count 进度（5=设定 / +2=加 / -1=减）"),
 )
 
 #: `-e/--exclusive` 的真值写法（``true`` 也可以省略：裸写 ``-e`` 就是 true）。
@@ -935,13 +938,14 @@ def _task_command(w):
         section="通用",
         usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
               " ... [-a <编号|none|current>] [-s <编号>] [-n 备注] [-e true|false]"
-              " [-m complete|discard] [-t <trigger> [参数...]] [-f <formatter> [参数...]]",
+              " [-m complete|discard] [-c 5|+2|-1]"
+              " [-t <trigger> [参数...]] [-f <formatter> [参数...]]",
         # 把 flag 放在 action 词前面：补全列表有 20 项上限，flag 被挤到后面
         # 就等于「有这个选项但 Tab 永远看不到」。
         # 紧凑短选项（-an/-ac/-m/-t/-f）由 task_completer 的 short 表补，不要
         # 在 options 里再写一遍 —— 否则 Tab 菜单里会出现两个一模一样的候选。
         options=("--assign", "-a", "--note", "-n", "--from", "-s", "--exclusive", "-e",
-                 "--mark", "--trigger",
+                 "--mark", "--count", "--trigger",
                  "--formatter", "--repeat", "--single-task",
                  "create", "import", "delete", "modify", "note", "assign", "select",
                  "swap", "repeat", "sync", "archive", "inspect-due"),
@@ -971,6 +975,9 @@ def task_completer(w, prior):
         return [str(i) for i in range(1, len(w.rows) + 1)] + ["none", "current"]
     if words and words[-1] in ("--from", "-s"):
         return [str(i) for i in range(1, len(w.rows) + 1)]
+    if words and words[-1] in ("--count", "-c"):
+        # count 后面就是一个整数；把最常用的三个形状摆出来（+1 / +2 / -1）。
+        return ["+1", "+2", "-1"]
     if words and words[-1] in TASK_HOOK_FLAGS["trigger"]:
         # 默认没有 trigger —— 返回空列表就是「空的 function 列表」。
         return list(th.preset_names("trigger"))
@@ -1838,6 +1845,9 @@ class TaskView(View):
         task repeat <id> <周几@HH:MM|off>   # 每周重复（只影响那一天的那一场）
         task -t                             # 列 trigger 预设（默认空列表）
         task 3 -f end                       # formatter：排到当天最后一段并自动挂上
+        task 3 -c 5                         # count = 5（时长跟着变成 125 分钟）
+        task 3 -c +2                        # 进度 +2；够数就当完成（勾 Focusmate + 写回）
+        task 3 -c -1                        # 进度 -1（最低 0）
         task sync                           # GET /v1/tasks → 把 completedAt 归档
         task archive [N]                    # 看归档（data/task-archive.json）
 
@@ -1869,11 +1879,11 @@ class TaskView(View):
     def idle_hint(self):
         return repl_kit.Hint(
             "命令", ("task create", "task 3 -a 1", "task 3 -an", "task 3 -ac",
-                     "task 3 swap 5", "task -s 5 -a 6", "task 3 -f end",
-                     "task -f", "inspect-due", "review"),
+                     "task 3 -c +2", "task 3 swap 5", "task -s 5 -a 6",
+                     "task 3 -f end", "task -f", "inspect-due", "review"),
             note="数字 = 面板上的序号（1 起连续）· task 3 ≡ task select 3"
-                 " · -an 下架 / -ac 当前这一场 · -f end 排到当天最后一段"
-                 " · 面板外的用 id:N · Tab 切视图",
+                 " · -an 下架 / -ac 当前这一场 · -c 5 设 count / -c +2 加进度"
+                 " · -f end 排到当天最后一段 · 面板外的用 id:N · Tab 切视图",
         )
 
     def status_line(self):
@@ -1882,7 +1892,7 @@ class TaskView(View):
     def unknown_hint(self):
         return ("「任务」视图认 task create/delete/modify/assign/select/duplicate/"
                 "drop/done/link/import/sync/swap、trigger/formatter、review、inspect-due"
-                "（也可以直接写序号，如 task 3 -a 1 / task 3 -an / "
+                "（也可以直接写序号，如 task 3 -a 1 / task 3 -an / task 3 -c +2 / "
                 "task 3 swap 5 / task 3 -f end / task -s 5 -a 6；"
                 "序号 = 面板上的第几条，面板外的任务用 id:N）；Shift+Tab 切回去再干别的。")
 
@@ -3294,7 +3304,7 @@ class Warden(object):
             row["task"] = tasks[0]                # 兼容：只关心一条的地方仍然能用
             row["tasks"] = tasks
             row["task_repeat"] = any(t.get("repeat_parent") for t in tasks)
-            row["task_text"] = self.task_cell_text(tasks)
+            row["task_text"] = self.task_cell_text(tasks, row.get("durationMin"))
         else:
             row["task"] = None
             row["tasks"] = []
@@ -3320,13 +3330,18 @@ class Warden(object):
             return "⤼" if ts.TRANSFER_TAG in (task.get("tags") or []) else "✗"
         return ts.STATUS_MARKS.get(ts.STATUS_ACTIVE) or "·"
 
-    def task_cell_text(self, tasks):
-        """契约表格 task 列的正文：``1: 任务… | ✓3: 任务…``（编号 + 裁剪过的标题）。
+    def task_cell_text(self, tasks, session_minutes=None):
+        """契约表格 task 列的正文：``1: (1+2/5) 任务… | ✓3: 任务…``。
 
         标题优先取 title/name 字段（`focusmate_title`），没有才退回整条摘要 ——
         编号 + 一长串 ``1. … 2. …`` 在表格里没法看。前面的记号见 :meth:`task_mark`。
+
+        ``(1+2/5)`` 是 count：已投入 + **这一场会涨的** / 最高。1 是这条任务之前
+        已经用掉的 count，2 = 这一场时长 / 25（往上取整）—— 那是预报，真正记账
+        发生在收尾（见 :meth:`begin_review`）。没设 count 的任务不显示这一格。
         """
         parts = []
+        delta = ts.minutes_to_count(session_minutes) or 0
         for task in tasks or []:
             if ts.TaskStore.is_repeat_template(task):
                 continue
@@ -3336,9 +3351,39 @@ class Warden(object):
             if task.get("formatter") and not ts.TaskStore.is_repeat_template(task):
                 prefix += "⏱"
             no = self.task_no(task)
-            parts.append("%s%d: %s" % (prefix, no, title) if no else
-                         "%s%s" % (prefix, title))
+            count = self.task_count_label(task, delta)
+            parts.append("%s%d: %s%s" % (prefix, no, count, title) if no else
+                         "%s%s%s" % (prefix, count, title))
         return " | ".join(parts)
+
+    @staticmethod
+    def task_count_delta(task):
+        """这条任务「完成这一场之后会自动涨多少 count」= 那一场时长 / 25。
+
+        只对**还开着**、并且挂在某一场 session 上的任务有意义：收工/放弃的任务
+        再预报一次涨幅就是在骗人。**已经记过账的那一场也不再预报**（否则收尾记完
+        账之后表格里还写着 ``(3+2/5)``，看起来像下一帧还要再涨 2 个）。
+        """
+        if not task or not ts.TaskStore.is_open(task):
+            return 0
+        sess = task.get("session") or {}
+        delta = ts.minutes_to_count(sess.get("duration")) or 0
+        if not delta:
+            return 0
+        day = str(sess.get("date") or "").strip()
+        if not day:
+            return delta
+        key = psv.session_key(day, sess.get("start"))
+        if key in (task.get("count_credits") or {}):
+            return 0
+        return delta
+
+    def task_count_label(self, task, delta=None):
+        """任务格子里那截 ``(1+2/5) ``（带尾随空格）；没设 count 就是空串。"""
+        if delta is None:
+            delta = self.task_count_delta(task)
+        text = ts.count_text(task, delta)
+        return (text + " ") if text else ""
 
     def frame_width(self):
         """这一帧能占多少列（= 终端宽度，和 repl_kit 排「状态」框用的是同一个数）。
@@ -3514,7 +3559,7 @@ class Warden(object):
                          "或 `task list` 看全部）" % (len(by_no), want))
 
     def task_index_title(self, task):
-        """任务面板里那一格的字：状态 + 来源记号 + 裁过的标题。"""
+        """任务面板里那一格的字：状态 + 来源记号 + count 进度 + 裁过的标题。"""
         title = self.task_store.focusmate_title(task, max_len=TASK_CELL_TITLE_MAX)
         prefix = self.task_mark(task) + ts.TaskStore.origin_marks(task)
         # 本体的 formatter 是给子任务的模板；⏱ 只画在真正排过的子任务上。
@@ -3525,7 +3570,8 @@ class Warden(object):
         if self._fm_pending(task):
             # 乐观挂载还在后台跑：⏳ 就是「这条还没落地，别当它是事实」
             prefix += "⏳"
-        return prefix + title
+        # count 进度和 session 表格里的写法**一模一样**：(1+2/5)
+        return prefix + self.task_count_label(task) + title
 
     def task_index_layout(self, tasks, width=None):
         """``(几对并排, 几行)``：屏幕够宽就摊成 3 对、4 对，装不下回来 2 对。
@@ -4952,6 +4998,7 @@ class Warden(object):
         note_text, kept = self._split_note(kept)
         exclusive, kept = self._split_exclusive(kept)
         mark_status, kept = self._split_mark(kept)
+        count_spec, kept = self._split_count(kept)
         trigger_tokens, kept = self._split_hook(kept, "trigger")
         formatter_tokens, kept = self._split_hook(kept, "formatter")
 
@@ -4972,6 +5019,9 @@ class Warden(object):
             if mark_status is not None:
                 raise ValueError("`-m/--mark` 是单条任务的状态标记，不能和 `-s/--from` 批量一起用；"
                                  "先切到那天再逐条标。")
+            if count_spec is not None:
+                raise ValueError("`-c/--count` 是单条任务的进度，不能和 `-s/--from` 批量一起用；"
+                                 "先切到那天再逐条加。")
             if trigger_spec is not None or formatter_spec is not None:
                 raise ValueError("`-t/--trigger`、`-f/--formatter` 都是单条任务的钩子，"
                                  "不能和 `-s/--from` 批量一起用；先切到那天再逐条挂。")
@@ -4981,10 +5031,11 @@ class Warden(object):
                                  "写成 `task -s 5 -a 6` 这样。" % kept[0])
             return self._apply_bulk(source, assign_to)
         if not kept and mark_status is None and trigger_spec is None \
-                and formatter_spec is None and exclusive is None:
+                and formatter_spec is None and exclusive is None \
+                and count_spec is None:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
-                             "或后缀 -e/--exclusive / -m/--mark / -t/--trigger"
-                             " / -f/--formatter")
+                             "或后缀 -e/--exclusive / -m/--mark / -c/--count"
+                             " / -t/--trigger / -f/--formatter")
         # 异步 action（import 这类要先读外面世界的）拿走**同一份**后缀，
         # 后台那半件事落地之后自己套 —— 和同步路径完全一样的那套 _apply_suffix_chain。
         self._import_suffix_doc = {
@@ -4992,6 +5043,7 @@ class Warden(object):
             "note_text": note_text,
             "exclusive": exclusive,
             "mark_status": mark_status,
+            "count_spec": count_spec,
             "trigger_spec": trigger_spec,
             "formatter_spec": formatter_spec,
         }
@@ -5022,6 +5074,7 @@ class Warden(object):
                 "note_text": note_text,
                 "exclusive": exclusive,
                 "mark_status": mark_status,
+                "count_spec": count_spec,
                 "trigger_spec": trigger_spec,
                 "formatter_spec": formatter_spec,
             }
@@ -5034,10 +5087,13 @@ class Warden(object):
                 self._apply_suffix_chain(
                     one, action, note_text=note_text, assign_to=assign_to,
                     exclusive=exclusive, mark_status=mark_status,
-                    trigger_spec=trigger_spec, formatter_spec=formatter_spec)
+                    count_spec=count_spec, trigger_spec=trigger_spec,
+                    formatter_spec=formatter_spec)
             return result.last
         if note_text is not None:
             self._apply_note(result, note_text, action)
+        if count_spec is not None:
+            result = self._apply_count(result, count_spec, action) or result
         if exclusive is not None:
             result = self._apply_exclusive(result, exclusive, action) or result
         if assign_to is not None:
@@ -5223,6 +5279,101 @@ class Warden(object):
                 raise ValueError("`-m/--mark` 一次只能给一个状态（complete / discard）。")
             status = want
         return status, kept
+
+    @staticmethod
+    def _split_count(toks):
+        """把 ``--count +2`` / ``-c 5`` / ``-c=+2`` 摘出来（count 后缀）。
+
+        三种写法（用户需求原话）：
+
+            task 3 -c 5     设定最高 count = 5（duration 跟着 = 125 分钟）
+            task 3 -c +2    进度 +2；加完够数 = 直接完成任务（不会超过最高 count）
+            task 3 -c -1    进度 -1（最低 0）
+
+        ``+``/``-`` 写在数值里，所以 ``-c -1`` 里的 ``-1`` 是**值**不是 flag ——
+        取值时按位置拿下一个 token，不看它长什么样。
+        """
+        spec = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = str(toks[i])
+            low = tok.lower()
+            if low in ("--count", "-c"):
+                if i + 1 >= len(toks):
+                    raise ValueError("`-c/--count` 后面要跟一个数（5 / +2 / -1）；"
+                                     "例如 task 3 -c +2")
+                value = str(toks[i + 1]).strip()
+                i += 2
+            elif low.startswith("--count=") or low.startswith("-c="):
+                value = tok.split("=", 1)[1].strip()
+                i += 1
+            else:
+                kept.append(tok)
+                i += 1
+                continue
+            if spec is not None:
+                raise ValueError("`-c/--count` 一次只能给一个（要么设定、要么加减）。")
+            if not re.match(r"^[+-]?\d+$", value):
+                raise ValueError("`-c/--count` 只认整数；`+2` 是加、`-1` 是减、`5` 是设定。"
+                                 "你给的是 %r" % value)
+            spec = value
+        return spec, kept
+
+    def _apply_count(self, task, spec, action="count"):
+        """把 ``-c`` 落到任务上：设定最高 count，或者推进/退回已投入的 count。
+
+        「加完正好/超过最高进度 = 等同于完成任务」（用户需求），所以够数的时候
+        走的是**和 ``task done`` 完全一样**的那条路：本地完成 + 归档 + 勾 Focusmate
+        + 写回 OmniFocus。不在这里另开一套「悄悄标完成」的岔路。
+        """
+        if spec is None or not isinstance(task, dict) or task.get("id") is None:
+            return task
+        text = str(spec).strip()
+        if text.startswith("+") or text.startswith("-"):
+            step = int(text)
+            out = self.task_store.add_count(task["id"], step)
+            task = out["task"]
+            now_text = self._count_progress_text(out)
+            if step == 0:
+                self.say("任务 %s 的 count 没动（%s）：加 0 什么都不会发生。"
+                         % (self.task_label(task), now_text), "info")
+                return task
+            if out.get("maxed"):
+                self.say("🎯 任务 %s 的 count 到位了（%s）—— 等同完成任务，走 done 那一套。"
+                         % (self.task_label(task), now_text), "ok")
+                return self._finish_task_with_count(task)
+            verb = "加" if step > 0 else "减"
+            self.say("✅ 任务 %s %s了 %d 个 count：%s%s"
+                     % (self.task_label(task), verb, abs(step), now_text,
+                        "（已经顶到最高 count，不会超过）" if out.get("capped") else ""),
+                     "ok")
+            return task
+        # 纯数字 = 设定最高 count（= 同时设定时长）
+        task, before, after = self.task_store.set_count(task["id"], text)
+        if after is None:
+            self.say("✅ 任务 %s 的最高 count 已取消（duration 没动）。"
+                     % self.task_label(task), "ok")
+            return task
+        self.say("✅ 任务 %s 的最高 count = %d（= %d 分钟）%s"
+                 % (self.task_label(task), after,
+                    ts.count_to_minutes(after) or 0,
+                    ("，原来是 %d" % before) if before else ""), "ok")
+        return task
+
+    @staticmethod
+    def _count_progress_text(out):
+        """``(1+2/5)`` 那种进度的纯文字版：``2/5（+2）``。"""
+        cap = out.get("cap")
+        before, after = out.get("before") or 0, out.get("after") or 0
+        if cap is None:
+            return "已投入 %d 个 count（没有上限）" % after
+        return "%d/%d（%s%d）" % (after, cap, "+" if after >= before else "",
+                                 after - before)
+
+    def _finish_task_with_count(self, task):
+        """count 够数 = 完成任务：和 ``task done`` 走同一条路（含外部联动）。"""
+        return self._complete_task(task, why="count-done")
 
     @staticmethod
     def _split_hook(toks, kind):
@@ -6256,14 +6407,23 @@ class Warden(object):
                 minutes = int(toks[1])
             except ValueError:
                 raise ValueError("分钟数得是整数；你给的是 %r" % toks[1]) from None
+        return self._complete_task(task, minutes=minutes, why="cmd-done")
+
+    def _complete_task(self, task, minutes=None, why="cmd-done"):
+        """完成任务的那一段（``task done`` / ``-c`` 够数 / 收尾 F 共用）。
+
+        一次操作、最多两步：先勾 Focusmate（那才是「这一场干完了」的事实），
+        再写回 OmniFocus。面板标题是这次操作本身。
+        """
+        if ts.TaskStore.is_repeat_template(task):
+            raise ValueError("任务 %s 是重复任务**本体**，不能当成一次 session 的活来完成。"
+                             % self.task_label(task))
         has_fm = bool((task.get("focusmate") or {}).get("task_id"))
         has_omni = bool(ts.TaskStore.omnifocus_id(task))
-        # 一次操作、两步：先勾 Focusmate（那才是「这一场干完了」的事实），
-        # 再写回 OmniFocus。面板标题是这次操作本身。
         self.jobs.begin(2 if (has_fm and has_omni) else 1,
                         title="完成任务 %s（task %s done）"
                               % (self.task_label(task), self.task_label(task)))
-        task = self.task_store.complete(task["id"], minutes=minutes, reason="cmd-done")
+        task = self.task_store.complete(task["id"], minutes=minutes, reason=why)
         self.task_store.archive_local(self.task_store.get(task["id"]))
         note_fm = self.fm_complete(task)
         note_of = self.omni_complete(task)
@@ -6355,16 +6515,21 @@ class Warden(object):
         return True
 
     def _apply_suffix_chain(self, task, action, note_text=None, assign_to=None,
-                            exclusive=None, mark_status=None, trigger_spec=None,
-                            formatter_spec=None):
+                            exclusive=None, mark_status=None, count_spec=None,
+                            trigger_spec=None, formatter_spec=None):
         """按固定顺序把一条任务的后缀跑完：
-        note → exclusive → assign → mark → trigger → formatter。
+        note → count → exclusive → assign → mark → trigger → formatter。
+
+        count 排在 formatter 前面是有意的：``task create ... -c 3 -f end`` 里
+        ``-f end`` 要按「刚刚设好的时长」去切 session（count 3 = 75 分钟）。
 
         这是 `cmd_task` 和 `task import` 共用的那一段；一次导入多条时由
         :meth:`_apply_import_suffix` 对**每一条**各跑一遍。
         """
         if note_text is not None:
             self._apply_note(task, note_text, action)
+        if count_spec is not None:
+            task = self._apply_count(task, count_spec, action) or task
         if exclusive is not None:
             task = self._apply_exclusive(task, exclusive, action) or task
         if assign_to is not None:
@@ -6397,6 +6562,7 @@ class Warden(object):
                     assign_to=suffix.get("assign_to"),
                     exclusive=suffix.get("exclusive"),
                     mark_status=suffix.get("mark_status"),
+                    count_spec=suffix.get("count_spec"),
                     trigger_spec=suffix.get("trigger_spec"),
                     formatter_spec=suffix.get("formatter_spec"))
             return last if last is not None else task.last
@@ -6407,6 +6573,7 @@ class Warden(object):
             assign_to=suffix.get("assign_to"),
             exclusive=suffix.get("exclusive"),
             mark_status=suffix.get("mark_status"),
+            count_spec=suffix.get("count_spec"),
             trigger_spec=suffix.get("trigger_spec"),
             formatter_spec=suffix.get("formatter_spec"))
 
@@ -7957,6 +8124,7 @@ class Warden(object):
             "next_session": lambda task: self.next_session_after(task),
             "assign_focusmate": lambda task, sess: self.assign_task_to(task, sess),
             "due_of": lambda task: self.omni_due_of(task),
+            "set_count": lambda task, cap: self.task_store.set_count(task["id"], cap),
         }
 
     def sync_completion_state(self, entry=None):
@@ -8029,6 +8197,9 @@ class Warden(object):
             day = self.sel_date
         tasks = self.task_store.tasks_for_session(day, start)
         opened = [t for t in tasks if self.task_store.is_open(t)]
+        # 先把这一场该给的 count 记进账（幂等），**但不完成** —— 够数的那条留给
+        # 收尾去问「再要 count 还是直接完成」（见 postsession.COUNT_OPTION）。
+        counts = self.credit_session_counts(entry, opened)
         self.rebuild_rows()
         if not opened:
             self.say("⏱ %s %s 那场没有未完成的任务（%d 条记录都已收）—— 这场翻篇。"
@@ -8036,10 +8207,49 @@ class Warden(object):
             psv.mark_done(entry, note="nothing-open")
             self.review = None
             return None
-        self.review = psv.Review(self.task_store, entry, opened, hooks=self.review_hooks())
+        self.review = psv.Review(self.task_store, entry, opened,
+                                 hooks=self.review_hooks(), counts=counts)
         self.say("⏱ %s 收尾：%d 条没做完的任务，一条一条来（A/B/C/D/E）。"
                  % (self.review.headline(), len(opened)), "cmd")
         return self.review
+
+    def credit_session_counts(self, entry, tasks):
+        """这一场该给的 count 记进每条任务（**幂等**），返回 ``{task_id: 状态}``。
+
+        用户的需求：``count`` 是「这件事要几个 25 分钟」，一场 session 干完就该往
+        前推一格（时长 / 25，往上取整）。但**推完不自动完成** —— 够数只是一次
+        「到点了」的预报，收尾里问过人之后才落成「完成」或「再加 count」。
+
+        记账的 key 是 ``postsession.session_key``（``2026-11-03T11:00``），写进任务的
+        ``count_credits`` 里：同一场收尾重开多少次都只加一次。
+        """
+        delta = ts.minutes_to_count(psv.session_minutes(entry)) or 0
+        key = str((entry or {}).get("key") or "?")
+        out = {}
+        for task in tasks or []:
+            if ts.TaskStore.is_repeat_template(task):
+                continue
+            cap = ts.task_count(task)
+            if cap is None:
+                continue                     # 没设 count 的任务：这一场不记账
+            credited = None
+            try:
+                credited = self.task_store.credit_count(task["id"], key, delta)
+            except (ValueError, TypeError) as e:      # noqa: BLE001 - 记账失败不该挡住收尾
+                self.say("⚠ 给任务 %s 记 count 失败：%s"
+                         % (self.task_label(task), e), "warn")
+            fresh = self.task_store.get(task["id"])
+            invested = ts.task_count_invested(fresh)
+            state = {"cap": cap, "invested": invested, "delta": delta,
+                     "credited": credited is not None,
+                     "maxed": invested >= cap}
+            out[fresh["id"]] = state
+            if credited is not None:
+                self.say("🧮 任务 %s 记了 %d 个 count：%d/%d%s"
+                         % (self.task_label(fresh), delta, invested, cap,
+                            "（够数了，收尾时问你：再要 count 还是直接完成）"
+                            if state["maxed"] else ""), "ok")
+        return out
 
     def begin_inspect_due(self, tasks, label=None, sync=True, within_minutes=0):
         """``inspect-due``：把「过期还没做完」的任务拉进同一套收尾状态机。

@@ -51,6 +51,8 @@ from __future__ import annotations
 import datetime
 import re
 
+import task_store as ts
+
 #: trigger / formatter 的注册表。值是内部的小 dict：name / params / help / func。
 TRIGGERS = {}
 FORMATTERS = {}
@@ -59,8 +61,9 @@ FORMATTERS = {}
 DEFAULT_BREAK_MINUTES = 5
 
 #: 任务时长的字段别名。第一个是推荐写法，其余是为了兼容手写数据。
-DURATION_KEYS = ("duration", "duration_minutes", "estimated_minutes",
-                 "estimated_duration", "minutes", "时长", "预计时长")
+#: **口径只有一份**：``count ↔ duration``（1 count = 25 分钟）的换算是 task_store
+#: 的事，这里只是借同一份别名表，别在两边各写一份然后慢慢漂。
+DURATION_KEYS = ts.DURATION_KEYS
 
 #: Focusmate 只卖这三种长度的 session。formatter 切割出来的场次必须落在这几个值上，
 #: 否则「排一场 30 分钟的 Focusmate session」就是一句空话 —— 订不出来。
@@ -203,27 +206,12 @@ def call_preset(kind, spec, ctx):
 
 def parse_minutes(value):
     """从 ``25`` / ``"25"`` / ``"25min"`` / ``"25 分钟"`` 里取分钟数。"""
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        out = int(value)
-        return out if out > 0 else None
-    match = re.search(r"\d+", str(value))
-    if not match:
-        return None
-    out = int(match.group(0))
-    return out if out > 0 else None
+    return ts.parse_minutes(value)
 
 
 def task_duration(task):
     """任务的持续时间（分钟）；没写 / 写坏了就是 ``None``。"""
-    fields = (task or {}).get("fields") or {}
-    for key in DURATION_KEYS:
-        if key in fields:
-            got = parse_minutes(fields.get(key))
-            if got is not None:
-                return got
-    return None
+    return ts.task_minutes(task)
 
 
 def parse_flag(value):

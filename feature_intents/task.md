@@ -19,7 +19,8 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
   "next_id": 3,
   "tasks": [{
     "id": 1,
-    "fields": {"title": "写论文", "due": "2026-10-26T11:50:00", "due_source": "session"},
+    "fields": {"title": "写论文", "due": "2026-10-26T11:50:00", "due_source": "session",
+               "count": 2, "count_invested": 1, "duration": 50},   // count ↔ duration 联动
     "created_at": "...",
     "updated_at": "...",
     "status": "active",                  // active / completed / dropped
@@ -53,6 +54,7 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
     "history": [                         // 哪一天的哪一场「处理」过它（见下）
       {"day": "2026-10-27", "start": "11:00", "action": "skip", "at": "..."}
     ],
+    "count_credits": {"2026-10-27T11:00": 2},   // 哪一场已经给它记过 count（幂等）
     "session": {"date": "2026-10-26", "start": "11:00", "end": "11:50",
                 "duration": 50, "focusmate_session_id": "..."},
     "focusmate": {"task_id": "...", "session_id": "...", "completed_at": "..."}
@@ -95,6 +97,70 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
   只剩当时处理过的。读写入口是 `mark_processed()` / `processed_on()`；
   老数据没有痕迹时 `processed_on()` 用 `status_at`（或 `focusmate.completed_at`）
   兜底，否则升级当天「过去几天」会整片空白。
+
+## count：1 count = 25 分钟
+
+两件事被同一个数字绑在一起，而且**永远得是同一个事实**：
+
+| 字段 | 意思 |
+| --- | --- |
+| `fields.count` | 这条活要几个 25 分钟的块（**最高**进度） |
+| `fields.duration` | 分钟数 |
+| `fields.count_invested` | 已经用掉几个 count |
+| `count_credits` | 哪一场 session 已经记过账（幂等台账，保留字段） |
+
+换算只有一个方向是精确的：`count × 25 = 分钟`；反过来 `分钟 → count` **往上取整**
+（30 分钟的任务 = 2 个 count）。两边的关系**不对称**，因为改哪一边是用户说了算：
+
+```
+task modify 3 duration 30   → count = 2，时长**还是 30**（不许偷偷改成 50）
+task modify 3 count 5       → duration = 125
+task create ... duration=50 → count = 2
+task create ... count=3     → duration = 75
+```
+
+这套换算只写在 `task_store.link_count_fields()` 一处（`create` / `modify` / 读盘
+都会走它），`task_hooks` 也借同一份 `DURATION_KEYS`，别再各写一份。
+
+### `-c/--count`（后缀）
+
+```
+task 3 -c 5      设定最高 count = 5（时长跟着 = 125 分钟）
+task 3 -c +2     进度 +2；**加完够数 = 等同于完成任务**（走 task done 那条路）
+task 3 -c -1     进度 -1（最低 0）
+```
+
+- 进度**不许超过**最高 count：`-c +5` 在 2/2 的任务上就是「顶在 2/2 并且完成」。
+- `-c +N` 一旦够数，走的是和 `task done` **完全一样**的那条路：本地完成 + 归档 +
+  勾 Focusmate + 写回 OmniFocus（不是另开一套「悄悄标完成」的岔路）。
+- 设定 count 时如果已投入比新上限还大，进度会被压到新上限。
+- 和 `-s/--from` 批量不能一起用（进度是单条任务的东西）。
+
+### 界面上的 `(1+2/5)`
+
+契约表格的 task 列和下方任务面板用同一个写法：
+
+```
+✓🔗3: (1+2/5) 数学易错修正
+```
+
+- `1` = 之前已经投入的 count
+- `2` = **这一场结束会涨的** count = session 时长 / 25（往上取整）
+- `5` = 最高 count
+
+中间那截是**预报**，不是事实：它只在「任务还开着、挂在一场 session 上、而且这一场
+还没记过账」时出现（记过账就变回 `(3/5)`，不然看起来像下一帧还要再涨 2 个）。
+没设 `count` 的任务不显示这一格；没挂 session 的任务只显示已投入（`(1/5)`）；
+收工/放弃、又一格都没记过的任务也不显示（`(0/1)` 只会让人以为「你 1 个都没干」）。
+
+### session 结束：记账，但不自动完成
+
+收尾一开始（`Warden.begin_review`）会先给这一场上的每条**没做完、且设了 count**
+的任务记一笔 `session 时长 / 25`（写进 `count_credits`，同一场重开多少次只记一次）。
+
+记完账**不等于完成**：够数（`count_invested >= count`）的那条留在收尾里问人
+—— 「额外 count 还是直接完成」（见 [`postsession.md`](postsession.md) 的 `f`）。
+用户原话：*session 结束之后 count 不直接计算进入 task 并完成*。
 
 ## 序号 = 面板上的第几条（不是内部 id）
 
