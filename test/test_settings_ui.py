@@ -132,19 +132,19 @@ def render(wd, width=120):
 
 print("== settings_store：注册表 / 取值 / 落盘 ==")
 rows = cfgs.SettingStore().rows()
-check("设置项齐全（含 OmniFocus / 收尾那两项）",
+check("设置项齐全（含 OmniFocus / 收尾 / 到点没开始那几项）",
       [r["id"] for r in rows],
-      ["edit-tomorrow", "omnifocus", "postsession", "tomorrow-plan"])
+      ["edit-tomorrow", "omnifocus", "postsession", "nostart", "tomorrow-plan"])
 check("每项都有解释", all(r["desc"] for r in rows), True)
 check("没改过也列出来（并标出默认值）",
       [(r["value"], r["changed"]) for r in rows],
-      [("on", False), ("on", False), ("on", False), ("", False)])
+      [("on", False), ("on", False), ("on", False), ("on", False), ("", False)])
 store = cfgs.SettingStore()
 check("默认 edit-tomorrow = on", store.get_bool("edit-tomorrow"), True)
 check("set off", store.set("edit-tomorrow", "off"), "off")
 check("落盘了", store.get("edit-tomorrow"), "off")
 check("界面里标成「改过的」",
-      [r["changed"] for r in store.rows()], [True, False, False, False])
+      [r["changed"] for r in store.rows()], [True, False, False, False, False])
 check("改回默认值 = 不算改过（跟着以后的默认走）",
       (store.set("edit-tomorrow", "on"), store.is_set("edit-tomorrow")), ("on", False))
 check("bool 只认 on/off",

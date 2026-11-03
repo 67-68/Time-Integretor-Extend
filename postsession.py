@@ -49,6 +49,7 @@ import task_store as ts
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMP = os.path.join(HERE, "temp")
 DEFAULT_STATE_FILE = os.path.join(TEMP, "keep_session-postsession.json")
+DEFAULT_NOSTART_FILE = os.path.join(TEMP, "keep_session-nostart.json")
 
 #: session 结束之后等多久把 warden 拉到前台。用户要求「准时 15s」。
 DELAY_SEC = 15
@@ -58,6 +59,36 @@ LOOKBACK_SEC = 3 * 3600
 
 #: 收尾状态文件的版本
 STATE_VERSION = 1
+
+#: 「到点没开始」这一问的判定窗口（秒）。
+#:
+#: 计划 14:00 的那一场，14:00–14:05 之间还算「你刚开始」—— 这 5 分钟就是**预约窗口**
+#: （Focusmate 也给你几分钟进场）。14:05 之后 API 里还是**没有这一场**，才算
+#: 「没开始」，才开始问人。用户原话：「3:00 的 session，在 3:05 还可以匹配。3:06 不行」。
+NOSTART_GRACE_SEC = 5 * 60
+
+#: 判定之后还允许「推迟」多久（秒）。14:05 判定 + 5 分钟 → **14:10 之前**还能说
+#: 「推后 30 分钟」；再晚推迟就作废：直接取消推迟，这一场算缺失（用户原话：
+#: 「推迟这个动作本身是在 14:10 之后输入的 … 那么取消推迟，这个 session 直接算缺失」）。
+NOSTART_POSTPONE_SEC = 5 * 60
+
+#: 多老的场次还值得问（秒）。机器合盖睡醒之后不要翻旧账。
+NOSTART_LOOKBACK_SEC = 3 * 3600
+
+#: 「到点没开始」的选项表：(键, 短名, 一句话)
+NOSTART_OPTIONS = (
+    ("p", "推迟", "p 15 = 这一场往后 15 分钟；p T1 15 = 整个时段往后 15 分钟"),
+    ("x", "不去了", "这一场算缺失（daemon 不再重订），挂在这场的任务交给收尾 A-E"),
+    ("s", "先不管", "这一轮不问；过了推迟窗口（+5 分钟）就自动算缺失"),
+)
+
+#: 这一问的别名（认中文、认大写）
+NOSTART_ALIASES = {
+    "x": "x", "n": "x", "miss": "x", "missed": "x", "不去": "x", "不去了": "x",
+    "缺席": "x", "放弃": "x",
+    "s": "s", "skip": "s", "先不管": "s", "等等": "s", "稍后": "s",
+    "p": "p", "postpone": "p", "推迟": "p", "推后": "p", "delay": "p",
+}
 
 #: 选项表：(键, 短名, 一句话)
 OPTIONS = (
@@ -102,6 +133,88 @@ HELP_TOKENS = {"?", "h", "help", "帮助"}
 
 def state_path(path=None):
     return path or os.environ.get("TI_POSTSESSION_FILE") or DEFAULT_STATE_FILE
+
+
+def nostart_path(path=None):
+    """「到点没开始」那一问的状态文件（daemon 写「该问了」，warden 写「答过了」）。"""
+    return path or os.environ.get("TI_NOSTART_FILE") or DEFAULT_NOSTART_FILE
+
+
+def load_nostart(path=None):
+    """→ ``{"version": 1, "answers": {key: {"action", "at", "note", ...}}}``。
+
+    ``action`` 的取值：
+        queued     daemon 发现这一场到点没开始，已经把 warden 叫起来了
+        postponed  你说推迟（附 ``target``）
+        missed     你说不去了（这一场算缺失）
+        deferred   你说先不管（这一轮不再问）
+    """
+    try:
+        with open(nostart_path(path), encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    answers = raw.get("answers")
+    if not isinstance(answers, dict):
+        answers = {}
+    return {"version": 1, "answers": answers}
+
+
+def save_nostart(data, path=None):
+    p = nostart_path(path)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, p)
+    return p
+
+
+def mark_nostart(key, action, entry=None, note=None, path=None):
+    """记一笔「这一场已经问过/答过了」（幂等：同一个 key 只留最后一次）。"""
+    key = str(key or "").strip()
+    if not key:
+        return None
+    data = load_nostart(path)
+    rec = dict(data["answers"].get(key) or {})
+    rec["action"] = str(action)
+    rec["at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    if note:
+        rec["note"] = str(note)
+    for field in ("date", "start", "end", "duration", "period_id", "target", "deadline"):
+        if entry and entry.get(field) is not None:
+            rec[field] = entry.get(field)
+    data["answers"][key] = rec
+    save_nostart(data, path)
+    return rec
+
+
+def nostart_answers(path=None):
+    """``{key: rec}`` —— 已经问过的场次（daemon 和 warden 都拿它去重）。"""
+    return dict(load_nostart(path)["answers"])
+
+
+def nostart_answered(path=None):
+    return set(nostart_answers(path))
+
+
+def nostart_pending(path=None):
+    """daemon 入过队、还没人来答的那些（从早到晚）。"""
+    out = [dict(rec, key=key) for key, rec in nostart_answers(path).items()
+           if rec.get("action") == "queued"]
+    out.sort(key=lambda r: (str(r.get("date") or ""), str(r.get("start") or "")))
+    return out
+
+
+def clear_nostart(path=None):
+    """清空（测试用）。"""
+    try:
+        os.unlink(nostart_path(path))
+    except OSError:
+        pass
 
 
 def load_state(path=None):
@@ -263,6 +376,112 @@ def ended_sessions(slots_by_day, now=None, delay=DELAY_SEC, lookback=LOOKBACK_SE
                 "fire_at": fire_at.isoformat(timespec="seconds"),
             })
     return sorted(out, key=lambda r: (r["date"], r["start"]))
+
+
+def nostart_entry(day, start_hhmm, duration, now=None, period_id=None, extra=None):
+    """一条「到点没开始」的场次记录（daemon 入队 / warden 追问都用这个形状）。
+
+    ``start_hhmm`` 是这一场**计划**的开始时刻；``grace_end`` / ``deadline`` 由它算出来：
+    预约窗口在 start+5 分钟结束，推迟窗口再往后 5 分钟（见模块顶部常量）。
+    """
+    now = now or datetime.datetime.now()
+    got = datetime.time(*(int(x) for x in str(start_hhmm).split(":")))
+    start_dt = datetime.datetime.combine(day, got)
+    dur = int(duration or 0)
+    end_dt = start_dt + datetime.timedelta(minutes=dur)
+    grace_end = start_dt + datetime.timedelta(seconds=NOSTART_GRACE_SEC)
+    deadline = grace_end + datetime.timedelta(seconds=NOSTART_POSTPONE_SEC)
+    rec = {
+        "kind": "nostart",
+        "key": session_key(day, start_hhmm),
+        "date": day.isoformat(),
+        "start": "%02d:%02d" % (start_dt.hour, start_dt.minute),
+        "end": end_dt.strftime("%H:%M"),
+        "duration": dur,
+        "period_id": str(period_id or ""),
+        "started_at": start_dt.isoformat(timespec="seconds"),
+        "grace_end": grace_end.isoformat(timespec="seconds"),
+        "deadline": deadline.isoformat(timespec="seconds"),
+        "queued_at": now.isoformat(timespec="seconds"),
+        "late": now > deadline,
+    }
+    rec.update(extra or {})
+    return rec
+
+
+def nostart_sessions(entries, now=None, actual=None, answered=(), grace=NOSTART_GRACE_SEC,
+                     lookback=NOSTART_LOOKBACK_SEC):
+    """计划里有、但到点（+5 分钟）之后 API 里**根本没有这一场**的 session。
+
+    ``actual`` 必须是真数据（``[{"start": datetime, "duration": 分钟}]``）。
+    **拉不到 API 就别判** —— 拿不到事实时宁可沉默，也不能诬告你没去。
+
+    判据（用户原话）：「refresh 能发现这个 session 没了」—— 计划 14:00 那场，
+    14:05 之后 API 里没有同一分钟（``schedule.match_slot`` 的 ``exact``）就算没开始。
+    已订上但你没进场的不算（那是另一件事，Focusmate 那边仍然是「有这一场」）。
+    """
+    import schedule as sch
+
+    now = now or datetime.datetime.now()
+    if not actual:
+        return []
+    if isinstance(entries, tuple) and len(entries) == 2:      # (entries, warnings)
+        entries = entries[0]
+    done = {str(k) for k in (answered or ())}
+    out = []
+    for day in (now.date() - datetime.timedelta(days=1), now.date()):
+        try:
+            slots = sch.day_slots(entries, day)
+        except Exception:                                     # noqa: BLE001 - 契约坏了不该炸
+            continue
+        for slot in slots:
+            start_dt, _end_dt = _slot_window(slot, day)
+            if now < start_dt + datetime.timedelta(seconds=grace):
+                continue
+            if (now - start_dt).total_seconds() > lookback:
+                continue
+            try:
+                match = sch.match_slot(actual, start_dt, int(slot.get("duration") or 0))
+            except Exception:                                 # noqa: BLE001
+                continue
+            if match.get("kind") != "none":
+                continue
+            key = session_key(day, slot["start"])
+            if key in done:
+                continue
+            out.append(nostart_entry(day, slot["start"], slot.get("duration"), now=now))
+    return out
+
+
+def parse_postpone_spec(raw):
+    """``"15"`` / ``"+15"`` / ``"T1 15"`` / ``"t1 +15"`` → ``(period_id|None, 分钟)``。
+
+    分钟必须是 15 的倍数、不能是 0（Focusmate 只认 15 分钟整点）。
+    """
+    toks = [t for t in str(raw or "").replace("，", " ").split() if t]
+    if not toks:
+        raise ValueError("推迟多少分钟？例如 `p 15` 或 `p T1 15`")
+    period_id = None
+    if len(toks) == 2:
+        if not re.match(r"^[Tt]\d+$", toks[0]):
+            raise ValueError("推迟要写成 `p 15`（这一场）或 `p T1 15`（整个时段）；"
+                             "你给的是 %r" % raw)
+        period_id = toks[0].upper()
+        num = toks[1]
+    elif len(toks) == 1:
+        num = toks[0]
+    else:
+        raise ValueError("推迟要写成 `p 15`（这一场）或 `p T1 15`（整个时段）；"
+                         "你给的是 %r" % raw)
+    if not re.match(r"^[+-]?\d+$", num):
+        raise ValueError("分钟数要像 15 / +15 / -15；你给的是 %r" % num)
+    minutes = int(num)
+    if minutes == 0:
+        raise ValueError("推迟 0 分钟等于没推迟；给 15 / +30 这样的数。")
+    if minutes % 15:
+        raise ValueError("Focusmate 只认 15 分钟整点；推迟分钟数要是 15 的倍数，你给的是 %r"
+                         % num)
+    return period_id, minutes
 
 
 def parse_due(value):
@@ -1031,6 +1250,173 @@ class Review(object):
 
 
 # ---------------------------------------------------------------- 手工入口
+
+
+class NostartReview(object):
+    """「这一场到点没开始」那一问的状态机：``p 推迟`` / ``x 不去了`` / ``s 先不管``。
+
+    为什么是**问**而不是直接判「没完成」（用户原话）：到点没开始有好几种可能 ——
+    你刚要开始只是晚了、想整场往后挪、或者今天确实不去了。直接记成「没完成」
+    是最偷懒也最伤人的做法，所以走和任务收尾一样的路：把事实（这场 API 里没有）
+    摆出来，让你选。
+
+    ``hooks`` 里全是「要碰外面世界」的东西（本模块保持纯逻辑、不联网）：
+
+        say(text, kind="info")                  往 Recent 里说一句
+        postpone(entry, period_id, minutes)     真去挪（单场 / 整段）；返回 {"target": "14:30"}
+        mark_missed(entry, note)                这一场算缺失（记 state + verdict，返回一句人话）
+        open_review(entry)                      把挂在这场的任务交给收尾（A 延期 / B 放弃 / …）
+    """
+
+    def __init__(self, entry, hooks=None, now=None):
+        self.entry = dict(entry or {})
+        self.hooks = hooks or {}
+        self.now = now or datetime.datetime.now()
+        self.closed = False
+        self.notes = []
+        # 和 Review 对齐的字段名：warden 的画帧缓存/面板代码两边通用
+        self.pending_task = None
+        self.index = 0
+
+    # -- 小工具 -------------------------------------------------------
+    def say(self, text, kind="info"):
+        hook = self.hooks.get("say")
+        if hook:
+            hook(text, kind)
+        self.notes.append((kind, text))
+
+    def _hook(self, name, *args, **kwargs):
+        fn = self.hooks.get(name)
+        if not fn:
+            return None
+        return fn(*args, **kwargs)
+
+    # -- 时间 ---------------------------------------------------------
+    def deadline(self):
+        try:
+            return datetime.datetime.fromisoformat(str(self.entry.get("deadline")))
+        except (TypeError, ValueError):
+            return None
+
+    def late(self, now=None):
+        """推迟窗口过了没？过了就**不能再推迟**：取消推迟，这一场算缺失。"""
+        got = self.deadline()
+        if got is None:
+            return False
+        return (now or self.now) > got
+
+    # -- 给界面用的文字 -----------------------------------------------
+    def solo(self):
+        return "%s %s–%s" % (self.entry.get("date") or "?", self.entry.get("start") or "?",
+                             self.entry.get("end") or "?")
+
+    def headline(self):
+        return "%s 到点没开始" % self.solo()
+
+    def options(self):
+        return list(NOSTART_OPTIONS)
+
+    def stage_hint(self):
+        got = self.deadline()
+        tail = ("推迟窗口已过（%s 之后就不能再推了）—— 只能 x 不去了 / s 先不管"
+                % got.strftime("%H:%M")) if (got and self.late()) else (
+                "%s 之前还能推迟 · p 推迟 / x 不去了 / s 先不管"
+                % got.strftime("%H:%M")) if got else "p 推迟 / x 不去了 / s 先不管"
+        return tail
+
+    def lines(self):
+        """面板正文：[(文本, 样式)]。"""
+        out = [("🚪 %s" % self.headline(), "bold yellow")]
+        bits = ["计划 %s（%d 分钟）" % (self.entry.get("start") or "?",
+                                     int(self.entry.get("duration") or 0)),
+                "API 里没有这一场"]
+        if self.entry.get("period_id"):
+            bits.append("时段 %s" % self.entry["period_id"])
+        out.append(("  " + " · ".join(bits), "dim"))
+        for key, name, desc in NOSTART_OPTIONS:
+            out.append(("  %s  %-4s %s" % (key.upper(), name, desc), ""))
+        out.append((self.stage_hint(), "cyan"))
+        return out
+
+    def pending(self):
+        return not self.closed
+
+    # -- 输入 ---------------------------------------------------------
+    def handle(self, line):
+        """吃一行输入：``{"action": "handled"|"close"|"dispatch"}``。"""
+        raw = str(line or "").strip()
+        if not raw:
+            self.say(self.stage_hint(), "info")
+            return {"action": "handled"}
+        head, _sep, tail = raw.partition(" ")
+        low = head.strip().lower()
+        if low in HELP_TOKENS:
+            for key, name, desc in NOSTART_OPTIONS:
+                self.say("%s %s：%s" % (key.upper(), name, desc), "info")
+            return {"action": "handled"}
+        choice = NOSTART_ALIASES.get(low)
+        if choice == "x":
+            return self._missed(note="user")
+        if choice == "s":
+            return self._defer()
+        if choice == "p":
+            spec = tail.strip()
+            if not spec:
+                self.say("推迟多少？`p 15` = 这一场往后 15 分钟；"
+                         "`p T1 15` = 整个时段往后 15 分钟。", "warn")
+                return {"action": "handled"}
+            try:
+                period_id, minutes = parse_postpone_spec(spec)
+            except ValueError as e:
+                self.say(str(e), "warn")
+                return {"action": "handled"}
+            return self._postpone(period_id, minutes)
+        # 别的手敲命令（`relocate T1 15` / `session ...`）照常派发
+        if low in ("relocate", "session", "period", "task", "mute", "title", "cancel"):
+            return {"action": "dispatch", "line": raw}
+        self.say("认不出 %r；p 推迟 / x 不去了 / s 先不管（? 看全部）" % raw, "warn")
+        return {"action": "handled"}
+
+    # -- 三个动作 -----------------------------------------------------
+    def _postpone(self, period_id, minutes):
+        if self.late():
+            got = self.deadline()
+            self.say("推迟窗口 %s 已经过了 —— 推迟作废，这一场按「没去」算。"
+                     % (got.strftime("%H:%M") if got else "?"), "warn")
+            return self._missed(note="late-postpone")
+        detail = self._hook("postpone", self.entry, period_id, minutes)
+        target = (detail or {}).get("target") if isinstance(detail, dict) else None
+        what = "整个时段 %s" % period_id if period_id else "这一场"
+        self.say("↦ %s 推迟 %+d 分钟%s" % (what, int(minutes),
+                                          ("：%s → %s" % (self.entry.get("start"), target))
+                                          if target else ""), "ok")
+        entry = dict(self.entry)
+        if target:
+            entry["target"] = target
+        return self._finish("postponed", note=target or "", entry=entry)
+
+    def _missed(self, note=None):
+        detail = self._hook("mark_missed", self.entry, note)
+        self.say("✗ %s 这场算缺失%s（挂在这场的任务交给收尾）"
+                 % (self.solo(), ("：" + detail) if detail else ""), "warn")
+        # 先落账再开收尾：开收尾会把这个提示面板收掉（begin_review → close_nostart），
+        # 顺序反了就会把「missed」写成「deferred」。
+        result = self._finish("missed", note=note or "")
+        self._hook("open_review", self.entry)
+        return result
+
+    def _defer(self):
+        self.say("⏭ %s 先不管 —— 过了推迟窗口还没开始，就自动算缺失。" % self.solo(), "info")
+        return self._finish("deferred", note="user")
+
+    def _finish(self, action, note="", entry=None):
+        self.closed = True
+        try:
+            mark_nostart(self.entry.get("key"), action, entry=entry or self.entry,
+                         note=note)
+        except OSError as e:                                   # noqa: BLE001
+            self.say("记不下这一问的结果（%s）；不影响已经做的动作。" % e, "warn")
+        return {"action": "close", "done": action, "note": note}
 
 
 def pick(sessions, key=None):

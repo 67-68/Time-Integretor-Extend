@@ -102,12 +102,19 @@ daemon 和 TUI 共用同一份实现，本模块只做转发，绝不再写第�
 ## 收尾线程（session 结束 +15s 叫人）
 
 `postsession_loop()` 是 `cmd_run()` 里起的一条**独立线程**，每秒跑一次
-`postsession_tick()` + `postsession_retry()`。它不跟订场那一轮的睡眠绑在一起 ——
+`postsession_tick()` + `postsession_retry()` + `nostart_tick()`。它不跟订场那一轮的睡眠绑在一起 ——
 一轮可能跑 20 分钟，绑在一起就会「迟到 20 分钟叫人」。
 `temp/warden-tui.json` 是 warden 启动时写的在场证明（pid / tty），
 daemon 用它判断「人叫得回来吗」：没开就 `--new`（新窗口跑 Warden.command），
 开着就按 tty 聚焦（marker 里那个 iTerm session id 早就不算数了），并且**不往
 TUI 里打字**（`--no-refresh`）。细节见 [`postsession.md`](./postsession.md)。
+
+`nostart_tick()` 是同一个线程里的第二件事：**到点 5 分钟还没开始**（计划里有、
+API 里没有）就把 `temp/keep_session-nostart.json` 里记成 `queued` + 拉 warden 来问
+「推迟 / 不去了 / 先不管」。判据在 `postsession.nostart_sessions()`（纯逻辑），
+`_run_once_locked()` 里对「已过点」的 slot 也照同一条界线：窗口内只写
+`status=nostart`（不判 missed、不记罪），过窗口才记 missed。
+细节见 [`postsession.md`](./postsession.md) 的「到点没开始」。
 
 ## 分心看门狗（session 进行时）
 
@@ -175,7 +182,7 @@ ground truth，MCP 的自述永远只是线索。
 ```json
 {"date":"2026-10-09",
  "api_snapshot":{"at":"...","horizon":"...","sessions":["..."]},
- "slots":{"2026-10-09T09:00":{"status":"booked|failed|null|missed|abandoned",
+ "slots":{"2026-10-09T09:00":{"status":"booked|failed|null|missed|abandoned|nostart",
                               "attempts":1,"infra_attempts":0,
                               "next_retry_at":"...","last_error":"...",
                               "last_error_code":"...",
@@ -188,6 +195,13 @@ ground truth，MCP 的自述永远只是线索。
 - `attempts` 只数 slot 级失败；`infra_attempts` 数环境级失败，不参与 3 次上限。
 - `status=missed` 只用于**已经过去**的 slot：确认今天没有这场 session，已无法补订，
   但仍显式记录，避免 status 静默不显示让人误判。
+- `status=nostart` = **刚到点（start+10 分钟以内）**、API 里还没有这一场。
+  这段窗口归 warden 的「到点没开始」那一问（推迟 / 不去了 / 先不管），
+  daemon 在这里**不写 missed、也不记罪** —— 以前它直接判 missed，顺手还可能记一笔
+  「你手动取消了」，等于替人拍板「你没去」。窗口过了还是空的才记 missed
+  （见 `postsession.NOSTART_GRACE_SEC` / `NOSTART_POSTPONE_SEC`）。
+- warden 答「不去了」时会反过来写 state（`keep_session.mark_slot(key, "missed")`
+  + `mark_abandoned`），所以下一轮 daemon 不会把它当成「订了又消失」。
 - `status=abandoned` = warden 认罪放弃，daemon 跳过（见上「罪与判决」）。
 - `past=true` 标记该行对应的 slot 已经过去。
 - `api_snapshot` 是每轮 API 结果的落盘快照，供 status / TUI 离线兜底展示。

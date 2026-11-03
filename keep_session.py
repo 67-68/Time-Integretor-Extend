@@ -459,6 +459,26 @@ def save_state(st):
     os.replace(tmp, STATE_FILE)
 
 
+def mark_slot(key, status, note="", **extra):
+    """在 state.json 里给某个 slot 记一个状态（warden 的「不去了」用它）。
+
+    为什么要有这条口子：**谁发现的事实谁记账**。到点没开始是 warden 问出来的
+    （它带着用户那句「不去了」），daemon 只知道自己上一轮看到什么；让 warden
+    直接写 state，下一轮 daemon 就不会把它当成「订了又消失」再记一笔罪。
+    """
+    st = load_state()
+    slots = st.setdefault("slots", {})
+    rec = dict(slots.get(key) or {})
+    rec["status"] = str(status)
+    if note:
+        rec["note"] = str(note)
+    rec.setdefault("at", datetime.datetime.now().isoformat(timespec="seconds"))
+    rec.update(extra)
+    slots[key] = rec
+    save_state(st)
+    return rec
+
+
 # ---------------------------------------------------------------- 判决 / 罪
 
 
@@ -1315,6 +1335,59 @@ def postsession_retry(now=None, dry_run=False, summon=None):
     return retried
 
 
+def nostart_enabled():
+    """设置里的 nostart 开不开（读不到设置就当开）。"""
+    try:
+        import settings_store as cfg
+
+        return cfg.SettingStore().get_bool("nostart")
+    except Exception:                      # noqa: BLE001 - 设置坏了不该让 daemon 挂
+        return True
+
+
+def nostart_tick(dry_run=False, now=None, summon=None):
+    """每秒叫一次：有没有「到点 5 分钟还没开始」的场次该问人？
+
+    事实只有一条：**计划里有、API 里没有**（用户原话：「refresh 能发现这个 session
+    没了就行」）。到点 +5 分钟（预约窗口）之后还是空的 → 入队 + 把 warden 拉起来，
+    由它问「推迟 / 不去了 / 先不管」（见 ``postsession.NostartReview``）。
+
+    为什么放在这个 1 秒线程里：一轮订场可能跑 5~20 分钟，挂在轮里问就是「14:05
+    该问的事 14:40 才问」。判据全在 ``postsession.nostart_sessions()``（纯逻辑，好测）。
+    """
+    if not nostart_enabled():
+        return []
+    now = now or datetime.datetime.now()
+    actual = fresh_snapshot_details(now)      # 上一轮订场写的带时长快照（太旧就当没有）
+    if not actual:
+        return []
+    try:
+        entries, _warnings = load_entries()
+        due = psv.nostart_sessions(entries, now=now, actual=actual,
+                                   answered=psv.nostart_answered())
+    except Exception as e:                 # noqa: BLE001 - data.csv 坏了也不该让 daemon 挂
+        log("  [nostart] 算不出该问的场次：%s" % e)
+        return []
+    if not due:
+        return []
+    fired = []
+    for rec in due:
+        if dry_run:
+            log("  [nostart] dry-run：该问 %s（%s 到点没开始）" % (rec["key"], rec["start"]))
+            fired.append(rec)
+            continue
+        psv.mark_nostart(rec["key"], "queued", entry=rec)
+        log("  [nostart] %s（%s %smin）到点没开始 → 入队，拉 warden 来问"
+            % (rec["key"], rec["start"], rec["duration"]))
+        fired.append(rec)
+    if fired and not dry_run:
+        try:
+            (summon or summon_warden)(dry_run=dry_run)
+        except Exception as e:             # noqa: BLE001 - 叫不起来队列还在
+            log("  [nostart] ⚠ 没叫起来：%s（warden 一打开就会自己接走）" % e)
+    return fired
+
+
 def postsession_loop(dry_run=False, interval=1.0):
     """收尾的**独立线程**：每秒看一眼，和「一轮订场」完全解耦。
 
@@ -1323,8 +1396,9 @@ def postsession_loop(dry_run=False, interval=1.0):
     内叫人」实际变成「结束 25~50 分钟后叫人」（日志里 10:11 结束的那场 10:55
     才叫，就是这原因）。收尾是**时间敏感**的，不能排在订场后面。
     """
-    log("收尾线程已启动：每 %.0fs 看一眼「刚结束满 %ds」的场次"
-        % (interval, POSTSESSION_DELAY))
+    log("收尾线程已启动：每 %.0fs 看一眼「刚结束满 %ds」的场次，"
+        "以及「到点 %ds 还没开始」的场次"
+        % (interval, POSTSESSION_DELAY, psv.NOSTART_GRACE_SEC))
     while not _STOP["flag"]:
         try:
             postsession_tick(dry_run=dry_run)
@@ -1334,6 +1408,10 @@ def postsession_loop(dry_run=False, interval=1.0):
             postsession_retry(dry_run=dry_run)
         except Exception as e:             # noqa: BLE001
             log("  [postsession] 补叫出错（下一秒再试）：%s" % e)
+        try:
+            nostart_tick(dry_run=dry_run)
+        except Exception as e:             # noqa: BLE001 - 线程不许死
+            log("  [nostart] 检查出错（下一秒再试）：%s" % e)
         for _ in range(max(1, int(interval * 10))):
             if _STOP["flag"]:
                 break
@@ -1573,6 +1651,7 @@ def _run_once_locked(dry_run=False, force=False):
                     ("(%dmin)" % r["duration"]) if r["duration"] else "") for r in extra[:8])))
 
     # 已经开始的：不补订，只把"到底有没有"记进 state（让 status / TUI 能看出来）
+    nd_started = []
     for day, slot, start in past:
         key = key_of(day, slot)
         rec = state["slots"].get(key) or {}
@@ -1591,6 +1670,23 @@ def _run_once_locked(dry_run=False, force=False):
                     # 只在**结论变了**的时候说一次；每轮都念一遍会把日志淹掉
                     log("  [已过] %s 认账：%s" % (key, note))
         else:
+            # 刚到点（预约窗口 + 推迟窗口之内）：**先别判「没完成」**。
+            # 这段窗口归 warden 的「到点没开始」那一问（推迟 / 不去了 / 先不管），
+            # 在这里写 missed 会抢在它前面把人钉死，而且会对「订了又消失」记罪。
+            if not is_abandoned(key, verdicts) and now <= (
+                    start + datetime.timedelta(
+                        seconds=psv.NOSTART_GRACE_SEC + psv.NOSTART_POSTPONE_SEC)):
+                if rec.get("status") != "nostart":
+                    log("  [已过] %s (%smin) 到点还没开始（API 里没这场）"
+                        "→ 留给 warden 问：推迟 / 不去了 / 先不管" % (key, slot["duration"]))
+                    state["slots"][key] = {"status": "nostart",
+                                           "duration": slot["duration"],
+                                           "attempts": rec.get("attempts", 0),
+                                           "past": True,
+                                           "at": now.isoformat(timespec="seconds")}
+                    changed = True
+                nd_started.append(key)
+                continue
             if rec.get("status") != "missed":
                 log("  [已过] %s (%smin) 没有这场 session，已经来不及补订了" % (key, slot["duration"]))
                 if rec.get("status") == "booked":
@@ -1790,6 +1886,16 @@ def _run_once_locked(dry_run=False, force=False):
 
     if changed:
         save_state(state)
+    # 刚过点还没开始的那些：把 warden 叫起来问一句（推迟 / 不去了 / 先不管）。
+    # 叫不起来也没关系 —— warden 一打开就会自己按表格算一遍（见
+    # postsession.NostartReview 和 warden._next_nostart_entry）。
+    if nd_started and not dry_run:
+        log("  [nostart] %d 场到点没开始（%s）→ 拉 warden 来问"
+            % (len(nd_started), "、".join(nd_started[:4])))
+        try:
+            summon_warden(dry_run=dry_run)
+        except Exception as e:                 # noqa: BLE001 - 叫不起来就算了
+            log("  [nostart] 没叫起来：%s" % e)
     log("=== round done ===")
     return 0
 

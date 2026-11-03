@@ -87,12 +87,39 @@ HH:MM-HH:MM                 —— 每天，如 11:15-12:05
 | `key_of(day, slot)` | 状态机 key：`2026-10-09T19:00`（带日期，跨天不串味） |
 | `add_row(...)` / `remove_row(...)` | TUI 的增删（合法性校验 + 排序插入 + 先备份） |
 | `add_relocation(...)` / `remove_relocation(...)` | 临时挪动：只覆盖具体日期，不写 data.csv |
+| `add_relocations(...)` / `remove_relocations(...)` | 一次挪好几场（整段 relocate）：要么全写、要么一条不写 |
+| `later_move_key(day, scope)` / `get_later_move(day, scope=)` | 「往后挪一次」额度的 key（整天一把 / 每个时段一把） |
 | `fingerprint()` | 内容 sha1：改文件前比对，防「改错行」 |
 
 临时挪动（`relocate`）不写 data.csv，只写 `temp/keep_session-relocations.json`：
 key 是「具体日期 + 原 HH:MM」，`day_slots()` 在对应日期把它替换成新时间；
 过了那一天记录不再命中，未来同星期几不受影响。推后额度也存在同一文件里，
-按 session 日期记一次。
+按 session 日期记一次（整段挪动按「日期 + 时段」记，见下）。
+
+### relocate：一场 / 一整段
+
+```
+relocate 3 -15      # 只有 #3 这一场提前 15 分钟
+relocate T1 +15     # 时段 T1 里每一场一起推后 15 分钟（相对位置不变）
+```
+
+两种都不写 data.csv，都只影响所选这一天。差别：
+
+| | 单场 `relocate N ±MM` | 整段 `relocate T1 ±MM` |
+|---|---|---|
+| 动谁 | 那一场 | 时段里**每一场**（11:00/12:00 → 11:15/12:15） |
+| 撞车判据 | 挪过去不能和别的场次**时间重叠** | 同上（整段尤其需要，只看起点会放过 11:15–12:05 撞 12:00） |
+| 推后额度 | 整天一次（`later_moves["2026-11-03"]`） | **每个时段**一次（`later_moves["2026-11-03|T1"]`），不吃 T2 的 |
+| 提前 | 随时可以 | 随时可以 |
+| 跨天 | 拒绝 | 拒绝 |
+
+**任务绑定跟着走**：任务是用「哪一天 + 哪一刻」认场次的（`tasks_for_session`），
+所以挪完必须把 `session.start` 一起改（`task_store.assign` → 截止时间也跟着变）。
+不跟着挪的话，表格会说「这场一条任务都没有」、收尾也不会再问这些任务 ——
+它们会静默地丢掉自己那一场。
+
+「到点没开始」那一问里的 `p 15` / `p T1 15` 走的是**同一套底层**
+（`warden._relocate_moves` → `_apply_relocate`），所以任务一样跟着走。
 
 `python3 schedule.py show [YYYY-MM-DD]` / `show --week` 是给人看的只读视图。
 

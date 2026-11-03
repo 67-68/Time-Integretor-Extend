@@ -881,8 +881,11 @@ def _hint_session(parts):
 def _hint_relocate(parts):
     if len(parts) >= 3:
         return repl_kit.Hint("取值", ("-30", "-15", "+15", "+30"))
-    return repl_kit.Hint("参数", ("<n>", "±MM"),
-                         note="15 的倍数，不能跨天")
+    if len(parts) == 2:
+        return repl_kit.Hint("参数", ("±MM",),
+                             note="15 的倍数；不能跨天；撞车就拒绝")
+    return repl_kit.Hint("参数", ("<n>", "T1"),
+                         note="<n> = 单场；T1 = 整段（里面每场一起挪）")
 
 
 def _hint_mute(parts):
@@ -1512,8 +1515,9 @@ class ContractView(View):
                  usage="period <T1> [25|50|75 ...] | period mute|unmute <T1> [--permanent]",
                  options=("25", "50", "75", "mute", "unmute", "--permanent"),
                  hint=_hint_period),
-            _cmd("relocate", w.cmd_relocate, "临时把 #N 提前/推后：relocate N ±MM",
-                 usage="relocate <n> ±MM",
+            _cmd("relocate", w.cmd_relocate,
+                 "临时挪一场（#N）或整个时段（T1）：relocate N ±MM / relocate T1 ±MM",
+                 usage="relocate <n>|T1 ±MM",
                  options=("-30", "-15", "+15", "+30"),
                  hint=_hint_relocate),
             _cmd("force-check", lambda a: w.cmd_force_check(),
@@ -2324,6 +2328,10 @@ class Warden(object):
         self.review = None
         self.review_check = None
         self.review_at = 0.0
+        # 「到点没开始」那一问（postsession.NostartReview）：和收尾互斥 ——
+        # 一次只问一件事，否则 p/x/s 和 A/B/C/D/E 会抢同一行输入。
+        self.nostart = None
+        self.nostart_at = 0.0
         # 静音时段（period mute）自动落地：mutes_at 是节流时间戳，
         # mute_tries 记「这一场刚才试过、几分钟内别再试」，mute_worker 是后台线程。
         self.mutes_at = 0.0
@@ -2422,6 +2430,9 @@ class Warden(object):
         """
         review = self.review
         if review is None:
+            prompt = getattr(self, "nostart", None)
+            if prompt is not None:
+                return ("nostart", id(prompt), prompt.closed, len(prompt.notes))
             return (id(self.review_check), bool(self.review_check))
         return (
             id(review), review.stage, review.index, review.closed,
@@ -4554,6 +4565,10 @@ class Warden(object):
         except Exception:                          # noqa: BLE001 - 收尾坏了也不能没帧
             pass
         try:
+            self._maybe_start_nostart()
+        except Exception:                          # noqa: BLE001 - 这一问坏了也不能没帧
+            pass
+        try:
             self._maybe_apply_mutes()
         except Exception:                          # noqa: BLE001 - 静音坏了也不能没帧
             pass
@@ -4813,126 +4828,326 @@ class Warden(object):
         self.refresh(quiet=True)
         return True
 
-    def cmd_relocate(self, args):
-        """relocate N ±MM —— 把当前表里 #N 临时提前/推后 MM 分钟。
+    # -- 临时挪动（单场 / 整段）----------------------------------------
 
-        提前：直接改临时计划并取消原 API session，不需要宣言（这是在往前赶）。
-        推后：同一天只能推一次，且不能跨天；防止把拖延变成日常操作。
-        **不写 data.csv**：只影响所选这一天的这一场，未来同星期几照旧。
+    def _period_rows(self, day, period_id):
+        """这一天属于某个时段的场次（形状和表格里的行一样，能直接拿去挪）。
+
+        以**契约**为准（``schedule.day_slots``，含已经落过的临时挪动），再从表格 /
+        API 快照里借出那一半（id / startMs / zone）—— 这样 `relocate T1 15` 既不会
+        漏掉刚改过的场次，也不会漏掉「订上了但表格还没重建」的那些。
         """
-        if not args:
-            raise ValueError("用法：relocate N ±MM（MM 是 15 的倍数，如 relocate 3 -15）")
-        idx_token, delta = parse_relocate_spec(args)
-        if idx_token is None:
-            raise ValueError("用法：relocate N ±MM（MM 是 15 的倍数，如 relocate 3 -15）")
-        idx, row = self.pick(idx_token)
-
-        if row.get("zone") == "past" or row.get("phase") == "已结束":
-            raise ValueError("#%d 已经开始（%s）—— 过去的场次不能挪。" % (idx, row["startLabel"]))
-        if not row.get("planned"):
-            raise ValueError("#%d 是计划外 session（data.csv 里没有对应契约），relocate 改不了它。"
-                             % idx)
-
-        day = self.sel_date
-        rec = row.get("relocation") or {}
-        from_hhmm = rec.get("from") or row.get("relocated_from") or row["startLabel"]
-        cur_hhmm = row["startLabel"]
-        dur = row.get("durationMin") or rec.get("duration")
-        if not dur:
-            raise ValueError("#%d 看不出时长（快照？），先 refresh 成功一次再挪。" % idx)
-        dur = str(int(dur))
-
-        got = sch.parse_hhmm(cur_hhmm)
-        if got is None:
-            raise ValueError("当前行时间 %r 不是合法 HH:MM" % cur_hhmm)
-        cur_start = datetime.datetime(day.year, day.month, day.day, got[0], got[1])
-        target = cur_start + datetime.timedelta(minutes=delta)
-        if target.date() != day:
-            raise ValueError("不能跨天移动：%s %s 挪 %+d 分钟会跑到 %s。"
-                             % (day.isoformat(), cur_hhmm, delta, target.date().isoformat()))
-        target_hhmm = target.strftime("%H:%M")
-
-        if delta > 0 and sch.get_later_move(day):
-            raise ValueError("%s 已经往后挪过一次了；一天只能往后挪一次。"
-                             % day.isoformat())
-
-        # 目标时间撞车：契约里不能撞，API 里也不能撞（原 session 自己不算）。
+        by_start = {}
+        for row in getattr(self, "rows", []) or []:
+            if row.get("date") == day.isoformat():
+                by_start.setdefault(row.get("startLabel"), row)
+        api_by_start = {}
+        for r in getattr(self, "api_rows", []) or []:
+            api_by_start.setdefault(r.get("startLabel"), r)
+        periods = self.periods_for_day(day)
+        now = datetime.datetime.now()
+        out = []
         for slot in sch.day_slots(self.entries, day):
-            if slot["start"] == cur_hhmm:
+            period = sp.period_for_session(periods, slot["start"])
+            if not period or period.get("id") != period_id:
                 continue
-            if slot["start"] == target_hhmm:
-                raise ValueError("目标时间 %s 已经有一场契约；不能撞车。" % target_hhmm)
-        for r in getattr(self, "api_rows", []):
-            if r.get("startLabel") == target_hhmm and r.get("id") != row.get("id"):
-                raise ValueError("目标时间 %s API 里已经有一场 session；不能撞车。" % target_hhmm)
+            row = by_start.get(slot["start"])
+            if row is None:
+                start_dt = sch.slot_datetime(slot, day)
+                dur = int(slot["duration"])
+                row = {
+                    "startMs": int(start_dt.timestamp() * 1000),
+                    "endMs": int((start_dt + datetime.timedelta(minutes=dur)
+                                  ).timestamp() * 1000),
+                    "startLabel": slot["start"],
+                    "durationMin": dur,
+                    "id": (api_by_start.get(slot["start"]) or {}).get("id"),
+                    "zone": self.effective_zone(sch.zone_name(start_dt, now), day),
+                    "date": day.isoformat(),
+                    "planned": True,
+                }
+            row = dict(row)
+            if slot.get("relocation"):
+                row["relocation"] = dict(slot["relocation"])
+                row["relocated_from"] = slot.get("relocated_from")
+            row["period_id"] = period_id
+            out.append(row)
+        out.sort(key=lambda r: r.get("startMs") or 0)
+        return out
 
-        old_offset = int(rec.get("offset") or 0)
-        new_offset = old_offset + delta
+    def _relocate_moves(self, day, rows, delta, allow_past=False):
+        """**纯计算**：这批行挪 delta 分钟之后是什么样 + 撞车检查（不改任何文件）。
+
+        返回 ``[{"row","from","cur","to","duration","offset"}]``；有任何问题抛
+        ValueError，调用方此时还没有副作用。
+        """
+        if not rows:
+            raise ValueError("没有要挪的场次。")
+        moves = []
+        for row in rows:
+            if not row.get("planned"):
+                raise ValueError("计划外 session（data.csv 里没有对应契约），relocate 改不了它。")
+            if not allow_past and (row.get("zone") == "past"
+                                   or row.get("phase") == "已结束"):
+                raise ValueError("%s 那场已经开始/结束了 —— 过去的场次不能挪。"
+                                 "（到点还没开始的那场走收尾里的 `p` 推迟。）"
+                                 % row.get("startLabel"))
+            rec = row.get("relocation") or {}
+            from_hhmm = rec.get("from") or row.get("relocated_from") or row["startLabel"]
+            cur_hhmm = row["startLabel"]
+            dur = row.get("durationMin") or rec.get("duration")
+            if not dur:
+                raise ValueError("%s 看不出时长（快照？），先 refresh 成功一次再挪。"
+                                 % cur_hhmm)
+            got = sch.parse_hhmm(cur_hhmm)
+            if got is None:
+                raise ValueError("当前行时间 %r 不是合法 HH:MM" % cur_hhmm)
+            cur_start = datetime.datetime(day.year, day.month, day.day, got[0], got[1])
+            target = cur_start + datetime.timedelta(minutes=delta)
+            if target.date() != day:
+                raise ValueError("不能跨天移动：%s %s 挪 %+d 分钟会跑到 %s。"
+                                 % (day.isoformat(), cur_hhmm, delta,
+                                    target.date().isoformat()))
+            moves.append({
+                "row": row,
+                "from": from_hhmm,
+                "cur": cur_hhmm,
+                "to": target.strftime("%H:%M"),
+                "duration": str(int(dur)),
+                "offset": int(rec.get("offset") or 0) + delta,
+            })
+        self._check_relocate_conflicts(day, moves)
+        return moves
+
+    def _check_relocate_conflicts(self, day, moves):
+        """撞车检查：挪过去之后不能和**别的**场次重叠。
+
+        单场挪动以前只查「同一时刻」，整段挪动必须查「时间重叠」——
+        T1 整段往后 15 分钟时，11:15–12:05 和 12:00 那场就是真撞车（以前只看
+        起点不同就放行了）。改成重叠判据之后，单场也一起受益。
+        """
+        moving_now = set(m["cur"] for m in moves)
+        moving_ids = set(m["row"].get("id") for m in moves if m["row"].get("id"))
+        targets = {}
+        for m in moves:
+            if m["to"] in targets:
+                raise ValueError("挪完之后 %s 撞车：这一批里有两场被挪到了同一时刻。"
+                                 % m["to"])
+            targets[m["to"]] = m
+
+        def _span(hhmm, dur):
+            got = sch.parse_hhmm(hhmm)
+            if got is None:
+                return None
+            begin = got[0] * 60 + got[1]
+            try:
+                dur = int(dur or 0)
+            except (TypeError, ValueError):
+                dur = 0
+            return begin, begin + max(1, dur)
+
+        occupied = []
+        for slot in sch.day_slots(self.entries, day):
+            if slot["start"] in moving_now:
+                continue
+            span = _span(slot["start"], slot.get("duration"))
+            if span:
+                occupied.append((span[0], span[1], "%s 那场契约" % slot["start"]))
+        for r in getattr(self, "api_rows", []) or []:
+            if r.get("id") in moving_ids or r.get("startLabel") in moving_now:
+                continue
+            span = _span(r.get("startLabel"), r.get("durationMin"))
+            if span:
+                occupied.append((span[0], span[1], "%s 那场 API session" % r.get("startLabel")))
+
+        for m in moves:
+            span = _span(m["to"], m["duration"])
+            if span is None:
+                raise ValueError("目标时间 %r 不是合法 HH:MM" % m["to"])
+            for begin, end, label in occupied:
+                if span[0] < end and begin < span[1]:
+                    raise ValueError("目标时间 %s 和 %s 重叠；不能撞车。" % (m["to"], label))
+
+    def _migrate_task_bindings(self, day, moves):
+        """把挂在这些场次上的任务**跟着挪过去**（绑定 + 截止时间一起动）。
+
+        为什么必须做：任务是用「哪一天 + 哪一刻」认场次的（``tasks_for_session``）。
+        session 挪了而绑定留在原地 —— 表格会说「这场一条任务都没有」，收尾也不会
+        再问这些任务，它们会静默地丢掉自己那一场（真实踩过的坑）。
+        """
+        moved = []
+        for m in moves:
+            try:
+                tasks = self.task_store.tasks_for_session(day, m["cur"])
+            except Exception:                      # noqa: BLE001 - 绑定挪不动不该挡住挪场次
+                tasks = []
+            session = {"date": day.isoformat(), "start": m["to"],
+                       "duration": int(m["duration"]),
+                       "focusmate_session_id": None,
+                       "relocated_from": m["from"]}
+            for task in tasks:
+                if ts.TaskStore.is_repeat_template(task):
+                    continue
+                try:
+                    self.task_store.assign(task["id"], session)
+                except (ValueError, TypeError) as e:
+                    self.say("⚠ 任务 %s 的绑定没跟着挪：%s"
+                             % (self.task_label(task), e), "warn")
+                    continue
+                moved.append(task)
+        if moved:
+            self.say("↔ %d 条任务跟着挪到新时间：%s"
+                     % (len(moved), "、".join(self.task_label(t) for t in moved)), "ok")
+        return moved
+
+    def _apply_relocate(self, day, moves, delta, later_scope=None, reason="relocate"):
+        """落临时挪动 → 取消旧 API session → 任务绑定跟着挪 → 立刻跑一轮 check。
+
+        顺序是有讲究的：**先落盘再取消**，取消失败就整批回滚（保证「取消 + 挪动」
+        不会只做一半）；绑定挪在取消之后（不然 tasks_for_session 找不到旧场次了）。
+        """
         stamp = datetime.datetime.now().isoformat(timespec="seconds")
-        key = sch.key_of(day, from_hhmm)
-
-        # 先落临时挪动记录；原 session 取消失败就回滚，保证「取消+挪动」不会只做一半。
         before = sch.load_relocations()
         after = copy.deepcopy(before)
-        after.setdefault("relocations", {})[key] = {
-            "kind": "temporary",
-            "date": day.isoformat(),
-            "from": from_hhmm,
-            "to": target_hhmm,
-            "duration": dur,
-            "offset": new_offset,
-            "at": stamp,
-        }
+        recs = after.setdefault("relocations", {})
+        for m in moves:
+            rec = {
+                "kind": "temporary",
+                "date": day.isoformat(),
+                "from": m["from"],
+                "to": m["to"],
+                "duration": m["duration"],
+                "offset": m["offset"],
+                "at": stamp,
+            }
+            if m.get("scope"):
+                rec["scope"] = m["scope"]
+            recs[sch.key_of(day, m["from"])] = rec
         if delta > 0:
-            after.setdefault("later_moves", {})[day.isoformat()] = {
-                "key": key,
-                "from": from_hhmm,
-                "to": target_hhmm,
+            last = moves[-1]
+            after.setdefault("later_moves", {})[sch.later_move_key(day, later_scope)] = {
+                "key": sch.key_of(day, last["from"]),
+                "from": last["from"],
+                "to": last["to"],
+                "scope": later_scope or "",
+                "count": len(moves),
+                "reason": reason,
                 "at": stamp,
             }
         sch.save_relocations(after)
 
-        if row.get("id") is not None:
-            self.say("#%d 取消原 session %s…" % (idx, cur_hhmm), "cmd")
+        # 1) 取消原 API session（有的话）。取消失败 → 整批回滚，不留半套。
+        for m in moves:
+            row = m["row"]
+            if row.get("id") is None:
+                continue
+            self.say("取消原 session %s…" % m["cur"], "cmd")
             try:
                 with self.console.status("[red]取消原 session…[/]", spinner="dots"):
-                    res = self.bridge.call("cancel", startMs=row["startMs"], meetingId=row["id"])
+                    res = self.bridge.call("cancel", startMs=row["startMs"],
+                                           meetingId=row["id"])
             except BridgeError:
                 sch.save_relocations(before)
                 raise
             if not res.get("verified"):
                 sch.save_relocations(before)
-                self.had_error = True
-                self.say("❌ #%d 原 session 取消后复核还在；临时挪动已回滚。" % idx, "error")
-                return False
+                raise ValueError("原 session %s 取消后复核还在；临时挪动已整批回滚。"
+                                 % m["cur"])
             # 本地表也把旧 session 拿掉，离线/测试环境不用等下一次 refresh 才看不到它。
             self.api_rows = [r for r in self.api_rows
                              if not (r.get("id") == row.get("id")
                                      and r.get("startMs") == row.get("startMs"))]
 
+        # 2) 旧 booked state 清掉：不清的话，等你哪天把挪动撤回去，daemon 会看到
+        #    「state 说 booked 但 API 没有」→ 记一笔罪（其实是 warden 自己干的活）。
+        self._forget_layout_state([{"date": day.isoformat(), "startLabel": m["cur"]}
+                                   for m in moves])
+
+        # 3) 任务绑定跟着挪（绑定 + 截止时间）
+        self._migrate_task_bindings(day, moves)
+        return len(moves)
+
+    def _relocate_say(self, day, moves, delta, period_id=None, label=""):
+        """挪完之后那一句人话（单场和整段共用）。"""
         moved = "提前" if delta < 0 else "推后"
-        self.say("✅ #%d %s %d 分钟：%s → %s（临时，不改 data.csv；原时间 %s）。"
-                 % (idx, moved, abs(delta), cur_hhmm, target_hhmm, from_hhmm), "ok")
+        what = ("%s 整段 " % period_id) if period_id else (label or "")
+        pairs = "、".join("%s→%s" % (m["cur"], m["to"]) for m in moves)
+        self.say("✅ %s%s %d 分钟：%s（临时，不改 data.csv；原时间 %s）。"
+                 % (what, moved, abs(delta), pairs,
+                    "、".join(sorted(set(m["from"] for m in moves)))), "ok")
 
-        # 执行区里的场次立刻走一轮 check：data.csv 原 slot 已被临时记录替换，
-        # check 会去订新时间；草稿区还没进窗口，等 daemon 到点再说。
-        if row.get("zone") != "draft":
-            self._release_browser("daemon 下单要独占同一个 Chromium profile")
-            self.say("立刻触发一轮 check（keep_session.py check）…", "cmd")
-            rc, out, err = run_keep_session("check", timeout=600)
-            for line in (out or "").splitlines()[-20:]:
-                self.say(line)
-            if rc == 0:
-                self.say("✅ check 跑完。", "ok")
-            else:
-                self.had_error = True
-                self.say("❌ check 退出码 %d%s（临时计划已落盘，daemon 后续还会补）"
-                         % (rc, ("：" + err) if err else ""), "error")
+    def _relocate_period(self, day, period_id, delta, allow_past=False, reason="relocate"):
+        """``relocate T1 ±MM`` —— 把一个时段里的**每一场**一起挪（相对位置不变）。"""
+        rows = self._period_rows(day, period_id)
+        if not rows:
+            raise ValueError("%s 在 %s 没有排出来的 session（先 `period %s 50 50` 排一下）。"
+                             % (period_id, day.isoformat(), period_id))
+        if delta > 0 and sch.get_later_move(day, scope=period_id):
+            raise ValueError("%s %s 已经往后挪过一次了；每个时段一天只能往后挪一次。"
+                             % (day.isoformat(), period_id))
+        moves = self._relocate_moves(day, rows, delta, allow_past=allow_past)
+        for m in moves:
+            m["scope"] = period_id
+        self._apply_relocate(day, moves, delta, later_scope=period_id, reason=reason)
+        self._relocate_say(day, moves, delta, period_id=period_id)
+        self._relocate_after(day, moves)
+        return True
 
+    def _relocate_after(self, day, moves):
+        """挪完之后收尾：重读契约、重画表格、（执行区里的场次）立刻跑一轮 check。"""
+        self.reload_entries()
+        self.rebuild_rows()
+        live = [m for m in moves if m["row"].get("zone") != "draft"]
+        if not live:
+            return True
+        self._release_browser("daemon 下单要独占同一个 Chromium profile")
+        self.say("立刻触发一轮 check（keep_session.py check）…", "cmd")
+        rc, out, err = run_keep_session("check", timeout=600)
+        for line in (out or "").splitlines()[-20:]:
+            self.say(line)
+        if rc == 0:
+            self.say("✅ check 跑完。", "ok")
+        else:
+            self.had_error = True
+            self.say("❌ check 退出码 %d%s（临时计划已落盘，daemon 后续还会补）"
+                     % (rc, ("：" + err) if err else ""), "error")
         self.reload_entries()
         self.rebuild_rows()
         if not self.offline:
             self.refresh(quiet=True)
+        return True
+
+    def cmd_relocate(self, args):
+        """relocate N ±MM | relocate T1 ±MM —— 临时挪一场 / 挪一整个时段。
+
+        ``relocate 3 -15``  只有 #3 这一场动。
+        ``relocate T1 15``  时段 T1 里**每一场**一起推后 15 分钟：11:00、12:00 两场
+                            变成 11:15、12:15，场次之间的相对位置一点不变。
+
+        两者都不写 data.csv：只影响所选这一天的这几场，未来同星期几照旧。
+        挪动的**任务绑定跟着走**（``tasks_for_session`` 认的是「哪一天 + 哪一刻」，
+        绑定留在原地等于把这些任务从这一场上摘掉）。
+        提前随时可以；推后单场是「一天一次」、整段是「每个时段一天一次」，
+        而且撞车（重叠）就拒绝 —— 撞车判据对单场也生效了。
+        """
+        if not args:
+            raise ValueError("用法：relocate N ±MM（单场）/ relocate T1 ±MM（整段）"
+                             "，MM 是 15 的倍数")
+        idx_token, delta = parse_relocate_spec(args)
+        if idx_token is None:
+            raise ValueError("用法：relocate N ±MM（单场）/ relocate T1 ±MM（整段）")
+        day = self.sel_date
+        if re.match(r"^[Tt]\d+$", idx_token):
+            return self._relocate_period(day, idx_token.upper(), delta)
+
+        idx, row = self.pick(idx_token)
+        if delta > 0 and sch.get_later_move(day):
+            raise ValueError("%s 已经往后挪过一次了；一天只能往后挪一次。"
+                             % day.isoformat())
+        moves = self._relocate_moves(day, [row], delta)
+        self._apply_relocate(day, moves, delta, later_scope=None)
+        self._relocate_say(day, moves, delta, label="#%d" % idx)
+        self._relocate_after(day, moves)
         return True
 
     # -- 任务系统 ------------------------------------------------------
@@ -8178,8 +8393,16 @@ class Warden(object):
         self.writeback_completions()
         return rows
 
-    def begin_review(self, entry, sync=True):
-        """进入一场收尾：核对完成状态 → 挑出没做完的任务 → 建 Review。"""
+    def begin_review(self, entry, sync=True, credit=True):
+        """进入一场收尾：核对完成状态 → 挑出没做完的任务 → 建 Review。
+
+        ``credit=False``：**不记这一场的 count**（「到点没开始」那场一分钟都没干，
+        不能往任务上记 count —— 见 :meth:`credit_session_counts`）。
+        """
+        if self.nostart is not None:
+            # 一次只问一件事：「没开始」那一问还开着就先收掉（记成 deferred），
+            # 否则两套提示抢同一行输入。
+            self.close_nostart(note="review-started")
         entry = dict(entry or {})
         day_iso = entry.get("date") or self.sel_date.isoformat()
         start = entry.get("start") or ""
@@ -8199,7 +8422,7 @@ class Warden(object):
         opened = [t for t in tasks if self.task_store.is_open(t)]
         # 先把这一场该给的 count 记进账（幂等），**但不完成** —— 够数的那条留给
         # 收尾去问「再要 count 还是直接完成」（见 postsession.COUNT_OPTION）。
-        counts = self.credit_session_counts(entry, opened)
+        counts = self.credit_session_counts(entry, opened) if credit else {}
         self.rebuild_rows()
         if not opened:
             self.say("⏱ %s %s 那场没有未完成的任务（%d 条记录都已收）—— 这场翻篇。"
@@ -8372,6 +8595,8 @@ class Warden(object):
         """每帧看一眼：daemon 说哪一场该收尾了，就接过来（**只在主线程动手**）。"""
         if self.review is not None:
             return
+        if self.nostart is not None:
+            return                              # 「没开始」那一问还开着：先答它
         now = time.time()
         if now - self.review_at < 1.0:
             return
@@ -8399,6 +8624,175 @@ class Warden(object):
         else:
             self.say("⏱ %s %s 那场结束了 —— 正在核对完成状态…"
                      % (entry.get("date"), entry.get("start")), "cmd")
+
+    # -- 「这一场到点没开始」那一问 -------------------------------------
+    #
+    # 事实只有一个来源：**表格**。planned 有、id 没有 = 契约有、API 里没这一场
+    # （用户原话：「refresh 能发现这个 session 没了就行」）。所以这里不需要任何
+    # 新接口 —— 到点 5 分钟之后 API 还是空的，就问；
+    # 问的时候不判「没完成」，而是给三个选择（见 postsession.NostartReview）。
+
+    def _maybe_start_nostart(self):
+        """每帧看一眼：有没有「早该开始、API 里却没有」的场次该问人。"""
+        if self.nostart is not None:
+            return
+        now_ts = time.time()
+        if now_ts - self.nostart_at < 1.0:      # 节流：别每帧都遍历
+            return
+        self.nostart_at = now_ts
+        if not self.settings.get_bool("nostart"):
+            return
+        if self.review is not None or self.review_check is not None:
+            return                              # 一次只问一件事（收尾优先）
+        if self.pending_sins():
+            return                              # 罪案区锁死：除了宣言什么都不受理
+        entry = self._next_nostart_entry()
+        if entry is None:
+            return
+        self.nostart = psv.NostartReview(entry, hooks=self.nostart_hooks())
+        self.say("🚪 %s 那场到点没开始（API 里没有这一场）—— "
+                 "p 推迟 / x 不去了 / s 先不管。" % self.nostart.solo(), "cmd")
+        self.invalidate()
+
+    def _next_nostart_entry(self):
+        """该问哪一场：daemon 入队的优先（它会专门叫我一声），其次自己按表格算。"""
+        try:
+            queued = psv.nostart_pending()
+        except Exception:                       # noqa: BLE001 - 状态文件坏了不该没帧
+            queued = []
+        if queued:
+            entry = dict(queued[0])
+            if not entry.get("period_id"):
+                try:
+                    day = datetime.date.fromisoformat(str(entry.get("date")))
+                    period = sp.period_for_session(self.periods_for_day(day),
+                                                   entry.get("start"))
+                    if period:
+                        entry["period_id"] = period.get("id") or ""
+                except (TypeError, ValueError):
+                    pass
+            return entry
+        if not self.authoritative:
+            # 拿不到真数据（离线 / 快照）就别判：「API 里没有这一场」这句话必须有依据
+            return None
+        now = datetime.datetime.now()
+        try:
+            answered = psv.nostart_answered()
+        except Exception:                       # noqa: BLE001
+            answered = set()
+        for row in self.rows:
+            entry = self._nostart_entry_for_row(row, now, answered)
+            if entry:
+                return entry
+        return None
+
+    def _nostart_entry_for_row(self, row, now, answered):
+        """表格里这一行该不该问？→ 该问就返回 entry，不该问返回 None。"""
+        if not row.get("planned") or row.get("id") is not None:
+            return None
+        try:
+            start = datetime.datetime.fromtimestamp(row["startMs"] / 1000.0)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if now < start + datetime.timedelta(seconds=psv.NOSTART_GRACE_SEC):
+            return None                          # 预约窗口里还不问（刚过几分钟很正常）
+        if (now - start).total_seconds() > psv.NOSTART_LOOKBACK_SEC:
+            return None                          # 太老了：别翻旧账
+        key = psv.session_key(row.get("date"), row.get("startLabel"))
+        if key in answered:
+            return None                          # 问过/答过了
+        try:
+            day = datetime.date.fromisoformat(str(row.get("date")))
+        except (TypeError, ValueError):
+            return None
+        return psv.nostart_entry(day, row.get("startLabel"), row.get("durationMin"),
+                                 now=now, period_id=row.get("period_id"))
+
+    def nostart_hooks(self):
+        """「没开始」那一问要碰外部世界的几个口子（其余全在 postsession 里）。"""
+        return {
+            "say": lambda text, kind="info": self.say(text, kind),
+            "postpone": lambda entry, period_id, minutes: self._nostart_postpone(
+                entry, period_id, minutes),
+            "mark_missed": lambda entry, note=None: self._nostart_mark_missed(entry, note),
+            # 不去了 → 挂在这场的任务交给收尾（A 延期 / B 放弃 / C 重议 / E 推后）。
+            # credit=False：这一场一分钟都没干，不记 count。
+            "open_review": lambda entry: self.begin_review(
+                {"kind": "session", "key": entry.get("key"), "date": entry.get("date"),
+                 "start": entry.get("start"), "end": entry.get("end"),
+                 "duration": entry.get("duration"),
+                 "nostart": True},
+                sync=False, credit=False),
+        }
+
+    def _nostart_postpone(self, entry, period_id, minutes):
+        """推迟：单场 / 整段都走 **relocate 那一套底层**（取消 → 落盘 → 任务跟着挪）。"""
+        try:
+            day = datetime.date.fromisoformat(str(entry.get("date")))
+        except (TypeError, ValueError):
+            raise ValueError("这一场没有合法日期（%r），推迟不了。" % entry.get("date"))
+        delta = int(minutes)
+        if period_id:
+            period_id = str(period_id).upper()
+            self._relocate_period(day, period_id, delta, allow_past=True,
+                                  reason="nostart-postpone")
+            return {"target": "整段 %+d 分钟" % delta}
+        row = None
+        for cand in self.rows:
+            if (cand.get("date") == entry.get("date")
+                    and cand.get("startLabel") == entry.get("start")):
+                row = cand
+                break
+        if row is None:
+            row = self._synth_planned_row(day, entry)
+        moves = self._relocate_moves(day, [row], delta, allow_past=True)
+        self._apply_relocate(day, moves, delta, later_scope=None,
+                             reason="nostart-postpone")
+        self._relocate_say(day, moves, delta, label="这一场")
+        self._relocate_after(day, moves)
+        return {"target": moves[0]["to"]}
+
+    def _nostart_mark_missed(self, entry, note=None):
+        """这一场算缺失：state 记 missed + 判「已放弃」（daemon 不重订、也不记罪）。"""
+        key = str(entry.get("key")
+                  or psv.session_key(entry.get("date"), entry.get("start")))
+        why = "到点没开始，我选了「不去了」（%s %s）" % (entry.get("date"),
+                                                        entry.get("start"))
+        try:
+            ks.mark_abandoned(key, why="nostart", note=why)
+        except Exception as e:                  # noqa: BLE001 - 记不上也别挡住下一步
+            self.say("⚠ 记「已放弃」失败：%s" % e, "warn")
+        try:
+            ks.mark_slot(key, "missed", note="nostart")
+        except Exception as e:                  # noqa: BLE001
+            self.say("⚠ 记 missed 失败：%s" % e, "warn")
+        return why
+
+    def close_nostart(self, note=None, action="deferred"):
+        """把「没开始」那一问收掉（没收过的记成 deferred，免得下次又弹）。"""
+        prompt, self.nostart = getattr(self, "nostart", None), None
+        if prompt is None:
+            return None
+        if not prompt.closed:
+            try:
+                psv.mark_nostart(prompt.entry.get("key"), action, entry=prompt.entry,
+                                 note=note or "closed")
+            except OSError:
+                pass
+        self.rebuild_rows()
+        self.invalidate()
+        return prompt
+
+    def nostart_panel(self):
+        """「到点没开始」那一问的正文（挂在 repl_kit 的打断栏位里）。"""
+        prompt = self.nostart
+        if prompt is None:
+            return None
+        body = Text()
+        for text, style in prompt.lines():
+            body.append(text + "\n", style=style or None)
+        return Panel(body, title="[bold yellow]🚪 到点没开始[/]",
+                     border_style="yellow", box=box.HEAVY)
 
     def _next_review_entry(self):
         """该收尾的是哪一场 → ``(entry, 是不是本地自己算出来的)``。
@@ -8443,6 +8837,8 @@ class Warden(object):
         """
         if self.pending_import is not None:
             return self.pending_import_panel()
+        if self.nostart is not None:
+            return self.nostart_panel()
         return self.review_panel()
 
     def pending_import_panel(self):
@@ -9777,6 +10173,12 @@ class Warden(object):
             ("task sync", "GET /v1/tasks，把 completedAt 连同 session 写进完成归档"),
             ("cancel N", "取消 #N：草稿区直接删契约；执行区要敲宣言"),
             ("relocate N ±MM", "临时把 #N 提前/推后：不写 data.csv；推后一天一次，且不能跨天"),
+            ("relocate T1 ±MM", "把整个时段里的每场一起挪：相对位置不变、任务跟着走；"
+                                "推后每时段一天一次，和别的场次重叠就拒绝"),
+            ("🚪 到点没开始（p/x/s）",
+             "计划 14:00 那场到 14:05 在 API 里还是没有 → 问一次：p 15 推迟这一场 / "
+             "p T1 15 推迟整个时段 / x 不去了（算缺失，任务交给收尾）/ s 先不管。"
+             "推迟到 14:10 之后作废，直接算缺失"),
             ("mute N on|off", "把 #N 静音；不写 on/off 就是取反"),
             ('title N "文本"', '把 #N 的标题改成文本；title N "" 清空'),
             ("force-check", "忽略重试上限/退避：把所有没订上的 session 各强制重订一次"),
@@ -9925,6 +10327,18 @@ class Warden(object):
         # y/n/q 就不派发任何命令，避免 prompt 被别的操作悄悄丢掉。
         if self.pending_import is not None:
             return self._answer_pending_import(line)
+
+        # 「到点没开始」那一问开着：p / x / s 先给它吃（和收尾互斥，见 _maybe_start_*）。
+        prompt = getattr(self, "nostart", None)
+        if prompt is not None:
+            verdict = prompt.handle(line)
+            action = (verdict or {}).get("action")
+            if action == "dispatch":
+                return None
+            if action == "close" or prompt.closed:
+                self.close_nostart(note=(verdict or {}).get("done") or "answered")
+            self.invalidate()
+            return True
 
         # 收尾进行中：这一行先给收尾吃。延期阶段要用户自己敲转移命令，
         # 所以「dispatch」= 照常派发（派发完 handle() 会回头问收尾一句）。
@@ -10192,12 +10606,13 @@ def parse_relocate_spec(args):
     （这种调用方自己已经有 ID）。
     """
     toks = [str(a).strip() for a in args if str(a).strip()]
-    usage = "用法：relocate N ±MM（MM 是 15 的倍数，如 relocate 3 -15）"
+    usage = ("用法：relocate N ±MM（单场）或 relocate T1 ±MM（整段）；"
+             "MM 是 15 的倍数，如 relocate 3 -15 / relocate T1 +15")
     if len(toks) == 2:
         return toks[0], parse_relocate_offset(toks[1])
     if len(toks) == 1:
-        # 有人会连写成 relocate 1-15 / relocate 1+15。
-        m = re.match(r"^(\d+)([+-]\d+)$", toks[0])
+        # 有人会连写成 relocate 1-15 / relocate 1+15 / relocate T1+15。
+        m = re.match(r"^([Tt]?\d+)([+-]\d+)$", toks[0])
         if m:
             return m.group(1), parse_relocate_offset(m.group(2))
         return None, parse_relocate_offset(toks[0])

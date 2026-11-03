@@ -24,6 +24,9 @@
 ``postsession``
     session 结束 15 秒后把 warden 拉到前台收尾（见 ``postsession.py``）。
 
+``nostart``
+    session 到点 5 分钟还没开始（API 里没有这一场）就问一句：推迟 / 不去了 / 先不管。
+
 这个模块不联网、不依赖 rich；warden 和测试都只调这里。
 """
 from __future__ import annotations
@@ -74,6 +77,17 @@ SETTINGS = [
         "desc": "开着 = 每场结束后 15 秒把 warden 拉到前台，逐个问没做完的任务"
                 "（A 延期 / B 放弃 / C 重议 / D 缺漏完成 / E 快捷推后）；"
                 "off = 不拉、不催（`review` 仍然可以手动开始）。",
+    },
+    {
+        "id": "nostart",
+        "type": "bool",
+        "default": "on",
+        "values": ("on", "off"),
+        "summary": "session 到点 5 分钟还没开始就问你（推迟 / 不去了 / 先不管）",
+        "desc": "开着 = 计划 14:00 的那场到 14:05 在 API 里还是没有，就问你："
+                "p 推迟（14:10 之前有效，可只推这一场或整个时段）/ x 不去了"
+                "（这一场算缺失，挂在这场的任务交给收尾）/ s 先不管；"
+                "off = 不问，到点没有就是没有。",
     },
     {
         "id": "tomorrow-plan",

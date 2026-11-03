@@ -353,10 +353,78 @@ def save_relocations(data, path=None):
     return p
 
 
-def get_later_move(day, relocations=None):
-    """这一天有没有已经用掉「往后挪一次」的额度？返回记录或 None。"""
+def later_move_key(day, scope=None):
+    """「往后挪一次」额度的 key：整天一把（``2026-11-03``），或每个时段一把。
+
+    ``scope=None`` = 单场挪动用的**全天**额度（一天只能往后挪一次，这是原来的规矩）；
+    ``scope="T1"`` = 整段挪动用的**每时段**额度（``2026-11-03|T1``）——
+    整段挪动影响的是 T1 那一串场次，不该顺手把 T2 的额度也吃掉。
+    """
+    iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+    return iso if not scope else "%s|%s" % (iso, scope)
+
+
+def get_later_move(day, relocations=None, scope=None):
+    """这一天（或这一天的某个时段）有没有已经用掉「往后挪一次」的额度？"""
     data = relocations if relocations is not None else load_relocations()
-    return (data.get("later_moves") or {}).get(day.isoformat())
+    return (data.get("later_moves") or {}).get(later_move_key(day, scope))
+
+
+def add_relocations(day, moves, later_scope=None, path=None):
+    """一次落**好几场**临时挪动（``relocate T1 15`` 用）：要么全写，要么一条不写。
+
+    ``moves``：``[{"from": "11:00", "to": "11:15", "duration": 50, "offset": 15}, ...]``
+    ``later_scope``：给定时同时占用这一天的「往后挪一次」额度，额度按它的粒度算
+    （``None`` = 全天一把，``"T1"`` = 每个时段一把）。返回值 = 写进去的记录列表。
+    """
+    data = load_relocations(path)
+    recs = (data.setdefault("relocations", {}))
+    wrote = []
+    stamp = datetime.datetime.now().isoformat(timespec="seconds")
+    for item in moves or []:
+        from_hhmm = item.get("from")
+        to_hhmm = item.get("to")
+        if not from_hhmm or not to_hhmm:
+            raise ValueError("挪动记录要有 from / to：%r" % (item,))
+        rec = {
+            "kind": "temporary",
+            "date": day.isoformat(),
+            "from": from_hhmm,
+            "to": to_hhmm,
+            "duration": str(item.get("duration") or ""),
+            "offset": int(item.get("offset") or 0),
+            "at": stamp,
+        }
+        if item.get("scope"):
+            rec["scope"] = item["scope"]
+        recs[key_of(day, from_hhmm)] = rec
+        wrote.append(rec)
+    if later_scope is not None or wrote:
+        if later_scope is not None:
+            data.setdefault("later_moves", {})[later_move_key(day, later_scope)] = {
+                "key": key_of(day, wrote[-1]["from"]),
+                "from": wrote[-1]["from"],
+                "to": wrote[-1]["to"],
+                "scope": later_scope or "",
+                "count": len(wrote),
+                "at": stamp,
+            }
+    save_relocations(data, path)
+    return wrote
+
+
+def remove_relocations(day, froms, path=None):
+    """一次撤掉好几场临时挪动（整段挪动的回滚用）。返回撤掉的记录列表。"""
+    data = load_relocations(path)
+    recs = data.get("relocations") or {}
+    gone = []
+    for hhmm in froms or []:
+        rec = recs.pop(key_of(day, hhmm), None)
+        if rec is not None:
+            gone.append(rec)
+    if gone:
+        save_relocations(data, path)
+    return gone
 
 
 def add_relocation(day, from_hhmm, to_hhmm, duration, offset=0, later=False, path=None):
@@ -394,9 +462,9 @@ def remove_relocation(day, from_hhmm, path=None):
     data = load_relocations(path)
     key = key_of(day, from_hhmm)
     rec = (data.get("relocations") or {}).pop(key, None)
-    later = (data.get("later_moves") or {}).get(day.isoformat())
+    later = (data.get("later_moves") or {}).get(later_move_key(day))
     if later and later.get("key") == key:
-        data["later_moves"].pop(day.isoformat(), None)
+        data["later_moves"].pop(later_move_key(day), None)
     if rec is not None or later:
         save_relocations(data, path)
     return rec
