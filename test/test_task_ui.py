@@ -1969,6 +1969,67 @@ check("is_exclusive：字符串 false 也是 False", w.th.is_exclusive(
 check("is_exclusive：没写就是 False", w.th.is_exclusive({"fields": {}}), False)
 
 
+print("== formatter end 切割：原来那场被**剪断**，只剩新的一两场 ==")
+# 用户原话：「切出来的 11:30 那场应该导致原来那场 11:00–11:50 的剪断（实际上
+# 就是取消 + 约定一个 25 分钟的）…… 原来的 11:00–11:50 不显示，仅显示新的两场。」
+_TOMORROW = TODAY + datetime.timedelta(days=1)
+_TMR = _TOMORROW.isoformat()
+_data = sp.load_download()
+_data["periods"] = [p for p in (_data.get("periods") or []) if p.get("id") != "T8"]
+_data["periods"].append({"id": "T8", "date": _TMR, "start": "11:00", "end": "12:00",
+                         "type": "工作", "name": "剪断", "calendar": "工作",
+                         "title": "剪断"})
+sp.save_download(_data)
+wd_cut = fresh_warden()
+wd_cut.reload_periods()
+check("明天 T8（11:00–12:00）先按默认排成一场 50 分钟",
+      [(s["start"], s["duration"]) for s in sp.sessions_for_period(
+          [p for p in wd_cut.periods_for_day(_TOMORROW) if p.get("id") == "T8"][0],
+          sp.load_layouts())], [("11:00", 50)])
+# 假设那一场**已经订在 Focusmate 上**了（今天切的话就是这样）：
+wd_cut.bridge.sessions = [{
+    "startMs": 1, "endMs": 2, "startLabel": "11:00", "endLabel": "11:50",
+    "durationMin": 50, "id": "sess-T8-1100", "title": "", "quiet": False,
+    "matched": False, "phase": "未开始", "date": _TMR}]
+wd_cut.bridge.calls = []
+wd_cut.messages = []
+check("task create title=剪断测试 duration=25 -f end date=明天 受理",
+      wd_cut.handle("task create title=剪断测试 duration=25 -f end date=%s" % _TMR), True)
+_cut_task = [t for t in wd_cut.task_store.list()
+             if (t.get("fields") or {}).get("title") == "剪断测试"][0]
+_cut_sess = sp.sessions_for_period(
+    [p for p in wd_cut.periods_for_day(_TOMORROW) if p.get("id") == "T8"][0],
+    sp.load_layouts())
+check("那个时段现在只剩两场：11:00–11:25 + 11:30–11:55",
+      [(s["start"], s["end"], s["duration"]) for s in _cut_sess],
+      [("11:00", "11:25", 25), ("11:30", "11:55", 25)])
+check("原来那场 11:00–11:50 **不在了**",
+      [s["start"] for s in _cut_sess if s["duration"] == 50], [])
+check("排布记的是 [25, 25]（那一天的 T8 被改写）",
+      sp.get_layout(sp.load_layouts(), _TOMORROW, "T8"), [25, 25])
+check("任务挂在切出来的那场（11:30，25 分钟）",
+      [_cut_task["session"]["start"], _cut_task["session"]["duration"]],
+      ["11:30", 25])
+check("截止时间 = 那场终点（明天 11:55）",
+      _cut_task["fields"].get("due"), "%sT11:55:00" % _TMR)
+check("任务是 🔒 独占的", _cut_task["fields"].get("exclusive"), True)
+check("已经订上的旧场真的去 Focusmate 取消了",
+      [c[1].get("meetingId") for c in wd_cut.bridge.calls if c[0] == "cancel"],
+      ["sess-T8-1100"])
+check_true("说清了「剪断成什么」",
+           any("剪断成" in m[2] and "11:00–11:25" in m[2] for m in wd_cut.messages))
+check("data.csv 里那一天也只剩这两行",
+      [l for l in open(sch.DATA_CSV, encoding="utf-8").read().splitlines()
+       if l.startswith(_TMR)],
+      ["%s,11:00,25" % _TMR, "%s,11:30,25" % _TMR])
+check("不用再额外造一次性 session（排布本身就能表达）",
+      [r for r in sp.load_extras()["dates"].get(_TMR, [])], [])
+# 幂等：再排一次什么都不该动
+wd_cut.bridge.calls = []
+wd_cut.handle("task id:%d -f end date=%s" % (_cut_task["id"], _TMR))
+check("再排一次不改排布、不再取消任何场次",
+      [c[0] for c in wd_cut.bridge.calls if c[0] in ("cancel", "add_task")], [])
+
 print("== 独占（exclusive）：一场 session 只能有一条任务 ==")
 wdx = fresh_warden()
 wdx.bridge.sessions = plan_sessions(wdx)

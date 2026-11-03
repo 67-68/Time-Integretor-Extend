@@ -31,7 +31,8 @@
    `task <序号> -m complete|discard` 是**只改本地账本**的手动状态标记（不碰外部）；
    `task <序号> -t <trigger>` / `-f <formatter>` 是具名预设函数框架
    （trigger 默认为空，formatter 有 `end`：在当天最后一段的尾巴上**切一场**
-   任务大小的 session、写进排期并自动 assign，见 `task_hooks.format_end`）；
+   任务大小的 session、把那个时段剪断（原来那场 50 分钟消失）并自动 assign，
+   见 `task_hooks.format_end` / `_cut_period_for_carve`）；
    `task assign` 成功后才写本地，Focusmate 侧 task id / completedAt 都会记回来。
    `task <序号> -e true` 是**独占**：这一场 session 只能有它一条任务
    （`end` 排出来的自动独占；`refresh --check` 发现一场挤了两条就全部下架）。
@@ -4466,12 +4467,15 @@ class Warden(object):
             % (date_iso, start, names))
 
     def _ensure_carved_session(self, day, chosen, task=None):
-        """把 formatter **切出来的那一场**写进当天排期（一次性 session）。
+        """把 formatter **切出来的那一场**作为一次性 session 写进当天排期。
 
-        ``end`` 现在会在「当天最后一段」的尾巴上切一场任务大小的 session
-        （11:00–12:00 的时段 + 25 分钟任务 → 11:30–11:55）。这一场必须真的落进
-        ``temp/session-extras.json`` + data.csv：否则任务挂不上（没有 session id）、
-        daemon 也不会去订它，第二天那段时间就白白空着。
+        这是**兜底**路径：正常的切割走 :meth:`_cut_period_for_carve`（直接改写那个
+        时段的 layout，连旧场一起取消掉）。只有排布表达不了的情况才落到这里 ——
+        切点和「前半截打包完的终点」之间隔着 5/20 分钟（Focusmate 只认 15 分钟
+        整点，填不上），例如 16:45–18:00 的时段要切 17:30 那场。
+
+        这一场必须真的落进 ``temp/session-extras.json`` + data.csv：否则任务挂不上
+        （没有 session id）、daemon 也不会去订它，那段时间就白白空着。
 
         返回 None（没造/不需要）或一句话（造了什么）。
         """
@@ -4497,6 +4501,162 @@ class Warden(object):
         else:
             self.reload_entries()
         return "切出来的 %s %dmin 这一场已经写进当天排期" % (start, duration)
+
+    def _cancel_stale_sessions_for(self, day, period, new_sessions,
+                                  reason="formatter-cut"):
+        """计划里不再包含的**已订上**场次 → 真的去 Focusmate 取消。返回取消掉的行。
+
+        formatter 切出来的场次多半落在未来（草稿区，还没订上），但也有今天就切这种
+        已经订好的 —— 那就得取消，否则 50 分钟的旧场会跟新的 25 分钟并存（用户原话：
+        「实际上就是取消 + 约定一个 25 分钟的」）。
+
+        和 `cmd_period_layout` 那条路同一套顺序：**先**给 daemon 挂 ``expect_cancel``
+        单，再取消，再清 state —— 否则 daemon 下一轮会把 warden 自己干的活记成
+        「用户手动取消」的罪，全局锁死 TUI。
+        """
+        if self.offline:
+            return []
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        keep = set()
+        for sess in new_sessions or []:
+            try:
+                keep.add((str(sess.get("start")), int(sess.get("duration"))))
+            except (TypeError, ValueError):
+                continue
+        stale = []
+        for row in self._snapshot_rows(iso):
+            start = row.get("startLabel")
+            if not start or not row.get("id"):
+                continue
+            if sp.period_for_session([period], start) is None:
+                continue
+            try:
+                dur = int(row.get("durationMin"))
+            except (TypeError, ValueError):
+                dur = None
+            if (str(start), dur) in keep:
+                continue
+            stale.append(row)
+        if not stale:
+            return []
+        try:
+            keys = [sch.key_of(day, row.get("startLabel")) for row in stale]
+        except (ValueError, TypeError):
+            keys = []
+        if keys:
+            ks.expect_cancel(sorted(keys), reason="%s:%s %s"
+                             % (reason, period.get("id"), iso))
+        cancelled = []
+        try:
+            for row in stale:
+                self.say("取消已经订上的旧场 %s–%s（%smin）：切割之后计划里不再包含它…"
+                         % (row.get("startLabel"), row.get("endLabel") or "?",
+                            row.get("durationMin") or "?"), "cmd")
+                try:
+                    res = self.bridge.call("cancel", timeout=180,
+                                           startMs=row.get("startMs"),
+                                           meetingId=row.get("id"))
+                except (BridgeError, KeyError) as e:
+                    self.had_error = True
+                    self.say("❌ 旧场 %s 取消失败：%s（它还在 Focusmate 上）"
+                             % (row.get("startLabel"), e), "error")
+                    continue
+                if not res.get("verified"):
+                    self.had_error = True
+                    self.say("❌ 旧场 %s 取消后复核还在（Focusmate 那边还有这一场）"
+                             % row.get("startLabel"), "error")
+                    continue
+                cancelled.append(row)
+                self.say("✅ 已取消旧场 %s" % row.get("startLabel"), "ok")
+        finally:
+            self._forget_layout_state(cancelled)
+            if cancelled and iso == self.sel_date.isoformat():
+                gone = {r.get("id") for r in cancelled}
+                self.api_rows = [r for r in self.api_rows
+                                 if r.get("id") not in gone]
+        return cancelled
+
+    def _apply_cut_layout(self, day, period, durations):
+        """按 formatter 算出来的时长序列重排这个时段（可能不是选中的那天）。
+
+        顺序照抄 `cmd_period_layout`：先取消计划里不再包含的旧 API session，再写
+        layout，再清掉动过的场次上的任务绑定，最后重算 data.csv —— 反过来的话
+        daemon 会在缝隙里把旧的 50 分钟场订回来。
+        """
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        period_id = period.get("id")
+        new_sessions = sp.plan_period(period, durations or sp.default_durations(period))
+        cancelled = self._cancel_stale_sessions_for(day, period, new_sessions)
+        if durations:
+            sp.set_layout(day, period_id, durations)
+        else:
+            sp.remove_layout(day, period_id)
+        dropped = self.clear_task_bindings_for_layout(period, new_sessions)
+        self.reload_periods()
+        self.rewrite_data_csv_from_plan()
+        self.reload_entries()
+        body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
+                         for s in new_sessions) or "（这个时段当天不排了）"
+        self.say("✂ %s %s 的排布剪断成：%s —— 原来那场不再存在"
+                 % (iso, period_id, body), "ok")
+        if cancelled:
+            self.say("   已在 Focusmate 取消 %d 场旧 session（计划里不再包含它们）。"
+                     % len(cancelled), "info")
+        if dropped:
+            self.say("   有 %d 条任务因为那几场没了而下架（任务本身还在，"
+                     "`task <序号> -f end` 可以重新排）。" % len(dropped), "warn")
+        return body
+
+    def _cut_period_for_carve(self, day, chosen, task=None):
+        """把 `end` 切出来的那一场**钉进当天排期**：原来那场剪断，只留新的一两场。
+
+        用户原话：「切出来的 11:30 那场应该导致原来那场 11:00–11:50 的剪断（实际上
+        就是取消 + 约定一个 25 分钟的）…… 原来的 11:00–11:50 不显示，仅显示新的两场。」
+
+        所以这里不玩「两场并存 + 警告」，直接把那个时段的**当天排布**改成
+        「前半截 + 切出来的这一场」：
+
+            11:00–12:00 的时段、原来一场 50 分钟、任务 25 分钟
+            → 11:00–11:25（空着）+ 11:30–11:55（这一场）
+
+        排布表达不了时（例如前半截打完包，最后一场落在 11:25，而切割点是 11:30
+        —— Focusmate 只认 15 分钟整点，中间那 5 分钟没法用一场 session 填），就
+        只把前半截写进 layout，切出来的那场单独作为**一次性 session** 补上。
+        """
+        day = day if hasattr(day, "isoformat") else self.sel_date
+        iso = day.isoformat()
+        period_id = chosen.get("cut_period_id")
+        start = str(chosen.get("start") or "").strip()
+        fit = int(chosen.get("duration") or 0)
+        prefix = [int(d) for d in (chosen.get("cut_prefix") or [])]
+        period = None
+        for probe in self.periods_for_day(day):
+            if probe.get("id") == period_id:
+                period = probe
+                break
+        if period is None or not start or fit <= 0:
+            # 没有时段信息（比如 data.csv 手写模式）：退回「只补一场」的老路。
+            return self._ensure_carved_session(day, chosen, task=task)
+
+        try:
+            planned = sp.plan_period(period, prefix + [fit])
+        except ValueError:
+            planned = []
+        exact = bool(planned) and str(planned[-1]["start"]) == start
+        durations = (prefix + [fit]) if exact else prefix
+
+        current = sp.get_layout(self.layouts, day, period_id)
+        if current is None:
+            current = sp.default_durations(period)
+        current = [int(d) for d in (current or [])]
+        if [int(d) for d in durations] != current:
+            self._apply_cut_layout(day, period, durations)
+        if exact:
+            body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
+                             for s in planned)
+            return "时段 %s 已经剪断成 %s" % (period_id, body)
+        return (self._ensure_carved_session(day, chosen, task=task)
+                or "时段 %s 的前半截留在 %s" % (period_id, iso))
 
     def _apply_formatter(self, result, spec, action):
         """``-f/--formatter`` 的收尾：记下 preset，并**当场调用它**。
@@ -4659,14 +4819,22 @@ class Warden(object):
                 % (spec.get("name"), day.isoformat(), chosen.get("start"), names))
 
         # `end` 会把「当天最后一段」的尾巴**切一场任务大小的 session** 出来
-        # （11:00–12:00 的时段 + 25 分钟任务 → 11:30–11:55）。切出来的这一场当天
-        # 可能还不存在（时段本来那场是 50 分钟的），先把它写进排期，任务才挂得上、
-        # daemon 才会去订它。
+        # （11:00–12:00 的时段 + 25 分钟任务 → 11:30–11:55），并**剪断**那个时段：
+        # 原来那场 50 分钟会真的被取消/从计划里拿掉，只剩「前半截 + 这一场」。
         carved_note = None
         if chosen.get("carved") and not chosen.get("existing"):
-            carved_note = self._ensure_carved_session(day, chosen, task=task)
+            if chosen.get("cut_period_id"):
+                carved_note = self._cut_period_for_carve(day, chosen, task=task)
+            else:
+                carved_note = self._ensure_carved_session(day, chosen, task=task)
             if carved_note:
                 sessions = self._formatter_sessions(day)
+            try:
+                # 剪断可能把我们这条任务（或它那一场）的绑定清掉了，重读一遍再判断
+                # 「原来挂在哪」—— 否则会对着一个已经不存在的绑定再下架一次。
+                task = self.task_store.get(task["id"])
+            except (ValueError, TypeError):
+                pass
 
         # 选中 session 的 Focusmate 身份：未来那天可能已经订好了，也可能还没有。
         hour, minute = map(int, chosen["start"].split(":"))
@@ -4700,7 +4868,8 @@ class Warden(object):
             notes = ""
             if carved_note:
                 notes += "；" + carved_note
-            conflicts = [str(s) for s in (out.get("conflicts") or []) if s]
+            conflicts = [] if chosen.get("cut_period_id") else \
+                [str(s) for s in (out.get("conflicts") or []) if s]
             if conflicts:
                 notes += ("；⚠ 你原来排的 %s 那场还在，跟这一场时间上重叠了 —— "
                           "不想留它：`period %s 25` 重排这个时段，"
@@ -6706,6 +6875,25 @@ class Warden(object):
 
     # -- 收尾用的几个动作（收尾和命令共用同一套，不写两遍）--------------
 
+    def _snapshot_rows(self, iso):
+        """某一天的 Focusmate 场次快照（带缓存；拉不到就是空列表，不抛）。
+
+        ``session_info_for`` 和 formatter 的「剪断」都要按**那一天**（可能不是当前
+        选中的那天）去问外面世界，所以独立成一处，别各写一份缓存逻辑。
+        """
+        cache = getattr(self, "_snapshot_cache", None)
+        if cache is None:
+            cache = self._snapshot_cache = {}
+        rows = cache.get(iso)
+        if rows is None:
+            try:
+                res = self.bridge.call("snapshot", timeout=180, date=iso)
+                rows = res.get("sessions") or []
+            except BridgeError:
+                rows = []
+            cache[iso] = rows
+        return rows
+
     def session_info_for(self, day, slot):
         """`(date, slot)` → 一场 session 的完整信息（含 Focusmate id，尽力而为）。"""
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
@@ -6726,18 +6914,7 @@ class Warden(object):
             pass
         if self.offline:
             return info
-        cache = getattr(self, "_snapshot_cache", None)
-        if cache is None:
-            cache = self._snapshot_cache = {}
-        rows = cache.get(iso)
-        if rows is None:
-            try:
-                res = self.bridge.call("snapshot", timeout=180, date=iso)
-                rows = res.get("sessions") or []
-            except BridgeError:
-                rows = []
-            cache[iso] = rows
-        for row in rows:
+        for row in self._snapshot_rows(iso):
             if row.get("startLabel") == slot.get("start") and row.get("id"):
                 info["focusmate_session_id"] = row["id"]
                 info["startMs"] = row.get("startMs")

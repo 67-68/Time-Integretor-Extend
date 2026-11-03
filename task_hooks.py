@@ -31,9 +31,13 @@ formatter
 ---------
 当前只有 ``end``：取**当天最后一个还有空位的时段**，在它的尾巴上**切一场任务
 大小的 session**（时长取 Focusmate 真能订的 25/50/75，起点落 15 分钟整点），
-把「时长 + 5 分钟休息」标成 reserved，后续 formatter 不会再用它。切出来那场
-当天没有的话，调用方（``warden._ensure_carved_session``）会把它当成额外的一场
-一次性 session 写进排期 —— 这一层只管算，不写盘。
+把「时长 + 5 分钟休息」标成 reserved，后续 formatter 不会再用它。
+
+这一层**只管算、不写盘**：切完把「那个时段的前半截该长什么样」（``cut_prefix``）
+和「切出来的这一场」（``session``）一起交出去，由 warden 去剪断排布
+（``_cut_period_for_carve``：取消旧的 50 分钟场 + 改写 layout + 重算 data.csv）。
+排布表达不了的边角（中间隔了 5/20 分钟那种）才额外补一场一次性 session
+（``warden._ensure_carved_session``）。
 
 独占（``exclusive``）也在这里落地：:func:`collect_reservations` 会把独占任务的
 占用扩展成**整场** session，所以「一场 session 只能有一条任务」不是靠各处的
@@ -453,9 +457,10 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
        的那个（Focusmate 只卖这三档），起点往下取整到 15 分钟整点，再留
        ``break_minutes`` 分钟休息 —— 11:00–12:00 的时段、25 分钟任务 ⇒
        切出 11:30–11:55（占用写 11:30–12:00）；
-    3. 切出来的那场如果和已有 session 同起点就复用那一场（``session["existing"]``），
-       否则 ``new_session`` 为真 —— 调用方要把它当成**当天额外的一场**写进排期，
-       任务才挂得上、Focusmate 才订得了。
+    3. 切出来的那场如果和已有 session 同起点、**同时长**就复用（``existing``，
+       排布一个字都不用改），否则 ``new_session`` 为真，调用方要**剪断**那个时段：
+       ``cut_prefix`` 是「整场都在切点之前」的那些场次（再用 50→25 把缝补上），
+       于是原来那场 50 分钟会消失，当天只剩「11:00–11:25 + 11:30–11:55」两场。
 
     同一时段里**不是最后一场**的 session 仍按老口径：任务从这场起点开始占
     「时长 + 休息」，绝不越过这场去抢下一场的时间。所以同一天多条任务各有各的
@@ -517,6 +522,7 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
         if sess_duration is None:
             sess_duration = sess_end - sess_start
         tail = bool(pid) and pid in period_range and last_start.get(pid) == sess_start
+        cut_prefix = None
         if tail:
             # 时段尾巴：窗口尾 = 时段终点（「切割」就从这儿往回量）。
             window_end = int(period_range[pid][1])
@@ -527,6 +533,31 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
                 carve_start = grid_floor(int(sess_end) - int(fit))
                 if carve_start < int(sess_start):
                     continue
+            # 「剪断」用的前半截：这个时段里**整场都在 carve_start 之前**的那些
+            # （它们是排布的前缀，重新打包位置不变），再用默认口味（50 → 25）把
+            # 缝补上 —— 这样 11:00–11:30 的空档会变成一场 11:00–11:25，而不是
+            # 白白空着、也不是留着原来那场 50 分钟的。
+            kept = []
+            for other in sessions:
+                if other.get("period_id") != pid:
+                    continue
+                span = _range_of(other)
+                if span is None or span[1] > carve_start:
+                    continue
+                dur = parse_minutes(other.get("duration"))
+                kept.append((span[0], int(dur) if dur else span[1] - span[0]))
+            kept.sort()
+            cut_prefix = [dur for _start, dur in kept]
+            cursor = kept[-1][0] + kept[-1][1] if kept else lower
+            for _round in range(12):                      # 保险丝：最多补 12 场
+                begin = cursor + (-cursor % 15)           # 往上取整到整点 :00/:15/:30/:45
+                for size in (50, 25):
+                    if begin + size <= carve_start:
+                        cut_prefix.append(size)
+                        cursor = begin + size
+                        break
+                else:
+                    break
         else:
             # 同一天更早的场次：占这一场的开头（绝不越过下一场）。
             if int(fit) > sess_duration:
@@ -543,6 +574,8 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
             "session_duration": int(fit),
             "session": session,
             "tail": tail,
+            "cut_prefix": cut_prefix,
+            "period_id": pid,
         })
     if not candidates:
         raise HookError(
@@ -560,13 +593,19 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
     source = pick["session"]
     source_range = _range_of(source) or (carved_start, carved_start)
 
-    # 已经有同起点的 session（比如时段本来就排成 25+25）就复用它，不重复造一场。
+    # 已经有同起点、而且**时长也正好**的 session（比如时段本来就排成 25+25）就复用，
+    # 不动排期；同起点但时长不一样（50 分钟的场里切 25 分钟）仍要剪断。
     existing = None
     for session in sessions:
         got = _range_of(session)
-        if got is not None and got[0] == carved_start:
+        if got is None or got[0] != carved_start:
+            continue
+        dur = parse_minutes(session.get("duration"))
+        if dur is None:
+            dur = got[1] - got[0]
+        if int(dur) == int(session_duration):
             existing = session
-            break
+        break
 
     # 切出来的这段和哪些已有 session 时间上重叠（多半是那个时段原来那场大 session）：
     # 调用方要把它说给用户听，别让「11:00–11:50」和「11:30–11:55」静悄悄叠在一起。
@@ -611,9 +650,15 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
         "carved": True,
         "existing": existing is not None,
         "source_start": source.get("start"),
+        # 尾巴上的切割要**剪断**那个时段：前半截（整场都在 carve_start 之前的场次）
+        # 保留、原来那场消失、然后接上切出来的这一场。调用方拿这两个字段去重排。
+        "cut_period_id": pick["period_id"] if pick["tail"] else None,
+        "cut_prefix": list(pick["cut_prefix"] or []) if pick["tail"] else [],
     }
     return {"name": "end", "reservation": reservation, "session": session,
             "new_session": existing is None,
+            "cut_period_id": session["cut_period_id"],
+            "cut_prefix": session["cut_prefix"],
             "carved_from": fmt_minutes(source_range[0]),
             "conflicts": [s.get("start") for s in conflicts],
             "created_at": _now()}
