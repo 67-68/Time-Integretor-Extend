@@ -31,8 +31,10 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
      │                                  └── Playwright ──> 常驻 Chromium
      │                                      └── 内部 API（PUT/DELETE，裸 Firebase token）
      │
-     ├──5) repl_kit.jobs：单 worker 串行网络队列（读异步 / 写乐观 / 失败可重放）
-     │      面板画在看板（Recent）下面：标题里有进度条，日志只留三行，干完消失
+     ├──5) repl_kit.jobs：单 worker 串行**外部操作**队列（读异步 / 写乐观 / 失败可重放）
+     │      覆盖 Focusmate(bridge) / OmniFocus(osascript) / keep_session / 日历同步
+     │      面板画在看板（Recent）下面：标题是这次操作、进度条在标题里、
+     │      步骤编号 + [omnifocus]/[focusmate] 标签，日志只留三行，干完消失
      │      失败 → 回滚本地 + 警告 + data/failed-actions.json → `re-action` 重放
      │      细节见 feature_intents/network.md
      │

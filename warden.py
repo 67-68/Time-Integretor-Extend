@@ -128,9 +128,13 @@ warden 只提供内容。
        ├── 子进程 ──> omnifocus.py → omnifocus_tasks.py → osascript → OmniFocus
        │              （读状态 / 写回完成与截止时间；**单向**，见 docs/omnifocus.md）
        ├── stats.py ──> 只读公开 API（/v1/me + /v1/sessions 分块拉全量历史）→ 统计视图
-       └── 网络队列 repl_kit.jobs（单 worker 串行）：读操作异步、写操作乐观。
-           面板挂在看板（Recent）**下面**：进度条在标题里、日志只留三行，干完消失；
-           失败 → 回滚本地 + 警告 + 记进 data/failed-actions.json，`re-action` 重放。
+       └── 外部操作队列 repl_kit.jobs（单 worker 串行）：**只要不是软件内部自己
+           完成的事**都走这儿 —— Focusmate（bridge）、OmniFocus（osascript）、
+           keep_session 子进程、日历同步。读异步、写乐观。
+           面板挂在看板（Recent）**下面**：标题是这次操作（`import 任务（task import -a 1）`）、
+           进度条在标题里、步骤编号 + [omnifocus]/[focusmate] 标签、日志只留三行，
+           干完消失；失败 → 回滚本地 + 警告 + 记进 data/failed-actions.json，
+           `re-action` 重放。
 
 - 写操作（mute / title / cancel）全部走 bridge（内部 API，见 docs/…-notes.md）。
 - daemon 的启停、`session` 之后的立刻下单，都走 keep_session.py 子进程
@@ -289,6 +293,16 @@ FRESH_TASK = 15 * 60
 
 #: focusmate 里「乐观预测、还没落地」的标记（任务库里的一个字段）
 FM_PENDING = "pending"
+
+#: 「这件事已经排进后台队列了」——同步写法里本该返回结果的地方返回它，
+#: `cmd_task` / `handle` 见到就知道后缀已经交给后台那半件事了。
+NET_PENDING = "__net_pending__"
+
+#: 面板上 `[…]` 里的那几个标签：谁在外面干活。
+SRC_FOCUSMATE = "focusmate"
+SRC_OMNIFOCUS = "omnifocus"
+SRC_KEEP = "keep_session"
+SRC_CALENDAR = "calendar"
 
 # 契约表格 task 列里的每条任务：「1: 任务… | 3: 任务…」。
 # 每条标题单独裁到 TASK_CELL_TITLE_MAX 个字（后面的内容 trim 掉），
@@ -2425,6 +2439,30 @@ class Warden(object):
         """worker 线程只说一句「画面脏了」。业务状态一律留给主线程。"""
         self._net_dirty = True
 
+    def net_action(self, name, label, args=None, source=SRC_FOCUSMATE):
+        """一条可重放的外部动作。``source`` 决定面板上的 ``[focusmate]`` 这种标签。"""
+        return repl_kit.Action(name, label, dict(args or {}), source=source)
+
+    def op_keep_session(self, argv, label, timeout=600, wait=False, on_ok=None):
+        """跑一次 keep_session.py（下单/对账/启停 daemon）—— 走后台队列。
+
+        ``wait=True`` 是给「对账」这种必须先有结果的流程用的（会等这一批落地）。
+        """
+        action = self.net_action("keep_session.run", label,
+                                 {"argv": [str(a) for a in argv],
+                                  "timeout": int(timeout)}, source=SRC_KEEP)
+        job = self.jobs.submit(action, on_ok=on_ok)
+        if wait:
+            self.wait_net(timeout + 60)
+        return job
+
+    def op_calendar(self, argv, label, timeout=300, on_ok=None):
+        """跑一次 download_calendar.py（日历 → data.csv）—— 走后台队列。"""
+        action = self.net_action("calendar.sync", label,
+                                 {"argv": [str(a) for a in argv],
+                                  "timeout": int(timeout)}, source=SRC_CALENDAR)
+        return self.jobs.submit(action, on_ok=on_ok)
+
     def drain_net(self):
         """每帧一次：把后台跑完的网络操作搬回主线程（成功/失败回调都在这里跑）。"""
         outcomes = self.jobs.drain()
@@ -2453,6 +2491,22 @@ class Warden(object):
                            apply=self._apply_session_mute)
         self.jobs.register("session.title", self.net_session_title,
                            apply=self._apply_session_title)
+        # ── OmniFocus（osascript 子进程：同样不属于「软件内部自己完成」）──
+        self.jobs.register("omnifocus.list", self.net_omnifocus_list,
+                           apply=self._apply_omnifocus_list)
+        self.jobs.register("omnifocus.import", self.net_omnifocus_import,
+                           apply=self._apply_omnifocus_import)
+        self.jobs.register("omnifocus.complete", self.net_omnifocus_complete,
+                           apply=self._apply_omnifocus_complete)
+        self.jobs.register("omnifocus.drop", self.net_omnifocus_drop,
+                           apply=self._apply_omnifocus_drop)
+        self.jobs.register("omnifocus.writeback", self.net_omnifocus_writeback,
+                           apply=self._apply_omnifocus_writeback)
+        # ── 别的进程：keep_session（下单/对账/daemon）与日历同步 ──
+        self.jobs.register("keep_session.run", self.net_keep_session,
+                           apply=self._apply_keep_session)
+        self.jobs.register("calendar.sync", self.net_calendar_sync,
+                           apply=self._apply_calendar_sync)
         # 重放的时候没有当初那个闭包了 —— 失败仍然要有人说话
         self.jobs.on_failure = self._net_action_failed
 
@@ -2579,6 +2633,145 @@ class Warden(object):
         rep.progress(1.0)
         rep.log("%s 标题已写入" % (args.get("start") or "?"), "ok")
         return {"title": args.get("title") or ""}
+
+    # -- worker 侧：OmniFocus（osascript）-----------------------------
+
+    def net_omnifocus_list(self, args, rep):
+        """读一遍 OmniFocus 任务列表。**读**操作。"""
+        rep.label("读 OmniFocus")
+        rep.progress(0.1)
+        rows = self.omnifocus.list_tasks(refresh=bool(args.get("refresh")))
+        rep.progress(1.0)
+        rep.log("OmniFocus %d 条" % len(rows or []), "ok")
+        return {"rows": rows or []}
+
+    def net_omnifocus_import(self, args, rep):
+        """``task import`` 的第 1 步：读 OmniFocus 补齐标题/时长 + 核对重复设置。
+
+        **读**操作（一次 list + 每条一次 repetition_info）。真正的建任务、
+        去重、问「复制重复设置吗」都在主线程那半件事里（见
+        :meth:`_apply_omnifocus_import`）。
+        """
+        items = [dict(item) for item in (args.get("items") or []) if item]
+        single_task = bool(args.get("single_task"))
+        rep.label("获取任务（OmniFocus）")
+        rep.progress(0.1)
+        items = self._task_import_resolve(items, warn=lambda text, kind="warn":
+                                          rep.log(text, kind))
+        rep.progress(0.5)
+        repeats, warnings = {}, []
+        checker = None if single_task else getattr(self.omnifocus, "repetition_info", None)
+        for index, item in enumerate(items):
+            if not item or not item.get("id") or checker is None:
+                continue
+            try:
+                info = checker(item["id"])
+            except Exception as e:                  # noqa: BLE001 - 核对不了就按普通任务导
+                warnings.append("没法核对「%s」是不是重复任务：%s（先按普通任务导入）"
+                                % (item.get("title") or item.get("id"), e))
+                continue
+            plan = task_repeat_plan_from_omnifocus(
+                info, sessions_for_day=self.sessions_for_day_plan)
+            if plan is not None:
+                repeats[index] = {"info": info, "plan": plan}
+            rep.progress(0.5 + 0.5 * (index + 1) / max(1, len(items)))
+        rep.log("拿到 %d 条%s" % (len(items),
+                                 ("，其中 %d 条是重复任务" % len(repeats)) if repeats else ""),
+                "ok")
+        return {"items": items, "repeats": repeats, "warnings": warnings}
+
+    def net_omnifocus_complete(self, args, rep):
+        """写回完成 + 截止时间。**写**操作（乐观：本地先记 writeback）。"""
+        pk = str(args.get("pk") or "")
+        rep.label("OmniFocus 完成 %s" % pk[:8])
+        rep.progress(0.1)
+        res = self.omnifocus.complete(pk, at=args.get("at"), due=args.get("due"),
+                                      yes=True)
+        after = res.get("after") if isinstance(res, dict) else None
+        advanced = bool(isinstance(res, dict) and res.get("repeat_clone_id")
+                        and str(res.get("repeat_clone_id")) != pk)
+        if isinstance(after, dict) and not after.get("completed") and not advanced:
+            raise ValueError("写完复核 completed 仍为 false（pk %s）" % pk)
+        rep.progress(1.0)
+        rep.log("OmniFocus %s 完成写回%s" % (pk[:8], "（重复任务已翻篇）" if advanced else ""),
+                "ok")
+        return {"pk": pk, "res": res or {}, "advanced": advanced}
+
+    def net_omnifocus_drop(self, args, rep):
+        """写回放弃。**写**操作。"""
+        pk = str(args.get("pk") or "")
+        rep.label("OmniFocus 放弃 %s" % pk[:8])
+        rep.progress(0.1)
+        res = self.omnifocus.drop(pk, at=args.get("at"),
+                                  all_occurrences=bool(args.get("all_occurrences")),
+                                  yes=True)
+        after = res.get("after") if isinstance(res, dict) else None
+        advanced = bool(isinstance(res, dict) and res.get("repeat_clone_id")
+                        and str(res.get("repeat_clone_id")) != pk)
+        if isinstance(after, dict) and not after.get("dropped") and not advanced:
+            raise ValueError("写完复核 dropped 仍为 false（pk %s）" % pk)
+        rep.progress(1.0)
+        rep.log("OmniFocus %s 已放弃" % pk[:8], "ok")
+        return {"pk": pk, "res": res or {}, "advanced": advanced}
+
+    def net_omnifocus_writeback(self, args, rep):
+        """把「Focusmate 说完成了」的那几条一次性写回 OmniFocus。**写**操作。
+
+        一条一次子进程，所以进度是「第几条 / 共几条」；单条失败不挡其余。
+        """
+        task_ids = [int(t) for t in (args.get("task_ids") or [])]
+        done, failed = [], []
+        rep.label("写回 OmniFocus（%d 条）" % len(task_ids))
+        for index, task_id in enumerate(task_ids, 1):
+            try:
+                task = self.task_store.get(task_id)
+            except (ValueError, TypeError):
+                continue
+            pk = ts.TaskStore.omnifocus_id(task)
+            if not pk:
+                continue
+            rep.progress(index / max(1, len(task_ids)))
+            try:
+                res = self.omnifocus.complete(pk, at=None,
+                                              due=self.omni_due_of(task) or None, yes=True)
+            except of.OmniFocusError as exc:
+                failed.append((task_id, str(exc)))
+                rep.log("任务 %s 写回失败：%s" % (task_id, exc), "warn")
+                continue
+            done.append({"task_id": task_id, "pk": pk, "res": res or {}})
+            rep.log("任务 %s → OmniFocus %s" % (task_id, pk[:8]), "ok")
+        if not done and failed:
+            raise ValueError("全部写回失败：%s" % failed[0][1])
+        return {"done": done, "failed": failed}
+
+    # -- worker 侧：别的进程（keep_session / 日历）---------------------
+
+    def net_keep_session(self, args, rep):
+        """跑一次 ``keep_session.py``（下单/对账/启停 daemon）。**外部**操作。"""
+        argv = [str(a) for a in (args.get("argv") or [])]
+        rep.label("keep_session %s" % (" ".join(argv) or "check"))
+        rep.progress(0.1)
+        rc, out, err = run_keep_session(*argv, timeout=int(args.get("timeout") or 600))
+        rep.progress(1.0)
+        if rc != 0:
+            raise ValueError("keep_session %s 退出码 %d：%s"
+                             % (" ".join(argv), rc, (err or out or "").strip()[:200]))
+        rep.log("keep_session %s 完成" % (" ".join(argv) or "check"), "ok")
+        return {"rc": rc, "out": out, "err": err, "argv": argv}
+
+    def net_calendar_sync(self, args, rep):
+        """跑 ``download_calendar.py``（日历 → data.csv）。**外部**操作。"""
+        argv = [str(a) for a in (args.get("argv") or ["download"])]
+        rep.label("日历 %s" % " ".join(argv))
+        rep.progress(0.1)
+        rc, out, err = run_download_calendar(*argv,
+                                            timeout=int(args.get("timeout") or 300))
+        rep.progress(1.0)
+        if rc != 0:
+            raise ValueError("download_calendar %s 退出码 %d：%s"
+                             % (" ".join(argv), rc, (err or out or "").strip()[:200]))
+        rep.log("日历 %s 完成" % " ".join(argv), "ok")
+        return {"rc": rc, "out": out, "err": err, "argv": argv}
 
     # -- 主线程侧：成功之后把本地落定（apply）--------------------------
 
@@ -2753,6 +2946,151 @@ class Warden(object):
         self.rebuild_rows()
         self.invalidate()
         return True
+
+    def _apply_omnifocus_import(self, payload, args):
+        """第 1 步回来了：去重 → （可能要问重复设置）→ 建本地任务 → 套后缀。
+
+        「套后缀」就是 ``task import -a 3`` 里的 ``-a 3`` —— 它会**再排一步**
+        （``[focusmate] 挂任务``），所以一次 import 在面板上就是两步。
+        """
+        payload = payload or {}
+        items = payload.get("items") or []
+        repeats = {int(k): v for k, v in (payload.get("repeats") or {}).items()}
+        warnings = payload.get("warnings") or []
+        suffix = dict(args.get("suffix") or {})
+        skipped = []
+        # 「已经导入过」只在**批量**里跳过：一次选十条里混着上个月的旧条目才是误伤；
+        # 单条导入是「我就要这条」的明确动作（再来一条同名关联是合法用法）。
+        if len(items) > 1:
+            items, skipped = self._task_import_skip_known(items)
+            if skipped and items:
+                self.say("📥 跳过已经导入过的 %d 条：%s"
+                         % (len(skipped), "、".join("%s→任务 %s" % (pk, tid)
+                                                   for pk, tid in skipped)), "info")
+        if not items:
+            detail = "、".join("%s → 任务 %s" % (pk, tid) for pk, tid in skipped)
+            self.say("📥 这一批都已经导入过了（%s）；没有新建任何任务。" % detail
+                     if detail else "📥 这一批没有可导入的条目。", "warn")
+            self.jobs.end()
+            return None
+        if repeats:
+            self._last_import_result = IMPORT_PENDING
+            self.pending_import = {"items": items, "repeats": repeats,
+                                   "warnings": [], "suffix": suffix}
+            titles = "、".join((items[i] or {}).get("title") or (items[i] or {}).get("id")
+                               or "?" for i in sorted(repeats))
+            self.say("📥 发现 OmniFocus 重复任务：%s —— 先确认要不要复制重复设置，"
+                     "还没建本地任务。" % titles, "cmd")
+            self.invalidate()
+            self.jobs.end()          # 等用户答 y/n，这一次操作到此为止
+            return IMPORT_PENDING
+        task = self._finish_task_import(items, copy_repeat=False, repeats={},
+                                        warnings=warnings)
+        if suffix:
+            try:
+                task = self._apply_import_suffix(task, suffix) or task
+            except Exception as e:                  # noqa: BLE001 - 建好了但没套上后缀
+                self.had_error = True
+                self.say("⚠ 任务导入建好了，但后缀（%s）没套上：%s"
+                         % (self._suffix_summary(suffix).strip() or "?", e), "error")
+        # 同步模式（--exec / 测试）里 cmd_task_import 要把「建出来的任务」还给
+        # 调用方；异步模式没人等这个返回值（后缀已经在上面套完了）。
+        self._last_import_result = task
+        return task
+
+    def _apply_omnifocus_list(self, payload, args):
+        """读到了：把行塞进 client 的缓存，调用方自己取（import / 对账用）。"""
+        rows = (payload or {}).get("rows") or []
+        try:
+            self.omnifocus.remember_rows(rows)
+        except Exception:                       # noqa: BLE001 - 老版本/替身没有这个方法
+            pass
+        self.invalidate()
+        return rows
+
+    def _apply_omnifocus_complete(self, payload, args):
+        payload = payload or {}
+        task_id = args.get("task_id")
+        try:
+            task = self.task_store.get(task_id)
+        except (ValueError, TypeError):
+            return None
+        advanced, moved = self._omni_repeat_advance(task, payload.get("pk") or "",
+                                                   payload.get("res") or {})
+        try:
+            self.task_store.set_omnifocus_writeback(task["id"], "completed")
+        except ValueError:
+            pass
+        self.say("✅ OmniFocus %s 完成写回%s"
+                 % (str(payload.get("pk") or "")[:8],
+                    self._omni_repeat_note(advanced, (payload.get("res") or {})
+                                          .get("repeat_clone_id"), moved)), "ok")
+        self.invalidate()
+        return task["id"]
+
+    def _apply_omnifocus_drop(self, payload, args):
+        payload = payload or {}
+        task_id = args.get("task_id")
+        try:
+            task = self.task_store.get(task_id)
+        except (ValueError, TypeError):
+            return None
+        advanced, moved = self._omni_repeat_advance(task, payload.get("pk") or "",
+                                                   payload.get("res") or {})
+        try:
+            self.task_store.set_omnifocus_writeback(task["id"], "dropped")
+        except ValueError:
+            pass
+        self.say("✅ OmniFocus %s 已放弃%s"
+                 % (str(payload.get("pk") or "")[:8],
+                    self._omni_repeat_note(advanced, (payload.get("res") or {})
+                                          .get("repeat_clone_id"), moved)), "ok")
+        self.invalidate()
+        return task["id"]
+
+    def _apply_omnifocus_writeback(self, payload, args):
+        payload = payload or {}
+        for item in payload.get("done") or []:
+            try:
+                self.task_store.set_omnifocus_writeback(int(item["task_id"]),
+                                                        "completed")
+            except (ValueError, TypeError):
+                pass
+        count = len(payload.get("done") or [])
+        failed = payload.get("failed") or []
+        if count:
+            self.say("✅ OmniFocus 写回 %d 条完成%s"
+                     % (count, ("；%d 条失败" % len(failed)) if failed else ""),
+                     "ok" if not failed else "warn")
+        self.invalidate()
+        return count
+
+    def _apply_keep_session(self, payload, args):
+        payload = payload or {}
+        out = (payload.get("out") or "").strip()
+        for line in out.splitlines()[-6:]:
+            if line.strip():
+                self.say(line.strip()[:160], "info")
+        self.forget_caches()
+        self.invalidate()
+        return payload.get("rc")
+
+    def _apply_calendar_sync(self, payload, args):
+        payload = payload or {}
+        argv = payload.get("argv") or []
+        verb = str(argv[0]).lower() if argv else "download"
+        out = (payload.get("out") or "").strip()
+        for line in out.splitlines()[-6:]:
+            if line.strip():
+                self.say(line.strip()[:160], "info")
+        if verb == "populate":
+            self.say("✅ data.csv 已同步（下载层 → 时段 layout → 精确日期契约）。", "ok")
+        else:
+            self.say("✅ 日历已下载到中间层（工作/空闲）。", "ok")
+        self.reload_entries()
+        self.refresh(quiet=True)
+        self.invalidate()
+        return payload.get("rc")
 
     def _net_action_failed(self, action, error):
         """没有专属失败钩子的失败（重放时的就是这种）：说话 + 记账就够了。"""
@@ -3420,7 +3758,7 @@ class Warden(object):
 
         拿到历史之后算数字在主线程做（纯 CPU，见 :meth:`_apply_stat_history`）。
         """
-        action = repl_kit.Action("stat.history", "拉生涯统计",
+        action = self.net_action("stat.history", "拉生涯统计",
                                  {"force": bool(force), "full": bool(full)})
         job = self.jobs.submit(action, persist=False,
                                on_fail=lambda error: self._stat_failed(error))
@@ -3528,7 +3866,7 @@ class Warden(object):
             if not self.rows:
                 self._fallback_rows("离线模式")
             return False
-        action = repl_kit.Action("session.snapshot",
+        action = self.net_action("session.snapshot",
                                  "拉 session %s" % day.strftime("%m-%d"),
                                  {"date": day.isoformat(), "timeout": int(timeout)})
         job = self.jobs.submit(
@@ -4312,7 +4650,7 @@ class Warden(object):
         self._patch_api_row(row["id"], quiet=want)
         self.rebuild_rows()
         self.invalidate()
-        action = repl_kit.Action("session.mute",
+        action = self.net_action("session.mute",
                                  "quiet %s %s" % (row["startLabel"], "ON" if want else "off"),
                                  {"date": self.sel_date.isoformat(),
                                   "start": row["startLabel"],
@@ -4344,7 +4682,7 @@ class Warden(object):
         self._patch_api_row(row["id"], title=title)
         self.rebuild_rows()
         self.invalidate()
-        action = repl_kit.Action("session.title",
+        action = self.net_action("session.title",
                                  "写标题 %s %r" % (row["startLabel"], title[:20]),
                                  {"date": self.sel_date.isoformat(),
                                   "start": row["startLabel"],
@@ -4409,7 +4747,7 @@ class Warden(object):
         removed_at = removed[0] if removed else None
         self.rebuild_rows()
         self.invalidate()
-        action = repl_kit.Action("session.cancel",
+        action = self.net_action("session.cancel",
                                  "取消 %s %s" % (self.sel_date.isoformat(), row["startLabel"]),
                                  {"date": self.sel_date.isoformat(),
                                   "start": row["startLabel"],
@@ -4647,14 +4985,32 @@ class Warden(object):
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
                              "或后缀 -e/--exclusive / -m/--mark / -t/--trigger"
                              " / -f/--formatter")
+        # 异步 action（import 这类要先读外面世界的）拿走**同一份**后缀，
+        # 后台那半件事落地之后自己套 —— 和同步路径完全一样的那套 _apply_suffix_chain。
+        self._import_suffix_doc = {
+            "assign_to": assign_to,
+            "note_text": note_text,
+            "exclusive": exclusive,
+            "mark_status": mark_status,
+            "trigger_spec": trigger_spec,
+            "formatter_spec": formatter_spec,
+        }
         if kept:
             action = kept[0].lower()
             rest = kept[1:]
-            result = self._dispatch_task(action, rest)
+            try:
+                result = self._dispatch_task(action, rest)
+            finally:
+                # 这份后缀只借给**这一次**分派用：直接调 cmd_task_import 的地方
+                # （测试、内部调用）不该被上一次命令的后缀污染。
+                self._import_suffix_doc = None
         else:
             # `task -m complete` / `task -f end`：作用于当前选中的任务。
             action = "hook" if (trigger_spec or formatter_spec) and mark_status is None else "mark"
             result = None
+        if result is NET_PENDING:
+            # 已经排进后台队列了：后缀跟着 Action 的参数走，不在这儿套
+            return None
         if result is IMPORT_PENDING:
             # 重复任务导入在等 y/n/q，**还没有**建出任务。这时 -a / -n / -m /
             # -t / -f 绝不能落到「上一次选中的任务」上（用户反馈：task import
@@ -5868,6 +6224,9 @@ class Warden(object):
             raise ValueError("用法：task <任务序号> drop [--local]")
         task = self.resolve_task(toks[0])
         template = ts.TaskStore.is_repeat_template(task)
+        if not local_only and ts.TaskStore.omnifocus_id(task):
+            self.jobs.begin(1, title="放弃任务 %s（task %s drop）"
+                                   % (self.task_label(task), self.task_label(task)))
         note = "" if local_only else self.omni_drop(task, all_occurrences=template)
         task = self.task_store.set_status(task["id"], ts.STATUS_DROPPED, reason="cmd-drop")
         self.say("✗ 任务 %s「%s」已放弃%s%s"
@@ -5897,6 +6256,13 @@ class Warden(object):
                 minutes = int(toks[1])
             except ValueError:
                 raise ValueError("分钟数得是整数；你给的是 %r" % toks[1]) from None
+        has_fm = bool((task.get("focusmate") or {}).get("task_id"))
+        has_omni = bool(ts.TaskStore.omnifocus_id(task))
+        # 一次操作、两步：先勾 Focusmate（那才是「这一场干完了」的事实），
+        # 再写回 OmniFocus。面板标题是这次操作本身。
+        self.jobs.begin(2 if (has_fm and has_omni) else 1,
+                        title="完成任务 %s（task %s done）"
+                              % (self.task_label(task), self.task_label(task)))
         task = self.task_store.complete(task["id"], minutes=minutes, reason="cmd-done")
         self.task_store.archive_local(self.task_store.get(task["id"]))
         note_fm = self.fm_complete(task)
@@ -6208,72 +6574,63 @@ class Warden(object):
                 # 粘进来的只有标题 → 去剪贴板对同名的那条（同一次 ⌘C 的两半）
                 items = self._task_import_match_clipboard(items, of.clipboard_links())
 
-        # 剪贴板这条路的 flavor 可能只给出「id」不给标题（OmniFocus 多选时 RTF 和
-        # 纯文本是两份互不相干的东西），所以先补标题/时长，再把抄了两遍的裸标题去掉。
-        items = self._task_import_resolve(items)
-        # 「已经导入过」只在**批量**里跳过：一次选十条里混着上个月的旧条目才是误伤；
-        # 单条导入是「我就要这条」的明确动作（再来一条同名关联是合法用法，例如
-        # 先按普通任务导入、再导一次复制成重复任务）。
-        if len(items) > 1:
-            items, skipped = self._task_import_skip_known(items)
-            if not items:
-                raise ValueError("这一批都已经导入过了（%s）；没有新建任何任务。"
-                                 % "、".join("%s → 任务 %s" % (pk, tid)
-                                            for pk, tid in skipped))
-
-        repeats = {}
-        warnings = []
-        checker = None if single_task else getattr(self.omnifocus, "repetition_info", None)
         if single_task:
             self.say("📥 按 -st/--single-task 只导入这一条；不去核对重复设置，"
                      "也不会建本地 repeat。", "cmd")
-        for index, item in enumerate(items):
-            if not item or not item.get("id") or checker is None:
-                continue
-            try:
-                info = checker(item["id"])
-            except Exception as e:                      # noqa: BLE001
-                warnings.append("⚠ 没法核对「%s」是不是重复任务：%s（先按普通任务导入）"
-                                % (item.get("title") or item.get("id"), e))
-                continue
-            plan = task_repeat_plan_from_omnifocus(
-                info, sessions_for_day=self.sessions_for_day_plan)
-            if plan is not None:
-                repeats[index] = {"info": info, "plan": plan}
 
-        if repeats:
-            self.pending_import = {
-                "items": items,
-                "repeats": repeats,
-                # warnings 已经在这里说过了；别再存一份，否则答完 y/n 又重复一遍
-                "warnings": [],
-                # 直接调 cmd_task_import 时也能保住 -a；走 cmd_task 时会被
-                # 包含全部后缀（-n/-m/-t/-f）的那份覆盖。
-                "suffix": {"assign_to": assign_to} if assign_to is not None else {},
-            }
-            titles = "、".join((items[i] or {}).get("title") or (items[i] or {}).get("id")
-                               or "?" for i in sorted(repeats))
-            self.say("📥 发现 OmniFocus 重复任务：%s —— 先确认要不要复制重复设置，"
-                     "还没建本地任务。" % titles, "cmd")
-            for warning in warnings:
-                self.say(warning, "warn")
-            self.invalidate()
-            return IMPORT_PENDING
+        # ── 一次操作，两步 ────────────────────────────────────────────
+        #   1) [omnifocus] 获取任务   ← 补标题/时长 + 核对重复设置（读）
+        #   2) [focusmate] 挂任务     ← 只有 -a 才有（写，乐观）
+        # 面板标题是**这个操作**（import 任务（task import -ac）），不是某一步。
+        suffix = dict(getattr(self, "_import_suffix_doc", None) or {})
+        if assign_to is not None and not suffix:
+            suffix = {"assign_to": assign_to}
+        title = "import 任务（task import%s）" % self._suffix_summary(suffix)
+        self.jobs.begin(2 if suffix.get("assign_to") is not None else 1, title=title)
+        action = self.net_action("omnifocus.import", "获取任务",
+                                 {"items": items, "single_task": single_task,
+                                  "suffix": suffix,
+                                  # 同步模式由 cmd_task 统一套后缀（这条路径原来就这样）
+                                  "apply_suffix": False}, source=SRC_OMNIFOCUS)
+        job = self.jobs.submit(action)
+        if self.jobs.sync:
+            outcome = job.outcome
+            if outcome is None or not outcome.ok:
+                return None
+            return getattr(self, "_last_import_result", None)
+        return NET_PENDING
 
-        task = self._finish_task_import(items, copy_repeat=False, repeats={},
-                                        warnings=warnings)
-        # 直接调本方法（不带 cmd_task 的后缀管线）时，-a 也要生效；走 cmd_task 时
-        # 由 cmd_task 统一把**全部**后缀逐条套到整批上（这里再套就是双份）。
-        if apply_suffix and assign_to is not None:
-            self._apply_import_suffix(task, {"assign_to": assign_to})
-        return task
+    @staticmethod
+    def _suffix_summary(suffix):
+        """后缀 → 面板标题里那一小段（``-a 3 -f end``），只为好看。"""
+        suffix = suffix or {}
+        bits = []
+        if suffix.get("assign_to") is not None:
+            bits.append("-a %s" % suffix["assign_to"])
+        if suffix.get("applied") is True:          # 内部占位，永不显示
+            pass
+        if suffix.get("exclusive"):
+            bits.append("-e true")
+        if suffix.get("note_text"):
+            bits.append("-n …")
+        formatter = suffix.get("formatter_spec") or {}
+        if formatter.get("name"):
+            bits.append("-f %s" % formatter["name"])
+        mark = suffix.get("mark_status")
+        if mark:
+            bits.append("-m %s" % mark)
+        trigger = suffix.get("trigger_spec") or {}
+        if trigger.get("name"):
+            bits.append("-t %s" % trigger["name"])
+        return (" " + " ".join(bits)) if bits else ""
 
-    def _task_import_omnifocus_rows(self, items):
+    def _task_import_omnifocus_rows(self, items, warn=None):
         """这一批 pk → OmniFocus 的行（一次 list，client 里 20 秒缓存）；读不到 None。
 
         只在 import 里用。读不到不是错误：标题退回剪贴板给的（可能为空），时长就
         不补 —— 导入本身照常进行。
         """
+        say = warn or (lambda text, kind="warn": self.say(text, kind))
         pks = {str(item.get("id")) for item in items or () if item.get("id")}
         if not pks:
             return {}
@@ -6284,14 +6641,13 @@ class Warden(object):
         if not enabled:
             if any(item.get("id") and not str(item.get("title") or "").strip()
                    for item in items or ()):
-                self.say("📴 没在读 OmniFocus：剪贴板没给标题的那几条先拿 primary key "
-                         "当标题，时长也补不上。", "info")
+                say("没在读 OmniFocus：剪贴板没给标题的那几条先拿 primary key "
+                    "当标题，时长也补不上。", "info")
             return None
         try:
             rows = self.omnifocus.list_tasks()
         except Exception as e:                      # noqa: BLE001 - 读失败不该挡住导入
-            self.say("⚠ 读 OmniFocus 失败（%s）：标题按剪贴板给的用，时长不补。" % e,
-                     "warn")
+            say("读 OmniFocus 失败（%s）：标题按剪贴板给的用，时长不补。" % e, "warn")
             return None
         out = {}
         for row in rows or ():
@@ -6300,7 +6656,7 @@ class Warden(object):
                 out[pk] = row
         return out
 
-    def _task_import_resolve(self, items):
+    def _task_import_resolve(self, items, warn=None):
         """补齐标题/时长，并把「另一份 flavor 抄了一遍」的裸标题去掉。
 
         多选 ⌘C 时剪贴板里其实是两份东西：RTF/HTML 给「链接 + 标题」，纯文本把
@@ -6316,7 +6672,7 @@ class Warden(object):
         items = [item for item in (items or []) if item]
         if not items:
             return []
-        rows = self._task_import_omnifocus_rows(items)
+        rows = self._task_import_omnifocus_rows(items, warn=warn)
         if rows:
             for item in items:
                 pk = item.get("id")
@@ -6737,7 +7093,7 @@ class Warden(object):
         self.selected_task_id = task_id
         self.rebuild_rows()
         self.invalidate()
-        action = repl_kit.Action("task.assign",
+        action = self.net_action("task.assign",
                                  "挂任务 %s 到 %s %s" % (self.task_label(task), date_iso,
                                                         session.get("start") or "?"),
                                  {"task_id": task_id, "date": date_iso,
@@ -6751,7 +7107,9 @@ class Warden(object):
                                   "session": dict(session)})
         job = self.jobs.submit(action, on_fail=lambda error: self._assign_failed(
             task_id, before, title, error))
-        if refresh and not self.offline:
+        if refresh and not self.offline and self.jobs.sync:
+            # 只有同步模式才顺手对一次账（老行为）。异步模式表格已经是乐观结果，
+            # 再排一次 refresh 只会变成这次操作多出来的一步，还可能把刚铺好的行刷掉。
             try:
                 self.refresh(quiet=True)
             except Exception:                       # noqa: BLE001 - 刷新失败不影响已挂上的
@@ -6787,7 +7145,7 @@ class Warden(object):
         self.task_store.unassign(task_id, reason=reason)
         self.rebuild_rows()
         self.invalidate()
-        action = repl_kit.Action("task.detach",
+        action = self.net_action("task.detach",
                                  "下架任务 %s" % self.task_label(task),
                                  {"task_id": task_id, "focusmate_task_id": fm_id,
                                   "date": sess.get("date"), "start": sess.get("start"),
@@ -7023,7 +7381,12 @@ class Warden(object):
         """GET /v1/tasks → 读 completedAt，给已完成任务写归档。
 
         顺带确保选中那天的重复子任务已经生成；子任务有 session 的再挂 Focusmate。
+
+        **一次操作、至少两步**：`[focusmate] 拉 Focusmate task` →
+        `[omnifocus] 写回 OmniFocus`（有要写回的才排这一步）。
         """
+        self.jobs.begin(1, title="同步 task（task %s）"
+                               % ("sync" if not quiet else "sync · 自动"))
         if not self.offline:
             try:
                 for task_id, start in self.materialize_repeats():
@@ -7072,7 +7435,7 @@ class Warden(object):
         """
         # 注：这里**不**看 self.offline —— 「离线」只挡 refresh 那种自己发起的拉取；
         # 用户显式敲 `task sync` 就是要求去对一次账（测试也靠这条路径）。
-        action = repl_kit.Action("task.pull", "拉 Focusmate task", {})
+        action = self.net_action("task.pull", "拉 Focusmate task", {})
         job = self.jobs.submit(action, persist=False)
         if self.jobs.sync:
             return bool(job.outcome is not None and job.outcome.ok)
@@ -7199,11 +7562,14 @@ class Warden(object):
             clone, len(moved))
 
     def omni_complete(self, task, minutes=None, at=None):
-        """OmniFocus：完成 + 把截止时间写回 session 终点。返回一句人话。"""
+        """OmniFocus：完成 + 把截止时间写回 session 终点。返回一句人话。
+
+        **写**操作，走后台队列：本地先记「已经写回过完成」（乐观），
+        osascript 那一趟在 worker 里跑；失败就回滚这个标记 + 记账（re-action）。
+        """
         pk = ts.TaskStore.omnifocus_id(task)
         if not pk:
             return ""
-        started = time.monotonic()
         enabled = self.omnifocus_enabled()
         fields = self._omni_log_fields(task, pk)
         due = self.omni_due_of(task)
@@ -7213,53 +7579,41 @@ class Warden(object):
             rl.log_event("omnifocus", "complete_skipped", reason="disabled_or_unavailable",
                          **fields)
             return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
-        try:
-            res = self.omnifocus.complete(pk, at=at, due=due or None, yes=True)
-        except of.OmniFocusError as e:
-            self.had_error = True
-            rl.log_event(
-                "omnifocus", "complete_error", kind=e.kind, exit_code=e.exit_code,
-                detail=e.detail, message=str(e),
-                elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
-            return "OmniFocus 写回失败：%s" % e
-        after = res.get("after") if isinstance(res, dict) else None
-        effective = None if not isinstance(after, dict) else bool(after.get("completed"))
-        advanced, moved = self._omni_repeat_advance(task, pk, res)
-        if effective is False and advanced:
-            # 重复任务：`after` 是**新那一次**（还没完成很正常），这一条确实写成功了
-            effective = True
-        rl.log_event(
-            "omnifocus", "complete_result",
-            changed=res.get("changed") if isinstance(res, dict) else None,
-            effective=effective,
-            before=res.get("before") if isinstance(res, dict) else None,
-            after=after,
-            repeat_clone_id=res.get("repeat_clone_id") if isinstance(res, dict) else None,
-            repeat_advanced=advanced,
-            repeat_moved=moved,
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
-        if effective is False:
-            self.had_error = True
-            return "OmniFocus 写回失败：写完复核 completed 仍为 false（pk %s）" % pk
+        before = copy.deepcopy(task)
         try:
             self.task_store.set_omnifocus_writeback(task["id"], "completed")
         except ValueError:
             pass
-        changed = ", ".join(res.get("changed") or [])
-        return "OmniFocus %s 完成%s%s" % (
-            pk, ("（%s）" % changed) if changed else "",
-            self._omni_repeat_note(advanced, res.get("repeat_clone_id"), moved))
+        action = self.net_action("omnifocus.complete",
+                                 "OmniFocus 完成 %s" % pk[:8],
+                                 {"task_id": task["id"], "pk": pk, "at": at,
+                                  "due": due or None}, source=SRC_OMNIFOCUS)
+        job = self.jobs.submit(action, on_fail=lambda error: self._omni_failed(
+            task["id"], before, "OmniFocus 写回完成（pk %s）" % pk[:8], error))
+        if self.jobs.sync:
+            outcome = job.outcome
+            if outcome is None or not outcome.ok:
+                return "OmniFocus 写回失败：%s" % (outcome and outcome.error or "没跑")
+            res = (outcome.result or {}).get("res") or {}
+            changed = ", ".join(res.get("changed") or [])
+            return "OmniFocus %s 完成%s" % (pk, ("（%s）" % changed) if changed else "")
+        return "OmniFocus 完成写回丢后台了（%s）" % pk[:8]
+
+    def _omni_failed(self, task_id, before, what, error):
+        """OmniFocus 写失败：把本地标记放回去 + 说清楚（账已经记下了）。"""
+        self._revert_task(task_id, before, "%s 没写成：%s" % (what, error))
 
     def omni_drop(self, task, at=None, all_occurrences=False):
         """OmniFocus：放弃这条任务（只给「真的不要了」用）。
 
         ``all_occurrences`` 给重复任务本体用：放弃「这一套」而不是「这一次」，
         否则 OmniFocus 会照着重复规则继续生出下一次。
+
+        **写**操作，走后台队列（乐观 → 失败回滚 + 记账）。
         """
         pk = ts.TaskStore.omnifocus_id(task)
         if not pk:
             return ""
-        started = time.monotonic()
         enabled = self.omnifocus_enabled()
         fields = self._omni_log_fields(task, pk)
         rl.log_event("omnifocus", "drop_start", at=at, enabled=enabled,
@@ -7268,38 +7622,26 @@ class Warden(object):
             rl.log_event("omnifocus", "drop_skipped", reason="disabled_or_unavailable",
                          **fields)
             return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
-        try:
-            res = self.omnifocus.drop(pk, at=at, all_occurrences=all_occurrences, yes=True)
-        except of.OmniFocusError as e:
-            self.had_error = True
-            rl.log_event(
-                "omnifocus", "drop_error", kind=e.kind, exit_code=e.exit_code,
-                detail=e.detail, message=str(e),
-                elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
-            return "OmniFocus 放弃失败：%s" % e
-        after = res.get("after") if isinstance(res, dict) else None
-        effective = None if not isinstance(after, dict) else bool(after.get("dropped"))
-        advanced, moved = self._omni_repeat_advance(task, pk, res)
-        if effective is False and advanced:
-            # 重复任务：放弃的是「这一次」，OmniFocus 已经翻到下一次了
-            effective = True
-        rl.log_event(
-            "omnifocus", "drop_result",
-            changed=res.get("changed") if isinstance(res, dict) else None,
-            effective=effective, before=res.get("before") if isinstance(res, dict) else None,
-            after=after, repeat_advanced=advanced, repeat_moved=moved,
-            elapsed_ms=round((time.monotonic() - started) * 1000, 1), **fields)
-        if effective is False:
-            self.had_error = True
-            return "OmniFocus 放弃失败：写完复核 dropped 仍为 false（pk %s）" % pk
+        before = copy.deepcopy(task)
         try:
             self.task_store.set_omnifocus_writeback(task["id"], "dropped")
         except ValueError:
             pass
-        changed = ", ".join(res.get("changed") or [])
-        return "OmniFocus %s 已放弃%s%s" % (
-            pk, ("（%s）" % changed) if changed else "",
-            self._omni_repeat_note(advanced, res.get("repeat_clone_id"), moved))
+        action = self.net_action("omnifocus.drop",
+                                 "OmniFocus 放弃 %s" % pk[:8],
+                                 {"task_id": task["id"], "pk": pk, "at": at,
+                                  "all_occurrences": bool(all_occurrences)},
+                                 source=SRC_OMNIFOCUS)
+        job = self.jobs.submit(action, on_fail=lambda error: self._omni_failed(
+            task["id"], before, "OmniFocus 放弃（pk %s）" % pk[:8], error))
+        if self.jobs.sync:
+            outcome = job.outcome
+            if outcome is None or not outcome.ok:
+                return "OmniFocus 放弃失败：%s" % (outcome and outcome.error or "没跑")
+            res = (outcome.result or {}).get("res") or {}
+            changed = ", ".join(res.get("changed") or [])
+            return "OmniFocus %s 已放弃%s" % (pk, ("（%s）" % changed) if changed else "")
+        return "OmniFocus 放弃丢后台了（%s）" % pk[:8]
 
     def fm_complete(self, task):
         """Focusmate：把这条 task 勾完成（走 bridge 的内部 API，GET 复核 completedAt）。"""
@@ -7322,7 +7664,7 @@ class Warden(object):
             })
         except ValueError:
             pass
-        action = repl_kit.Action("task.complete",
+        action = self.net_action("task.complete",
                                  "勾完成 %s" % self.task_label(task),
                                  {"task_id": local_id, "focusmate_task_id": fm_task_id})
         job = self.jobs.submit(action, on_fail=lambda error: self._complete_failed(
@@ -7443,14 +7785,16 @@ class Warden(object):
 
         需求（第 2 条）：任务被分配到的 session 时间＝它的截止时间；完成的时候
         把这条截止时间一起写回 OmniFocus —— 于是 OmniFocus 里记的是「这一场是什么时候结束的」。
+
+        **写**操作，走后台队列：一次子进程一条任务，全部塞进**同一个** job 里跑
+        （进度是「第几条/共几条」），本地 writeback 标记在 apply 里落定。
+        这一批会**并进当前那一步操作**（refresh / task sync），不会另起一个标题。
         """
-        done = []
-        enabled = self.omnifocus_enabled()
-        rl.log_event("omnifocus", "writeback_scan_start", enabled=enabled)
-        if not enabled:
+        if not self.omnifocus_enabled():
             rl.log_event("omnifocus", "writeback_scan_skipped",
                          reason="disabled_or_unavailable")
-            return done
+            return []
+        todo = []
         for task in (tasks if tasks is not None else self.task_store.list()):
             if ts.TaskStore.is_repeat_template(task):
                 # 本体不可完成；它的子任务共享同一条 OmniFocus 链接，写回由子任务做。
@@ -7462,13 +7806,16 @@ class Warden(object):
             wb = ((task.get("omnifocus") or {}).get("writeback") or {})
             if wb.get("completed"):
                 continue
-            note = self.omni_complete(task)
-            if note:
-                done.append((task["id"], note))
-                self.say("↗ 写回 OmniFocus：任务 %s %s"
-                         % (self.task_label(task), note), "ok")
-        rl.log_event("omnifocus", "writeback_scan_result", written=done)
-        return done
+            todo.append(task["id"])
+        if not todo:
+            rl.log_event("omnifocus", "writeback_scan_result", written=[])
+            return []
+        rl.log_event("omnifocus", "writeback_scan_start", pending=len(todo))
+        action = self.net_action("omnifocus.writeback",
+                                 "写回 OmniFocus（%d 条）" % len(todo),
+                                 {"task_ids": todo}, source=SRC_OMNIFOCUS)
+        self.jobs.submit(action, persist=False)
+        return [(task_id, "丢后台了") for task_id in todo]
 
     # -- 收尾用的几个动作（收尾和命令共用同一套，不写两遍）--------------
 
@@ -8750,6 +9097,7 @@ class Warden(object):
         失败不拦路：任何一块刷不动就记一句警告，其余照刷 —— refresh 是「再对一次账」，
         不是「全有或全无」。
         """
+        self.jobs.begin(2, title="刷新（refresh）")
         self.forget_caches()
         pulled = self.refresh()
         # 「再对一次账」必须拿着刚拉回来的账：后台模式下这里等它落地
@@ -8921,13 +9269,12 @@ class Warden(object):
         self.say("⚠ %d 场该订却没订上：%s —— 叫 daemon 补一轮（check）…"
                  % (len(missing), names), "warn")
         self._release_browser("daemon 下单要独占同一个 Chromium profile")
-        rc, out, err = run_keep_session("check", timeout=600)
-        for line in (out or "").splitlines()[-20:]:
-            self.say(line)
-        if rc != 0:
+        job = self.op_keep_session(["check"], "对账（keep_session check）", wait=True)
+        outcome = job.outcome
+        if outcome is None or not outcome.ok:
             self.had_error = True
-            self.say("❌ check 退出码 %d%s（计划照旧留着，daemon 下一轮还会补）"
-                     % (rc, ("：" + err) if err else ""), "error")
+            self.say("❌ check 没跑成%s（计划照旧留着，daemon 下一轮还会补）"
+                     % (("：" + outcome.error) if outcome else ""), "error")
             return 0
         return len(missing)
 
@@ -9097,31 +9444,25 @@ class Warden(object):
 
         这里**不重写**日历逻辑：薄封装 download_calendar.py，和 schedule.py 一样是唯一真源。
         `sync --days 3` 之类的参数原样透传给 populate。
+
+        **两步、一个标题**：`sync（同步日历）` 下面先是 `[calendar] 日历 download`，
+        再是 `[calendar] 日历 populate` —— 第二步挂在第一步的成功回调里，
+        因为「下载成功才谈得上切 csv」。
         """
+        argv = [str(a) for a in args]
+        self.jobs.begin(2, title="同步日历（sync）")
         self.say("sync：先 download（工作/空闲 → 中间层），再 populate "
                  "（中间层 + 时段 layout → data.csv）…", "cmd")
-        rc, out, err = run_download_calendar("download", *args, timeout=300)
-        for line in (out or "").splitlines()[-20:]:
-            self.say(line)
-        if rc != 0:
-            self.had_error = True
-            self.say("❌ download 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
-            if not (err or out):
-                self.say("   （download_calendar.py 没有输出；先跑 "
-                         "python3 download_calendar.py status 看配置/依赖）", "warn")
-            return False
-        rc, out, err = run_download_calendar("populate", "--from-download", *args,
-                                             timeout=300)
-        for line in (out or "").splitlines()[-25:]:
-            self.say(line)
-        if rc != 0:
-            self.had_error = True
-            self.say("❌ populate 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
-            return False
-        self.say("✅ data.csv 已同步（下载层 → 时段 layout → 精确日期契约）。", "ok")
-        self.reload_entries()
-        self.refresh()
+        first = self.op_calendar(["download"] + argv, "日历 download",
+                                 on_ok=lambda payload: self._sync_populate(argv))
+        if self.jobs.sync:
+            outcome = first.outcome
+            return bool(outcome is not None and outcome.ok)
         return True
+
+    def _sync_populate(self, argv):
+        """sync 的第二步：download 成功了才切 csv（同一批里的第 2 步）。"""
+        self.op_calendar(["populate", "--from-download"] + list(argv), "日历 populate")
 
     def _release_browser(self, why):
         """让 bridge 放开浏览器（daemon 下单用同一个 profile，会撞锁）。"""
@@ -9141,16 +9482,12 @@ class Warden(object):
 
     def cmd_start(self):
         self._release_browser("daemon 下单要独占同一个 Chromium profile")
-        self.say("启动 daemon…", "cmd")
-        rc, out, err = run_keep_session("daemon", "start")
-        for line in (out or "").splitlines():
-            self.say(line)
-        if rc == 0:
-            self.say("✅ daemon 已启动", "ok")
-        else:
-            self.had_error = True
-            self.say("❌ daemon 启动失败（rc=%d）%s" % (rc, err), "error")
-        return rc == 0
+        self.jobs.begin(1, title="启动 daemon（start）")
+        self.say("启动 daemon…（在后台起，结果进 Recent）", "cmd")
+        job = self.op_keep_session(["daemon", "start"], "起 daemon")
+        if self.jobs.sync:
+            return bool(job.outcome is not None and job.outcome.ok)
+        return True
 
     def cmd_stop(self):
         """停用 daemon —— 和取消 session 共用同一道宣言闸门（密码系统已删掉）。
@@ -9167,16 +9504,12 @@ class Warden(object):
         if not self.require_declaration("停用 daemon"):
             self.say("没认罪，daemon 还活着。", "warn")
             return False
-        self.say("停 daemon…", "cmd")
-        rc, out, err = run_keep_session("daemon", "stop")
-        for line in (out or "").splitlines():
-            self.say(line)
-        if rc == 0:
-            self.say("✅ daemon 已停止（bridge 还活着，随时能改 session）", "ok")
-        else:
-            self.had_error = True
-            self.say("❌ daemon 停止失败（rc=%d）%s" % (rc, err), "error")
-        return rc == 0
+        self.jobs.begin(1, title="停用 daemon（stop）")
+        self.say("停 daemon…（在后台停，结果进 Recent）", "cmd")
+        job = self.op_keep_session(["daemon", "stop"], "停 daemon")
+        if self.jobs.sync:
+            return bool(job.outcome is not None and job.outcome.ok)
+        return True
 
     def cmd_help(self):
         t = Table.grid(padding=(0, 2))

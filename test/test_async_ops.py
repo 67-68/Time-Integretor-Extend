@@ -155,10 +155,62 @@ class GateBridge(object):
         pass
 
 
+class FakeOmni(object):
+    """OmniFocus 替身：记调用、能按需失败、能给 repetition_info。"""
+
+    def __init__(self):
+        self.calls = []
+        self.fail = {}
+        self.rows = [{"id": "pk-1", "name": "写论文（OmniFocus 全名）",
+                      "estimated_minutes": 25, "completed": False}]
+        self.gate = threading.Event()
+        self.gate.set()
+
+    def hold(self):
+        self.gate.clear()
+
+    def release(self):
+        self.gate.set()
+
+    def available(self):
+        return True
+
+    def list_tasks(self, refresh=False):
+        self.calls.append(("list", refresh))
+        self.gate.wait(20)
+        if "list" in self.fail:
+            raise w.of.OmniFocusError(self.fail["list"])
+        return [dict(row) for row in self.rows]
+
+    def repetition_info(self, pk):
+        self.calls.append(("repetition_info", pk))
+        if "repetition_info" in self.fail:
+            raise w.of.OmniFocusError(self.fail["repetition_info"])
+        return {}
+
+    def complete(self, pk, at=None, due=None, yes=True):
+        self.calls.append(("complete", pk, at, due))
+        self.gate.wait(20)
+        if "complete" in self.fail:
+            raise w.of.OmniFocusError(self.fail["complete"])
+        return {"changed": ["completed"], "before": {"completed": False},
+                "after": {"completed": True, "id": pk}}
+
+    def drop(self, pk, at=None, all_occurrences=False, yes=True):
+        self.calls.append(("drop", pk, all_occurrences))
+        self.gate.wait(20)
+        if "drop" in self.fail:
+            raise w.of.OmniFocusError(self.fail["drop"])
+        return {"changed": ["dropped"], "before": {"dropped": False},
+                "after": {"dropped": True, "id": pk}}
+
+
 def mkwarden(bridge=None, async_net=True):
     console = Console(file=io.StringIO(), width=200, force_terminal=False)
     wd = w.Warden(console, bridge or GateBridge(), no_clear=True, offline=False,
                   net_async=async_net)
+    wd.omnifocus = FakeOmni()
+    wd.settings.set_bool("omnifocus", True) if hasattr(wd.settings, "set_bool") else None
     return wd
 
 
@@ -186,10 +238,20 @@ def seed_rows(wd):
         wd.bridge.sessions = [dict(row) for row in wd.api_rows]
 
 
-def settle(wd, timeout=10.0):
-    """等后台那批跑完 + 把结果搬回主线程（等价于「下一帧」）。"""
-    wd.jobs.wait(timeout)
-    wd.drain_net()
+def settle(wd, timeout=15.0):
+    """等后台那批跑完 + 把结果搬回主线程（等价于连续过几帧）。
+
+    注意**要循环**：一次 apply 里可能又排下一步（import → 挂任务），
+    所以「wait 一次、drain 一次」不够 —— 真界面里是靠每帧 drain 自然收敛的。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        wd.jobs.wait(max(0.1, deadline - time.time()))
+        wd.drain_net()
+        if not wd.jobs.busy:
+            wd.drain_net()
+            if not wd.jobs.busy:
+                return
 
 
 def wait_for(predicate, timeout=10.0):
@@ -369,6 +431,75 @@ bridge.hold()
 wd.handle("cancel 2")                            # 执行区要敲宣言 —— 见下一条
 bridge.release()
 settle(wd)
+
+print("\n== 5.5 OmniFocus 也走同一条管道（乐观 + 回滚 + [标签]）==")
+bridge = GateBridge()
+wd = mkwarden(bridge)
+wd.offline = False
+task = wd.task_store.create(fields={"title": "写论文"})
+wd.task_store.link_omnifocus(task["id"], "pk-1")
+wd.omnifocus.hold()
+wd.omni_complete(wd.task_store.get(task["id"]))
+check("乐观：本地先记「写回过完成」（真值，里面是时间戳）",
+      bool(((wd.task_store.get(task["id"]).get("omnifocus") or {}).get("writeback")
+            or {}).get("completed")), True)
+check("队列忙（面板画得出来）", wd.jobs.busy, True)
+check("Focusmate 那份还没落地（osascript 还在后台跑）",
+      (wd.task_store.get(task["id"]).get("focusmate") or {}).get("completed_at"), None)
+wd.omnifocus.release()
+settle(wd)
+check("落地：真的调了 complete", [c[0] for c in wd.omnifocus.calls],
+      ["complete"])
+check("日志里带 [omnifocus] 标签",
+      any("[omnifocus]" in text for _l, text in wd.jobs.log_lines(6)), True)
+check("失败账空着", wd.jobs.failures, [])
+
+# 失败：回滚 writeback 标记 + 记账
+if os.path.exists(FAILED_FILE):
+    os.unlink(FAILED_FILE)
+wd.jobs.clear_failures()
+task2 = wd.task_store.create(fields={"title": "会失败的写回"})
+wd.task_store.link_omnifocus(task2["id"], "pk-2")
+wd.omnifocus.fail["complete"] = "OmniFocus 自动化被拒（测试）"
+wd.omni_complete(wd.task_store.get(task2["id"]))
+settle(wd)
+check("回滚：writeback 标记退回去了",
+      ((wd.task_store.get(task2["id"]).get("omnifocus") or {}).get("writeback")
+       or {}).get("completed"), None)
+check("记进失败账（名字是 omnifocus.complete）",
+      [f.action.name for f in wd.jobs.failures], ["omnifocus.complete"])
+check("失败账那条带 omnifocus 标签",
+      wd.jobs.failures[0].action.source, "omnifocus")
+wd.jobs.clear_failures()
+
+print("\n== 5.6 一次操作、一个标题、编号步骤（task import -a）==")
+bridge = GateBridge()
+wd = mkwarden(bridge)
+seed_rows(wd)
+wd.omnifocus.hold()
+wd.omnifocus.rows = [{"id": "pk-9", "name": "数学易错修正",
+                      "estimated_minutes": 25, "completed": False}]
+wd.handle("task import -a 1 [数学](omnifocus:///task/pk-9)")
+check("操作标题是这次操作（不是某一步）",
+      (wd.jobs.batch_title or "").startswith("import 任务（task import -a 1）"),
+      True)
+check("标题栏里带进度条 + 步骤数",
+      bool(wd.jobs.total >= 1) and "─" in wd.jobs.title_text(), True)
+wd.omnifocus.release()
+settle(wd)
+lines = [text for _l, text in wd.jobs.log_lines(10)]
+check_true("步骤 1 是 [omnifocus] 获取任务",
+           any(text.startswith("步骤 1：[omnifocus]") for text in lines))
+check_true("步骤 2 是 [focusmate] 挂任务",
+           any(text.startswith("步骤 2：[focusmate]") for text in lines))
+check("导入 + 挂载都落地了",
+      [(t.get("fields") or {}).get("title")
+       for t in wd.task_store.list()
+       if (t.get("fields") or {}).get("title") == "数学易错修正"
+       and (t.get("session") or {}).get("start") == "11:00"],
+      ["数学易错修正"])
+check("面板干完就消失", wd.shell.progress_value(), None)
+check("标题也清掉了", wd.jobs.batch_title, None)
 
 print("\n== 6. 命令表：re-action / jobs 每个视图都在 ==")
 bridge = GateBridge()
