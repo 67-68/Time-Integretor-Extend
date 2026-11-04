@@ -1372,7 +1372,10 @@ class _OnlineBridge(FakeBridge):
 
 def online_warden(done_tasks):
     console = Console(file=io.StringIO(), width=160, force_terminal=False)
-    wd2 = w.Warden(console, _OnlineBridge(done_tasks), no_clear=True, offline=False)
+    # 这组断言在同一行里紧接着读结果；钉死同步模式，避免终端是不是 TTY
+    # 把 JobRunner 变成异步后产生时序抖动。
+    wd2 = w.Warden(console, _OnlineBridge(done_tasks), no_clear=True, offline=False,
+                   net_async=False)
     wd2.reload_entries()
     wd2.omnifocus = FakeOmni()
     return wd2

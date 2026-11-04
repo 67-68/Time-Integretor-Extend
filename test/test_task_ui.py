@@ -272,6 +272,9 @@ wd.handle("task create 5 title=论文 notes=先写intro")
 check("task sync 受理", wd.handle("task sync"), True)
 check("本地记 completedAt", wd.task_store.get(5)["focusmate"]["completed_at"],
       "2026-10-26T12:00:00Z")
+_row_synced = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
+check_true("task sync 后契约表状态立刻变成 ✓（不用手动 rebuild）",
+           (_row_synced.get("task_text") or "").startswith("✓"))
 arch = wd.task_store.load_archive()["records"]
 check("归档 1 条", len(arch), 1)
 check("归档里有 session", arch[0]["session"]["focusmate_session_id"], "sess-11:00")
@@ -2176,6 +2179,36 @@ check("都不独占 → refresh --check 不动它们", wdd.check_exclusive_sessi
 check("两条都还在场上",
       [t["id"] for t in wdd.task_store.tasks_for_session(ISO, "11:00")
        if t["id"] in (p["id"], q["id"])], [p["id"], q["id"]])
+
+print("== 删除任务后：session 表格立刻重算，不等下一次 refresh ==")
+_row = [r for r in wdd.rows if r.get("startLabel") == "11:00"][0]
+check_true("删除前 task 列看得见并肩甲", "并肩甲" in (_row.get("task_text") or ""))
+check("task delete 受理", wdd.handle("task delete id:%d" % p["id"]), True)
+_row = [r for r in wdd.rows if r.get("startLabel") == "11:00"][0]
+check("删除后 task 列立刻不再显示并肩甲",
+      "并肩甲" in (_row.get("task_text") or ""), False)
+check_true("同一场别的任务不受影响", "并肩乙" in (_row.get("task_text") or ""))
+
+print("== command 间隔太久 / 改表命令完成后的后台对账 ==")
+wdd.net_async = True
+calls = []
+wdd.refresh = lambda quiet=False, **kw: calls.append("session")
+wdd.refresh_task_state = lambda: calls.append("task")
+wdd.refresh_stat_state = lambda: calls.append("stat")
+wdd.refresh_review_state = lambda: calls.append("review")
+wdd.forget_caches = lambda: calls.append("cache")
+wdd._last_line = "status"
+wdd._last_command_input_at = 1000.0
+check("29 分钟不算太久", wdd._record_command_input("status", now=1000 + 29 * 60), False)
+check("超过 30 分钟记为 stale",
+      wdd._record_command_input("status", now=1000 + 29 * 60 + 31 * 60), True)
+check("stale 后命令完成会排后台 refresh", wdd._after_command_finished(), True)
+check("同时拉 session 和 task（其余按需）", calls,
+      ["session", "task", "stat", "review", "cache"])
+calls[:] = []
+wdd._auto_refresh_pending = False
+wdd._last_line = "task id:%d -n 改备注" % q["id"]
+check("改表命令即使没 stale 也会后台对账", wdd._after_command_finished(), True)
 
 
 # 5) trigger 框架可以用：注册一个 demo 之后，task -t 能列出来、能挂到任务上。

@@ -259,6 +259,29 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 working 模式下表格左侧的 `ID` 仍然保留它在 `self.rows` 里的原始序号，所以
 `cancel N` / `mute N` / `task -a N` 不会因为收起行而指错。
 
+任意 session 行的 task 栏如果没有任何任务，会显示红色警告 `没有设定任务🔞`；
+不能留空，否则「空」和「没渲染」在界面上分不出来。
+
+### 命令完成后的本地重算 + 后台对账
+
+表格里的 `task_text`、任务完成记号是 `rebuild_rows()` 算出来的缓存。命令改了
+本地账本后不重算，就会出现「任务已经删了 / 勾了，session 表格还显示旧内容」。
+现在的收尾规则是：
+
+1. **本地立即生效**：`session` / `period` / `cancel` / `mute` / `title` /
+   `day` / `plan` / `project` / `task` 中真正改账本的命令跑完后，立刻重读
+   本地 `data.csv` 并 `rebuild_rows()`；表格/任务面板先显示本地事实。
+2. **远端随后覆盖**：交互式 TUI 里再把 `session.snapshot`（session）和
+   `task.pull`（Focusmate task 完成状态）排进 `JobRunner`。队列是 FIFO，
+   所以写操作的动作先落地，之后才拉快照；拉回来由 apply 回调换表，不阻塞输入。
+   这就是「本地乐观更新 → 云端确认后更新」的现有接口用法。
+3. `task.pull` 的 apply 回调也会 `rebuild_rows()`：Focusmate 说某条完成了，
+   task 列的 `✓` / 归档摘要当场更新，不用再手动 `refresh`。
+4. **空闲太久**：两次命令输入间隔 ≥ 30 分钟，下一条命令完成时也强制走第 2 步；
+   即使这条命令本身只读（例如 `status`），也会把看板重新对一次账。
+5. `--exec` / 测试 / 离线模式只做第 1 步的本地重算，不隐式发网络请求；真正的
+   对账仍由显式 `refresh` 负责（避免脚本执行时凭空多出网络副作用）。
+
 - 通用命令（三个视图都认）：`Tab`（切视图）/ `open working|detail` /
   `stat` / `status` / `help` / `quit`。
   注意：**罪案区锁死时 `stat` 也进不去**（和别的命令一样，除了敲宣言什么都不受理）——

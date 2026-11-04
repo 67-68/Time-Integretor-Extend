@@ -736,11 +736,13 @@ for width in (40, 120):
 
 # 已匹配标记必须真的渲染出来（Text.append 不解析 markup，踩过）
 buf = io.StringIO()
-console = Console(file=buf, width=120, force_terminal=False)
+# 表格加了「没有设定任务🔞」列宽之后，120 列会把标题列截成「已匹」；
+# 这个用例只验渲染内容，用足够宽的画布看完整标记。
+console = Console(file=buf, width=180, force_terminal=False)
 wd = w.Warden(console, FakeBridge(replies={
     "snapshot": lambda kw: {"date": kw.get("date"), "now": int(NOW.timestamp() * 1000),
                             "sessions": [api_row("21:00", 25, "s1", "t", True, True, "未开始")]}
-}), no_clear=True)
+}), no_clear=True, net_async=False)
 wd.refresh()
 wd.paint()
 out = buf.getvalue()

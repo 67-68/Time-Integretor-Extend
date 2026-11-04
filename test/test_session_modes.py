@@ -129,6 +129,16 @@ check_true("working 画出折叠数量",
 check_true("working 保留最近过去场次 11:00", "11:00–11:50" in working_out)
 check_true("working 不画更早过去场次 09:00", "09:00–09:50" in working_out, False)
 
+print("\n== 空 session：task 栏红色警告 ==")
+wd.session_ui_mode = "detail"
+wd.rows[2]["task_text"] = "1: 有任务"
+tbl = wd.render_table()
+task_cells = tbl.columns[-1]._cells
+check("没任务的 session 明确写警告", str(task_cells[0]), "没有设定任务🔞")
+check("警告是粗体红", task_cells[0].style, "bold red")
+check_true("有任务的 session 不误报", "没有设定任务" in str(task_cells[2]), False)
+check("有任务的 task 栏仍是绿色", task_cells[2].style, "bold green")
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if fails:

@@ -128,10 +128,20 @@ class GateBridge(object):
             self.completed[tid] = "2026-10-26T12:00:00Z"
             return {"verified": True, "completedAt": self.completed[tid], "taskId": tid}
         if cmd == "mute":
+            # 命令完成后的自动对账会再拉一次 snapshot；替身必须和真实 API
+            # 一样，把已经写成功的 quiet 反映到这份快照里。
+            for row in self.sessions:
+                if row.get("id") == kw.get("meetingId"):
+                    row["quiet"] = bool(kw.get("quiet"))
             return {"verified": True, "quiet": bool(kw.get("quiet"))}
         if cmd == "title":
+            for row in self.sessions:
+                if row.get("id") == kw.get("meetingId"):
+                    row["title"] = kw.get("title")
             return {"verified": True, "title": kw.get("title")}
         if cmd == "cancel":
+            self.sessions = [row for row in self.sessions
+                             if row.get("id") != kw.get("meetingId")]
             return {"verified": True}
         if cmd == "tasks":
             rows = [{"id": k, "title": self.titles.get(k, "论文"), "completedAt": v,

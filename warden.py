@@ -300,6 +300,30 @@ FAILED_ACTIONS_FILE = (os.environ.get("TI_FAILED_ACTIONS")
 FRESH_SESSION = 5 * 60
 FRESH_TASK = 15 * 60
 
+# 两条「命令跑完后自动对账」策略：
+#   * 两次输入隔太久（TUI 可能开着过夜/去吃饭了）→ 下一条命令跑完就 refresh；
+#   * 命令会改到看板（session / task / plan...）→ 先按本地账本立刻重算，
+#     再把远端拉取排进后台队列，用云端结果覆盖乐观视图。
+COMMAND_REFRESH_GAP = 30 * 60
+
+# 这些命令会改变契约表 / 任务面板 / 项目表的内容。命令跑完后先 rebuild_rows()
+# 让本地修改立刻可见，再把真正的远端快照排进 JobRunner（不阻塞输入）。
+BOARD_MUTATING_COMMANDS = frozenset({
+    "session", "period", "relocate", "cancel", "mute", "title", "day", "sync",
+    "force-check", "plan", "project", "task",
+})
+
+# task 里只有这些子命令/后缀会改账本；`task 3` / `task select 3` 只是换选中项。
+TASK_MUTATING_ACTIONS = frozenset({
+    "create", "import", "delete", "modify", "note", "assign", "duplicate",
+    "drop", "done", "link", "repeat", "sync", "swap", "archive",
+})
+TASK_MUTATING_FLAGS = (
+    "-a", "--assign", "-n", "--note", "-m", "--mark", "-c", "--count",
+    "-e", "--exclusive", "-t", "--trigger", "-f", "--formatter",
+    "-s", "--from",
+)
+
 #: focusmate 里「乐观预测、还没落地」的标记（任务库里的一个字段）
 FM_PENDING = "pending"
 
@@ -2446,6 +2470,10 @@ class Warden(object):
         self.review_now = None
         self._snapshot_cache = {}
         self._last_line = ""
+        # 命令输入节流：记录「上一条命令开始输入」的墙钟时刻。间隔太长，
+        # 下一条命令完成时要主动对一次账（用户可能在外面改了任务/session）。
+        self._last_command_input_at = None
+        self._auto_refresh_pending = False
         # 警告板：框架负责画在「状态」框里，这里只负责"有什么问题"。
         # 每次操作 / 每 5 秒重算一次（见 refresh_warnings）。
         self.warnings = repl_kit.WarningBoard()
@@ -2979,6 +3007,10 @@ class Warden(object):
         if archived:
             self.announce_completions(before)
         self.writeback_completions()
+        # reconcile() 改了任务状态；契约表 task 列里的 ✓/✗ 是 rebuild_rows()
+        # 算出来的缓存，不重算就会一直显示同步前的旧状态（用户报的
+        # 「任务都删了/勾了，session 上还显示旧任务」就是这一层缓存没拍掉）。
+        self.rebuild_rows()
         self.say("Focusmate task 同步：匹配 %d 条，新增完成归档 %d 条。"
                  % (len(matched), archived), "ok")
         self.invalidate()
@@ -4595,7 +4627,12 @@ class Warden(object):
             ptype = (period.get("type") or period.get("calendar") or "") if first else ""
             pname = (period.get("name") or period.get("title") or "") if first else ""
             task_text = r.get("task_text") or ""
-            task_cell = Text(task_text, style="bold green" if task_text else STYLE_MUTED)
+            if task_text:
+                task_cell = Text(task_text, style="bold green")
+            else:
+                # 每一行都是一场要执行的 session（计划或实际）；没有任务就明确报警，
+                # 不要留空让用户以为只是「这一格没画东西」。
+                task_cell = Text("没有设定任务🔞", style="bold red")
             t.add_row(
                 Text(pid or "", style="bold magenta"),
                 Text(pspan, style="cyan"),
@@ -11200,7 +11237,95 @@ class Warden(object):
                 if self.review is not None:
                     self.after_dispatch_review(self._last_line or "")
                 self.refresh_warnings(force=True)
+                self._after_command_finished()
         return run
+
+    def _command_line_parts(self, line):
+        """把 ``_last_line`` 拆成 (规范命令名, 参数 tokens)；拆不了就返回空。"""
+        try:
+            parts = shlex.split(line or "")
+        except ValueError:
+            parts = (line or "").split()
+        if not parts:
+            return "", []
+        command = None
+        registry = getattr(getattr(self, "shell", None), "registry", None)
+        if registry is not None:
+            try:
+                command = registry.get(parts[0].lower())
+            except Exception:                          # noqa: BLE001 - 只是刷新判定
+                command = None
+        name = (getattr(command, "name", "") or parts[0]).lower()
+        return name, parts[1:]
+
+    @staticmethod
+    def _task_command_mutates(tokens):
+        """``task`` 是否真的改账本（select / 列表这类只看的不算）。"""
+        for token in tokens:
+            word = str(token).strip().lower()
+            if word in TASK_MUTATING_ACTIONS:
+                return True
+            if any(word == flag or word.startswith(flag + "=")
+                   for flag in TASK_MUTATING_FLAGS):
+                return True
+        return False
+
+    def _command_touches_board(self, name, tokens):
+        if name == "task":
+            return self._task_command_mutates(tokens)
+        return name in BOARD_MUTATING_COMMANDS
+
+    def _record_command_input(self, line, now=None):
+        """记下命令输入时刻，并判断距离上一条是否已超过自动 refresh 的阈值。"""
+        if not (line or "").strip():
+            return False
+        # 用墙钟而不是 monotonic：机器睡眠时 monotonic 可能不走，
+        # 而「半小时没碰 TUI」应该包含睡眠过去的时间。
+        now = time.time() if now is None else float(now)
+        previous = self._last_command_input_at
+        stale = (previous is not None
+                 and now - previous >= COMMAND_REFRESH_GAP)
+        if stale:
+            self._auto_refresh_pending = True
+        self._last_command_input_at = now
+        return stale
+
+    def _after_command_finished(self):
+        """命令完成后的统一收尾：本地立刻重算 + 需要时后台对远端账。
+
+        本地重算必须发生在任何网络往返之前：task delete/assign、session 改动
+        这类动作已经写进本地账本，表格应马上反映；随后排进 JobRunner 的
+        ``session.snapshot`` / ``task.pull`` 再拿云端事实覆盖它。
+        """
+        name, tokens = self._command_line_parts(self._last_line)
+        touches = self._command_touches_board(name, tokens)
+        stale = self._auto_refresh_pending
+        self._auto_refresh_pending = False
+        if touches:
+            try:
+                self.reload_entries()
+            except Exception as e:                     # noqa: BLE001 - 本地重算失败别掀 TUI
+                self.say("本地表格重算失败（先用上一份）：%s" % e, "warn")
+            try:
+                self.rebuild_rows()
+            except Exception as e:                     # noqa: BLE001
+                self.say("本地表格重算失败（先用上一份）：%s" % e, "warn")
+            self.invalidate()
+        if not (touches or stale):
+            return False
+        if not self.net_async:
+            # --exec / 测试 / 离线走同步语义：本地重算已经完成，不额外发网络。
+            return False
+        if name == "refresh" and not stale:
+            # refresh 自己就是全量对账，别再排一遍。
+            return False
+        self.refresh(quiet=True)
+        self.refresh_task_state()
+        self.refresh_stat_state()
+        self.refresh_review_state()
+        self.forget_caches()
+        self.invalidate()
+        return True
 
     def exit_tui(self):
         raise SystemExit(0)
@@ -11233,6 +11358,7 @@ class Warden(object):
         「你刚才那条算不算把任务转移走了」。
         """
         self._last_line = line
+        self._record_command_input(line)
         # 这条命令可能改画面（表格/任务/消息/警告）：先作废上一次的画帧缓存。
         self.invalidate()
         # 罪案区的全局锁：除了敲宣言，什么都不受理。
