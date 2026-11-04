@@ -10,13 +10,14 @@
       → 15 秒后把 warden 拉到前台（keep_session 的 daemon 干这件事）
       → 核对一遍完成状态（Focusmate 的 completedAt + OmniFocus 的 completed）
       → 每一条没做完的任务问你一次，A/B/C/D/E 选一个
+        （``inspect-due`` 额外有 G：校准已投入/还需 count 后自动排到下一场）
       → 全部处理完，这一场才算翻篇
 
 除了「session 结束自动催」，还有一条**主动**入口：``inspect-due``
 —— 把「过期还没做完」的任务（不管它挂在哪一场、或者根本没挂）拉出来，
 用同一套状态机逐个过一遍。见 :func:`due_candidates`。
 
-五个选项（用户原话见 feature_intents/postsession.md）：
+五个通用选项（用户原话见 feature_intents/postsession.md）：
 
     A 延期      用户自己敲命令把任务转移走；转移成功之后，旧的那条标成「放弃」+
                 本地标签「未完成转移」。**OmniFocus 一个字节都不动** —— 交付物是
@@ -99,6 +100,15 @@ OPTIONS = (
     ("e", "快捷推后", "和延期一样，但复制品由系统建好、直接塞进下一场"),
 )
 
+#: ``inspect-due`` 专属的 G：延长任务时间。
+#:
+#: 过期任务常常只是「比原先估的还要久」，不是不要了。这时让用户报两个数：
+#: 已经投入了几个 count、还需要几个；把上限设成两者之和，然后自动挂到下一场。
+#: 它是**推迟并加时**，不是 A/E 那种「旧记录放弃 + 复制品」。
+DUE_OPTION = ("g", "延长排期",
+              "先报已投入 count、再报还需 count → 抬高上限并自动排到下一场")
+DUE_OPTIONS = OPTIONS + (DUE_OPTION,)
+
 #: **count 达标**的那条才多出来的动作（用户需求：「问是否需要额外的 count 或者直接完成」）。
 #:
 #:     f        这一场就把它记满 → 直接完成（勾 Focusmate + 写回 OmniFocus）
@@ -117,6 +127,7 @@ OPTION_ALIASES = {
     "c": "c", "重议": "c", "duplicate": "c", "3": "c",
     "d": "d", "缺漏完成": "d", "补充": "d", "补录": "d", "完成": "d", "4": "d",
     "e": "e", "快捷推后": "e", "next": "e", "5": "e",
+    "g": "g", "延长": "g", "加时": "g", "extend": "g", "6": "g",
 }
 
 #: 跳过 / 退出 / 帮助
@@ -697,6 +708,8 @@ class Review(object):
     ASK = "ask"
     TRANSFER = "transfer"
     MINUTES = "minutes"
+    EXTEND_INVESTED = "extend-invested"
+    EXTEND_REMAIN = "extend-remain"
     DONE = "done"
 
     def __init__(self, store, session, tasks, hooks=None, now=None, index=0,
@@ -712,6 +725,7 @@ class Review(object):
         self.skipped = []
         self.closed = False
         self.pending_task = None      # 处于「等你的转移命令」/「等分钟数」的那条
+        self.extend_invested = None   # G 延长：刚刚问到的「已投入 count」
         # count 的进度账（``{task_id: {...}}``）：谁在这一场涨了几个、够数了没有。
         # 由 warden 在 begin_review 里**记完账**之后递进来 —— 这里只负责问人。
         self.counts = dict(counts or {})
@@ -815,7 +829,8 @@ class Review(object):
                                   sess.get("end") or "?")
 
     def options(self):
-        return list(OPTIONS)
+        """当前这一轮能用的选项：G 只属于 ``inspect-due``。"""
+        return list(DUE_OPTIONS if self.due_mode() else OPTIONS)
 
     def stage_hint(self):
         if self.stage == self.TRANSFER:
@@ -824,7 +839,18 @@ class Review(object):
                     "敲 `b` 直接放弃、`s` 跳过。" % self._task_label())
         if self.stage == self.MINUTES:
             return "大概花了多少分钟？（填个整数就行，例如 35）"
+        if self.stage == self.EXTEND_INVESTED:
+            return ("任务 %s「%s」当前已经投入了多少个 count？"
+                    "（非负整数，0 = 还没投入；s 跳过）"
+                    % (self._task_label(), self.title_of(self.pending_task or self.current())))
+        if self.stage == self.EXTEND_REMAIN:
+            return ("任务 %s「%s」还需要多少个 count？"
+                    "（正整数，例如 3；s 跳过）"
+                    % (self._task_label(), self.title_of(self.pending_task or self.current())))
         hint = "A 延期 · B 放弃 · C 重议 · D 缺漏完成 · E 快捷推后 · s 跳过 · q 结束收尾"
+        if self.due_mode():
+            hint = ("A 延期 · B 放弃 · C 重议 · D 缺漏完成 · E 快捷推后 · "
+                    "G 延长排期 · s 跳过 · q 结束")
         if self.at_cap(self.current()):
             hint = "F 直接完成 / f 2 再要 2 个 count · " + hint
         return hint
@@ -930,7 +956,7 @@ class Review(object):
             out.append(("  " + self.count_line(state),
                         "bold yellow" if state.get("maxed") else "dim"))
         if self.stage == self.ASK:
-            for key, name, desc in OPTIONS:
+            for key, name, desc in self.options():
                 out.append(("  %s  %-6s %s" % (key.upper(), name, desc), ""))
         out.append(("第 %d/%d 条 · %s" % (min(self.index + 1, self.total()),
                                           self.total(), self.stage_hint()), "cyan"))
@@ -977,6 +1003,39 @@ class Review(object):
             self.stage = self.ASK
             return self._complete_manually(task, minutes)
 
+        if self.stage in (self.EXTEND_INVESTED, self.EXTEND_REMAIN):
+            task = self.pending_task or self.current()
+            if low in QUIT_TOKENS:
+                self.pending_task = None
+                self.stage = self.ASK
+                self.extend_invested = None
+                return self._close()
+            if low in SKIP_TOKENS:
+                self.pending_task = None
+                self.stage = self.ASK
+                self.extend_invested = None
+                return self._skip(task)
+            if not raw:
+                self.say(self.stage_hint(), "info")
+                return {"action": "handled"}
+            got = ts.parse_count(raw)
+            if self.stage == self.EXTEND_INVESTED:
+                if got is None or got < 0:
+                    self.say("已投入 count 要填非负整数（例如 2；0 = 还没投入）。", "warn")
+                    return {"action": "handled"}
+                self.extend_invested = got
+                self.stage = self.EXTEND_REMAIN
+                self.say("已投入 %d 个 count。还需要多少个？（正整数）" % got, "info")
+                return {"action": "handled"}
+            if got is None or got <= 0:
+                self.say("还需要 count 要填正整数（例如 3）。", "warn")
+                return {"action": "handled"}
+            invested = int(self.extend_invested or 0)
+            self.pending_task = None
+            self.stage = self.ASK
+            self.extend_invested = None
+            return self._extend_and_schedule(task, invested, got)
+
         # stage == ASK
         if not raw:
             self.say(self.stage_hint(), "info")
@@ -986,23 +1045,25 @@ class Review(object):
         if low in SKIP_TOKENS:
             return self._skip(self.current())
         if low in HELP_TOKENS:
-            for key, name, desc in OPTIONS:
+            for key, name, desc in self.options():
                 self.say("%s %s：%s" % (key.upper(), name, desc), "info")
             return {"action": "handled"}
         count_choice = self._parse_count_choice(raw)
         if count_choice is not None:
             task = self.current()
             if not self.at_cap(task):
+                more = " / G 延长排期" if self.due_mode() else ""
                 self.say("`f` 只给「这一场就够数」的那条任务用（它的 count 还没到上限）；"
-                         "别的照旧 A/B/C/D/E。", "warn")
+                         "别的照旧 A/B/C/D/E%s；s 跳过。" % more, "warn")
                 return {"action": "handled"}
             if count_choice <= 0:
                 return self._complete_by_count(task)
             return self._extend_count(task, count_choice)
         choice = OPTION_ALIASES.get(low)
         if choice is None:
-            self.say("认不出 %r；A 延期 / B 放弃 / C 重议 / D 缺漏完成 / E 快捷推后 / s 跳过 / q 结束"
-                     % raw, "warn")
+            tail = "G 延长排期 / " if self.due_mode() else ""
+            self.say("认不出 %r；A 延期 / B 放弃 / C 重议 / D 缺漏完成 / E 快捷推后 / %ss 跳过 / q 结束"
+                     % (raw, tail), "warn")
             return {"action": "handled"}
         return self._choose(choice)
 
@@ -1068,6 +1129,64 @@ class Review(object):
                     cap - int(invested)), "ok")
         return self._advance()
 
+    def _extend_and_schedule(self, task, invested, remaining):
+        """G：记下「已投入 + 还需」，把任务自动排到下一场。
+
+        和 ``f`` / ``_extend_count`` 的区别：这里不只知道额外要几个，还让用户
+        校准已经投入了几个；而且这是 ``inspect-due`` 的过期任务，光抬上限不够，
+        必须给它一个新的落点，否则它下一分钟还在「过期」列表里。
+        """
+        nxt = self._hook("next_session", task)
+        if not nxt:
+            self.say("找不到下一场可以排（data.csv 里后面没有 session）；"
+                     "任务没动，用 A 延期自己挑地方。", "warn")
+            return {"action": "handled"}
+        setter = self.hooks.get("set_count_plan")
+        if setter:
+            fresh = setter(task, invested, remaining)
+        elif hasattr(self.store, "set_count_plan"):
+            fresh = self.store.set_count_plan(task["id"], invested, remaining)
+        else:
+            # 兼容只实现了 set_count / add_count 的老替身：先抬上限，再校准进度。
+            self.store.set_count(task["id"], invested + remaining)
+            before = ts.task_count_invested(self.store.get(task["id"]))
+            self.store.add_count(task["id"], invested - before)
+            fresh = self.store.get(task["id"])
+        if not isinstance(fresh, dict):
+            fresh = self.store.get(task["id"])
+        assigner = self.hooks.get("assign_focusmate")
+        if assigner:
+            note = assigner(fresh, nxt)
+        else:
+            # 纯逻辑测试 / 自定义 store 没提供 hook：至少把本地排期落下来。
+            self.store.assign(task["id"], nxt)
+            note = "只记了本地"
+        cap = invested + remaining
+        self.counts[task.get("id")] = {
+            "cap": cap, "invested": invested, "delta": 0, "maxed": False,
+        }
+        label = "%s %s" % (nxt.get("date"), nxt.get("start"))
+        try:
+            scheduled = self.store.get(task["id"])
+        except ValueError:
+            scheduled = fresh
+        got_sess = (scheduled or {}).get("session") or {}
+        landed = (got_sess.get("date"), got_sess.get("start")) == (
+            nxt.get("date"), nxt.get("start"))
+        if not landed:
+            self.say("⚠ 任务 %s「%s」的 count 已更新（已投入 %d + 还需 %d = %d），"
+                     "但没排到 %s%s。换一场再试，或用 A 延期自己挑地方。"
+                     % (self.label_of(task), self.title_of(task), invested, remaining,
+                        cap, label, ("；" + note) if note else ""), "warn")
+            return {"action": "handled"}
+        self.mark_processed(task, "count-extend-schedule")
+        self.say("➕ 任务 %s「%s」延长：已投入 %d + 还需 %d = %d count（%d 分钟），"
+                 "已排到 %s%s。"
+                 % (self.label_of(task), self.title_of(task), invested, remaining,
+                    cap, ts.count_to_minutes(cap) or 0, label,
+                    ("；" + note) if note else ""), "ok")
+        return self._advance()
+
     def _choose(self, choice):
         task = self.current()
         if task is None:
@@ -1091,6 +1210,16 @@ class Review(object):
             return {"action": "handled"}
         if choice == "e":
             return self._postpone(task)
+        if choice == "g":
+            if not self.due_mode():
+                self.say("G 延长排期只在 `inspect-due` 查账里用；普通 session 收尾请用 E 快捷推后。", "warn")
+                return {"action": "handled"}
+            self.pending_task = task
+            self.extend_invested = None
+            self.stage = self.EXTEND_INVESTED
+            self.say("延长排期：任务 %s「%s」当前已经投入了多少个 count？"
+                     % (self.label_of(task), self.title_of(task)), "cmd")
+            return {"action": "handled"}
         return {"action": "handled"}
 
     # -- 五个动作 -----------------------------------------------------
@@ -1106,8 +1235,15 @@ class Review(object):
         self.closed = True
         self.stage = self.DONE
         if self.notes:
-            self.say("这一场收尾完成（%d 条任务里 %d 条已收）。"
-                     % (self.total(), self.done_count()), "ok")
+            if self.due_mode():
+                # 查账里 G 会把任务留着继续干，不能用「已收（完成/放弃）」来计数；
+                # 这里报「看过/处理过」多少条才和实际动作对得上。
+                handled = min(self.index, self.total())
+                self.say("查账完成（%d 条任务里处理了 %d 条；跳过的下一轮还会问）。"
+                         % (self.total(), handled), "ok")
+            else:
+                self.say("这一场收尾完成（%d 条任务里 %d 条已收）。"
+                         % (self.total(), self.done_count()), "ok")
         return {"action": "close"}
 
     def _skip(self, task):

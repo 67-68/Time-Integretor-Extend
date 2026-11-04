@@ -1868,6 +1868,37 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-04T20:29:12",
+      "task_id": 114,
+      "fields": {
+        "title": "history work",
+        "due": "2026-11-04T17:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-04",
+        "start": "16:15",
+        "end": "17:05",
+        "duration": 50,
+        "focusmate_session_id": "a9b694dc-2f85-42fd-ac67-b9fbf8b1cb02",
+        "previous_due": "2026-11-04T16:50:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "df19ae56-206b-4e79-9323-34c90c3f21f9",
+        "title": "history work",
+        "description": "",
+        "completed_at": "2026-11-04T08:50:39.807203+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "a9b694dc-2f85-42fd-ac67-b9fbf8b1cb02"
+          }
+        ]
+      }
     }
   ]
 }

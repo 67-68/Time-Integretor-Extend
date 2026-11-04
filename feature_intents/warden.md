@@ -126,9 +126,11 @@ stat [refresh]      切到「统计」视图：生涯累计 / 每天分布 / 按
                     （1 小时缓存；refresh = 立刻增量刷新，只拉缺口 + 最近几天）
 stat refresh full   统计：丢掉缓存、全量重拉（两千多条；只在怀疑缓存坏了时用）
 status / s          重画看板
+open working        只看实际 session：当前/将来 + 真订上的；过去只留最近一场
+open detail         计划 + 实际全部内容（原来的完整契约表）
 help / quit
 review [HH:MM|日期T时刻]   手动开始一场 session 的收尾（逐个问没做完的任务）
-inspect-due [分钟] [--all] 主动 inspect 过期没做完的任务（同一套 A~E）
+inspect-due [分钟] [--all] 主动 inspect 过期没做完的任务（A~E，另有 G 延长排期）
 project [序号] [refresh|remove]  项目库：列表 / 清单 / 重读 OmniFocus / 撤掉
 plan [天数]         把这一天剩下的空场切成 count 分给项目，complete 之后自动排任务
                     （不带参数 = 今天；plan +1 = 明天；今天没 plan 会在状态框里提醒）
@@ -229,7 +231,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
-| 1 | 契约（默认） | **状态框（平滑边框）+ The Contract Table + 任务面板 + 项目表** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `project` |
+| 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `project` / `open working|detail` |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
 | 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` + `plan` / `project` |
@@ -243,7 +245,22 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
   通常 1 个请求、几百 ms；TTL 内的第二次连请求都不发（见 [`stat.md`](./stat.md)）。
 - **「永不重订」名单（verdicts 的 `abandoned`）只在统计视图底部逐行列**（一条一行）。
   契约视图里原来那句指路已经**换成警告**（见下面的「状态框」），平常视图不铺开这些记录。
-- 通用命令（三个视图都认）：`Tab`（切视图）/ `stat` / `status` / `help` / `quit`。
+### session 看板的两个口径：`working` / `detail`
+
+同一块 session 看板有两种口径，底部指示条一直是 `working | detail`，当前那个
+反色高亮；用 `open working` / `open detail` 切换（在任何视图里敲都会切回契约视图
+并应用这个口径）：
+
+| 口径 | 内容 |
+| --- | --- |
+| `detail`（默认） | 原来的完整合并表：计划行 + 实际行 +「认账」解释行都保留 |
+| `working` | 实际为主：当前/将来的 session、真正订上的 session；过去只留最近一条**实际** session，更早的折成「还有 N 条过去 session 已收起（open detail 查看）」。「认账」这种计划被实际场次覆盖的伪行不显示；过去根本没订上的计划行也不显示。 |
+
+working 模式下表格左侧的 `ID` 仍然保留它在 `self.rows` 里的原始序号，所以
+`cancel N` / `mute N` / `task -a N` 不会因为收起行而指错。
+
+- 通用命令（三个视图都认）：`Tab`（切视图）/ `open working|detail` /
+  `stat` / `status` / `help` / `quit`。
   注意：**罪案区锁死时 `stat` 也进不去**（和别的命令一样，除了敲宣言什么都不受理）——
   这是既有的锁语义，不是统计视图的特例。
 - **专注视图的 `stop` ≠ 契约视图的 `stop`**：前者是「消耗一次暂停」，
@@ -390,7 +407,7 @@ TUI 启动时写 `{pid, tty, started_at}`，退出时只擦自己那条。daemon
 - 细节见 [`postsession.md`](./postsession.md)。
 
 **`inspect-due`：主动查账**。自动催只盯「刚结束的那一场」；过期了却压根没挂过场次、
-或者那场早就翻篇的任务，用这条命令拉出来过一遍（同一套 A~E）：
+或者那场早就翻篇的任务，用这条命令拉出来过一遍（同一套 A~E，另有 G 延长排期）：
 
 ```
 inspect-due          已经过了截止时间的
@@ -399,7 +416,9 @@ inspect-due --all    不按截止时间筛（没做完的都看）
 ```
 
 面板标题是「过期未完成任务」，每条多一行「截止 …，已过期 2 小时」。
-结束时不写 postsession 状态文件（没有那一场可以翻篇）。
+按 `G` 会先问「当前已投入多少 count」、再问「还需多少 count」，然后校准
+`count_invested` / `count`（时长同步 = count × 25）并自动把同一个任务排到下一场；
+A–E 的语义不变。结束时不写 postsession 状态文件（没有那一场可以翻篇）。
 过期任务同时会出现在状态框的警告里，提示你敲这条命令。
 
 ## 项目（OmniFocus Project）：母体 → 当天的任务

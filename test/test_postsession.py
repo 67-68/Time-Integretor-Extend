@@ -454,6 +454,51 @@ check("E：只叫了一次挂 Focusmate",
       [c[0] for c in calls if c[0] != "say"], ["assign"])
 check("E：拒绝把旧记录删掉（还在库里）", store.get(ids[0])["id"], ids[0])
 
+# G 延长排期：inspect-due 专属，先问已投入、再问还需，最后排下一场
+print("\n== G inspect-due 延长排期 ==")
+calls = []
+store, review, ids = mk_review(hooks=hooks_base(
+    next_session=lambda task: NEXT,
+    assign_focusmate=lambda task, sess: (
+        store.assign(task["id"], sess),
+        calls.append(("assign", task["id"], sess["start"])))[1] or "Focusmate task x",
+    set_count_plan=lambda task, invested, remaining: (
+        calls.append(("plan", task["id"], invested, remaining)),
+        store.set_count_plan(task["id"], invested, remaining))[1]))
+store.set_count(ids[0], 2)
+store.add_count(ids[0], 1)
+review.tasks = [store.get(ids[0])]
+review.session = dict(SESS)
+check("普通 session 收尾不出 G", "g" in [k for k, _n, _d in review.options()], False)
+review.session = {"kind": "due", "label": "过期未完成任务"}
+check("inspect-due 出 G", "g" in [k for k, _n, _d in review.options()], True)
+body = "\n".join(text for text, _style in review.lines())
+check_true("面板上看得见 G 延长排期", "G" in body and "延长排期" in body)
+check("敲 G 进入「问已投入」", review.handle("g"), {"action": "handled"})
+check("stage = extend-invested", review.stage, psv.Review.EXTEND_INVESTED)
+review.handle("-1")
+check("负的已投入被拒、还在问", review.stage, psv.Review.EXTEND_INVESTED)
+review.handle("2")
+check("已投入记下、进入「问还需」", (review.stage, review.extend_invested),
+      (psv.Review.EXTEND_REMAIN, 2))
+review.handle("0")
+check("还需 0 被拒、还在问", review.stage, psv.Review.EXTEND_REMAIN)
+review.handle("3")
+fresh = store.get(ids[0])
+check("G：已投入校准为 2", ts.task_count_invested(fresh), 2)
+check("G：上限 = 已投入 2 + 还需 3 = 5", ts.task_count(fresh), 5)
+check("G：时长跟着 = 125 分钟", fresh["fields"].get("duration"), 125)
+check("G：任务仍然进行中", fresh["status"], ts.STATUS_ACTIVE)
+check("G：自动排到下一场", (fresh["session"].get("start"),
+                              fresh["session"].get("date")), ("12:00", "2026-10-27"))
+check("G：截止时间跟下一场终点", fresh["fields"].get("due"), "2026-10-27T12:50:00")
+check("G：先写 count plan，再挂下一场",
+      [c for c in calls if c[0] != "say"],
+      [("plan", ids[0], 2, 3), ("assign", ids[0], "12:00")])
+check_true("G：说清楚排到了哪场", any("已排到 2026-10-27 12:00" in text
+                                        for _kind, text in review.notes))
+check("G：一条任务处理完就收工", (review.closed, review.pending()), (True, False))
+
 # A 延期：等用户自己敲命令
 store, review, ids = mk_review(hooks=hooks_base())
 store.link_omnifocus(ids[0], "omnifocus:///task/pk1")
@@ -1447,6 +1492,44 @@ check("OmniFocus 里手动勾掉的 → 本地跟着完成",
       ts.TaskStore.status_of(store.get(manual["id"])), "completed")
 check("跟着完成之后也补写了一次截止时间（幂等）",
       [w[0] for w in manual_wd.omnifocus.writes], ["complete"])
+
+# ---------------------------------------------------------------- warden：inspect-due 的 G
+print("== warden：inspect-due 里敲 G 真的校准 count 并排到下一场 ==")
+# 过期任务原来那场是昨天：下一场必须从「现在」往后找，不能排回昨天后面的 slot。
+ns_wd = mkwarden()
+ns_wd.offline = True
+_today = datetime.date.today()
+_ns_now = datetime.datetime.combine(_today, datetime.time(10, 0))
+ns_wd.review_now = _ns_now
+_ns_entries = w.sch.parse_text("09:00,50\n11:00,50\n13:00,50")[0]
+ns_wd.reload_entries = lambda: _ns_entries
+_nxt = ns_wd.next_session_after({
+    "session": {"date": (_today - datetime.timedelta(days=1)).isoformat(),
+                "start": "09:00"}})
+check("过期任务的下一次从今天往后找",
+      (_nxt.get("date"), _nxt.get("start")), (_today.isoformat(), "11:00"))
+for old in store.list():
+    store.delete(old["id"])
+g_wd = mkwarden()
+g_wd.offline = True
+g_task = store.create(fields={"title": "写论文", "count": "2",
+                              "due": "2026-10-27T09:00:00"})
+store.add_count(g_task["id"], 1)
+g_wd.next_session_after = lambda task: dict(NEXT)
+g_wd.begin_inspect_due([store.get(g_task["id"])], sync=False)
+check_true("inspect-due 面板开起来", g_wd.review is not None)
+check("intercept 吃掉 G", g_wd.intercept("g"), True)
+check("提示问已投入", g_wd.review.stage, psv.Review.EXTEND_INVESTED)
+check("intercept 吃掉已投入 2", g_wd.intercept("2"), True)
+check("提示问还需", g_wd.review.stage, psv.Review.EXTEND_REMAIN)
+check("intercept 吃掉还需 3", g_wd.intercept("3"), True)
+g_fresh = store.get(g_task["id"])
+check("warden 的 set_count_plan 真的写进库",
+      (ts.task_count_invested(g_fresh), ts.task_count(g_fresh)), (2, 5))
+check("warden 自动排到下一场",
+      (g_fresh["session"].get("date"), g_fresh["session"].get("start")),
+      ("2026-10-27", "12:00"))
+check("处理完收尾面板消失", g_wd.review, None)
 
 print()
 if fails:

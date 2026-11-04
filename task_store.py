@@ -205,6 +205,11 @@ def count_text(task, delta=0):
         if not invested:
             return ""
         return "(%d)" % invested
+    if not invested and cap <= 1:
+        # 一格都还没投入、上限也是 1：这是「25 分钟任务」的默认形状。
+        # 表格里每条都挂 `(0+1/1)` / `(0+2/1)` 只是噪音，不提供任何信息。
+        # 有进度（例如 `(1+1/1)`）或本来就要好几个 count（`(0+2/5)`）才显示。
+        return ""
     if not invested and not extra and str((task or {}).get("status") or STATUS_ACTIVE) != STATUS_ACTIVE:
         # 收工/放弃的任务、一格都没记过：`(0/1)` 只会让人以为「你 1 个都没干」。
         # 有进度的照样显示（那才是「这条当时干了多少块」）。
@@ -1011,6 +1016,35 @@ class TaskStore(object):
         return found
 
     # -- count（最高进度 / 已投入）-------------------------------------
+
+    def set_count_plan(self, task_id, invested, remaining):
+        """一次设定「已投入 + 还需」两个 count，并把上限/时长一起对齐。
+
+        这是 ``inspect-due`` 的 G「延长排期」用的原子操作：用户先报当前已经投入
+        几个 count，再报还需要几个；上限 = 已投入 + 还需，时长 = 上限 × 25。
+        分两步调 :meth:`add_count` / :meth:`set_count` 会碰到旧上限把进度夹住，
+        所以这里一次写清楚。
+
+        参数校验：``invested`` 必须是非负整数，``remaining`` 必须是正整数。
+        """
+        invested = parse_count(invested)
+        remaining = parse_count(remaining)
+        if invested is None or invested < 0:
+            raise ValueError("已投入 count 必须是非负整数；你给的是 %r" % (invested,))
+        if remaining is None or remaining <= 0:
+            raise ValueError("还需要 count 必须是正整数；你给的是 %r" % (remaining,))
+        cap = invested + remaining
+
+        def apply(task):
+            fields = task.setdefault("fields", {})
+            fields[COUNT_KEY] = cap
+            fields[DURATION_KEYS[0]] = count_to_minutes(cap)
+            if invested > 0:
+                fields[COUNT_INVESTED_KEY] = invested
+            else:
+                fields.pop(COUNT_INVESTED_KEY, None)
+
+        return self._mutate(task_id, apply)
 
     def set_count(self, task_id, count):
         """设定最高 count（duration 跟着变成 25 × count）；``None``/0 = 取消上限。

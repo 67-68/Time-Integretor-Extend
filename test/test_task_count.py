@@ -186,6 +186,14 @@ check("count_text 已投入/上限", ts.count_text({"fields": {"count": 5, "coun
       "(1/5)")
 check("count_text 带这一场的涨幅",
       ts.count_text({"fields": {"count": 5, "count_invested": 1}}, delta=2), "(1+2/5)")
+check("默认 1 count、零进度 → 不显示噪音",
+      ts.count_text({"fields": {"count": 1}}, delta=1), "")
+check("默认 1 count、零进度但这场报 +2 → 也不显示",
+      ts.count_text({"fields": {"count": 1}}, delta=2), "")
+check("多个 count、零进度 → 保留（0+2/5 是有用的目标信息）",
+      ts.count_text({"fields": {"count": 5}}, delta=2), "(0+2/5)")
+check("有进度就显示",
+      ts.count_text({"fields": {"count": 1, "count_invested": 1}}, delta=0), "(1/1)")
 
 wd = mkwarden()
 store = wd.task_store
@@ -238,6 +246,27 @@ d, _before, after = store.set_count(d["id"], 2)
 check("上限降到 2", after, 2)
 check("进度被压到 2", ts.task_count_invested(store.get(d["id"])), 2)
 
+print("\n-- set_count_plan：一次写清「已投入 + 还需」，旧上限不会夹住进度 --")
+plan = store.create(fields={"title": "延长排期", "count": "1"})
+store.add_count(plan["id"], 1)
+plan = store.set_count_plan(plan["id"], 4, 3)
+check("上限 = 已投入 4 + 还需 3 = 7", ts.task_count(plan), 7)
+check("已投入校准为 4（没被旧上限 1 夹住）", ts.task_count_invested(plan), 4)
+check("时长跟着 count = 175 分钟", plan["fields"].get("duration"), 175)
+plan = store.set_count_plan(plan["id"], 0, 2)
+check("已投入可以报 0", ts.task_count_invested(plan), 0)
+check("只剩还需 2", ts.task_count(plan), 2)
+try:
+    store.set_count_plan(plan["id"], -1, 3)
+    check("负的已投入要报错", False, True)
+except ValueError:
+    check("负的已投入要报错", True, True)
+try:
+    store.set_count_plan(plan["id"], 1, 0)
+    check("还需 0 个要报错", False, True)
+except ValueError:
+    check("还需 0 个要报错", True, True)
+
 # ---------------------------------------------------------------- 4. 表格
 print("\n== 4. 契约表格 / 任务面板里的 (1+2/5) ==")
 for old in store.list():
@@ -257,6 +286,16 @@ loose = store.create(fields={"title": "没挂 session 的", "count": "2"})
 check("没挂 session 的任务不预报涨幅", wd.task_count_delta(store.get(loose["id"])), 0)
 nolo = store.create(fields={"title": "没有 count"})
 check("没设 count 的任务不显示这一格", wd.task_count_label(store.get(nolo["id"])), "")
+
+print("\n-- 默认 (0+1/1) 不在 session 表格 / 下方任务栏出现 --")
+plain = store.create(fields={"title": "flashcard review", "duration": "25"})
+store.assign(plain["id"], {"date": ISO, "start": "11:00", "duration": 50})
+plain = store.get(plain["id"])
+check("session 表格里没有 (0+2/1)", "(0+2/1)" in wd.task_cell_text([plain], 50), False)
+check("任务栏里没有 (0+2/1)", "(0+2/1)" in wd.task_index_title(plain), False)
+check("这两处的 count 标记都为空",
+      (wd.task_count_label(plain), wd.task_count_label(plain, 0)), ("", ""))
+store.delete(plain["id"])
 
 # ---------------------------------------------------------------- 5. 收尾
 print("\n== 5. session 结束：count 记进账，但够数的那条要问过人才完成 ==")

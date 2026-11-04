@@ -1407,6 +1407,12 @@ class View(object):
             _cmd("view", lambda a: w.cycle_view(),
                  "下一个视图", ("tab", "switch"), "通用",
                  usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
+            _cmd("open", w.cmd_open,
+                 "切换看板口径：working（实际为主、旧场次收起）/ detail（计划 + 实际）",
+                 ("看板",), "通用", usage="open working|detail",
+                 options=("working", "detail"),
+                 hint=_hint_actions("working", "detail",
+                                    note="working = 实际 session；detail = 计划 + 实际")),
             _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
                  ("stats",), "通用", usage="stat [refresh [full]]",
                  options=("refresh", "full"), hint=_hint_stat),
@@ -1479,8 +1485,9 @@ class ContractView(View):
     def idle_hint(self):
         return repl_kit.Hint(
             "命令",
-            ("session", "period", "cancel", "mute", "title", "day", "sync", "help", "quit"),
-            note="Tab 切下一个视图（专注 → 统计 → 任务）",
+            ("session", "period", "cancel", "mute", "title", "day", "sync",
+             "open working", "open detail", "help", "quit"),
+            note="Tab 切下一个视图（专注 → 统计 → 任务）；open 切换看板口径",
         )
 
     def status_box(self):
@@ -1553,7 +1560,7 @@ class ContractView(View):
                  usage="review [HH:MM | 日期T时刻]",
                  hint=_hint_actions("review", note="结束后 15 秒 daemon 会自动拉你回来收尾")),
             _cmd("inspect-due", w.cmd_inspect_due,
-                 "主动 inspect 过期没做完的任务（同一套 A/B/C/D/E）",
+                 "主动 inspect 过期没做完的任务（同一套 A/B/C/D/E/G）",
                  ("inspect_due", "due", "过期", "查账"),
                  usage="inspect-due [分钟] [--all]",
                  options=("--all", "60"),
@@ -1940,9 +1947,10 @@ class TaskView(View):
             _cmd("review", w.cmd_review,
                  "手动开始一场 session 的收尾（逐个问没做完的任务）", ("收尾",),
                  usage="review [HH:MM | 日期T时刻]",
-                 hint=_hint_actions("review", note="A 延期 / B 放弃 / C 重议 / D 补录 / E 推后")),
+                 hint=_hint_actions("review", note="A 延期 / B 放弃 / C 重议 / D 补录 / E 推后"
+                                                   "（inspect-due 另有 G 延长排期）")),
             _cmd("inspect-due", w.cmd_inspect_due,
-                 "主动 inspect 过期没做完的任务（同一套 A/B/C/D/E）",
+                 "主动 inspect 过期没做完的任务（同一套 A/B/C/D/E/G）",
                  ("inspect_due", "due", "过期", "查账"),
                  usage="inspect-due [分钟] [--all]",
                  options=("--all", "60"),
@@ -2320,6 +2328,47 @@ class WardenShell(repl_kit.ReplShell):
         return shutil.get_terminal_size((80, 24)).lines
 
 
+#: session 看板的两种口径。``detail`` 是原来的完整视图；``working`` 只看
+#: 「现在/将来要干的 + 真的订上的」，并把过去的实际 session 折成最近一条。
+SESSION_UI_MODES = ("working", "detail")
+
+
+def visible_session_rows(rows, mode="detail"):
+    """按看板口径筛 session 行 → ``(items, collapsed_past)``。
+
+    ``items`` 是 ``[(原表格序号, row), ...]``。序号故意保留**原 self.rows 里的
+    位置**，因为 `task -a N` / `cancel N` / `mute N` 这些命令一直按这个数找行；
+    working 模式只是少画几条，不能把命令的编号也改掉。
+
+    working 口径：
+    * 当前/将来：保留计划行与实际行；``认账`` 那种「计划被别的场次覆盖」的
+      伪行不显示（真正的实际场次会自己出现在 API 行里）。
+    * 过去：只留最近一条**实际存在**的 session；更早的折成 caption 计数。
+    * 过去但根本没订上的计划行不显示（它不是实际内容）。
+    """
+    items = list(enumerate(rows or [], 1))
+    if mode != "working":
+        return items, 0
+    current_future, past_actual = [], []
+    for idx, row in items:
+        planned_only = bool(row.get("planned")) and not row.get("id")
+        if planned_only and row.get("adopted"):
+            # 认账行：它是契约被实际场次覆盖后的解释，不是一个 session。
+            continue
+        if row.get("phase") == "已结束":
+            if planned_only:
+                continue
+            past_actual.append((idx, row))
+        else:
+            current_future.append((idx, row))
+    past_actual.sort(key=lambda pair: (pair[1].get("startMs") or 0, pair[0]))
+    kept_past = past_actual[-1:]
+    collapsed = max(0, len(past_actual) - 1)
+    out = current_future + kept_past
+    out.sort(key=lambda pair: (pair[1].get("startMs") or 0, pair[0]))
+    return out, collapsed
+
+
 class Warden(object):
     def __init__(self, console, bridge, no_clear=False, offline=False, day_offset=0,
                  net_async=None):
@@ -2340,6 +2389,9 @@ class Warden(object):
         self.had_error = False
         self.bridge_note = ""
         self.day_offset = int(day_offset)
+        # 看板口径：detail = 计划 + 实际全量（默认，保持原行为）；
+        # working = 实际为主并收起旧场次。
+        self.session_ui_mode = "detail"
         # 视图（Shift+Tab 切换）：默认「契约」视图，第二个是「专注」视图。
         self.view_impls = [cls(self) for cls in VIEWS] or [ContractView(self)]
         # 生涯统计（统计视图 / stat 命令）：self.stat 是 stats.compute_stats 的结果，
@@ -3399,7 +3451,7 @@ class Warden(object):
             self.bridge_note or "", bool(self.had_error),
             self.csv_fp, len(self.entries),
             self.review_signature(), pending_sig,
-            self.sel_date.isoformat(), self.day_offset,
+            self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
             id(getattr(self, "stat", None)),
             # 队列一动（进度条、日志、失败账）画面就得重排版
             self.jobs.signature(),
@@ -3911,9 +3963,14 @@ class Warden(object):
         return "宣言> " if self.pending_sins() else None
 
     def render_view_bar(self):
-        """一行「当前在第几个视图」，带切换键提示。视图多了自动跟着排。"""
+        """看板口径 + 「当前在第几个视图」，当前项都染色。"""
         bar = Text()
-        bar.append("视图 ", style="dim")
+        for mode in SESSION_UI_MODES:
+            if mode != SESSION_UI_MODES[0]:
+                bar.append(" | ", style="dim")
+            style = "bold reverse cyan" if self.session_ui_mode == mode else "dim"
+            bar.append(mode, style=style)
+        bar.append("    视图 ", style="dim")
         for i, v in enumerate(self.view_impls):
             if i:
                 bar.append("  ", style="dim")
@@ -4442,7 +4499,8 @@ class Warden(object):
 
     def render_table(self):
         day = self.sel_date
-        title = "The Contract Table · %s %s" % (day.isoformat(), sch.cn_weekday_of_day(day))
+        title = "The Contract Table · %s %s" % (day.isoformat(),
+                                                sch.cn_weekday_of_day(day))
         if self.day_offset == 0:
             title += "（今天）"
         elif self.day_offset == 1:
@@ -4458,6 +4516,7 @@ class Warden(object):
             else:
                 title += "  [yellow](快照)[/]"
 
+        items, collapsed = visible_session_rows(self.rows, self.session_ui_mode)
         if not self.rows:
             empty = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold magenta",
                           title_justify="left", expand=False)
@@ -4480,14 +4539,13 @@ class Warden(object):
         t.add_column("task", no_wrap=True, overflow="crop")
 
         live_idx = None
-        for i, r in enumerate(self.rows):
+        for idx, r in items:
             if r["phase"] == "进行中":
-                live_idx = i + 1
+                live_idx = idx
                 break
         zone_tag = {"locked": ("锁", "bold red"), "draft": ("草", "bold green"),
                     "past": ("过", STYLE_MUTED)}
-        for i, r in enumerate(self.rows):
-            idx = i + 1
+        for idx, r in items:
             # 数据（标题/时间/状态）不用 dim：dim 是给说明和单位的，压在数据上就看不清了
             style = STYLE_MUTED if r["phase"] == "已结束" else ""
             st = Text()
@@ -4552,6 +4610,15 @@ class Warden(object):
                 label,
                 task_cell,
             )
+        if collapsed:
+            t.caption = Text(
+                "… 还有 %d 条过去 session 已收起（open detail 查看）" % collapsed,
+                style="dim")
+            t.caption_justify = "left"
+        elif not items:
+            t.caption = Text("working 模式没有可展示的实际 session（open detail 查看全部）",
+                             style="dim")
+            t.caption_justify = "left"
         return t
 
     def render_status_rows(self):
@@ -4680,7 +4747,8 @@ class Warden(object):
                 "%d 条任务过了截止时间还没做完（最早：%s「%s」）"
                 % (len(overdue), first.get("id"), title),
                 level="warn", source="task",
-                hint="敲 inspect-due 逐个过一遍（A 延期 / B 放弃 / C 重议 / D 补录 / E 推后）"))
+                hint="敲 inspect-due 逐个过一遍"
+                     "（A 延期 / B 放弃 / C 重议 / D 补录 / E 推后 / G 延长排期）"))
         # 3.6) 网络操作失败账：有它就告诉你，而且告诉你下一步敲什么
         failures = self.jobs.failures
         if failures:
@@ -8634,20 +8702,27 @@ class Warden(object):
         return "这场还没有 Focusmate session id（没订上），只记了本地"
 
     def next_session_after(self, task, max_days=2):
-        """这条任务「下一场」放哪儿：同一场之后最近的那个 slot（跨天也找）。"""
+        """这条任务「下一场」放哪儿：不早于现在、且在原场次之后最近的那个 slot。
+
+        收尾里的 E 和 ``inspect-due`` 的 G 都用它。以前只从任务原场次的起点往后
+        找，一条几天前过期、但当天后面还有 slot 的任务会被排回**已经过去**的
+        那一天；``inspect-due`` 专门处理过期任务，所以下界必须取「原场次」和
+        「现在」的较大者。
+        """
         sess = task.get("session") or {}
+        now = self.review_now or datetime.datetime.now()
+        day = now.date()
+        start = now.strftime("%H:%M")
         if sess.get("date") and sess.get("start"):
-            day_iso = str(sess["date"])
-            start = str(sess["start"])
-        else:
-            # 没挂过场次（`inspect-due` 里的过期任务常常这样）：从「现在」往后找
-            now = datetime.datetime.now()
-            day_iso = now.date().isoformat()
-            start = now.strftime("%H:%M")
-        try:
-            day = datetime.date.fromisoformat(day_iso)
-        except ValueError:
-            day = self.sel_date
+            try:
+                sess_day = datetime.date.fromisoformat(str(sess["date"]))
+                sess_start = str(sess["start"])
+                sess_dt = datetime.datetime.combine(
+                    sess_day, datetime.time.fromisoformat(sess_start))
+                if sess_dt > now:
+                    day, start = sess_day, sess_start
+            except (ValueError, TypeError):
+                pass
         entries = self.reload_entries()
         for offset in range(0, int(max_days) + 1):
             probe = day + datetime.timedelta(days=offset)
@@ -8656,7 +8731,7 @@ class Warden(object):
             except Exception:                    # noqa: BLE001 - 排布坏了就当这天没有
                 continue
             for slot in slots:
-                if offset == 0 and str(slot.get("start") or "") <= start:
+                if probe == day and str(slot.get("start") or "") <= start:
                     continue
                 return self.session_info_for(probe, slot)
         return None
@@ -8677,6 +8752,8 @@ class Warden(object):
             "assign_focusmate": lambda task, sess: self.assign_task_to(task, sess),
             "due_of": lambda task: self.omni_due_of(task),
             "set_count": lambda task, cap: self.task_store.set_count(task["id"], cap),
+            "set_count_plan": lambda task, invested, remaining: (
+                self.task_store.set_count_plan(task["id"], invested, remaining)),
         }
 
     def sync_completion_state(self, entry=None):
@@ -8837,7 +8914,7 @@ class Warden(object):
             self.review = None
             return None
         self.review = psv.Review(self.task_store, entry, opened, hooks=self.review_hooks())
-        self.say("🔍 %s：%d 条要过一遍（A/B/C/D/E，s 跳过，q 结束）。"
+        self.say("🔍 %s：%d 条要过一遍（A/B/C/D/E，G 延长排期，s 跳过，q 结束）。"
                  % (self.review.headline(), len(opened)), "cmd")
         return self.review
 
@@ -9851,6 +9928,29 @@ class Warden(object):
         else:
             self.refresh()
         return True
+
+    def cmd_open(self, args=None):
+        """``open working`` / ``open detail``：切换 session 看板口径。
+
+        working：只看实际为主的列表 —— 当前/将来的 session + 真订上的 session；
+        过去只留最近一场，其余折成 caption。detail：原来的计划 + 实际全量表。
+        """
+        toks = [str(a).strip().lower() for a in (args or []) if str(a).strip()]
+        mode = toks[0] if toks else (
+            "detail" if self.session_ui_mode == "working" else "working")
+        aliases = {"w": "working", "work": "working", "d": "detail", "all": "detail"}
+        mode = aliases.get(mode, mode)
+        if mode not in SESSION_UI_MODES:
+            raise ValueError("open 只认 working / detail；你给的是 %r"
+                             % (toks[0] if toks else ""))
+        self.session_ui_mode = mode
+        if not isinstance(self.view, ContractView):
+            self.go_to_view(ContractView)
+        self.say("看板切到 %s：%s"
+                 % (mode, "实际 session（过去只留最近一场）"
+                    if mode == "working" else "计划 + 实际全部内容"), "cmd")
+        self.invalidate()
+        return mode
 
     def _period_row_is_stale(self, row, new_by_start):
         """这一行 API session 还符合新排布吗？（按起点 + 时长判断）"""
@@ -10938,6 +11038,8 @@ class Warden(object):
         t.add_column()
         for cmd, desc in [
             ("Tab", "切换视图：契约 → 专注 → 统计 → 任务 → 设置 → 契约（循环）"),
+            ("open working|detail", "切换 session 看板口径：working = 实际为主、"
+                                     "过去只留最近一场；detail = 计划 + 实际全部"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
             ("stat refresh full", "统计：丢掉缓存、全量重拉（默认只增量拉缺口 + 最近几天）"),
             ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),
