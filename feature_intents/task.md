@@ -213,6 +213,9 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task -m complete` / `task -m discard` | 不写序号 = 标记当前选中的任务；`-m` 与 `--mark`、后缀位置都等价 |
 | `task <序号> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
 | `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus；OmniFocus 里**多选 ⌘C** 就是一次导入多条，`-a` / `-f` 等后缀对**整批**生效；如果 OmniFocus 里是重复任务，会先问要不要复制重复设置 |
+| `task import`（剪贴板里是**项目**） | 走另一条路：写进**项目库**（`data/projects.json`），任务清单只存不展示；项目里每条未完成任务都必须有「持续时间」，缺一条就**整批拒绝导入**。见 [`project.md`](project.md) |
+| `project [序号] [refresh\|remove]` | 看项目库 / 看清单 / 重新读 OmniFocus / 撤掉（见 [`project.md`](project.md)） |
+| `plan` | 把这一天剩下的空场切成 count 分给项目，`complete` 之后自动挑任务排进 session（见 [`project.md`](project.md)） |
 | `task import -st`（`--single-task`） | 只导入这一条：不查重复设置、不问、不建本地 `repeat` |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
 | `task <序号> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |
@@ -321,6 +324,14 @@ Focusmate 没有「把 task 挪到另一场」这个动作（只能建一条新�
 - 一条失败不挡其余，最后报总账（`N 条 → 目标`，失败的另说）；
 - 没有 `-a` 就只列一下（手滑不会掉东西）；`-a none` = 全量下架；
 - 源 = 目标 → 什么都不动。
+
+### 导入时认出「这不是任务，是一个项目」
+
+`parse_link()` 认两种链接：`omnifocus:///task/PK` 和 `omnifocus:///project/PK`
+（`item["kind"]` 就是 `task` / `project`）。项目**不进任务库**：它的任务清单进
+`data/projects.json`（项目库），任务本身要等 `plan` 分了 count 才被「唤起」。
+判定只认 primary key 落在 `kind == "project_root"` 那一行上，不拿标题猜。
+整条流程、时长校验和「拒绝导入」的规则见 [`project.md`](project.md)。
 
 ### 导入时检查 OmniFocus 重复任务
 

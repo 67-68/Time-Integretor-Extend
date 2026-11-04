@@ -129,6 +129,9 @@ status / s          重画看板
 help / quit
 review [HH:MM|日期T时刻]   手动开始一场 session 的收尾（逐个问没做完的任务）
 inspect-due [分钟] [--all] 主动 inspect 过期没做完的任务（同一套 A~E）
+project [序号] [refresh|remove]  项目库：列表 / 清单 / 重读 OmniFocus / 撤掉
+plan [天数]         把这一天剩下的空场切成 count 分给项目，complete 之后自动排任务
+                    （不带参数 = 今天；plan +1 = 明天；今天没 plan 会在状态框里提醒）
 ```
 
 `sync` 不重写日历逻辑：薄封装 `download_calendar.py populate`（`--days` 等参数原样透传），
@@ -226,10 +229,10 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
-| 1 | 契约（默认） | **状态框（平滑边框）+ The Contract Table + 任务面板** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…） |
+| 1 | 契约（默认） | **状态框（平滑边框）+ The Contract Table + 任务面板 + 项目表** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `project` |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
-| 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` |
+| 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` + `plan` / `project` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 
 - **统计视图的数据链在 `stats.py`**（只读公开 API，按 ≤365 天分块拉全量历史，
@@ -399,6 +402,16 @@ inspect-due --all    不按截止时间筛（没做完的都看）
 结束时不写 postsession 状态文件（没有那一场可以翻篇）。
 过期任务同时会出现在状态框的警告里，提示你敲这条命令。
 
+## 项目（OmniFocus Project）：母体 → 当天的任务
+
+`data/projects.json`（`project_store.py`）里存的是**活的母体**：一个 OmniFocus 项目
+的任务清单 + 每天分了多少 count。它**永远不挂 session**（和重复任务本体一个规矩），
+真正挂 session 的是 `plan` 唤起出来的本地任务。`plan` 的分资源问答和收尾 / 到点没
+开始共用同一个打断栏位 —— **一次只问一件事**（`planning` 开着时那两个都不会弹）。
+
+整条链路（导入 → 时长门槛 → 项目表 → `plan` → 挑任务 → 排 session → 「部分完成不勾
+OmniFocus」）见 [`project.md`](./project.md)。
+
 ## OmniFocus 联动（只单向）
 
 - 「完成 / 放弃 / 截止时间」写回 OmniFocus；「活还在不在、叫什么」以 OmniFocus 为准。
@@ -505,7 +518,17 @@ stdout  每行： {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
 10. **帧外打印不记账 = 屏幕留残影**。整帧重画靠「上一帧占几行」来决定上移多少，
    帧外的 `console.print`（帮助面板 / 宣言闸门 / `>>>`）不经过 `emit()` 就没记进
    `_tail_rows` → 少上移几行 → 光标落在旧面板中间重画。全部改走 `emit()`。
-11. **上移行数要用 `console.height`，不是 `_term_height()`**。测试里造的是
+11. **用例别读真实的 `temp/` 状态**。真 daemon 每秒钟都在往
+    `temp/keep_session-nostart.json` 里入队「到点没开始」的提问；用例只要没把这个
+    文件钉到临时目录，warden 一开就会被那一问接管 —— `intercept()` 把命令全喂给它，
+    于是「`review` 没进去」「`b` 没作用」这种毫无线索的失败就出现了（真踩过：
+    2026-11-04 00:03 daemon 入队两场，`test_postsession` 立刻红）。现在所有
+    `Warden(...)` 的用例都钉 `TI_NOSTART_FILE` / `TI_POSTSESSION_FILE`。
+12. **「到点前/后几分钟」这类用例必须钉住时钟**。`datetime.now()` 跟着墙上时钟走，
+    同一行代码午夜前一分钟算出来是「今天 23:52」、午夜后就是「昨天 23:52」——
+    `test_nostart` 因此在 00:03 全红。现在用 `_FrozenDatetime`（`now()` 永远返回
+    固定值）钉住 daemon 和 warden 两边的时钟。
+13. **上移行数要用 `console.height`，不是 `_term_height()`**。测试里造的是
    `Console(file=StringIO, height=40)` 这种"矮终端"，用 `shutil.get_terminal_size()`
    会拿到 fallback（24 行）→ 钳位钳错，断言就对不上。真 TTY 上两者一致。
 

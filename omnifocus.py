@@ -63,13 +63,19 @@ SCRIPT = os.path.join(HERE, "omnifocus_tasks.py")
 #: 每次都真跑一遍 osascript（1 秒级）没必要；但也不能太久，完成状态要新鲜。
 CACHE_TTL = 20.0
 
-#: omnifocus:///task/<primary key>；primary key 是 base64url 风格的串
-#: （含 `-` `_` 和偶尔的 `=` 填充），所以字符集要放宽，别用 \w。
-ID_RE = re.compile(r"omnifocus:///task/([A-Za-z0-9_\-=+%/]+)")
+#: Omnifocus 的两种链接：任务 `omnifocus:///task/<pk>` 和**项目**
+#: `omnifocus:///project/<pk>`。primary key 是 base64url 风格的串（含 `-` `_`
+#: 和偶尔的 `=` 填充），所以字符集要放宽，别用 \w。
+#:
+#: 项目也要认：`task import` 分不清这两种的话，导入一个项目会当成「一条叫项目名的
+#: 任务」，项目里那一堆任务就永远进不来（见 project_store.py）。
+LINK_PATH_RE = r"omnifocus:///(?:task|project)/[A-Za-z0-9_\-=+%/]+"
+PROJECT_URL_RE = re.compile(r"omnifocus:///project/([A-Za-z0-9_\-=+%/]+)")
+ID_RE = re.compile(r"omnifocus:///(task|project)/([A-Za-z0-9_\-=+%/]+)")
 #: [标题](omnifocus:///task/PK) —— Markdown / Obsidian 的粘贴结果
-MD_RE = re.compile(r"\[([^\]\n]*)\]\((omnifocus:///task/[^)\s]+)\)")
+MD_RE = re.compile(r"\[([^\]\n]*)\]\((%s)\)" % LINK_PATH_RE)
 #: <omnifocus:///task/PK>
-ANGLE_RE = re.compile(r"<(omnifocus:///task/[^>\s]+)>")
+ANGLE_RE = re.compile(r"<(%s)>" % LINK_PATH_RE)
 #: title: "数学易错修正" / title: 数学易错修正 / 标题：…
 TITLE_RE = re.compile(r"^(?:title|标题)\s*[:：]\s*(.+)$", re.IGNORECASE)
 
@@ -125,8 +131,10 @@ class OmniFocusError(RuntimeError):
 def _clean_id(raw):
     """把链接里抓到的 primary key 收敛一下（去掉 scheme 前缀、尾部标点）。"""
     pk = str(raw or "").strip()
-    if pk.lower().startswith("omnifocus:///task/"):
-        pk = pk[len("omnifocus:///task/"):]
+    for prefix in ("omnifocus:///task/", "omnifocus:///project/"):
+        if pk.lower().startswith(prefix):
+            pk = pk[len(prefix):]
+            break
     pk = pk.strip("<>")
     pk = pk.rstrip(".,;:!?)]}>\"'，。、；：）」』】")
     pk = pk.replace("%2F", "/").replace("%20", " ")
@@ -136,6 +144,21 @@ def _clean_id(raw):
 def task_url(pk):
     pk = _clean_id(pk)
     return "omnifocus:///task/%s" % pk if pk else ""
+
+
+def project_url(pk):
+    """项目的 OmniFocus 链接（`omnifocus:///project/<pk>`）。"""
+    pk = _clean_id(pk)
+    return "omnifocus:///project/%s" % pk if pk else ""
+
+
+def link_kind(text):
+    """这段文本指的是**任务**还是**项目**（认不出就 ``None``）。"""
+    match = PROJECT_URL_RE.search(str(text or ""))
+    if match:
+        return "project"
+    match = ID_RE.search(str(text or ""))
+    return match.group(1) if match else None
 
 
 def parse_link(text):
@@ -149,19 +172,23 @@ def parse_link(text):
         return None
     body = raw.strip(_LEAD)
     pk = None
+    kind = None
     title = None
     match = MD_RE.search(body)
     if match:
         title = match.group(1).strip() or None
+        kind = link_kind(match.group(2))
         pk = _clean_id(match.group(2))
     else:
         match = ANGLE_RE.search(body)
         if match:
+            kind = link_kind(match.group(1))
             pk = _clean_id(match.group(1))
         else:
             match = ID_RE.search(body)
             if match:
-                pk = _clean_id(match.group(1))
+                kind = match.group(1)
+                pk = _clean_id(match.group(2))
     if pk is None:
         match = TITLE_RE.match(body)
         if match:
@@ -176,7 +203,8 @@ def parse_link(text):
         title = body
     return {
         "id": pk,
-        "url": task_url(pk) if pk else None,
+        "url": (project_url(pk) if kind == "project" else task_url(pk)) if pk else None,
+        "kind": kind or ("task" if pk else None),
         "title": title,
         "has_id": bool(pk),
         "raw": raw,
@@ -198,8 +226,8 @@ def split_line_links(line):
     """
     found = [m.group(0) for m in MD_RE.finditer(line)]
     if len(found) < 2:
-        found = ["omnifocus:///task/%s" % _clean_id(m.group(0))
-                 for m in re.finditer(r"omnifocus:///task/[^\s\"'<>]+", line)]
+        found = [m.group(0) for m in
+                 re.finditer(r"omnifocus:///(?:task|project)/[^\s\"'<>]+", line)]
         if len(found) < 2:
             return [line]
     return found
@@ -242,7 +270,8 @@ def html_links(markup):
     if not markup:
         return out
     pattern = re.compile(
-        r"<a\b[^>]*href\s*=\s*[\"'](omnifocus:///task/[^\"']+)[\"'][^>]*>(.*?)</a>",
+        r"<a\b[^>]*href\s*=\s*[\"'](omnifocus:///(?:task|project)/[^\"']+)[\"'][^>]*>"
+        r"(.*?)</a>",
         re.IGNORECASE | re.DOTALL,
     )
     for href, text in pattern.findall(markup):
@@ -250,8 +279,11 @@ def html_links(markup):
         title = html_mod.unescape(title)
         title = re.sub(r"\s+", " ", title).strip()
         pk = _clean_id(href)
-        out.append({"id": pk or None, "url": task_url(pk), "title": title or None,
-                    "has_id": bool(pk), "raw": href})
+        kind = link_kind(href)
+        out.append({"id": pk or None,
+                    "url": project_url(pk) if kind == "project" else task_url(pk),
+                    "kind": kind or "task",
+                    "title": title or None, "has_id": bool(pk), "raw": href})
     return out
 
 
@@ -270,7 +302,8 @@ def rtf_links(markup):
         return out
     seen = set()
     pattern = re.compile(
-        r'HYPERLINK\s+"(omnifocus:///task/[^"]+)"\s*\}*\s*\{\\fldrslt\s*([^{}]*)',
+        r'HYPERLINK\s+"(omnifocus:///(?:task|project)/[^"]+)"\s*\}*\s*'
+        r'\{\\fldrslt\s*([^{}]*)',
         re.IGNORECASE | re.DOTALL,
     )
     for href, text in pattern.findall(markup):
@@ -278,14 +311,21 @@ def rtf_links(markup):
         if not pk or pk in seen:
             continue
         seen.add(pk)
-        out.append({"id": pk, "url": task_url(pk), "title": _rtf_unescape(text) or None,
+        kind = link_kind(href)
+        out.append({"id": pk,
+                    "url": project_url(pk) if kind == "project" else task_url(pk),
+                    "kind": kind or "task",
+                    "title": _rtf_unescape(text) or None,
                     "has_id": True, "raw": href})
-    for href in re.findall(r"omnifocus:///task/[^\s\"'\\{}<>]+", markup):
+    for href in re.findall(r"omnifocus:///(?:task|project)/[^\s\"'\\{}<>]+", markup):
         pk = _clean_id(href)
         if not pk or pk in seen:
             continue
         seen.add(pk)
-        out.append({"id": pk, "url": task_url(pk), "title": None,
+        kind = link_kind(href)
+        out.append({"id": pk,
+                    "url": project_url(pk) if kind == "project" else task_url(pk),
+                    "kind": kind or "task", "title": None,
                     "has_id": True, "raw": href})
     return out
 

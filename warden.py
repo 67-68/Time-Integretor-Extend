@@ -69,6 +69,13 @@
 （`inspect-due 60` = 未来 60 分钟内到期的也算，`--all` = 不按截止时间筛）
 拉进同一套状态机过一遍。过期任务还会出现在状态框的警告里，提示敲这条命令。
 
+**项目 + `plan`（资源 → 任务 → session）**：`task import` 认出剪贴板里是 OmniFocus
+**项目**时，把它的任务清单存进项目库（`data/projects.json`），**不建本地任务**；
+契约视图的任务面板下面多一张项目表（剩余 count / 进度 / 今天排了多少）。`plan`
+先把这一天剩下的空场切成 count（1 count = 25 分钟），逐个项目问「分多少」
+（`task 1 4` / `task 1 clear` / `complete`），再按分到的 count 唤起任务、排进 session
+（一场一个任务、尽量不拆）。见 [`feature_intents/project.md`](feature_intents/project.md)。
+
 **收尾面板长在哪儿**：不是某个视图的内部件，而是 `repl_kit` 的**打断栏位**
 （`ReplShell(interrogate=...)`）—— 压在整块看板下面、状态栏上面。换视图、表格变长、
 终端太矮被裁屏，都冲不掉它；一问完栏位立刻消失，不占一行。
@@ -263,6 +270,8 @@ import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + �
 import settings_store as cfg  # noqa: E402  设置项注册表 + data/settings.json
 import omnifocus as of  # noqa: E402  OmniFocus：链接解析 + 读写（osascript 子进程）
 import postsession as psv  # noqa: E402  session 结束 15s 后的收尾（纯逻辑）
+import project_store as pj  # noqa: E402  项目库：OmniFocus Project 的存在与进度
+import project_plan as pp  # noqa: E402  plan：空闲容量 → 分资源 → 排任务（纯逻辑）
 import runtime_log as rl  # noqa: E402  按天落盘的 JSONL 运行日志（Focusmate 拉取 / OmniFocus 写回）
 
 BRIDGE_JS = os.path.join(HERE, "scripts", "bridge.mjs")
@@ -936,7 +945,8 @@ def _task_command(w):
     return repl_kit.Command(
         name="task",
         handler=w.cmd_task,
-        summary="任务 CRUD / 挂到 session / 手动标记状态 / trigger + formatter / 同步完成时间",
+        summary="任务 CRUD / 挂到 session / 手动标记状态 / trigger + formatter / "
+                "同步完成时间 / 导入 OmniFocus 项目",
         aliases=(),
         section="通用",
         usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
@@ -1487,6 +1497,10 @@ class ContractView(View):
         index = self.w.render_task_index()
         if index is not None:
             out.append(index)
+        # 任务面板**下面**那块项目表（剩余 count / 进度 / 今天排了多少）
+        projects = self.w.render_projects_table()
+        if projects is not None:
+            out.append(projects)
         return out
 
     def unknown_hint(self):
@@ -1545,6 +1559,22 @@ class ContractView(View):
                  options=("--all", "60"),
                  hint=_hint_actions("--all", "60", "120",
                                     note="不给参数 = 看已经过期的；给分钟数 = 提前看")),
+            _cmd("plan", w.cmd_plan,
+                 "把这一天的空闲切成 count 分给项目，再自动排任务进 session",
+                 ("排期", "分配"),
+                 usage="plan [+1|今天|明天|YYYY-MM-DD] → "
+                       "task <序号> <count> | task <序号> clear | complete",
+                 options=("+1", "+2", "today", "明天", "complete", "task 1 4"),
+                 hint=_hint_actions("+1", "明天", "complete", "task 1 4", "task 1 clear",
+                                    note="不带参数 = 今天；plan +1 = 明天；"
+                                         "序号 = 项目表上的 #；超预算整条命令不执行")),
+            _cmd("project", w.cmd_project,
+                 "看项目库：project | project 1 | project 1 refresh | project 1 remove",
+                 ("pr", "项目"),
+                 usage="project [<序号> [refresh|remove]]",
+                 options=("refresh", "remove"),
+                 hint=_hint_actions("1", "1 refresh", "1 remove",
+                                    note="序号 = 项目表上的 #")),
             _cmd("start", lambda a: w.cmd_start(), "启动 daemon",
                  usage="start", hint=_hint_actions("start", note="启动 daemon")),
             _cmd("stop", lambda a: w.cmd_stop(), "停用 daemon（要敲宣言）",
@@ -1918,6 +1948,22 @@ class TaskView(View):
                  options=("--all", "60"),
                  hint=_hint_actions("--all", "60", "120",
                                     note="不给参数 = 看已经过期的；给分钟数 = 提前看")),
+            _cmd("plan", w.cmd_plan,
+                 "把这一天的空闲切成 count 分给项目，再自动排任务进 session",
+                 ("排期", "分配"),
+                 usage="plan [+1|今天|明天|YYYY-MM-DD] → "
+                       "task <序号> <count> | task <序号> clear | complete",
+                 options=("+1", "+2", "today", "明天", "complete", "task 1 4"),
+                 hint=_hint_actions("+1", "明天", "complete", "task 1 4", "task 1 clear",
+                                    note="不带参数 = 今天；plan +1 = 明天；"
+                                         "序号 = 项目表上的 #；超预算整条命令不执行")),
+            _cmd("project", w.cmd_project,
+                 "看项目库：project | project 1 | project 1 refresh | project 1 remove",
+                 ("pr", "项目"),
+                 usage="project [<序号> [refresh|remove]]",
+                 options=("refresh", "remove"),
+                 hint=_hint_actions("1", "1 refresh", "1 remove",
+                                    note="序号 = 项目表上的 #")),
         ]
 
     def render(self):
@@ -2332,6 +2378,12 @@ class Warden(object):
         # 一次只问一件事，否则 p/x/s 和 A/B/C/D/E 会抢同一行输入。
         self.nostart = None
         self.nostart_at = 0.0
+        # 项目库（OmniFocus Project）：导入的是「活的母体」，任务清单躺着不动，
+        # 等 `plan` 给它分了 count 才唤起当天的任务（见 project_store.py）。
+        self.projects = pj.ProjectStore()
+        # `plan` 的分资源问答（project_plan.Allocator）：和收尾 / 到点没开始一样
+        # 是「一次只问一件事」—— 它开着的时候那两个都不会弹。
+        self.planning = None
         # 静音时段（period mute）自动落地：mutes_at 是节流时间戳，
         # mute_tries 记「这一场刚才试过、几分钟内别再试」，mute_worker 是后台线程。
         self.mutes_at = 0.0
@@ -2679,6 +2731,18 @@ class Warden(object):
         rep.progress(0.1)
         items = self._task_import_resolve(items, warn=lambda text, kind="warn":
                                           rep.log(text, kind))
+        # 剪贴板里可能是**项目**（OmniFocus 的 project_root）：项目不进任务库，
+        # 进项目库；时长不齐的项目直接拒绝（一条都不建），见 _task_import_projects。
+        items, projects, refused = self._task_import_projects(
+            items, warn=lambda text, kind="warn": rep.log(text, kind))
+        if refused:
+            rep.log("拒绝导入 %d 个项目（任务没设持续时间）" % len(refused), "error")
+            return {"items": [], "projects": [], "refused": refused,
+                    "repeats": {}, "warnings": []}
+        for payload in projects:
+            rep.log("项目「%s」：%d 条任务（其中 %d 条已完成）"
+                    % (payload.get("title"), len(payload.get("tasks") or []),
+                       int(payload.get("done") or 0)), "ok")
         rep.progress(0.5)
         repeats, warnings = {}, []
         checker = None if single_task else getattr(self.omnifocus, "repetition_info", None)
@@ -2696,10 +2760,13 @@ class Warden(object):
             if plan is not None:
                 repeats[index] = {"info": info, "plan": plan}
             rep.progress(0.5 + 0.5 * (index + 1) / max(1, len(items)))
-        rep.log("拿到 %d 条%s" % (len(items),
-                                 ("，其中 %d 条是重复任务" % len(repeats)) if repeats else ""),
+        rep.log("拿到 %d 条任务%s%s"
+                % (len(items),
+                   ("，其中 %d 条是重复任务" % len(repeats)) if repeats else "",
+                   ("；另有 %d 个项目" % len(projects)) if projects else ""),
                 "ok")
-        return {"items": items, "repeats": repeats, "warnings": warnings}
+        return {"items": items, "projects": projects, "refused": [],
+                "repeats": repeats, "warnings": warnings}
 
     def net_omnifocus_complete(self, args, rep):
         """写回完成 + 截止时间。**写**操作（乐观：本地先记 writeback）。"""
@@ -2980,6 +3047,22 @@ class Warden(object):
         warnings = payload.get("warnings") or []
         suffix = dict(args.get("suffix") or {})
         skipped = []
+        # 项目：要么「时长不齐 → 整批拒绝」，要么写进项目库（不进任务库）。
+        refused = payload.get("refused") or []
+        if refused:
+            self.had_error = True
+            for payload_item in refused:
+                self.say("✗ " + (pj.format_missing(payload_item)
+                                 or payload_item.get("reason")
+                                 or "没法导入这个项目。"), "error")
+            self.say("🚫 这次导入被拒：一条任务、一个项目都没建。先去 OmniFocus 给上面"
+                     "那几条设「持续时间」（预计时长），再 ⌘C 重新 `task import`。",
+                     "error")
+            self._last_import_result = None
+            self.jobs.end()
+            return None
+        imported = self._apply_project_imports(payload.get("projects") or [],
+                                               suffix=suffix)
         # 「已经导入过」只在**批量**里跳过：一次选十条里混着上个月的旧条目才是误伤；
         # 单条导入是「我就要这条」的明确动作（再来一条同名关联是合法用法）。
         if len(items) > 1:
@@ -2989,6 +3072,10 @@ class Warden(object):
                          % (len(skipped), "、".join("%s→任务 %s" % (pk, tid)
                                                    for pk, tid in skipped)), "info")
         if not items:
+            if imported:
+                # 只有项目、没有普通任务：项目已经进库了，没有「空导入」这回事。
+                self.jobs.end()
+                return imported[0]
             detail = "、".join("%s → 任务 %s" % (pk, tid) for pk, tid in skipped)
             self.say("📥 这一批都已经导入过了（%s）；没有新建任何任务。" % detail
                      if detail else "📥 这一批没有可导入的条目。", "warn")
@@ -3018,6 +3105,47 @@ class Warden(object):
         # 调用方；异步模式没人等这个返回值（后缀已经在上面套完了）。
         self._last_import_result = task
         return task
+
+    def _apply_project_imports(self, payloads, suffix=None):
+        """把项目 payload 写进**项目库**（同一个 OmniFocus 项目只留一条）。
+
+        项目**不**进任务库、不上任务面板：它的任务清单先在库里躺着，等 `plan`
+        给它分了 count 才「唤起」成当天的任务（用户原话：*不展示直到他们被 project
+        唤起*）。第二次导入同一个项目 = 刷新它的任务清单。
+        """
+        made = []
+        for payload in payloads or []:
+            if not payload:
+                continue
+            try:
+                project, created = self.projects.upsert(payload)
+            except ValueError as e:
+                self.had_error = True
+                self.say("⚠ 项目没写进库：%s" % e, "error")
+                continue
+            made.append(project)
+            num = self.projects.number_of(project["id"]) or project["id"]
+            tasks = project.get("tasks") or []
+            open_tasks = [t for t in tasks if not t.get("completed")]
+            stat = pj.stats(project, self.task_store)
+            head = "📁 导入项目" if created else "🔄 刷新项目"
+            self.say("%s #%d「%s」→ OmniFocus 项目 %s"
+                     % (head, num, project.get("title"),
+                        (project.get("omnifocus") or {}).get("id") or "?"), "ok")
+            self.say("   %d 条任务（%d 条未完成、%d 条已完成）· 共 %d count = %d 分钟"
+                     " · 剩余 %d count（进度 %s）"
+                     % (len(tasks), len(open_tasks), len(tasks) - len(open_tasks),
+                        stat["total"], stat["total"] * pp.MINUTES_PER_COUNT,
+                        stat["remaining"], stat["progress_text"]), "info")
+            self.say("   任务清单先躺着不占 session；`plan` 分给这个项目 count 时才会"
+                     "把当天的任务挑出来。", "info")
+        if made and (suffix or {}):
+            # 项目自己不挂 session（母体永远是母体），-a / -f 这些后缀对它没有意义。
+            self.say("· 项目不吃后缀（%s）：它自己不占 session，等 `plan` 唤起任务时再"
+                     "挂。" % self._suffix_summary(suffix).strip(), "info")
+        if made:
+            self.invalidate()
+        return made
 
     def _apply_omnifocus_list(self, payload, args):
         """读到了：把行塞进 client 的缓存，调用方自己取（import / 对账用）。"""
@@ -4530,6 +4658,19 @@ class Warden(object):
                                                 first.error, more),
                 level="error", source="网络",
                 hint="re-action 重放全部（re-action --list 先看清单，--clear 清空）"))
+        # 3.7) 今天还没 plan：项目在那儿、空闲也在那儿，但今天一个项目都没分到 count
+        try:
+            pending = self.pending_plan(datetime.date.today())
+        except Exception:                      # noqa: BLE001 - 警告板不能因为这里坏掉
+            pending = None
+        if pending:
+            out.append(repl_kit.Warning(
+                "今天还没 plan：还有 %d 场空闲（%d count）没分给项目（%s）"
+                % (pending["sessions"], pending["counts"],
+                   "、".join(str(s) for s in pending["starts"][:3])
+                   + ("…" if len(pending["starts"]) > 3 else "")),
+                level="warn", source="项目",
+                hint="敲 plan 分今天的资源（plan +1 = 明天；task 1 4 = 项目 #1 分 4 个 count）"))
         # 4) 重复任务：今天该不该有 occurrence（日期对上就算；挂不挂得上 session
         # 是另一回事，不再用「同起点同时长」否定整条规则）
         today = datetime.date.today()
@@ -6239,8 +6380,12 @@ class Warden(object):
         走内部的 :meth:`_assign_task` —— 绝不能再把它扔回 ``cmd_task_assign`` 让
         「序号解析」重新认一遍（内部 id 和面板序号是两套数，绕回去就会挂错任务）。
         """
-        task = result if isinstance(result, dict) and result.get("id") is not None else None
-        if task is None and self.selected_task_id is not None:
+        # 只认**本地任务**（有 fields 的那种）。项目记录也带 id，但它不是任务：
+        # `task import <项目链接> -a 1` 不该顺手把「上一次选中的任务」挂上去。
+        task = (result if isinstance(result, dict)
+                and result.get("id") is not None
+                and isinstance(result.get("fields"), dict) else None)
+        if task is None and action != "import" and self.selected_task_id is not None:
             try:
                 task = self.task_store.get(self.selected_task_id)
             except ValueError:
@@ -6356,9 +6501,12 @@ class Warden(object):
         # 于是 `task 3 -a 1` = 「选中第 3 条再挂到表格 #1」。
         if numeric:
             if rest:
+                hint = ("`task <项目序号> <count>` 只在 `plan` 的分配问答里才有意义 —— "
+                        "先敲 `plan`。" if not self.planning else
+                        "allocate 的写法是 `task <项目序号> <count>`：序号 = 项目表上的 #。")
                 raise ValueError("`task %s` 就等于 `task select %s`，后面不用再跟东西；"
-                                 "要挂到 session 用 -a/--assign（例如 task %s -a %s）。"
-                                 % (action, action, action, rest[0]))
+                                 "要挂到 session 用 -a/--assign（例如 task %s -a %s）。%s"
+                                 % (action, action, action, rest[0], hint))
             return self.cmd_task_select([action])
         raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/repeat/"
                          "duplicate/drop/done/link/import/sync/archive；"
@@ -7131,6 +7279,83 @@ class Warden(object):
             else:
                 out.append(item)
         return out
+
+    # -- 导入：剪贴板里可能是一个 **项目** ---------------------------------
+
+    def _task_import_projects(self, items, warn=None):
+        """把「剪贴板里其实是 OmniFocus 项目」的条目认出来。
+
+        返回 ``(剩下的普通条目, 项目 payload 列表, 被拒的项目 payload 列表)``。
+
+        判定只靠一件事：这个 primary key 在 OmniFocus 里是一条
+        ``kind == "project_root"`` 的行（项目自身的根任务）。**不拿标题猜**——
+        猜错了就不是「导入项目」而是「导入了一个同名任务」，两种东西的行为差得远。
+
+        项目里**每条未完成任务都必须有「持续时间」**（OmniFocus 的 estimated
+        duration）：没有时长就算不出要占几个 count，而这种项目一旦被唤起就是满地
+        0 count 的任务。所以那一条项目整个**拒绝导入**（用户要求：报错，不建任何
+        东西），并列出是哪几条要去补。
+        """
+        say = warn or (lambda text, kind="warn": self.say(text, kind))
+        pks = [str(item.get("id")) for item in items or () if item.get("id")]
+        if not pks:
+            return list(items or ()), [], []
+        try:
+            enabled = self.omnifocus_enabled()
+        except Exception:                          # noqa: BLE001 - 替身/坏设置都不该挡住导入
+            enabled = False
+        # 链接本身已经说了「这是项目」（omnifocus:///project/PK）：这时候**读不到**
+        # OmniFocus 就不能装作没看见 —— 拿不到清单 = 不知道里面有哪几条任务要几个
+        # count，硬导进去只会得到一条「叫项目名的任务」。
+        looks_project = [item for item in items or ()
+                         if str(item.get("kind") or "") == "project"]
+        if not enabled:
+            if looks_project:
+                return list(items or ()), [], [
+                    {"title": item.get("title") or item.get("id"),
+                     "missing": [],
+                     "reason": "「%s」是 OmniFocus **项目**链接，但 OmniFocus 集成关着"
+                               "（`set omnifocus on` 打开）—— 读不到它的任务清单，"
+                               "没法算 count。" % (item.get("title") or item.get("id"))}
+                    for item in looks_project]
+            return list(items or ()), [], []
+        try:
+            rows = self.omnifocus.list_tasks()
+        except Exception as e:                      # noqa: BLE001 - 读不到就按普通任务导
+            if looks_project:
+                return list(items or ()), [], [
+                    {"title": item.get("title") or item.get("id"), "missing": [],
+                     "reason": "「%s」是 OmniFocus **项目**链接，但读不到 OmniFocus"
+                               "（%s）—— 没法核对它的任务清单。" %
+                               (item.get("title") or item.get("id"), e)}
+                    for item in looks_project]
+            say("读 OmniFocus 失败（%s）：没法核对这里面有没有项目，先按普通任务导入。"
+                % e, "info")
+            return list(items or ()), [], []
+        by_pk = {}
+        for row in rows or ():
+            pk = str(row.get("id") or "")
+            if pk:
+                by_pk[pk] = row
+        kept, projects, refused = [], [], []
+        for item in items or ():
+            row = by_pk.get(str(item.get("id") or ""))
+            if not row or row.get("kind") != "project_root":
+                kept.append(item)
+                continue
+            try:
+                payload = pj.project_payload(row, rows)
+            except ValueError as e:
+                say("认不出这个项目（%s）：先按普通任务导入。" % e, "warn")
+                kept.append(item)
+                continue
+            for note in payload.get("warnings") or ():
+                say("⚠ %s" % note, "warn")
+            if payload.get("missing"):
+                refused.append(payload)
+                continue
+            projects.append(payload)
+        return kept, projects, refused
 
     # -- 位置：挂上 / 下架 / 调换 / 全量转移 ---------------------------
 
@@ -7952,6 +8177,16 @@ class Warden(object):
         pk = ts.TaskStore.omnifocus_id(task)
         if not pk:
             return ""
+        # 项目唤起出来的任务可能只覆盖那条 OmniFocus 任务的一部分 count：
+        # 这时候勾完成等于把剩下的 count 抹掉，所以挡一下（见 project_store）。
+        try:
+            allowed, why = pj.completion_guard(task, self.projects, self.task_store)
+        except Exception:                       # noqa: BLE001 - 账算不出来不该挡住完成
+            allowed, why = True, ""
+        if not allowed:
+            rl.log_event("omnifocus", "complete_blocked", reason="project-partial",
+                         pk=pk, task_id=task.get("id"))
+            return why
         enabled = self.omnifocus_enabled()
         fields = self._omni_log_fields(task, pk)
         due = self.omni_due_of(task)
@@ -8542,6 +8777,478 @@ class Warden(object):
             return None
         return self.begin_inspect_due(candidates, label=label, within_minutes=within)
 
+    # -- 项目 / plan ----------------------------------------------------
+    #
+    # 项目是「活的母体」：导入时把 OmniFocus 项目下的任务清单快照进项目库，但
+    # **不建本地任务、不上任务面板**；等到 `plan` 给它分了 count，才把当天的任务
+    # 「唤起」成本地任务、排进 session（用户原话：*在项目入库的时候就应该获取他
+    # 所有的 task，但不展示直到他们被 project 唤起*）。
+
+    def project_rows(self, day=None):
+        """项目预览表格的行（序号 = `task <序号> <count>` 里的那个数）。"""
+        return self.projects.preview(day or self.sel_date, self.task_store)
+
+    def render_projects_table(self):
+        """契约视图里**任务面板下面**那块项目表：剩余 count / 进度 / 今天 plan 了多少。"""
+        rows = self.project_rows()
+        if not rows:
+            return None
+        day = self.sel_date
+        t = Table(title="Project · 项目（OmniFocus Project · 序号 = `task <序号> <count>` "
+                        "里的那个数）",
+                  box=box.SIMPLE_HEAVY, header_style="bold blue",
+                  title_justify="left", expand=False)
+        t.add_column("#", justify="right", style="bold", no_wrap=True)
+        t.add_column("项目", no_wrap=True, overflow="crop")
+        t.add_column("剩余 count", justify="right", no_wrap=True)
+        t.add_column("进度", justify="right", no_wrap=True)
+        t.add_column("今天 plan", no_wrap=True)
+        t.add_column("未完成", justify="right", no_wrap=True)
+        t.add_column("OmniFocus", no_wrap=True, style=STYLE_MUTED)
+        for row in rows:
+            plan_txt = "—"
+            if row["allocated"]:
+                plan_txt = "说好 %d count" % row["allocated"]
+                if row["scheduled"]:
+                    plan_txt += " · 已排 %d" % row["scheduled"]
+            elif row["scheduled"]:
+                plan_txt = "已排 %d count" % row["scheduled"]
+            t.add_row(str(row["number"]),
+                      row["title"],
+                      Text(str(row["remaining"]), style="bold cyan"),
+                      Text(row["progress_text"], style=STYLE_MUTED),
+                      Text(plan_txt, style="green" if row["allocated"] else STYLE_MUTED),
+                      Text(str(row["tasks_open"]), style=STYLE_MUTED),
+                      Text(str(row["pk"])[:10] or "—"))
+        total_remaining = sum(r["remaining"] for r in rows)
+        t.caption = ("%d 个项目 · 剩余 %d count（%d 分钟）· 剩余 count = 未完成任务还差"
+                     "几块 25 分钟；进度 = 已完成 / 总共（按 count 算）· `plan` 分配今天的"
+                     "资源" % (len(rows), total_remaining,
+                              total_remaining * pp.MINUTES_PER_COUNT))
+        return t
+
+    def cmd_project(self, args=None):
+        """``project`` —— 看项目库 / 刷新 / 撤掉。
+
+            project                 列出全部项目（和任务面板下面那张表一样）
+            project 1               看 #1 的任务清单和今天的分工
+            project 1 refresh       重新去 OmniFocus 读一遍清单（时长不齐就拒绝）
+            project 1 remove        从项目库撤掉（OmniFocus 一个字节都不动）
+            project refresh         所有项目都刷一遍
+        """
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks:
+            rows = self.project_rows()
+            if not rows:
+                self.say("📁 项目库是空的：在 OmniFocus 里 ⌘C 一个项目，再敲 `task import`。",
+                         "warn")
+                return []
+            for row in rows:
+                self.say("📁 #%d %s：剩余 %d count · 进度 %s · %d 条未完成%s"
+                         % (row["number"], row["title"], row["remaining"],
+                            row["progress_text"], row["tasks_open"],
+                            ("· 今天说好 %d count（已排 %d）"
+                             % (row["allocated"], row["scheduled"]))
+                            if row["allocated"] else ""), "info")
+            return rows
+        action = toks[0].lower()
+        if action in ("refresh", "sync", "reload", "更新"):
+            made = [self._project_refresh(project) for project in self.projects.active()]
+            return [p for p in made if p]
+        project = self.projects.resolve(toks[0])
+        rest = [t.lower() for t in toks[1:]]
+        if rest and rest[0] in ("refresh", "sync", "reload", "更新"):
+            return self._project_refresh(project)
+        if rest and rest[0] in ("remove", "rm", "delete", "撤掉", "删除"):
+            num = self.projects.number_of(project["id"]) or project["id"]
+            self.projects.remove(project["id"])
+            self.rebuild_rows()
+            self.invalidate()
+            self.say("🗑 项目 #%d「%s」从项目库撤掉了（OmniFocus 那边没动；已经排进 "
+                     "session 的任务照旧）。" % (num, project.get("title")), "ok")
+            return project
+        return self._project_detail(project)
+
+    def _project_detail(self, project):
+        """一个项目的清单 + 今天的分工（`project 1`）。"""
+        invested = pj.invested_by_project(self.task_store).get(project["id"]) or {}
+        stat = pj.stats(project, self.task_store, invested)
+        num = self.projects.number_of(project["id"]) or project["id"]
+        self.say("📁 #%d「%s」OmniFocus %s · 剩余 %d count · 进度 %s（%d/%d）"
+                 % (num, project.get("title"),
+                    ((project.get("omnifocus") or {}).get("id") or "?"),
+                    stat["remaining"], stat["progress_text"],
+                    stat["done"], stat["total"]), "cmd")
+        items = pj.remaining_tasks(project, invested)
+        for item in items[:12]:
+            bits = ["%d count" % int(item.get("count") or 0),
+                    "还剩 %d" % int(item.get("remaining") or 0)]
+            if item.get("due"):
+                bits.append("截止 %s" % str(item["due"]).replace("T", " ")[:16])
+            if item.get("blocked"):
+                bits.append("被前置阻塞")
+            self.say("   · %s（%s）" % (item.get("title"), " · ".join(bits)), "info")
+        if len(items) > 12:
+            self.say("   …还有 %d 条" % (len(items) - 12), "info")
+        plan = pj.plan_of(project, self.sel_date)
+        if plan and (plan.get("count") or plan.get("items")):
+            self.say("   今天（%s）说好 %d count，已经排了 %d 条："
+                     % (self.sel_date.isoformat(), int(plan.get("count") or 0),
+                        len(plan.get("items") or [])), "info")
+            for rec in plan.get("items") or []:
+                task = None
+                try:
+                    task = self.task_store.get(rec["task_id"])
+                except (ValueError, TypeError):
+                    task = None
+                self.say("     %s(%d) ← 任务 %s「%s」%s"
+                         % (rec.get("start") or "?", int(rec.get("duration") or 0),
+                            self.task_no(task) or rec["task_id"],
+                            (task or {}).get("fields", {}).get("title") or "?",
+                            "" if task else "（本地任务已经不在了）"), "info")
+        else:
+            self.say("   今天还没给它分资源（`plan` 分 count 才会唤起任务）。", "info")
+        return project
+
+    def _project_refresh(self, project):
+        """重新读 OmniFocus 里这个项目的清单（写回项目库）。"""
+        project = project or {}
+        pk = (project.get("omnifocus") or {}).get("id")
+        num = self.projects.number_of(project.get("id")) or project.get("id")
+        if not pk:
+            self.say("⚠ 项目 #%s 没有 OmniFocus 关联，刷不了。" % num, "warn")
+            return None
+        try:
+            if not self.omnifocus_enabled():
+                raise ValueError("OmniFocus 关着（`set omnifocus on` 打开）")
+            rows = self.omnifocus.list_tasks(refresh=True)
+        except Exception as e:                      # noqa: BLE001 - 读不到就说清楚
+            self.had_error = True
+            self.say("⚠ 刷新项目 #%s 失败：%s" % (num, e), "error")
+            return None
+        row = next((r for r in rows or () if str(r.get("id") or "") == str(pk)), None)
+        if row is None:
+            self.say("⚠ OmniFocus 里找不到项目 %s（被删了？）—— 项目库先留着旧的清单。"
+                     % pk, "warn")
+            return None
+        payload = pj.project_payload(row, rows)
+        if payload.get("missing"):
+            self.had_error = True
+            self.say("✗ " + pj.format_missing(payload), "error")
+            self.say("🚫 这次刷新没写库（清单先按旧的算）。", "error")
+            return None
+        updated, _created = self.projects.upsert(payload)
+        stat = pj.stats(updated, self.task_store)
+        self.say("🔄 项目 #%s「%s」刷新了：%d 条任务、剩余 %d count（进度 %s）"
+                 % (num, updated.get("title"), len(updated.get("tasks") or []),
+                    stat["remaining"], stat["progress_text"]), "ok")
+        self.rebuild_rows()
+        self.invalidate()
+        return updated
+
+    def _plan_slots(self, day):
+        """这一天的**可用空场** → ``(slots, notes)``。
+
+        只算四种条件全中的：计划里有、还没开始（今天就按「现在」筛）、没静音、
+        **API 里确实订上了**、而且这一场还没挂任务。
+
+        为什么「没订上」的不算：拿一场可能不存在的 session 当资源，等于把任务排进
+        空气里；等它订上了再 plan 一次就好（notes 里会说清楚有哪几场。
+        """
+        slots, notes = [], []
+        now_ms = int(time.time() * 1000)
+        is_today = (day == datetime.date.today())
+        unbooked, busy, past = [], 0, 0
+        for index, row in enumerate(self.rows, 1):
+            if not row.get("planned") or row.get("date") != day.isoformat():
+                continue
+            if row.get("period_muted"):
+                continue
+            if is_today and (row.get("startMs") or 0) <= now_ms:
+                past += 1
+                continue
+            if self.task_store.tasks_for_session(row.get("date"), row.get("startLabel")):
+                busy += 1
+                continue
+            if row.get("id") is None:
+                unbooked.append(row.get("startLabel") or "?")
+                continue
+            slots.append(pp.slot_record(index, row.get("date"), row.get("startLabel"),
+                                        row.get("durationMin"), row.get("id"),
+                                        row.get("endLabel")))
+        if past:
+            notes.append("今天已经过去的 %d 场不算空闲。" % past)
+        if busy:
+            notes.append("%d 场已经挂着任务了，不算空闲。" % busy)
+        if unbooked:
+            notes.append("%s 还没订上 Focusmate（`refresh --check` 订上之后再 plan），"
+                         "先不算空闲。" % "、".join(unbooked))
+        return slots, notes
+
+    def cmd_plan(self, args=None):
+        """``plan`` —— 把这一天剩下的空闲切成 count，分给项目，再自动排任务。
+
+        用户要的整条链路：先看元数据（今天还剩多少空闲时间 / 几个 count），再逐个
+        项目问「分多少」，敲 ``complete`` 之后按每个项目分到的 count 唤起任务、排进
+        session（尽量一场一个任务、尽量不拆开）。
+
+            plan                    今天（**默认就是今天**，和当前看的是哪天无关）
+            plan +1                 明天（plan 1 / plan 明天 / plan 2026-11-07 同义）
+            task 1 4                项目 #1 分 4 个 count（= 100 分钟）
+            task 1 2                再敲一次是**覆盖**（变成 2，不是 6）
+            task 1 clear            清空 #1
+            complete                分配完了，开始排任务
+
+        分配**超预算**（加起来超过今天剩下的 count）时整条命令都不执行。
+
+        为什么不跟着 `day` 走：`plan` 是「给哪一天分资源」的**动作**，不是看板。
+        晚上正在看明天（`day 1`）时顺手敲 `plan`，想排的多半还是明天，所以有
+        `plan +1` 这种明确写法；不给参数就是今天 —— 免得「我以为在排今天、
+        其实排了后天」。
+        """
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if self.planning is not None:
+            raise ValueError("已经有一次 plan 在等你的分配（看下面那块面板）："
+                             "`task <序号> <count>` 分资源、`complete` 开始排、`q` 放弃。")
+        if self.pending_import is not None or self.nostart is not None or self.review_active():
+            raise ValueError("先把手头那一问答完（收尾 / 到点没开始 / 导入确认）再来 plan。")
+        day, offset = self._plan_target(toks)
+        projects = self.projects.active()
+        if not projects:
+            raise ValueError("项目库是空的：在 OmniFocus 里 ⌘C 一个**项目**，再敲 "
+                             "`task import`（项目里每条未完成任务都要有「持续时间」）。")
+        if offset != self.day_offset:
+            # 空场、`-a <编号>` 都按**看板那一天**的表格算，所以先把看板搬过去。
+            # 搬过去之后必须**等到**那天的真数据：空场判据要看「订没订上」，
+            # 拿别的天的旧行去算会把整场排进空气里（wait=True 就是为了这一条）。
+            self.day_offset = offset
+            try:
+                self.refresh(quiet=True, wait=not self.offline)
+            except Exception:                      # noqa: BLE001 - 拉不到就照旧
+                pass
+            try:
+                self.rebuild_rows()
+            except Exception:                      # noqa: BLE001 - 快照模式也能 plan
+                pass
+            self.say("· 看板切到 %s（plan 的就是这一天）" % day.isoformat(), "info")
+        elif day != datetime.date.today():
+            self.say("· plan 的是 %s（不是今天；不带参数就是今天）" % day.isoformat(),
+                     "info")
+        try:
+            self.rebuild_rows()
+        except Exception:                          # noqa: BLE001 - 快照模式也能 plan
+            pass
+        slots, notes = self._plan_slots(day)
+        for note in notes:
+            self.say("· %s" % note, "info")
+        if not slots:
+            raise ValueError("%s 一场空着的、订上的 session 都没有 —— 先 `refresh --check` "
+                             "把 session 订上，或者 `day` 换个日子。" % day.isoformat())
+        cap = pp.capacity(slots)
+        self.planning = pp.Allocator(day, projects, slots, task_store=self.task_store,
+                                     hooks=self.plan_hooks())
+        self.say("🗂 %s 的资源分配：%d 个项目、%d 场空 session = %d count 可以分"
+                 "（%d 分钟；1 count = %d 分钟）"
+                 % (day.isoformat(), len(projects), cap["sessions"], cap["counts"],
+                    cap["minutes"], pp.MINUTES_PER_COUNT), "cmd")
+        self.say("   `task <序号> <count>` 分给项目（序号 = 项目表上的 #）、"
+                 "`task <序号> clear` 清空、`complete` 开始排任务、`q` 放弃。", "info")
+        self.invalidate()
+        return self.planning
+
+    #: `plan` 的日期参数里认的那几个人话
+    PLAN_DAY_WORDS = {"今天": 0, "today": 0, "明天": 1, "tomorrow": 1,
+                      "后天": 2, "大后天": 3, "昨天": -1, "yesterday": -1}
+
+    def _plan_target(self, toks):
+        """``plan`` 的参数 → ``(day, offset)``。不给参数 = **今天**（用户要求）。"""
+        today = datetime.date.today()
+        if not toks:
+            return today, 0
+        if len(toks) > 1:
+            raise ValueError("plan 只认一个日期：plan / plan +1 / plan 明天 / plan 2026-11-07")
+        tok = toks[0]
+        low = tok.lower()
+        if low in self.PLAN_DAY_WORDS:
+            offset = self.PLAN_DAY_WORDS[low]
+        else:
+            try:
+                offset = int(tok)
+            except ValueError:
+                try:
+                    day = datetime.date.fromisoformat(tok)
+                except ValueError:
+                    raise ValueError(
+                        "plan 的参数要么是偏移量（+1 / 0 / -1）、今天/明天/后天，"
+                        "要么是 YYYY-MM-DD；你给的是 %r" % tok) from None
+                offset = (day - today).days
+        if offset < 0:
+            raise ValueError("%s 是过去的日子 —— 那是已经发生的事，不用再 plan"
+                             "（`plan` 不带参数就是今天，`plan +1` 是明天）。"
+                             % (today + datetime.timedelta(days=offset)).isoformat())
+        if offset > 60:
+            raise ValueError("最多 plan 到 +60 天（你给的是 %+d）" % offset)
+        return today + datetime.timedelta(days=offset), offset
+
+    def free_plan_slots(self, day):
+        """那一天「还没开始、没静音、没挂任务」的排好的场次（只看 data.csv + 本地绑定）。
+
+        和 :meth:`_plan_slots` 的区别只有一个：**不问 API**（所以不知道「订上没」）。
+        警告板每 5 秒算一次，不能为了提醒去拉一次网络。
+        """
+        day = day or datetime.date.today()
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        now = datetime.datetime.now()
+        out = []
+        try:
+            sessions = self.sessions_for_day_plan(day)
+        except Exception:                          # noqa: BLE001 - 下载层坏了不该没帧
+            return out
+        for sess in sessions:
+            label = sess.get("start")
+            try:
+                hour, minute = (int(x) for x in str(label).split(":")[:2])
+                start = datetime.datetime.combine(day, datetime.time(hour, minute))
+            except (TypeError, ValueError):         # noqa: BLE001 - 坏行跳过
+                continue
+            if start <= now:
+                continue
+            if self.task_store.tasks_for_session(iso, label):
+                continue
+            try:
+                if mute_window_for(day, label):
+                    continue
+            except Exception:                      # noqa: BLE001
+                pass
+            out.append(sess)
+        return out
+
+    def pending_plan(self, day=None):
+        """今天还没 plan 吗？→ ``{"sessions", "counts", "starts"}`` 或 ``None``。
+
+        三条同时成立才算「该提醒」：项目库里有 active 项目、这一天**一个项目都没分过
+        count**、而且这一天还有没开始、没挂任务、没静音的场次。已经 plan 过（哪怕只
+        排了一部分）就不再吵 —— 提醒是用来「别忘了」，不是用来记账的。
+        """
+        day = day or datetime.date.today()
+        try:
+            projects = self.projects.active()
+        except Exception:                          # noqa: BLE001 - 项目库坏了别挡住警告板
+            return None
+        if not projects:
+            return None
+        allocated = 0
+        for project in projects:
+            plan = pj.plan_of(project, day)
+            allocated += int((plan or {}).get("count") or 0)
+        if allocated:
+            return None
+        slots = self.free_plan_slots(day)
+        if not slots:
+            return None
+        counts = sum(int(s.get("duration") or 0) // pp.MINUTES_PER_COUNT for s in slots)
+        return {"sessions": len(slots), "counts": counts,
+                "starts": [s.get("start") for s in slots]}
+
+    def plan_hooks(self):
+        """`plan` 要碰外面世界的那个口子（其余全在 project_plan.Allocator 里）。"""
+        return {"say": lambda text, kind="info": self.say(text, kind),
+                "apply": lambda allocator, allocs: self._plan_apply(allocator, allocs)}
+
+    def _plan_apply(self, allocator, allocs):
+        """分配完了：先记资源，再挑任务、排进 session。
+
+        「尽量一场一个任务、尽量不拆开」在 :func:`project_plan.schedule` 里：先跑
+        二分图匹配求「一对一站位」，配不上才拆、才往同一场里叠。
+        """
+        day = allocator.day
+        invested = pj.invested_by_project(self.task_store)
+        items, notes = pp.distribute(allocs, [a["project"] for a in allocs], invested)
+        placements, unscheduled, more = pp.schedule(items, allocator.slots)
+        notes = list(notes) + list(more)
+        for alloc in allocs:
+            self.projects.set_allocation(alloc["project_id"], day, alloc["count"])
+        made, failed = {}, 0
+        for place in placements:
+            item = place["item"]
+            slot = place["slot"]
+            project = item["project"]
+            url = of.task_url(item["pk"])
+            fields = {"title": item.get("title") or item["pk"],
+                      pj.PROJECT_FIELD: project.get("title") or "",
+                      pj.PROJECT_ID_FIELD: item["project_id"],
+                      pj.PROJECT_TASK_FIELD: item["pk"],
+                      "count": int(place["count"])}
+            try:
+                task = self.task_store.create(
+                    fields,
+                    omnifocus={"id": item["pk"], "url": url,
+                               "title": item.get("title")},
+                    source={"kind": "project", "id": item["pk"], "url": url,
+                            "title": item.get("title")})
+            except ValueError as e:
+                failed += 1
+                self.say("⚠ 「%s」没建成本地任务：%s" % (item.get("title"), e), "error")
+                continue
+            made.setdefault(item["project_id"], []).append({
+                "pk": item["pk"], "task_id": task["id"],
+                "count": int(place["count"]), "start": slot.get("start") or "",
+                "duration": int(place["count"]) * pp.MINUTES_PER_COUNT})
+            try:
+                self._assign_task(task, str(slot["index"]), refresh=False)
+            except ValueError as e:
+                failed += 1
+                self.say("⚠ 「%s」建好了但没挂到 session #%s：%s"
+                         % (item.get("title"), slot["index"], e), "warn")
+        for pid, records in made.items():
+            self.projects.record_items(pid, day, records)
+        self.rebuild_rows()
+        total_counts = sum(int(p["count"]) for p in placements)
+        self.say("🗂 %s 排好了：%d 条任务 → %d 场 session（共 %d count = %d 分钟）"
+                 % (day.isoformat(), len(placements),
+                    len({p["slot"]["index"] for p in placements}), total_counts,
+                    total_counts * pp.MINUTES_PER_COUNT), "ok")
+        for place in placements:
+            item = place["item"]
+            self.say("   %s(%d) ← %s / %s（%d count%s%s）"
+                     % (place["slot"].get("start"), int(place["slot"].get("duration") or 0),
+                        item["project"].get("title") or "?",
+                        item.get("title") or item["pk"], int(place["count"]),
+                        "，拆开的" if place.get("split") else "",
+                        "，和别的任务同一场" if place.get("stacked") else ""), "info")
+        for note in notes:
+            self.say("⚠ %s" % note, "warn")
+        for item in unscheduled:
+            self.say("⚠ 「%s」（%d count）没排进去：空场次不够。"
+                     % (item.get("title"), int(item.get("count") or 0)), "warn")
+        if failed:
+            self.had_error = True
+        self.invalidate()
+        return {"placements": len(placements), "counts": total_counts,
+                "unscheduled": len(unscheduled), "notes": notes, "failed": failed}
+
+    def plan_panel(self):
+        """`plan` 的分资源问答面板（挂在 repl_kit 的打断栏位里）。"""
+        prompt = self.planning
+        if prompt is None:
+            return None
+        body = Text()
+        for text, style in prompt.lines():
+            body.append(text + "\n", style=style or None)
+        return Panel(body, title="[bold cyan]🗂 plan · 资源分配[/]",
+                     border_style="cyan", box=box.HEAVY)
+
+    def close_plan(self, note=None):
+        """把 `plan` 那一问收掉（`complete` / `q` 之后）。"""
+        prompt, self.planning = self.planning, None
+        if prompt is None:
+            return None
+        if not prompt.closed:
+            prompt.closed = True
+        self.rebuild_rows()
+        self.invalidate()
+        return prompt
+
     def focus_day(self, day_iso):
         """把看板切到某一天（收尾时用：那一场在哪天就看哪天）。"""
         try:
@@ -8597,6 +9304,8 @@ class Warden(object):
             return
         if self.nostart is not None:
             return                              # 「没开始」那一问还开着：先答它
+        if self.planning is not None:
+            return                              # plan 在等分配：别拿 A/B/C/D/E 抢它的输入
         now = time.time()
         if now - self.review_at < 1.0:
             return
@@ -8644,6 +9353,8 @@ class Warden(object):
             return
         if self.review is not None or self.review_check is not None:
             return                              # 一次只问一件事（收尾优先）
+        if self.planning is not None:
+            return                              # plan 在等分配：别拿 p/x/s 抢它的输入
         if self.pending_sins():
             return                              # 罪案区锁死：除了宣言什么都不受理
         entry = self._next_nostart_entry()
@@ -8839,6 +9550,8 @@ class Warden(object):
             return self.pending_import_panel()
         if self.nostart is not None:
             return self.nostart_panel()
+        if self.planning is not None:
+            return self.plan_panel()
         return self.review_panel()
 
     def pending_import_panel(self):
@@ -10160,6 +10873,16 @@ class Warden(object):
             ("task import", "读剪贴板导入 OmniFocus 任务；如果是重复任务（例如每周三），"
                             "会先问要不要把重复设置也复制到本地；-st / --single-task "
                             "= 只导入这一条，不问也不建 repeat"),
+            ("task import（项目）", "剪贴板里是 **OmniFocus 项目**（omnifocus:///project/PK）"
+                                   "→ 进项目库：它手底下每条任务都要有「持续时间」，"
+                                   "缺一条就整批拒绝导入；清单只存不展示，等 plan 唤起"),
+            ("project [序号] [refresh|remove]", "看项目库 / 看 #1 的任务清单 / 重新去 "
+                                                "OmniFocus 读一遍 / 从项目库撤掉（OmniFocus 不动）"),
+            ("plan [天数]", "把这一天剩下的空场切成 count（1 count = 25 分钟），逐个项目问"
+                            "给多少，complete 之后自动挑任务、排进 session（一场一个任务、"
+                            "尽量不拆）。**不带参数 = 今天**（和看板在看哪天无关）；"
+                            "plan +1 = 明天，plan 明天 / plan 2026-11-07 同义。"
+                            "今天一个项目都没分到 count 时，状态框会提醒"),
             ("task -t  /  --trigger", "列出 trigger（创建触发）预设；现在是空列表 —— "
                                         "框架已就位，注册函数后才有名字"),
             ("task <id> -t <preset> [参数...]", "挂创建触发：只有在预设条件成立时才建任务；"
@@ -10175,6 +10898,9 @@ class Warden(object):
             ("relocate N ±MM", "临时把 #N 提前/推后：不写 data.csv；推后一天一次，且不能跨天"),
             ("relocate T1 ±MM", "把整个时段里的每场一起挪：相对位置不变、任务跟着走；"
                                 "推后每时段一天一次，和别的场次重叠就拒绝"),
+            ("plan 里那几句", "task 1 4 = 项目 #1 分 4 count（100 分钟）· task 1 clear = 清空 · "
+                              "再敲一次是覆盖（不是相加）· 超预算时整条命令都不执行 · "
+                              "q 放弃这次 plan（不建任何任务）"),
             ("🚪 到点没开始（p/x/s）",
              "计划 14:00 那场到 14:05 在 API 里还是没有 → 问一次：p 15 推迟这一场 / "
              "p T1 15 推迟整个时段 / x 不去了（算缺失，任务交给收尾）/ s 先不管。"
@@ -10337,6 +11063,18 @@ class Warden(object):
                 return None
             if action == "close" or prompt.closed:
                 self.close_nostart(note=(verdict or {}).get("done") or "answered")
+            self.invalidate()
+            return True
+
+        # `plan` 的分资源问答开着：这一行先给它吃（task 1 4 / complete / q）。
+        # 它和「到点没开始」「收尾」互斥（一次只问一件事，见各自的开场判断）。
+        if self.planning is not None:
+            verdict = self.planning.handle(line)
+            action = (verdict or {}).get("action")
+            if action == "dispatch":
+                return None
+            if action == "close" or self.planning.closed:
+                self.close_plan(note=(verdict or {}).get("done"))
             self.invalidate()
             return True
 

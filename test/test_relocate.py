@@ -60,6 +60,10 @@ ks.SINS_FILE = os.path.join(TMP, "sins.json")
 # 排障时会以为 daemon 半夜自己干了什么。
 ks.LOG_FILE = os.path.join(TMP, "keep_session.log")
 ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
+# 真实的 temp/keep_session-nostart.json 里可能正躺着 daemon 刚入队的「到点没开始」，
+# 不钉住的话 warden 一开就会弹那一问、把命令输入吃掉（p/x/s 才认）。
+os.environ["TI_NOSTART_FILE"] = os.path.join(TMP, "nostart.json")
+os.environ["TI_POSTSESSION_FILE"] = os.path.join(TMP, "postsession.json")
 
 
 def _no_network(*a, **kw):

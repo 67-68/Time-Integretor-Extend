@@ -94,7 +94,27 @@ ks.fetch_sessions = _no_network
 
 TODAY = datetime.date.today()
 ISO = TODAY.isoformat()
-NOW = datetime.datetime.now()
+# 「现在」钉在当天 14:00：用例全是「到点前/后几分钟」这种相对时间，跟着墙上时钟走
+# 就会在午夜前 8 分钟算出「昨天 23:52」这种落不到今天的时刻（真踩过）。
+NOW = datetime.datetime.combine(TODAY, datetime.time(14, 0))
+
+
+class _FrozenDatetime(datetime.datetime):
+    """``datetime.datetime`` 的替身：``.now()`` 永远返回 NOW。
+
+    daemon（`keep_session`）和 warden 都自己取 `now()`，不钉住的话「到点后 5 分钟」
+    这种用例会跟着墙上时钟漂：午夜前跑一遍是 23:52 那场，午夜后同一行代码算出来的
+    就成了「昨天 23:52」。
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOW
+
+
+_frozen = mock.patch.object(w.datetime, "datetime", _FrozenDatetime)
+_frozen.start()
+
 
 
 class FakeBridge(object):
@@ -294,8 +314,12 @@ START = (NOW - datetime.timedelta(minutes=8)).replace(second=0, microsecond=0)
 HHMM = hhmm_of(START)
 write_csv(["%s,%s,50" % (ISO, HHMM)])
 # API 里什么都没有（快照是空的）
+# 快照里给一场**离得远**的 session：nostart_tick 需要「有真数据」才判，
+# 但这一场不能落在计划那一场的匹配窗口里（写死 23:45 会随用例跑的钟点撞上 3 小时
+# 前那条判据）。固定「5 小时前」= 永远不会被当成这一场的替代场次。
 ks.fresh_snapshot_details = lambda now=None: [
-    {"start": NOW.replace(hour=23, minute=45, second=0, microsecond=0), "duration": 25}]
+    {"start": (NOW - datetime.timedelta(hours=5)).replace(second=0, microsecond=0),
+     "duration": 25}]
 SUMMONED = []
 ks.summon_warden = lambda **kw: (SUMMONED.append(kw), True)[1]
 fired = ks.nostart_tick(now=NOW)
@@ -423,9 +447,11 @@ check("提前不占推后额度", sch.get_later_move(TOMORROW, scope="T1"), None
 
 # ================================================================ 5. warden 里那一问
 
+FIXED = NOW
+
 print("== warden：表格里「计划有、API 没有」→ 弹那一问 ==")
 reset_all()
-START = (NOW - datetime.timedelta(minutes=10)).replace(second=0, microsecond=0)
+START = (FIXED - datetime.timedelta(minutes=10)).replace(second=0, microsecond=0)
 HHMM = hhmm_of(START)
 write_csv(["%s,%s,50" % (ISO, HHMM)])
 wd = mkwarden(day_offset=0, bridge=FakeBridge())
@@ -457,7 +483,7 @@ check("这一场没记 count（一分钟都没干）", wd.review.counts, {})
 print("== p 30：推迟这一场（走 relocate 底层，任务跟着走）==")
 reset_all()
 # 6 分钟前那场：deadline = start + 10 分钟，现在还在推迟窗口里
-START = (NOW - datetime.timedelta(minutes=6)).replace(second=0, microsecond=0)
+START = (FIXED - datetime.timedelta(minutes=6)).replace(second=0, microsecond=0)
 HHMM = hhmm_of(START)
 write_csv(["%s,%s,50" % (ISO, HHMM)])
 wd = mkwarden(day_offset=0, bridge=FakeBridge())
@@ -489,6 +515,7 @@ wd2.rebuild_rows()
 wd2._maybe_start_nostart()
 check("答过就不再弹", wd2.nostart, None)
 
+_frozen.stop()
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if fails:

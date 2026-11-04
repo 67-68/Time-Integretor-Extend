@@ -43,6 +43,9 @@ os.environ["TI_SESSION_EXTRAS"] = os.path.join(TMP, "extras.json")
 os.environ["TI_SESSION_RULES"] = os.path.join(TMP, "rules.json")
 os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
+# 真实的 temp/keep_session-nostart.json 里可能正躺着 daemon 刚入队的「到点没开始」，
+# 不钉住的话 warden 一开就会弹那一问、把命令输入吃掉（p/x/s 才认）。
+os.environ["TI_NOSTART_FILE"] = os.path.join(TMP, "nostart.json")
 os.environ["TI_TASK_ARCHIVE"] = os.path.join(TMP, "archive.json")
 
 spec = importlib.util.spec_from_file_location("warden", os.path.join(ROOT, "warden.py"))
