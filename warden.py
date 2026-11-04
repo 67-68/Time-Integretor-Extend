@@ -2567,6 +2567,7 @@ class Warden(object):
         # ── OmniFocus（osascript 子进程：同样不属于「软件内部自己完成」）──
         self.jobs.register("omnifocus.list", self.net_omnifocus_list,
                            apply=self._apply_omnifocus_list)
+        self.jobs.register("omnifocus.clipboard", self.net_omnifocus_clipboard)
         self.jobs.register("omnifocus.import", self.net_omnifocus_import,
                            apply=self._apply_omnifocus_import)
         self.jobs.register("omnifocus.complete", self.net_omnifocus_complete,
@@ -2718,6 +2719,15 @@ class Warden(object):
         rep.log("OmniFocus %d 条" % len(rows or []), "ok")
         return {"rows": rows or []}
 
+    def net_omnifocus_clipboard(self, args, rep):
+        """读 macOS 剪贴板里的 OmniFocus 链接（**外部读**，不能在提示符线程跑）。"""
+        rep.label("读剪贴板（OmniFocus）")
+        rep.progress(0.1)
+        items = [dict(item) for item in of.clipboard_links()]
+        rep.progress(1.0)
+        rep.log("剪贴板里拿到 %d 条 OmniFocus 链接" % len(items), "ok")
+        return {"items": items}
+
     def net_omnifocus_import(self, args, rep):
         """``task import`` 的第 1 步：读 OmniFocus 补齐标题/时长 + 核对重复设置。
 
@@ -2728,6 +2738,17 @@ class Warden(object):
         items = [dict(item) for item in (args.get("items") or []) if item]
         single_task = bool(args.get("single_task"))
         rep.label("获取任务（OmniFocus）")
+        rep.progress(0.05)
+        # 剪贴板也是外部世界（osascript / pbpaste）：在 worker 里读，别卡输入。
+        if args.get("clipboard"):
+            items = [dict(item, from_clipboard=True) for item in of.clipboard_links()]
+            if not items:
+                raise ValueError(
+                    "剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本四个 flavor "
+                    "都试过了）。在 OmniFocus 里 ⌘C 一条任务再回来敲 `task import`；"
+                    "也可以手写 `task import [标题](omnifocus:///task/PK)`。")
+        elif args.get("match_clipboard"):
+            items = self._task_import_match_clipboard(items, of.clipboard_links())
         rep.progress(0.1)
         items = self._task_import_resolve(items, warn=lambda text, kind="warn":
                                           rep.log(text, kind))
@@ -2963,6 +2984,18 @@ class Warden(object):
             "via": payload.get("via"),
         }, session=None)
         self.task_store.settle_focusmate(task["id"], FM_PENDING)   # 落地了：撤掉在途标记
+        # 重复任务的子任务落地之后，把本体 occurrence 里的 Focusmate 信息也换
+        # 成真 id（materialize_repeats 现在是乐观队列，不再当场等复核）。
+        if task.get("repeat_parent") and task.get("repeat_date"):
+            try:
+                current = self.task_store.get(task["id"])
+                self.task_store.record_occurrence(
+                    task["repeat_parent"], task["repeat_date"],
+                    child_id=task["id"],
+                    session=current.get("session") or session,
+                    focusmate=current.get("focusmate") or None)
+            except (ValueError, TypeError):
+                pass
         self.selected_task_id = task["id"]
         self.rebuild_rows()
         remote_had = payload.get("existingCount")
@@ -5976,22 +6009,31 @@ class Warden(object):
                 self.say("取消已经订上的旧场 %s–%s（%smin）：切割之后计划里不再包含它…"
                          % (row.get("startLabel"), row.get("endLabel") or "?",
                             row.get("durationMin") or "?"), "cmd")
-                try:
-                    res = self.bridge.call("cancel", timeout=180,
-                                           startMs=row.get("startMs"),
-                                           meetingId=row.get("id"))
-                except (BridgeError, KeyError) as e:
+                # **乐观 + 后台**：先把它从本地表格拿掉，取消请求丢给单 worker。
+                # 这里以前直接 bridge.call("cancel")，formatter 切场时会在提示符
+                # 线程上等浏览器几十秒 —— 和「外部操作全异步」的约定不符。
+                before_index, _ = self._forget_api_row(row.get("id")) or (None, None)
+                action = self.net_action(
+                    "session.cancel",
+                    "取消旧场 %s %s" % (iso, row.get("startLabel") or "?"),
+                    {"startMs": row.get("startMs"), "meeting_id": row.get("id"),
+                     "date": iso, "start": row.get("startLabel")})
+                job = self.jobs.submit(
+                    action,
+                    on_fail=lambda error, _row=dict(row), _idx=before_index:
+                    self._row_op_failed("旧场 %s 取消" % _row.get("startLabel"),
+                                        _row, error, index=_idx))
+                if self.jobs.sync and (job.outcome is None or not job.outcome.ok):
+                    # 同步模式回调已经回滚；这一轮别再把它算成取消成功。
                     self.had_error = True
-                    self.say("❌ 旧场 %s 取消失败：%s（它还在 Focusmate 上）"
-                             % (row.get("startLabel"), e), "error")
-                    continue
-                if not res.get("verified"):
-                    self.had_error = True
-                    self.say("❌ 旧场 %s 取消后复核还在（Focusmate 那边还有这一场）"
-                             % row.get("startLabel"), "error")
                     continue
                 cancelled.append(row)
-                self.say("✅ 已取消旧场 %s" % row.get("startLabel"), "ok")
+                self.say("✅ %s 旧场 %s %s"
+                         % ("已取消" if self.jobs.sync else "已排进后台取消",
+                            row.get("startLabel"), "" if self.jobs.sync else "（失败会自动放回）"),
+                         "ok")
+            if cancelled and not self.jobs.sync:
+                self.rebuild_rows()
         finally:
             self._forget_layout_state(cancelled)
             if cancelled and iso == self.sel_date.isoformat():
@@ -6024,8 +6066,10 @@ class Warden(object):
         self.say("✂ %s %s 的排布剪断成：%s —— 原来那场不再存在"
                  % (iso, period_id, body), "ok")
         if cancelled:
-            self.say("   已在 Focusmate 取消 %d 场旧 session（计划里不再包含它们）。"
-                     % len(cancelled), "info")
+            self.say("   %s %d 场旧 session（计划里不再包含它们）。"
+                     % ("已在 Focusmate 取消" if self.jobs.sync
+                        else "已排进后台取消",
+                        len(cancelled)), "info")
         if dropped:
             self.say("   有 %d 条任务因为那几场没了而下架（任务本身还在，"
                      "`task <序号> -f end` 可以重新排）。" % len(dropped), "warn")
@@ -6818,25 +6862,56 @@ class Warden(object):
         rest = toks[1:]
         auto = not rest
         if auto:
-            items = [item for item in of.clipboard_links() if item.get("id")]
-            if not items:
-                raise ValueError("剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本 "
-                                 "都读了）。在 OmniFocus 里 ⌘C 那条任务再来。")
-            if len(items) > 1:
-                raise ValueError("剪贴板里有 %d 条 OmniFocus 链接：%s —— 只拷一条再来，"
-                                 "或者把要的那条的链接直接写出来。"
-                                 % (len(items), "、".join(i["id"] for i in items[:5])))
-            info = items[0]
-        else:
-            info = of.parse_link(" ".join(rest))
+            # 读剪贴板走 worker（osascript / pbpaste 也是外部操作）。
+            # 这里不能先读：用户敲完 link 应该立刻回到提示符。
+            self.jobs.begin(1, title="关联 OmniFocus（task %s link）"
+                                   % self.task_label(self.task_store.get(task_id)))
+            holder = {}
+
+            def apply_links(payload):
+                items = [item for item in ((payload or {}).get("items") or [])
+                         if item.get("id")]
+                if not items:
+                    self.had_error = True
+                    self.say("剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本 "
+                             "都读了）。在 OmniFocus 里 ⌘C 那条任务再来。", "error")
+                    self.invalidate()
+                    return
+                if len(items) > 1:
+                    self.had_error = True
+                    self.say("剪贴板里有 %d 条 OmniFocus 链接：%s —— 只拷一条再来，"
+                             "或者把要的那条的链接直接写出来。"
+                             % (len(items), "、".join(i["id"] for i in items[:5])),
+                             "error")
+                    self.invalidate()
+                    return
+                info = items[0]
+                task = self.task_store.link_omnifocus(
+                    task_id, info["id"], title=info.get("title"))
+                holder["task"] = task
+                self.say("🔗 任务 %s 已关联 OmniFocus %s%s（链接是从剪贴板读的）"
+                         % (self.task_label(task), info["id"],
+                            ("「%s」" % info["title"]) if info.get("title") else ""), "ok")
+
+            action = self.net_action(
+                "omnifocus.clipboard", "读剪贴板里的 OmniFocus 链接", {},
+                source=SRC_OMNIFOCUS)
+            self.jobs.submit(
+                action, persist=False, on_ok=apply_links,
+                on_fail=lambda error: (setattr(self, "had_error", True),
+                                       self.say("读剪贴板失败：%s" % error, "error")))
+            if self.jobs.sync:
+                return holder.get("task")
+            self.say("正在后台读剪贴板里的 OmniFocus 链接…", "cmd")
+            return NET_PENDING
+        info = of.parse_link(" ".join(rest))
         if not info or not info.get("id"):
             raise ValueError("认不出 OmniFocus 任务 primary key：%r（要 omnifocus:///task/… "
                              "或裸 PK；只有标题的那种粘贴认不出来）" % (" ".join(rest),))
         task = self.task_store.link_omnifocus(task_id, info["id"], title=info.get("title"))
-        self.say("🔗 任务 %s 已关联 OmniFocus %s%s%s"
+        self.say("🔗 任务 %s 已关联 OmniFocus %s%s"
                  % (self.task_label(task), info["id"],
-                    ("「%s」" % info["title"]) if info.get("title") else "",
-                    "（链接是从剪贴板读的）" if auto else ""), "ok")
+                    ("「%s」" % info["title"]) if info.get("title") else ""), "ok")
         return task
 
     def _answer_pending_import(self, line):
@@ -7091,18 +7166,18 @@ class Warden(object):
             i += 1
 
         pasted = " ".join(toks).strip()
+        read_clipboard = False
+        match_clipboard = False
         if not pasted:
-            items = [dict(item, from_clipboard=True) for item in of.clipboard_links()]
-            if not items:
-                raise ValueError(
-                    "剪贴板里没有 OmniFocus 链接（URL / HTML / RTF / 纯文本四个 flavor "
-                    "都试过了）。在 OmniFocus 里 ⌘C 一条任务再回来敲 `task import`；"
-                    "也可以手写 `task import [标题](omnifocus:///task/PK)`。")
+            # 空的 items + clipboard 标记：真正读剪贴板放到 worker 里做。
+            items = []
+            read_clipboard = True
         else:
             items = of.parse_links(pasted) or [of.parse_link(pasted)]
             if not any(item and item.get("id") for item in items):
-                # 粘进来的只有标题 → 去剪贴板对同名的那条（同一次 ⌘C 的两半）
-                items = self._task_import_match_clipboard(items, of.clipboard_links())
+                # 粘进来的只有标题 → 到 worker 里对剪贴板同名的那条
+                # （同一次 ⌘C 的两半）。
+                match_clipboard = True
 
         if single_task:
             self.say("📥 按 -st/--single-task 只导入这一条；不去核对重复设置，"
@@ -7120,6 +7195,8 @@ class Warden(object):
         action = self.net_action("omnifocus.import", "获取任务",
                                  {"items": items, "single_task": single_task,
                                   "suffix": suffix,
+                                  "clipboard": read_clipboard,
+                                  "match_clipboard": match_clipboard,
                                   # 同步模式由 cmd_task 统一套后缀（这条路径原来就这样）
                                   "apply_suffix": False}, source=SRC_OMNIFOCUS)
         job = self.jobs.submit(action)
@@ -7959,28 +8036,31 @@ class Warden(object):
                 "duration": base.get("duration"),
                 "focusmate_session_id": (row or {}).get("id") or base.get("focusmate_session_id"),
             })
-            self.task_store.assign(child["id"], session)
             occ = ((parent.get("repeat") or {}).get("occurrences") or {}).get(iso) or {}
             already = occ.get("focusmate") or {}
             if already.get("task_id"):
                 continue
-            focusmate = {}
             if row is not None and row.get("id") and not self.offline:
                 title = self.task_store.focusmate_title(child)
                 notes = (child.get("fields") or {}).get("notes") or ""
-                res = self.bridge.call("add_task", timeout=240,
-                                       startMs=row["startMs"], meetingId=row["id"],
-                                       title=title, notes=str(notes))
-                if not res.get("verified"):
-                    raise ValueError("重复任务 %s 没能挂到 %s %s（Focusmate 没确认）"
-                                     % (self.task_label(child), iso, session["start"]))
-                focusmate = {"task_id": res.get("taskId"),
-                             "session_id": row["id"], "attached_at": ts._now(),
-                             "title": title}
-                self.task_store.attach_focusmate(child["id"], focusmate, session=session)
-            self.task_store.record_occurrence(
-                parent["id"], day, child_id=child["id"], session=session,
-                focusmate=focusmate or None)
+                # 和 task <序号> -ac 同一条异步路径：本地先挂 pending，Focusmate
+                # 建 task 丢后台。sync 模式（测试 / --exec）仍当场复核完。
+                try:
+                    self._op_task_assign(
+                        child, session, self.rows.index(row) + 1, iso, title, notes,
+                        refresh=False, start_ms=row.get("startMs"))
+                except ValueError:
+                    # 同步模式下没复核成功：把错误往上传，cmd_task_sync 会报出来。
+                    raise
+                current = self.task_store.get(child["id"])
+                self.task_store.record_occurrence(
+                    parent["id"], day, child_id=child["id"], session=session,
+                    focusmate=current.get("focusmate") or None)
+            else:
+                self.task_store.assign(child["id"], session)
+                self.task_store.record_occurrence(
+                    parent["id"], day, child_id=child["id"], session=session,
+                    focusmate=None)
             done.append((child["id"], session["start"]))
         return done
 
@@ -8437,23 +8517,50 @@ class Warden(object):
     # -- 收尾用的几个动作（收尾和命令共用同一套，不写两遍）--------------
 
     def _snapshot_rows(self, iso):
-        """某一天的 Focusmate 场次快照（带缓存；拉不到就是空列表，不抛）。
+        """某一天的 Focusmate 场次快照（带缓存；读不到就是空列表，不抛）。
 
-        ``session_info_for`` 和 formatter 的「剪断」都要按**那一天**（可能不是当前
-        选中的那天）去问外面世界，所以独立成一处，别各写一份缓存逻辑。
+        **绝不在提示符线程上等 bridge。** 这个方法会被 formatter / 剪断这类
+        用户命令间接调用；以前这里 ``bridge.call("snapshot")`` 是同步的，浏览器
+        冷启动时一条 ``task 5 -ac`` 能整整数十秒没反应。现在分三档：
+
+        * 当前选中的那一天：直接用已经拉回来的 ``self.rows``（有 session id）；
+        * 别的天：只认 ``_snapshot_cache`` 里已有的快照；
+        * 只有后台线程（例如收尾核对）或 sync 模式（测试 / ``--exec``）才真正去拉。
+
+        交互式别的天没缓存时返回空列表。formatter 会退化成「先只记本地绑定」，
+        等那一场真的订上、refresh/check 再补 Focusmate task —— 这比卡死 UI 好。
         """
         cache = getattr(self, "_snapshot_cache", None)
         if cache is None:
             cache = self._snapshot_cache = {}
         rows = cache.get(iso)
-        if rows is None:
+        if rows is not None:
+            return rows
+        # 当前表格就是最新的一份当天快照，不必再问一次 bridge。
+        try:
+            if iso == self.sel_date.isoformat() and self.rows_source == "bridge":
+                rows = [dict(row) for row in self.rows
+                        if row.get("date") == iso]
+                if not self.jobs.sync:
+                    cache[iso] = rows
+                    return rows
+                # sync 模式（测试 / --exec）可能只关心「某一列还没在本地表格
+                # 里拿到 id」；按老语义再问一次 bridge，脚本才能拿到真 session。
+        except Exception:                          # noqa: BLE001 - 日期/行坏了就走缓存
+            pass
+        # worker 线程可以拉；交互式主线程只读缓存，绝不让一次外部读卡住输入。
+        # sync 模式（测试 / --exec）本来就是「等结果」的语义，仍按老行为同步拉，
+        # 保证脚本里的 formatter 能立刻拿到未来那天的 session id。
+        if (self.jobs.sync
+                or threading.current_thread() is not threading.main_thread()):
             try:
                 res = self.bridge.call("snapshot", timeout=180, date=iso)
                 rows = res.get("sessions") or []
             except BridgeError:
                 rows = []
             cache[iso] = rows
-        return rows
+            return rows
+        return []
 
     def session_info_for(self, day, slot):
         """`(date, slot)` → 一场 session 的完整信息（含 Focusmate id，尽力而为）。"""
@@ -8501,35 +8608,30 @@ class Warden(object):
         title = self.task_store.focusmate_title(task)
         notes = self.task_store.notes(task) or ""
         payload = {
-            "index": None,
+            "index": session.get("index"),
             "date": date_iso,
             "start": session.get("start"),
             "end": session.get("end"),
             "duration": session.get("duration"),
             "focusmate_session_id": sid,
         }
-        note = ""
         if sid and start_ms is not None and not self.offline:
+            # formatter / 收尾也会走到这里：同样走「本地先挂、Focusmate 丢后台」，
+            # 不在提示符线程上等 add_task。同步模式（测试 / --exec）仍然当场跑完。
             try:
-                res = self.bridge.call("add_task", timeout=240, startMs=start_ms,
-                                       meetingId=sid, title=title, notes=str(notes))
+                self._op_task_assign(
+                    task, payload, session.get("index") or 0, date_iso,
+                    title, notes, refresh=False, start_ms=start_ms)
+                return ("Focusmate task 后台挂（%s %s）"
+                        % (date_iso, session.get("start") or "?"))
             except (BridgeError, ValueError) as e:
-                res = {}
-                note = "Focusmate 没建上：%s" % e
-            if res.get("verified"):
-                self.task_store.assign(task["id"], payload)
-                self.task_store.attach_focusmate(task["id"], {
-                    "task_id": res.get("taskId") or (res.get("task") or {}).get("id"),
-                    "session_id": sid,
-                    "attached_at": ts._now(),
-                    "title": title,
-                    "via": res.get("via"),
-                }, session=payload)
-                note = "Focusmate task %s" % (res.get("taskId") or "?")
-                self.rebuild_rows()
-                return note
+                return "Focusmate 没建上：%s（只记了本地）" % e
+        if payload.get("focusmate_session_id"):
+            # session id 有但缺少 startMs（只可能是缓存/旧数据）：先记本地，
+            # 等 refresh/check 从 Focusmate 真数据里补挂。
+            payload["focusmate_session_id"] = None
         self.task_store.assign(task["id"], payload)
-        return note or "这场还没有 Focusmate session id（没订上），只记了本地"
+        return "这场还没有 Focusmate session id（没订上），只记了本地"
 
     def next_session_after(self, task, max_days=2):
         """这条任务「下一场」放哪儿：同一场之后最近的那个 slot（跨天也找）。"""

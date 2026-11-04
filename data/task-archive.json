@@ -1564,6 +1564,310 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 91,
+      "fields": {
+        "title": "前几天那一套的数学",
+        "due": "2026-11-02T20:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": null,
+        "date": "2026-11-02",
+        "start": "20:00",
+        "end": "20:50",
+        "duration": "50",
+        "focusmate_session_id": "f2ba16f3-bae3-4ca4-b68b-30038ef4d3e1",
+        "previous_due": "2026-11-02T19:50:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "053d6e25-bce2-43c7-8eb1-24568e38277f",
+        "title": "前几天那一套的数学",
+        "description": "",
+        "completed_at": "2026-11-02T12:27:48.376676+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "f2ba16f3-bae3-4ca4-b68b-30038ef4d3e1"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 92,
+      "fields": {
+        "title": "词汇题修正",
+        "due": "2026-11-02T21:25:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 8,
+        "date": "2026-11-02",
+        "start": "21:00",
+        "end": "21:25",
+        "duration": 25,
+        "focusmate_session_id": "aeb1a7a4-3331-41f5-88ca-66f719f83db0"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "8e5f7298-76df-4363-8cb5-3c7d73d33b0b",
+        "title": "词汇题修正",
+        "description": "",
+        "completed_at": "2026-11-02T13:06:07.945959+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "aeb1a7a4-3331-41f5-88ca-66f719f83db0"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 94,
+      "fields": {
+        "title": "数学易错修正",
+        "due": "2026-11-02T21:25:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 8,
+        "date": "2026-11-02",
+        "start": "21:00",
+        "end": "21:25",
+        "duration": 25,
+        "focusmate_session_id": "aeb1a7a4-3331-41f5-88ca-66f719f83db0"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "6c188490-d2e7-456e-9edb-d9b722ec04da",
+        "title": "数学易错修正",
+        "description": "",
+        "completed_at": "2026-11-02T13:25:42.371018+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "aeb1a7a4-3331-41f5-88ca-66f719f83db0"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 98,
+      "fields": {
+        "title": "完成permutation group 文档",
+        "due": "2026-11-03T00:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 10,
+        "date": "2026-11-02",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": 50,
+        "focusmate_session_id": "21b8983d-d945-4100-819e-1fea8c3db78c"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "779b04ed-caf7-4e78-a1c9-c65a9f38707e",
+        "title": "完成permutation group 文档",
+        "description": "",
+        "completed_at": "2026-11-02T15:57:42.197335+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "21b8983d-d945-4100-819e-1fea8c3db78c"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 100,
+      "fields": {
+        "title": "难题 12",
+        "due": "2026-11-03T11:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 1,
+        "date": "2026-11-03",
+        "start": "11:00",
+        "end": "11:50",
+        "duration": 50,
+        "focusmate_session_id": "34a93289-d428-4e7b-a55a-72ccbd873125"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "849893ec-ad80-4477-853e-5ed8b26c887b",
+        "title": "难题 12",
+        "description": "",
+        "completed_at": "2026-11-03T03:42:56.395703+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "34a93289-d428-4e7b-a55a-72ccbd873125"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 101,
+      "fields": {
+        "title": "难题 13",
+        "due": "2026-11-03T17:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-11-03",
+        "start": "16:45",
+        "end": "17:35",
+        "duration": 50,
+        "focusmate_session_id": "12eba064-68a5-486c-b89f-2d29bdcec711"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "abd58c09-4785-4fda-afc4-9e8009aa3767",
+        "title": "难题 13",
+        "description": "",
+        "completed_at": "2026-11-03T09:30:02.782488+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "12eba064-68a5-486c-b89f-2d29bdcec711"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 103,
+      "fields": {
+        "title": "语法难修正",
+        "duration": "15",
+        "due": "2026-11-03T17:35:00",
+        "due_source": "session",
+        "count": 1
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-11-03",
+        "start": "16:45",
+        "end": "17:35",
+        "duration": 50,
+        "focusmate_session_id": "12eba064-68a5-486c-b89f-2d29bdcec711"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "c6b12db3-e3e7-45df-bbad-389c78610f85",
+        "title": "语法难修正",
+        "description": "",
+        "completed_at": "2026-11-03T09:32:02.712237+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "12eba064-68a5-486c-b89f-2d29bdcec711"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 107,
+      "fields": {
+        "title": "find task",
+        "due": "2026-11-03T23:20:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 8,
+        "date": "2026-11-03",
+        "start": "22:30",
+        "end": "23:20",
+        "duration": 50,
+        "focusmate_session_id": "5077ec21-c581-4c9e-8035-521bc42c5121"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "3492aee5-2c90-46cf-ab67-60bbd14c5115",
+        "title": "find task",
+        "description": "",
+        "completed_at": "2026-11-03T14:58:13.782307+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "5077ec21-c581-4c9e-8035-521bc42c5121"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 109,
+      "fields": {
+        "title": "write_project_focus",
+        "due": "2026-11-03T23:20:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 8,
+        "date": "2026-11-03",
+        "start": "22:30",
+        "end": "23:20",
+        "duration": 50,
+        "focusmate_session_id": "5077ec21-c581-4c9e-8035-521bc42c5121"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "8688fdc1-86fd-4ba7-ac63-41646a5c6cd4",
+        "title": "write_project_focus",
+        "description": "",
+        "completed_at": "2026-11-03T15:07:41.394143+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "5077ec21-c581-4c9e-8035-521bc42c5121"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-04T11:10:18",
+      "task_id": 111,
+      "fields": {
+        "title": "难题 13 correct",
+        "due": "2026-11-04T10:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 1,
+        "date": "2026-11-04",
+        "start": "09:45",
+        "end": "10:35",
+        "duration": 50,
+        "focusmate_session_id": "81934528-bc23-429e-a118-f2cbce30dc9d",
+        "previous_due": "2026-11-03T23:20:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "fa2d36e4-beef-4059-9c47-f1895bf5352c",
+        "title": "难题 13 correct",
+        "description": "",
+        "completed_at": "2026-11-04T02:12:53.249229+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "81934528-bc23-429e-a118-f2cbce30dc9d"
+          }
+        ]
+      }
     }
   ]
 }

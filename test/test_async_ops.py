@@ -310,6 +310,75 @@ check("面板真的消失", wd.shell.progress_value(), None)
 check_true("Recent 里有成功那句话", any("已挂上" in m[2] for m in wd.messages))
 check("没有进失败账", wd.jobs.failures, [])
 
+# ---------------------------------------------------------------- 1.5 用户命令
+print("\n== 1.5 task <序号> -ac / formatter 挂载都不在提示符线程等 bridge ==")
+bridge = GateBridge()
+wd = mkwarden(bridge)
+seed_rows(wd)
+task = wd.task_store.create(fields={"title": "紧凑写法也要异步"})
+wd.current_session = lambda: (1, wd.rows[0])
+bridge.hold()
+started = time.time()
+wd.handle("task %d -ac" % wd.task_no(task))
+elapsed = time.time() - started
+check("task <序号> -ac 立刻返回", elapsed < 1.0, True)
+check("乐观结果已经落到本地",
+      (wd.task_store.get(task["id"]).get("session") or {}).get("start"),
+      wd.rows[0].get("startLabel"))
+check("add_task 真的排了", any(c[0] == "add_task" for c in bridge.calls), True)
+check("bridge 在 worker 线程里跑", bridge.threads[-1], "repl-kit-jobs")
+bridge.release()
+settle(wd)
+
+# formatter / 收尾共用的 assign_task_to 也不能同步等 add_task。
+bridge = GateBridge()
+wd = mkwarden(bridge)
+seed_rows(wd)
+task = wd.task_store.create(fields={"title": "formatter 挂载"})
+row = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
+session = {"date": wd.sel_date.isoformat(), "start": row["startLabel"],
+           "end": row["endLabel"], "duration": row["durationMin"],
+           "focusmate_session_id": row["id"], "startMs": row["startMs"],
+           "index": 1}
+bridge.hold()
+before_calls = len(bridge.calls)
+started = time.time()
+wd.assign_task_to(task, session)
+elapsed = time.time() - started
+check("formatter / 收尾的挂载立刻返回", elapsed < 1.0, True)
+check("assign_task_to 先记本地",
+      (wd.task_store.get(task["id"]).get("session") or {}).get("start"), "11:00")
+check("assign_task_to 的 add_task 真的排了",
+      any(c[0] == "add_task" for c in bridge.calls[before_calls:]), True)
+check("assign_task_to 的 bridge 也在 worker 线程",
+      bridge.threads[-1], "repl-kit-jobs")
+bridge.release()
+settle(wd)
+
+# 剪贴板同样是外部读：task <id> link（不给链接）不能先在主线程等 osascript。
+bridge = GateBridge()
+wd = mkwarden(bridge)
+task = wd.task_store.create(fields={"title": "剪贴板异步"})
+_clip_gate = threading.Event()
+_real_clip = w.of.clipboard_links
+w.of.clipboard_links = lambda: (_clip_gate.wait(20),
+                                [{"id": "pk-clip", "title": "剪贴板任务"}])[1]
+try:
+    started = time.time()
+    wd.handle("task id:%d link" % task["id"])
+    elapsed = time.time() - started
+    check("task link 读剪贴板也立刻返回", elapsed < 1.0, True)
+    check("命令返回时还没读完（后台在排队）",
+          (wd.task_store.get(task["id"]).get("omnifocus") or {}).get("id"), None)
+    _clip_gate.set()
+    settle(wd)
+    check("剪贴板读完后关联落到本地",
+          (wd.task_store.get(task["id"]).get("omnifocus") or {}).get("id"), "pk-clip")
+finally:
+    _clip_gate.set()
+    w.of.clipboard_links = _real_clip
+
+
 # ---------------------------------------------------------------- 2. 失败回滚
 print("\n== 2. 失败：精确回滚 + 警告 + 记账（落盘）==")
 if os.path.exists(FAILED_FILE):

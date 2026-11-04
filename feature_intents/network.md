@@ -1,10 +1,11 @@
 # network —— 外部操作（Focusmate / OmniFocus / 子进程）：读异步、写乐观、失败可重放
 
 warden 里**所有不在软件内部自己完成的事**都不在提示符线程上跑：Focusmate
-（bridge 子进程 + 浏览器）、OmniFocus（osascript 子进程）、keep_session（下单 /
-对账 / 启停 daemon）、日历同步（download_calendar.py）。这一层由 `repl_kit.jobs`
-提供（单 worker 串行队列 + 进度面板 + 失败账），warden 只负责“哪件事叫什么名字、
-参数是什么、本地那半件事怎么做、失败怎么退回去”。
+（bridge 子进程 + 浏览器）、OmniFocus（osascript 子进程）、macOS 剪贴板
+（osascript / pbpaste）、keep_session（下单 / 对账 / 启停 daemon）、日历同步
+（download_calendar.py）。这一层由 `repl_kit.jobs` 提供（单 worker 串行队列 +
+进度面板 + 失败账），warden 只负责“哪件事叫什么名字、参数是什么、本地那半件事
+怎么做、失败怎么退回去”。
 
 ## 为什么
 
@@ -34,10 +35,11 @@ warden 里**所有不在软件内部自己完成的事**都不在提示符线程
   排进去的），它会并进同一批 —— 分母变大，标题不变；
 * 干完标题就没了，面板消失，结果进 Recent。
 
-已经这样串起来的操作：`task import`（[omnifocus] 获取任务 → [focusmate] 挂任务）、
+已经这样串起来的操作：`task import`（[omnifocus] 读剪贴板/获取任务 →
+[focusmate] 挂任务）、`task 5 link`（读剪贴板 → 写本地关联）、
 `task done`（[focusmate] 勾完成 → [omnifocus] 写回完成）、`task drop`、
-`task sync`、`refresh`、`sync`（[calendar] download → [calendar] populate）、
-`daemon start/stop`。
+`task sync`、formatter 切出来的旧场取消、`refresh`、
+`sync`（[calendar] download → [calendar] populate）、`daemon start/stop`。
 
 ## 两种操作，两种待遇
 
@@ -89,9 +91,12 @@ apply=本地那半)`。所以 warden 关掉再开、断网恢复之后，照样�
 
 ## 边界：哪些外部调用**不**进队列
 
-一次改好几场的“多步事务”仍然同步跑：
+一次改好几场的“多步事务”里，**本地写**仍然同步跑（要么都改、要么都别改），
+但其中碰外面世界的子步骤已经拆进队列：
 
-- 时段排布剪断（取消旧场 + 写 layout + 重算 data.csv）
+- 时段排布剪断：写 layout + 重算 data.csv 是本地同步事务；旧场的 Focusmate
+  取消走 `session.cancel` 队列（本地先乐观拿掉，失败自动放回）
+- formatter / 收尾要挂 Focusmate 时，走 `task.assign` 队列，本地先打 pending
 - 收尾（postsession）那一串里的读写（它自己有一个后台线程，见下）
 - 布局重写
 

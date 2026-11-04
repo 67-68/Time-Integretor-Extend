@@ -348,6 +348,9 @@ wd.rows_source = "bridge"
 wd.rebuild_rows()
 wd.bridge.calls = []
 check("task sync 受理", wd.handle("task sync"), True)
+# task sync 现在是异步：先等队列落地（真界面的每帧 drain 做同一件事）
+wd.wait_net()
+wd.drain_net()
 adds = [c for c in wd.bridge.calls if c[0] == "add_task"]
 check("给这一场调了一次 add_task", len(adds), 1)
 check("add_task 用的是那场 session id", adds[0][1].get("meetingId"), "sess-9")
@@ -365,6 +368,8 @@ check("Focusmate task 挂在子任务上，不在本体上",
       ("ft-repeat-1", {}))
 wd.bridge.calls = []
 wd.handle("task sync")
+wd.wait_net()
+wd.drain_net()
 check("再 sync 不会重复挂（幂等）",
       [c for c in wd.bridge.calls if c[0] == "add_task"], [])
 check("完成时间进归档", len(wd.task_store.load_archive()["records"]), 1)
