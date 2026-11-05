@@ -1899,6 +1899,37 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-05T17:17:10",
+      "task_id": 117,
+      "fields": {
+        "title": "correct bluebook 7",
+        "due": "2026-11-05T11:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-11-05",
+        "start": "10:45",
+        "end": "11:35",
+        "duration": 50,
+        "focusmate_session_id": "e9b329c0-c991-48f0-a25b-d22e2a8687fc",
+        "previous_due": "2026-11-05T11:20:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "42e9d3d5-773e-4677-9213-90cfb67a4741",
+        "title": "correct bluebook 7",
+        "description": "",
+        "completed_at": "2026-11-05T02:57:40.473704+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "e9b329c0-c991-48f0-a25b-d22e2a8687fc"
+          }
+        ]
+      }
     }
   ]
 }

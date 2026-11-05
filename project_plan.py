@@ -120,13 +120,23 @@ def distribute(allocations, projects, invested_map=None):
             take = min(int(item.get("remaining") or 0), need)
             if take <= 0:
                 continue
-            out.append({"project_id": pid,
-                        "project": project,
-                        "pk": item["pk"],
-                        "title": item.get("title") or item["pk"],
-                        "count": take,
-                        "total": int(item.get("count") or 0),
-                        "remaining": int(item.get("remaining") or 0)})
+            rec = {"project_id": pid,
+                   "project": project,
+                   "pk": item["pk"],
+                   "title": item.get("title") or item["pk"],
+                   "count": take,
+                   "total": int(item.get("count") or 0),
+                   "remaining": int(item.get("remaining") or 0)}
+            if item.get("children"):
+                # 父任务壳：真正的 session 内容是不可拆的子任务。这里把整套
+                # 剩余子任务交给 schedule，由它按每场的实际分钟数选子集。
+                rec.update({
+                    "shell": True,
+                    "children": [dict(child) for child in item.get("children") or []],
+                    "duration": int(item.get("duration") or 0),
+                    "budget_minutes": take * MINUTES_PER_COUNT,
+                })
+            out.append(rec)
             need -= take
             took += take
         if need > 0:
@@ -171,6 +181,118 @@ def _match(items, slots):
     return {i: j for j, i in owner.items()}
 
 
+def _pick_child_subset(children, capacity_minutes):
+    """0/1 子集和：选若干**整条**子任务，使总分钟数尽量贴近容量。
+
+    子任务不可拆（用户明确要求）。这里返回选中的 child 列表；没有能放下的
+    就返回空列表。数量通常很小，用 sum→选择清单 的 DP 就够。
+    """
+    capacity = int(capacity_minutes or 0)
+    if capacity <= 0:
+        return []
+    dp = {0: []}
+    for child in children or ():
+        try:
+            minutes = int(child.get("duration") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes <= 0 or minutes > capacity:
+            continue
+        for total, chosen in list(dp.items()):
+            nxt = total + minutes
+            if nxt <= capacity and nxt not in dp:
+                dp[nxt] = chosen + [child]
+    if not dp:
+        return []
+    return dp[max(dp)]
+
+
+def _schedule_children(items, slots, placements, unscheduled, notes):
+    """把带子任务的父任务壳按 session 实际分钟数排进表。
+
+    一个 session 只放**同一个父任务**的子任务；放不下就换下一场，剩余子任务
+    继续找场。每个子任务都是原子单位，不拆。返回处理完后仍然可用的 slots。
+    """
+    group_items = [item for item in items if item.get("children")]
+    for item in group_items:
+        remaining = [dict(child) for child in item.get("children") or []
+                     if int(child.get("duration") or 0) > 0]
+        budget = int(item.get("budget_minutes") or 0)
+        if budget <= 0:
+            budget = sum(int(child.get("duration") or 0) for child in remaining)
+        touched_slots = []
+        while remaining and budget > 0:
+            wanted = min(sum(int(child.get("duration") or 0) for child in remaining),
+                         budget)
+            candidates = []
+            for slot in slots:
+                if slot.get("used", 0) >= slot.get("counts", 0):
+                    continue
+                free_minutes = int(slot.get("duration") or 0) - int(
+                    slot.get("used_minutes") or 0)
+                if free_minutes <= 0:
+                    continue
+                pick = _pick_child_subset(remaining, min(free_minutes, budget))
+                if not pick:
+                    continue
+                got = sum(int(child.get("duration") or 0) for child in pick)
+                # 先优先「一场装得下全部剩余」；否则选装得最多的场，再选浪费小的。
+                fits_all = got >= wanted
+                candidates.append((0 if fits_all else 1, -got,
+                                   abs(free_minutes - got), free_minutes, slot, pick))
+            if not candidates:
+                break
+            candidates.sort(key=lambda row: row[:4])
+            _all, _neg, _waste, free_minutes, slot, pick = candidates[0]
+            got = sum(int(child.get("duration") or 0) for child in pick)
+            for child in pick:
+                minutes = int(child.get("duration") or 0)
+                count = ts.minutes_to_count(minutes) or 1
+                placements.append({
+                    "item": {
+                        "project_id": item["project_id"],
+                        "project": item["project"],
+                        "pk": child.get("pk"),
+                        "title": child.get("title") or child.get("pk"),
+                        "duration": minutes,
+                        "count": count,
+                        "note": child.get("note") or "",
+                        "parent_pk": item.get("pk"),
+                        "parent_title": item.get("title") or item.get("pk"),
+                    },
+                    "slot": slot,
+                    "count": count,
+                    "duration": minutes,
+                    "split": False,
+                    "stacked": False,
+                    "parent": item,
+                })
+                remaining = [ch for ch in remaining
+                             if str(ch.get("pk")) != str(child.get("pk"))]
+            budget -= got
+            slot["used_minutes"] = int(slot.get("used_minutes") or 0) + got
+            # 一场只放一个父任务套；宁可留白，也不把另一套的子任务混进同一场。
+            slot["used"] = int(slot.get("counts") or 0)
+            touched_slots.append(slot)
+        if touched_slots:
+            for place in placements:
+                if place.get("parent") is item:
+                    place["split"] = len(touched_slots) > 1
+            if len(touched_slots) > 1:
+                notes.append("「%s」的子任务跨了 %d 场（子任务不拆，按场次容量分组）"
+                             % (item.get("title") or item.get("pk"), len(touched_slots)))
+        if remaining:
+            rest_minutes = sum(int(child.get("duration") or 0) for child in remaining)
+            unscheduled.append(dict(item,
+                                    count=ts.minutes_to_count(rest_minutes) or 0,
+                                    remaining_count=ts.minutes_to_count(rest_minutes) or 0,
+                                    children=remaining))
+            notes.append("「%s」还有 %d 分钟子任务没地方放（空场次不够或单条子任务太长）"
+                         % (item.get("title") or item.get("pk"), rest_minutes))
+    return [slot for slot in slots
+            if int(slot.get("used") or 0) < int(slot.get("counts") or 0)]
+
+
 def schedule(items, slots):
     """把任务排进空场次。
 
@@ -183,15 +305,19 @@ def schedule(items, slots):
     顺序就是两条原则的优先级：**先求一对一**（每场一个任务、每条任务一整场），
     配不上才拆、才叠。
     """
-    slots = [dict(s, used=0) for s in slots or []]
+    slots = [dict(s, used=0, used_minutes=0) for s in slots or []]
     items = [dict(i) for i in items or []]
     placements, unscheduled, notes = [], [], []
+    # 先排父任务壳（子任务不可拆、同一套尽量放同一场），再把剩余容量交给普通任务。
+    slots = _schedule_children(items, slots, placements, unscheduled, notes)
+    items = [item for item in items if not item.get("children")]
     matched = _match(items, slots)
     for i in sorted(matched):
         item = items[i]
         slot = slots[matched[i]]
         count = int(item.get("count") or 0)
-        slot["used"] = count
+        slot["used"] = int(slot.get("used") or 0) + count
+        slot["used_minutes"] = int(slot.get("used_minutes") or 0) + count * MINUTES_PER_COUNT
         placements.append({"item": item, "slot": slot, "count": count,
                            "split": False, "stacked": False})
     left = [item for i, item in enumerate(items) if i not in matched]

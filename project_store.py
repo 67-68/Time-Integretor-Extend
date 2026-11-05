@@ -94,6 +94,36 @@ def projects_path(path=None):
     return path or os.environ.get("TI_PROJECTS_FILE") or DEFAULT_PROJECTS_FILE
 
 
+def sync_check_path(path=None):
+    """每日项目对账的日期戳文件（跟项目库同目录，测试自动隔离）。"""
+    if path:
+        return path
+    env = os.environ.get("TI_PROJECT_SYNC_FILE")
+    if env:
+        return env
+    return os.path.join(os.path.dirname(projects_path()) or ".", "project-sync.json")
+
+
+def last_sync_day(path=None):
+    """上次每日项目对账的日期（``YYYY-MM-DD``）；没有/坏了返回空串。"""
+    try:
+        with open(sync_check_path(path), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return str((raw or {}).get("last_day") or "") if isinstance(raw, dict) else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def mark_sync_day(day=None, path=None):
+    """记下今天已经做过每日项目对账。``day`` 可以是 date 或 ISO 文本。"""
+    text = (day.isoformat() if hasattr(day, "isoformat") else str(day or ""))
+    if not text:
+        text = datetime.date.today().isoformat()
+    _atomic_write(sync_check_path(path),
+                  {"last_day": text, "at": _now()})
+    return text
+
+
 def project_url(pk):
     pk = str(pk or "").strip()
     return "omnifocus:///project/%s" % pk if pk else ""
@@ -201,6 +231,104 @@ def _local_dt(raw):
     return ts.parse_iso_datetime(raw)
 
 
+def _task_map(tasks):
+    """``pk -> task``；同一个 pk 只认第一条，避免坏数据把层级绕成环。"""
+    out = {}
+    for item in tasks or ():
+        if not isinstance(item, dict):
+            continue
+        pk = str(item.get("pk") or item.get("id") or "").strip()
+        if pk and pk not in out:
+            out[pk] = item
+    return out
+
+
+def child_map(tasks):
+    """``parent_pk -> [直接子任务]``（只认在同一个项目清单里的父任务）。"""
+    index = _task_map(tasks)
+    out = {}
+    for item in tasks or ():
+        if not isinstance(item, dict):
+            continue
+        pk = str(item.get("pk") or item.get("id") or "").strip()
+        parent_pk = str(item.get("parent_id") or "").strip()
+        if not pk or not parent_pk or parent_pk == pk or parent_pk not in index:
+            continue
+        out.setdefault(parent_pk, []).append(item)
+    return out
+
+
+def top_level_tasks(tasks):
+    """项目清单里的顶层任务（子任务不在这里重复出现）。"""
+    index = _task_map(tasks)
+    out = []
+    for item in tasks or ():
+        if not isinstance(item, dict):
+            continue
+        parent_pk = str(item.get("parent_id") or "").strip()
+        if parent_pk and parent_pk in index:
+            continue
+        out.append(item)
+    return out
+
+
+def hierarchy_errors(tasks):
+    """检查「最多父-子两层」；返回 ``[{"pk", "title", "depth", "chain"}]``。
+
+    0 = 顶层，1 = 子任务；2 就是孙任务（三层），严格禁止。
+    """
+    index = _task_map(tasks)
+    errors = []
+    for item in tasks or ():
+        if not isinstance(item, dict):
+            continue
+        pk = str(item.get("pk") or item.get("id") or "").strip()
+        chain = [pk]
+        cursor = item
+        seen = {pk}
+        depth = 0
+        while True:
+            parent_pk = str((cursor or {}).get("parent_id") or "").strip()
+            if not parent_pk or parent_pk not in index:
+                break
+            if parent_pk in seen:
+                errors.append({"pk": pk,
+                               "title": _one_line(item.get("title")) or pk,
+                               "depth": 99,
+                               "chain": chain + [parent_pk],
+                               "reason": "父子关系成环"})
+                break
+            seen.add(parent_pk)
+            chain.append(parent_pk)
+            depth += 1
+            cursor = index[parent_pk]
+        else:  # pragma: no cover - while True 由 break 收口
+            depth = 0
+        if depth > 1 and not (errors and errors[-1].get("pk") == pk
+                              and errors[-1].get("depth") == 99):
+            errors.append({"pk": pk,
+                           "title": _one_line(item.get("title")) or pk,
+                           "depth": depth,
+                           "chain": chain,
+                           "reason": "超过父-子两层"})
+    return errors
+
+
+def _item_minutes(item):
+    """一条项目任务的分钟数；父任务壳取子任务之和。"""
+    try:
+        minutes = ts.parse_minutes((item or {}).get("duration"))
+    except Exception:                       # noqa: BLE001 - 坏记录当没有
+        minutes = None
+    return int(minutes or 0)
+
+
+def _parent_duration(item, children):
+    if not children:
+        return _item_minutes(item)
+    return sum(_item_minutes(child) for child in children)
+
+
 def _norm_repeat_info(info):
     """把 ``repetition_info()`` / 已存 task.repeat 收敛成可保存的重复信息。"""
     if not isinstance(info, dict):
@@ -305,6 +433,67 @@ def _week_item_date(item, now_dt, week_start, week_end):
     return day, False
 
 
+#: 每日项目对账时决定「任务数据被修改」的字段。完成状态不在这里比较：
+#: 本地完成会单向写回 OmniFocus，不能用还没写回的远端状态反过来判冲突。
+DIFF_FIELDS = ("title", "duration", "defer", "due", "planned", "parent_id")
+
+
+def diff_tasks(local_tasks, remote_tasks):
+    """本地项目清单 vs OmniFocus 清单 → ``{"added", "removed", "modified"}``。
+
+    - ``added``：远端有、本地没有；调用方应自动拉取；
+    - ``removed``：本地有、远端没有；属于冲突，问用户保哪边；
+    - ``modified``：两边都有但关键字段不同；属于冲突。
+    """
+    def index(tasks):
+        out = {}
+        for task in tasks or ():
+            pk = str((task or {}).get("pk") or (task or {}).get("id") or "")
+            if pk:
+                out[pk] = task
+        return out
+
+    local = index(local_tasks)
+    remote = index(remote_tasks)
+    added = [remote[pk] for pk in remote if pk not in local]
+    removed = [local[pk] for pk in local if pk not in remote]
+    modified = []
+    for pk in sorted(set(local) & set(remote)):
+        changes = []
+        for field in DIFF_FIELDS:
+            left = local[pk].get(field)
+            right = remote[pk].get(field)
+            if field == "duration":
+                left = ts.parse_minutes(left)
+                right = ts.parse_minutes(right)
+            if left != right:
+                changes.append({"field": field, "local": left, "remote": right})
+        if changes:
+            modified.append({"pk": pk,
+                             "title": remote[pk].get("title") or local[pk].get("title"),
+                             "changes": changes})
+    return {"added": added, "removed": removed, "modified": modified}
+
+
+def diff_text(diff, limit=5):
+    """一条冲突摘要（面板/消息用）。"""
+    diff = diff or {}
+    bits = []
+    if diff.get("added"):
+        bits.append("新增 %d" % len(diff["added"]))
+    if diff.get("removed"):
+        names = "、".join("「%s」" % item.get("title")
+                          for item in diff["removed"][:limit])
+        bits.append("删除 %d%s" % (len(diff["removed"]),
+                                   ("（%s）" % names) if names else ""))
+    if diff.get("modified"):
+        names = "、".join("「%s」" % item.get("title")
+                          for item in diff["modified"][:limit])
+        bits.append("修改 %d%s" % (len(diff["modified"]),
+                                   ("（%s）" % names) if names else ""))
+    return " · ".join(bits) or "没有变化"
+
+
 def weekly_yield(tasks, now=None):
     """一组项目任务 → 本周会产生的任务清单 + 时长缺口（纯函数）。
 
@@ -330,15 +519,34 @@ def weekly_yield(tasks, now=None):
     week_start, week_end = week_bounds(now_dt)
     produced, missing_by_pk = [], {}
     seen = set()
-    for raw in tasks or ():
+    all_tasks = [dict(item) for item in (tasks or ()) if isinstance(item, dict)]
+    index = _task_map(all_tasks)
+    kids = child_map(all_tasks)
+    for raw in all_tasks:
         item = raw if isinstance(raw, dict) else {}
         if item.get("completed") or item.get("dropped"):
             continue
         pk = str(item.get("pk") or item.get("id") or "")
+        # 子任务不单独计入「本周产生多少条」；父任务壳代表这一整套。
+        parent_pk = str(item.get("parent_id") or "").strip()
+        if parent_pk and parent_pk in index:
+            continue
         title = _one_line(item.get("title") or item.get("name")) or pk or "?"
-        minutes = ts.parse_minutes(item.get("duration"))
-        if minutes is None:
-            minutes = ts.parse_minutes(item.get("estimated_minutes"))
+        children = kids.get(pk) or []
+        if children:
+            missing_children = [child for child in children
+                                if not child.get("completed")
+                                and ts.parse_minutes(child.get("duration")) is None]
+            good_children = [child for child in children if not child.get("completed")]
+            minutes = (sum(_item_minutes(child) for child in good_children)
+                       if good_children and not missing_children else None)
+            if not good_children:
+                continue
+        else:
+            missing_children = []
+            minutes = ts.parse_minutes(item.get("duration"))
+            if minutes is None:
+                minutes = ts.parse_minutes(item.get("estimated_minutes"))
         repeat = _task_repeat(item)
         # repetition_info 里的时长也可以补 row 里没写出来的情况。
         if minutes is None and repeat:
@@ -381,6 +589,8 @@ def weekly_yield(tasks, now=None):
                     "count": 0,
                     "repeat": bool(repeat),
                     "deferred": bool(is_deferred),
+                    "children": [_one_line(c.get("title")) or str(c.get("pk") or "")
+                                 for c in missing_children],
                 })
                 rec["dates"].append(day.isoformat())
                 rec["count"] += 1
@@ -421,6 +631,23 @@ def week_summary(payload_or_week):
                int(week.get("count") or 0), " · ".join(bits)))
 
 
+def format_depth_errors(payload, limit=6):
+    """父子层级超过两层的报错句；没有错误返回空串。"""
+    errors = list((payload or {}).get("depth_errors") or [])
+    if not errors:
+        return ""
+    bits = []
+    for rec in errors[:limit]:
+        chain = rec.get("chain") or []
+        bits.append("「%s」%s" % (rec.get("title") or rec.get("pk") or "?",
+                                  ("（层级：%s）" % " → ".join(chain)) if chain else ""))
+    more = (" 等 %d 条" % len(errors)) if len(errors) > limit else ""
+    return ("项目「%s」里这 %d 条任务超过父-子两层（严禁三层任务）：%s%s。"
+            "请回 OmniFocus 把孙任务上移或拆成独立的父任务，再重新导入。"
+            % ((payload or {}).get("title") or "?", len(errors),
+               "、".join(bits), more))
+
+
 def format_week_missing(payload, limit=6):
     """本周任务缺时长的报错句；没有缺口返回空串。"""
     week = (payload or {}).get("week") or {}
@@ -439,8 +666,11 @@ def format_week_missing(payload, limit=6):
     bits = []
     for rec in missing[:limit]:
         dates = "、".join(str(d)[5:] for d in (rec.get("dates") or []))
-        bits.append("「%s」%s" % (rec.get("title") or rec.get("pk") or "?",
-                                  ("（%s）" % dates) if dates else ""))
+        detail = ""
+        if rec.get("children"):
+            detail = "（子任务：%s）" % "、".join(rec["children"])
+        bits.append("「%s」%s%s" % (rec.get("title") or rec.get("pk") or "?",
+                                   ("（%s）" % dates) if dates else "", detail))
     head = "、".join(bits)
     total = sum(int(rec.get("count") or 0) for rec in missing)
     if len(missing) > limit:
@@ -503,9 +733,11 @@ def _norm_task(raw, rank=0):
         "pk": pk,
         "title": _one_line(raw.get("title") or raw.get("name")) or pk,
         "parent": _one_line(raw.get("parent")),
+        "parent_id": str(raw.get("parent_id") or "").strip(),
         "due": raw.get("due") or None,
         "defer": raw.get("defer") or None,
         "planned": raw.get("planned") or None,
+        "note": str(raw.get("note") or ""),
         "count": int(count or 0),
         "duration": minutes,
         "completed": bool(raw.get("completed")),
@@ -618,7 +850,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
     if len(same_name) > 1:
         warnings.append("OmniFocus 里有 %d 个同名项目「%s」—— 任务清单按项目名归组，"
                         "同名的那几个会串在一起。" % (len(same_name), name))
-    members, missing, done = [], [], 0
+    members, done = [], 0
     for r in rows:
         if r.get("kind") == "project_root":
             continue
@@ -631,15 +863,15 @@ def project_payload(row, rows, repeat_infos=None, now=None):
         completed = bool(r.get("completed"))
         if completed:
             done += 1
-        elif not minutes:
-            missing.append(title)
         item = {
             "pk": str(r.get("id") or ""),
             "title": title,
             "parent": _one_line(r.get("parent")),
+            "parent_id": str(r.get("parent_id") or "").strip(),
             "due": r.get("due") or None,
             "defer": r.get("defer") or None,
             "planned": r.get("planned") or None,
+            "note": r.get("note") or "",
             "duration": minutes,
             "count": ts.minutes_to_count(minutes) if minutes else 0,
             "completed": completed,
@@ -650,6 +882,33 @@ def project_payload(row, rows, repeat_infos=None, now=None):
         if rep:
             item["repeat"] = rep
         members.append(item)
+
+    index = _task_map(members)
+    kids = child_map(members)
+    for item in members:
+        children = kids.get(item["pk"]) or []
+        if children:
+            item["shell"] = True
+            item["child_pks"] = [child["pk"] for child in children]
+            item["duration"] = _parent_duration(item, children)
+            item["count"] = ts.minutes_to_count(item["duration"]) if item["duration"] else 0
+    # 父任务本身是空壳：有子任务时不要求它自己有 estimated_minutes；缺时长的是
+    # 具体子任务。没有子任务的普通任务仍按原来的硬门槛检查。
+    missing = []
+    for item in members:
+        if item.get("completed"):
+            continue
+        if kids.get(item["pk"]):
+            continue
+        if ts.parse_minutes(item.get("duration")) is None:
+            missing.append(item.get("title") or item.get("pk"))
+    depth_errors = hierarchy_errors(members)
+    if depth_errors:
+        warnings.append("有 %d 条任务超过父-子两层（严禁三层）：%s"
+                        % (len(depth_errors),
+                           "、".join("「%s」" % item.get("title")
+                                    for item in depth_errors[:6])))
+    # 重复任务本身是父任务时，重复规则仍在父任务上；weekly_yield 会按整套算一条。
     payload = {
         "kind": "project",
         "id": pk,
@@ -657,6 +916,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
         "url": project_url(pk),
         "tasks": members,
         "missing": missing,
+        "depth_errors": depth_errors,
         "done": done,
         "warnings": warnings,
     }
@@ -767,15 +1027,22 @@ def completion_guard(task, store, task_store):
 def stats(project, task_store=None, invested_map=None):
     """一个项目的账：``total`` / ``done`` / ``remaining`` / ``progress``。
 
-    - ``total``：清单里全部任务的 count 之和；
-    - ``done``：OmniFocus 里已完成的任务算满，其余按「本地已投入」封顶；
-    - ``remaining``：只数**还没完成**的任务（已投入的照样减掉）。
+    父任务壳的 ``duration/count`` 由子任务派生，不能和子任务重复计账：
+    ``total/done/remaining`` 只逐条算叶子任务。父任务本身已完成的，它的子任务
+    在 OmniFocus 里通常也已完成，仍按叶子算，不会把父壳再加一遍。
     """
     if invested_map is None:
         invested_map = invested(task_store, project)
+    tasks = project.get("tasks") or []
+    kids = child_map(tasks)
     total = done = remaining = 0
-    for item in project.get("tasks") or []:
+    for item in tasks:
+        if kids.get(item.get("pk")):
+            continue
+        minutes = _item_minutes(item)
         cap = int(item.get("count") or 0)
+        if not cap and minutes:
+            cap = ts.minutes_to_count(minutes)
         total += cap
         if item.get("completed"):
             done += cap
@@ -793,18 +1060,72 @@ def stats(project, task_store=None, invested_map=None):
 
 
 def remaining_tasks(project, invested_map=None):
-    """还没做完、而且还有 count 可干的那些任务（按清单顺序）。"""
+    """还没做完、而且还有内容可干的**顶层任务**（按清单顺序）。
+
+    有子任务的父任务返回成一条派生单元：``duration`` 是剩余子任务分钟数之和，
+    ``count`` 是它的 ceil(minutes/25)，``children`` 里是每个剩余子任务（子任务
+    不可再拆）。没有子任务的普通任务行为和以前一样。
+    """
     invested_map = invested_map or {}
+    tasks = project.get("tasks") or []
+    kids = child_map(tasks)
     out = []
-    for item in project.get("tasks") or []:
+    for item in top_level_tasks(tasks):
         if item.get("completed"):
             continue
+        children = kids.get(item.get("pk")) or []
+        if children:
+            open_children = []
+            for child in children:
+                if child.get("completed"):
+                    continue
+                minutes = _item_minutes(child)
+                if minutes <= 0:
+                    continue
+                open_children.append(dict(child, remaining=minutes,
+                                          invested=0))
+            if not open_children:
+                continue
+            total_minutes = sum(_item_minutes(child) for child in open_children)
+            cap = ts.minutes_to_count(total_minutes) or 0
+            out.append(dict(item, remaining=cap, invested=0,
+                            duration=total_minutes, count=cap,
+                            shell=True, children=open_children,
+                            composite=True))
+            continue
         cap = int(item.get("count") or 0)
-        got = min(cap, int(invested_map.get(item["pk"], 0) or 0))
+        got = min(cap, int(invested_map.get(item.get("pk"), 0) or 0))
         if cap - got <= 0:
             continue
         out.append(dict(item, remaining=cap - got, invested=got))
     return out
+
+
+def task_by_pk(project, pk):
+    """项目清单里按 primary key 找一条任务；没有返回 None。"""
+    want = str(pk or "").strip()
+    if not want:
+        return None
+    for item in (project or {}).get("tasks") or ():
+        if str(item.get("pk") or "") == want:
+            return item
+    return None
+
+
+def parent_of(project, child_pk):
+    """子任务 → 直接父任务；不是子任务 / 父不在清单里返回 None。"""
+    child = task_by_pk(project, child_pk)
+    parent_pk = str((child or {}).get("parent_id") or "").strip()
+    return task_by_pk(project, parent_pk) if parent_pk else None
+
+
+def children_of(project, parent_pk):
+    """项目清单里某个父任务的直接子任务（按 rank 顺序）。"""
+    want = str(parent_pk or "").strip()
+    if not want:
+        return []
+    return [item for item in (project or {}).get("tasks") or ()
+            if str(item.get("parent_id") or "").strip() == want]
 
 
 def plan_of(project, day):
@@ -968,6 +1289,42 @@ class ProjectStore(object):
             raise ValueError("没有项目 %s" % project_id)
         self.save(store)
         return before - len(store["projects"])
+
+    def complete_subtasks(self, project_id, parent_pk, child_pks):
+        """把这次排进 session 的子任务标完成；全部完成 → 父任务自动完成。
+
+        返回 ``(project, parent_completed_now, newly_completed_children)``。
+        父任务本身是空壳，不参与 session；这里只更新项目库里的完成状态。
+        外部 OmniFocus 写回由 warden 决定（普通 ``task done`` 会立刻写，纯本地
+        ``-m complete`` 不写）。
+        """
+        wanted = [str(pk) for pk in (child_pks or []) if str(pk).strip()]
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            direct = {str(item.get("pk")) for item in children_of(project, parent_pk)}
+            newly = []
+            for item in project.get("tasks") or []:
+                pk = str(item.get("pk") or "")
+                if pk in wanted and pk in direct and not item.get("completed"):
+                    item["completed"] = True
+                    item["completed_at"] = _now()
+                    newly.append(pk)
+            parent = task_by_pk(project, parent_pk)
+            all_done = bool(direct) and all(
+                bool(task_by_pk(project, pk).get("completed"))
+                for pk in direct if task_by_pk(project, pk) is not None)
+            auto_done = False
+            if parent is not None and all_done and not parent.get("completed"):
+                parent["completed"] = True
+                parent["completed_at"] = _now()
+                auto_done = True
+            if newly or auto_done:
+                project["synced_at"] = _now()
+                self.save(store)
+            return project, auto_done, newly
+        raise ValueError("没有项目 %s" % project_id)
 
     def set_allocation(self, project_id, day, count):
         """记下「这一天给这个项目多少 count」（**只记资源，不排任务**）。"""

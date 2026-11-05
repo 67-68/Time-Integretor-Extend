@@ -366,6 +366,197 @@ check_true("说清是「项目链接 + 读不到」",
            any("项目" in t and "读不到" in t for t in texts(wd_off)))
 wd_off.settings.set("omnifocus", "on")
 
+print("== 子任务：最多父-子两层、父任务空壳、周账按父任务算一条 ==")
+_sub_rows = [
+    {"id": "p-sub", "name": "子任务项目", "kind": "project_root",
+     "completed": False, "dropped": False},
+    {"id": "parent", "name": "父任务", "kind": "action", "project": "子任务项目",
+     "parent_id": "", "estimated_minutes": None, "completed": False},
+    {"id": "c10", "name": "子 10", "kind": "action", "project": "子任务项目",
+     "parent_id": "parent", "estimated_minutes": 10, "completed": False},
+    {"id": "c13", "name": "子 13", "kind": "action", "project": "子任务项目",
+     "parent_id": "parent", "estimated_minutes": 13, "completed": False},
+    {"id": "c27", "name": "子 27", "kind": "action", "project": "子任务项目",
+     "parent_id": "parent", "estimated_minutes": 27, "completed": False},
+]
+_sub_payload = pj.project_payload(_sub_rows[0], _sub_rows, now=_fixed_now)
+check("父任务壳没设时长也不缺时长",
+      _sub_payload["missing"], [])
+check("父任务时长 = 子任务之和", _sub_payload["tasks"][0]["duration"], 50)
+check("父任务 count = ceil(50/25)", _sub_payload["tasks"][0]["count"], 2)
+check("父任务被标成 shell", _sub_payload["tasks"][0]["shell"], True)
+check("父任务下三个子任务",
+      _sub_payload["tasks"][0]["child_pks"], ["c10", "c13", "c27"])
+check("本周按父任务算一条，不把三个子任务重复计", _sub_payload["week"]["count"], 1)
+_sub_rem = pj.remaining_tasks(dict(_sub_payload, id=1), {})
+check("排期只返回父任务壳", [(x["pk"], x["duration"], len(x["children"]))
+                             for x in _sub_rem],
+      [("parent", 50, 3)])
+
+_sub_grand = [dict(r) for r in _sub_rows]
+_sub_grand.append({"id": "grand", "name": "孙任务", "kind": "action",
+                   "project": "子任务项目", "parent_id": "c13",
+                   "estimated_minutes": 5, "completed": False})
+_sub_bad = pj.project_payload(_sub_grand[0], _sub_grand, now=_fixed_now)
+check("三层任务被点名", [e["title"] for e in _sub_bad["depth_errors"]],
+      ["孙任务"])
+check_true("三层任务有明确拒绝话术",
+           "严禁三层任务" in pj.format_depth_errors(_sub_bad))
+
+print("== 子任务完成：一条条勾，全部完成父任务自动完成 ==")
+reset_projects()
+_sub_store = pj.ProjectStore()
+_sub_proj, _created = _sub_store.upsert(_sub_payload)
+_sub_proj, _auto1, _new1 = _sub_store.complete_subtasks(
+    _sub_proj["id"], "parent", ["c10"])
+check("勾一个子任务", _new1, ["c10"])
+check("父任务还没完成", _auto1, False)
+_sub_proj, _auto2, _new2 = _sub_store.complete_subtasks(
+    _sub_proj["id"], "parent", ["c13", "c27"])
+check("剩下两个子任务一起勾", sorted(_new2), ["c13", "c27"])
+check("全部子任务完成 → 父任务自动完成", _auto2, True)
+check("项目库里父任务 completed",
+      pj.task_by_pk(_sub_proj, "parent")["completed"], True)
+
+print("== 子任务排期：父任务为单元，25 分钟场只能放 10+13=23，27 留到以后 ==")
+_sub_items, _sub_notes = pp.distribute(
+    [{"project_id": 1, "project": dict(_sub_payload, id=1), "count": 2}],
+    [dict(_sub_payload, id=1)], {1: {}})
+check("distribute 给出一套父任务单元", len(_sub_items), 1)
+check("单元里带三个不可拆子任务",
+      [c["pk"] for c in _sub_items[0]["children"]], ["c10", "c13", "c27"])
+_slot25 = pp.slot_record(1, ISO, "11:00", 25, "s25")
+_places, _uns, _more = pp.schedule(_sub_items, [_slot25])
+check("25 分钟场选中 10+13",
+      sorted(p["duration"] for p in _places), [10, 13])
+check("27 分钟子任务没被拆 / 没硬塞",
+      [p["item"]["pk"] for p in _places], ["c10", "c13"])
+check("没排下的仍是剩余子任务",
+      [c["pk"] for c in _uns[0]["children"]], ["c27"])
+check_true("说明剩余分钟数", any("还有 27 分钟" in n for n in _more))
+check("父任务信息跟着每个 placement",
+      {(p["parent"]["pk"], p["item"]["parent_pk"]) for p in _places},
+      {("parent", "parent")})
+_slot75 = pp.slot_record(1, ISO, "12:00", 75, "s75")
+_places75, _uns75, _more75 = pp.schedule(_sub_items, [_slot75])
+check("75 分钟场放得下就三个子任务一起排",
+      sorted(p["duration"] for p in _places75), [10, 13, 27])
+check("全部排下就没有 unscheduled", _uns75, [])
+
+print("== plan 落地子任务：session 里只出现子任务，note 标注父任务 ==")
+wd_sub = fresh(_sub_rows)
+check("导入含子任务的项目", wd_sub.handle("task import omnifocus:///project/p-sub"), True)
+wd_sub.handle("day 1")
+wd_sub.handle("session T1 25")          # 明天：T1 25 分钟 + T2 50 分钟
+book_all(wd_sub)
+workspace_ids = [t["id"] for t in wd_sub.task_store.list()]
+check("plan 前任务库是空的", workspace_ids, [])
+wd_sub.handle("plan +1")
+check_true("plan 打开", wd_sub.planning is not None)
+wd_sub.planning.handle("task 1 1")       # 只分 1 count = 25 分钟
+wd_sub.handle("complete")
+_sub_locals = wd_sub.task_store.list()
+check("session 里只建了子任务，没有父任务空壳",
+      sorted(t["fields"]["title"] for t in _sub_locals), ["子 10", "子 13"])
+check("每个子任务都记着父任务来源",
+      {((t.get("source") or {}).get("parent_id"),
+        (t.get("source") or {}).get("parent_title")) for t in _sub_locals},
+      {("parent", "父任务")})
+check("note 写明是谁的子",
+      all("父任务：父任务" in ((t["fields"].get("note")
+                               or t["fields"].get("notes") or ""))
+          for t in _sub_locals), True)
+check("本地任务时长是子任务原时长",
+      sorted(t["fields"]["duration"] for t in _sub_locals), [10, 13])
+check("两个子任务挂在同一场 session",
+      len({(t["session"]["date"], t["session"]["start"]) for t in _sub_locals}), 1)
+check("项目 plan 记账也按子任务落",
+      sorted(x["pk"] for x in (pj.plan_of(wd_sub.projects.by_id(1),
+                                          wd_sub.sel_date) or {}).get("items") or []),
+      ["c10", "c13"])
+
+_first = next(t for t in _sub_locals if t["fields"]["title"] == "子 10")
+wd_sub.handle("task id:%d done" % _first["id"])
+_sub_proj_after = wd_sub.projects.by_id(1)
+check("完成一个 session 子任务会更新项目库",
+      pj.task_by_pk(_sub_proj_after, "c10")["completed"], True)
+check("还有子任务没完成 → 父任务不完成",
+      pj.task_by_pk(_sub_proj_after, "parent")["completed"], False)
+
+print("== 每日项目对账 diff：新增 / 删除 / 修改 ==")
+_diff = pj.diff_tasks(
+    [{"pk": "a", "title": "甲", "duration": 25},
+     {"pk": "b", "title": "乙", "duration": 50}],
+    [{"pk": "a", "title": "甲改", "duration": 25},
+     {"pk": "c", "title": "丙", "duration": 25}],
+)
+check("新增任务", [x["pk"] for x in _diff["added"]], ["c"])
+check("删除任务", [x["pk"] for x in _diff["removed"]], ["b"])
+check("修改任务", [x["pk"] for x in _diff["modified"]], ["a"])
+check_true("diff 摘要说清三种变化",
+           all(x in pj.diff_text(_diff) for x in ("新增 1", "删除 1", "修改 1")))
+
+print("== 每日项目对账：新增自动拉，删除/修改整项目问一次 ==")
+reset_projects()
+_sync_store = pj.ProjectStore()
+_local_payload = pj.project_payload(
+    {"id": "p-sync", "name": "同步项目", "kind": "project_root"},
+    [
+        {"id": "p-sync", "name": "同步项目", "kind": "project_root"},
+        {"id": "old-a", "name": "旧甲", "kind": "action", "project": "同步项目",
+         "estimated_minutes": 25, "completed": False},
+        {"id": "old-b", "name": "旧乙", "kind": "action", "project": "同步项目",
+         "estimated_minutes": 50, "completed": False},
+    ], now=_fixed_now)
+_sync_proj, _ = _sync_store.upsert(_local_payload)
+_remote_payload = pj.project_payload(
+    {"id": "p-sync", "name": "同步项目", "kind": "project_root"},
+    [
+        {"id": "p-sync", "name": "同步项目", "kind": "project_root"},
+        {"id": "old-a", "name": "旧甲改", "kind": "action", "project": "同步项目",
+         "estimated_minutes": 25, "completed": False},
+        {"id": "new-c", "name": "新丙", "kind": "action", "project": "同步项目",
+         "estimated_minutes": 25, "completed": False},
+    ], now=_fixed_now)
+_wd_sync = mkwarden()
+_wd_sync._apply_project_sync_result({"projects": [{
+    "project_id": _sync_proj["id"], "title": "同步项目",
+    "payload": _remote_payload,
+    "diff": pj.diff_tasks(_sync_proj["tasks"], _remote_payload["tasks"]),
+    "remote_found": True, "invalid": "",
+}]})
+_synced = _wd_sync.projects.by_id(_sync_proj["id"])
+check("新增任务已自动拉进项目库",
+      "new-c" in [t["pk"] for t in _synced["tasks"]], True)
+check("旧乙还在（冲突还没回答，不先删）",
+      "old-b" in [t["pk"] for t in _synced["tasks"]], True)
+check("删除 + 修改只开一个项目级问答", _wd_sync.project_sync is not None, True)
+check_true("问答面板一次列完冲突",
+           "删除 1" in _wd_sync.project_sync_panel().renderable.plain
+           and "修改 1" in _wd_sync.project_sync_panel().renderable.plain)
+_wd_sync._answer_project_sync("l")
+check("选本地覆盖后保留本地旧任务",
+      "old-b" in [t["pk"] for t in _wd_sync.projects.by_id(_sync_proj["id"])["tasks"]], True)
+check("问答关闭", _wd_sync.project_sync, None)
+
+# 再建一次冲突，选择 OmniFocus 覆盖
+_sync_proj2 = _wd_sync.projects.upsert(_local_payload)[0]
+_wd_sync._apply_project_sync_result({"projects": [{
+    "project_id": _sync_proj2["id"], "title": "同步项目",
+    "payload": _remote_payload,
+    "diff": pj.diff_tasks(_sync_proj2["tasks"], _remote_payload["tasks"]),
+    "remote_found": True, "invalid": "",
+}]})
+_wd_sync._answer_project_sync("o")
+_after_remote = _wd_sync.projects.by_id(_sync_proj2["id"])
+check("OmniFocus 覆盖后删掉本地多出的旧乙",
+      "old-b" in [t["pk"] for t in _after_remote["tasks"]], False)
+check("OmniFocus 覆盖后保留新丙",
+      "new-c" in [t["pk"] for t in _after_remote["tasks"]], True)
+check("OmniFocus 覆盖后采用远端标题",
+      [t["title"] for t in _after_remote["tasks"] if t["pk"] == "old-a"],
+      ["旧甲改"])
+
 print("== task import：重复 / 被推迟的本周任务没时长 → 整批拒绝 ==")
 _week_mon = TODAY - datetime.timedelta(days=TODAY.weekday())
 _thu = _week_mon + datetime.timedelta(days=3)
@@ -450,12 +641,14 @@ check("进度文字", stat["progress_text"], "1/10")
 print("== task import <项目> -a N：不去挂「上一次选中的任务」 ==")
 wd_s = fresh(rows_ok)
 wd_s.handle("task create title=别的活")
+_other = next(t for t in wd_s.task_store.list()
+              if (t.get("fields") or {}).get("title") == "别的活")
 wd_s.handle("session T1 25")
 book_all(wd_s)
 check("带 -a 的 import 受理",
       wd_s.handle("task import omnifocus:///project/p-lunwen -a 1"), True)
 check("别的活没被顺手挂上",
-      (wd_s.task_store.get(1).get("session") or {}).get("start"), None)
+      (wd_s.task_store.get(_other["id"]).get("session") or {}).get("start"), None)
 check_true("说了「项目不吃后缀」",
            any("项目不吃后缀" in t for t in texts(wd_s)))
 
@@ -728,23 +921,32 @@ wd8.handle("day 0")
 wd8.handle("session T1 75 25")             # 今天的排布（12:15 那场是今天的记号）
 book_all(wd8)                              # 今天的都订上了
 check("看板在今天是哪一天", wd8.sel_date, datetime.date.today())
+# 真实时钟跑到晚上时今天已经没有未来的场次；这条用例只关心「默认目标今天」，
+# 所以用一个固定的未来 slot 替掉时钟依赖，别让 23:00 跑测试时假红。
+wd8._plan_slots = lambda day: (
+    [pp.slot_record(1, day.isoformat(), "12:15", 25, "s99")], [])
 wd8.handle("plan")
-check("plan 不带参数 = 今天", wd8.planning.day, datetime.date.today())
 check("今天有空场才开得了问答", wd8.planning is not None, True)
+check("plan 不带参数 = 今天", wd8.planning.day, datetime.date.today())
 wd8.handle("q")
 wd8.handle("day 1")                        # 切到明天（离线模式下 API 行会被清掉）
 check("看板到明天", wd8.sel_date.isoformat(), TOMORROW)
 wd8.messages.clear()
 wd8.handle("plan")                         # 照样该排今天
 check("看板被切回今天", wd8.sel_date, datetime.date.today())
-check_true("说的是今天的场次（12:15 只存在于今天的排布里）",
-           any("12:15" in t for t in texts(wd8)))
+check("plan 打开且目标仍是今天", wd8.planning.day, datetime.date.today())
+wd8.handle("q")
 
 print("== 今天没 plan → 状态框里有一条警告；plan 过就消失 ==")
 wd9 = fresh(rows_ok)
 wd9.omnifocus.rows = [dict(r) for r in rows_ok]
 check("没项目时不该提这件事", wd9.pending_plan(), None)
 wd9.handle("task import omnifocus:///project/p-lunwen")
+# 这条用例验证「提醒/plan 一次就消失」，不依赖测试跑在一天里的哪个时刻。
+wd9.free_plan_slots = lambda day: [{"start": "12:15", "duration": 25}]
+wd9._plan_slots = lambda day: (
+    [pp.slot_record(1, day.isoformat(), "12:15", 25, "s99")], [])
+wd9._assign_task = lambda *args, **kwargs: None
 pend = wd9.pending_plan()
 check_true("有项目 + 今天有空场 → 该提醒", pend is not None)
 check("提醒里带着场次数", pend["sessions"] > 0, True)

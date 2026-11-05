@@ -144,7 +144,9 @@ FIELD_SPECS = (
     ("name", "text", "name of t"),
     ("kind", "text", "vKind"),
     ("project", "text", "vProject"),
+    ("project_id", "text", "vProjectId"),
     ("parent", "text", "vParent"),
+    ("parent_id", "text", "vParentId"),
     ("in_inbox", "bool", "in inbox of t"),
     ("tags", "tags", "vTags"),
     ("tag_ids", "tags", "vTagIds"),
@@ -258,13 +260,17 @@ on run
 				set vInbox to in inbox of t
 				set vProjectObj to containing project of t
 				set vProject to ""
+				set vProjectId to ""
 				if vProjectObj is not missing value then
 					set vProject to name of vProjectObj
+					set vProjectId to id of vProjectObj
 				end if
 				set vParentObj to parent task of t
 				set vParent to ""
+				set vParentId to ""
 				if vParentObj is not missing value then
 					set vParent to name of vParentObj
+					set vParentId to id of vParentObj
 				end if
 				set vKind to "action"
 				if vInbox then
@@ -352,7 +358,9 @@ OMNIJS_SOURCE = r'''
       name: t.name || "",
       kind: inbox ? "inbox" : (t.project ? "project_root" : "action"),
       project: project ? project.name : "",
+      project_id: project ? idOf(project) : "",
       parent: parent ? parent.name : "",
+      parent_id: parent ? idOf(parent) : "",
       in_inbox: inbox,
       tags: Array.from(t.tags).map(g => g.name),
       tag_ids: Array.from(t.tags).map(g => idOf(g)),

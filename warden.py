@@ -2557,6 +2557,12 @@ class Warden(object):
         # `plan` 的分资源问答（project_plan.Allocator）：和收尾 / 到点没开始一样
         # 是「一次只问一件事」—— 它开着的时候那两个都不会弹。
         self.planning = None
+        # 每日项目对账：每天第一次进 TUI / refresh 时后台读一次 OmniFocus。
+        # 新增任务自动拉；删除/修改按项目整包问「本地 / OmniFocus / 先不处理」。
+        self.project_sync = None
+        self._project_sync_queue = []
+        self._project_sync_day = None
+        self.auto_project_sync = True
         # 静音时段（period mute）自动落地：mutes_at 是节流时间戳，
         # mute_tries 记「这一场刚才试过、几分钟内别再试」，mute_worker 是后台线程。
         self.mutes_at = 0.0
@@ -2747,6 +2753,7 @@ class Warden(object):
         # ── OmniFocus（osascript 子进程：同样不属于「软件内部自己完成」）──
         self.jobs.register("omnifocus.list", self.net_omnifocus_list,
                            apply=self._apply_omnifocus_list)
+        self.jobs.register("omnifocus.project_sync", self.net_omnifocus_project_sync)
         self.jobs.register("omnifocus.clipboard", self.net_omnifocus_clipboard)
         self.jobs.register("omnifocus.import", self.net_omnifocus_import,
                            apply=self._apply_omnifocus_import)
@@ -2937,7 +2944,7 @@ class Warden(object):
         items, projects, refused = self._task_import_projects(
             items, warn=lambda text, kind="warn": rep.log(text, kind))
         if refused:
-            rep.log("拒绝导入 %d 个项目（任务没设持续时间）" % len(refused), "error")
+            rep.log("拒绝导入 %d 个项目（本周任务检查不通过）" % len(refused), "error")
             return {"items": [], "projects": [], "refused": refused,
                     "repeats": {}, "warnings": []}
         for payload in projects:
@@ -2970,6 +2977,59 @@ class Warden(object):
                 "ok")
         return {"items": items, "projects": projects, "refused": [],
                 "repeats": repeats, "warnings": warnings}
+
+    def net_omnifocus_project_sync(self, args, rep):
+        """每日项目对账的**读**侧：读一份 OmniFocus 清单，和本地项目快照做 diff。
+
+        在 worker 里逐项目查重复任务规则，避免主线程被 osascript 卡住。返回的
+        ``payload`` 已经带 ``week`` / 重复信息，主线程决定自动拉新增还是发起冲突问答。
+        """
+        local_projects = list(args.get("projects") or [])
+        rep.label("每日检查 OmniFocus 项目（%d 个）" % len(local_projects))
+        rep.progress(0.05)
+        rows = self.omnifocus.list_tasks(refresh=True)
+        by_pk = {str(row.get("id") or ""): row for row in rows or ()}
+        out = []
+        for index, local in enumerate(local_projects, 1):
+            pk = str(((local or {}).get("omnifocus") or {}).get("id") or "")
+            title = (local or {}).get("title") or pk
+            rep.progress(0.05 + 0.9 * index / max(1, len(local_projects)))
+            root = by_pk.get(pk)
+            if root is None:
+                payload = {
+                    "kind": "project", "id": pk, "title": title,
+                    "url": pj.project_url(pk), "tasks": [], "missing": [],
+                    "depth_errors": [], "done": 0, "warnings": [],
+                }
+                out.append({"project_id": local.get("id"), "title": title,
+                            "payload": payload,
+                            "diff": pj.diff_tasks(local.get("tasks") or [], []),
+                            "remote_found": False, "invalid": ""})
+                continue
+            try:
+                payload = pj.project_payload(root, rows)
+                payload = pj.attach_week(
+                    payload, self._project_repeat_infos(
+                        payload, lambda text, kind="warn": rep.log(text, kind)))
+            except Exception as e:                  # noqa: BLE001 - 单个项目坏了不挡其余
+                out.append({"project_id": local.get("id"), "title": title,
+                            "payload": None, "diff": {},
+                            "remote_found": True,
+                            "invalid": "读项目失败：%s" % e})
+                continue
+            invalid = ""
+            if payload.get("depth_errors"):
+                invalid = pj.format_depth_errors(payload)
+            elif payload.get("missing") or payload.get("week_missing"):
+                invalid = pj.format_missing(payload)
+            out.append({"project_id": local.get("id"), "title": title,
+                        "payload": payload,
+                        "diff": pj.diff_tasks(local.get("tasks") or [],
+                                              payload.get("tasks") or []),
+                        "remote_found": True, "invalid": invalid})
+        rep.progress(1.0)
+        rep.log("项目对账读完：%d 个" % len(out), "ok")
+        return {"projects": out}
 
     def net_omnifocus_complete(self, args, rep):
         """写回完成 + 截止时间。**写**操作（乐观：本地先记 writeback）。"""
@@ -3272,11 +3332,17 @@ class Warden(object):
             self.had_error = True
             for payload_item in refused:
                 self.say("✗ " + (pj.format_missing(payload_item)
+                                 or pj.format_depth_errors(payload_item)
                                  or payload_item.get("reason")
                                  or "没法导入这个项目。"), "error")
-            self.say("🚫 这次导入被拒：一条任务、一个项目都没建。先去 OmniFocus 给上面"
-                     "那几条设「持续时间」（预计时长），再 ⌘C 重新 `task import`。",
-                     "error")
+            if any(payload_item.get("depth_errors") for payload_item in refused):
+                self.say("🚫 这次导入被拒：一条任务、一个项目都没建。先去 OmniFocus "
+                         "把三层任务改成最多父-子两层，再 ⌘C 重新 `task import`。",
+                         "error")
+            else:
+                self.say("🚫 这次导入被拒：一条任务、一个项目都没建。先去 OmniFocus "
+                         "给上面那几条设「持续时间」（预计时长），再 ⌘C 重新 "
+                         "`task import`。", "error")
             self._last_import_result = None
             self.jobs.end()
             return None
@@ -5045,6 +5111,11 @@ class Warden(object):
             self._maybe_apply_mutes()
         except Exception:                          # noqa: BLE001 - 静音坏了也不能没帧
             pass
+        try:
+            self._maybe_daily_project_sync()
+            self._maybe_start_project_sync_conflict()
+        except Exception:                          # noqa: BLE001 - 项目对账坏了也不能没帧
+            pass
         now = time.time()
         if not force and self.warnings_at and now - self.warnings_at < max_age:
             return self.warnings
@@ -6777,9 +6848,11 @@ class Warden(object):
             task = self.task_store.complete(task_id, reason="cmd-mark-complete")
             self.task_store.archive_local(self.task_store.get(task_id),
                                           reason="cmd-mark-complete")
+            note_sub = self._project_child_completed(task, writeback=False)
             self.say("✓ 任务 %s「%s」已标记完成（只改本地账本：没勾 Focusmate、"
-                     "没当场写 OmniFocus；之后同步仍会按单向契约写回）"
-                     % (self.task_label(task), self.task_store.focusmate_title(task, 40)),
+                     "没当场写 OmniFocus；之后同步仍会按单向契约写回）%s"
+                     % (self.task_label(task), self.task_store.focusmate_title(task, 40),
+                        ("；" + note_sub) if note_sub else ""),
                      "ok")
         else:
             task = self.task_store.drop(task_id, reason="cmd-mark-discard")
@@ -7115,6 +7188,67 @@ class Warden(object):
                 raise ValueError("分钟数得是整数；你给的是 %r" % toks[1]) from None
         return self._complete_task(task, minutes=minutes, why="cmd-done")
 
+    def _project_child_completed(self, task, writeback=True):
+        """本地子任务完成后，更新项目库；全部子任务完成 → 父任务自动完成。
+
+        ``writeback=True`` 时把父任务立刻写回 OmniFocus（普通 ``task done`` /
+        收尾完成走这条）；``-m complete`` 这种「只动本地账本」的路径传 False。
+        """
+        fields = (task or {}).get("fields") or {}
+        source = (task or {}).get("source") or {}
+        parent_pk = str(source.get("parent_id") or "").strip()
+        child_pk = str(source.get("id") or fields.get(pj.PROJECT_TASK_FIELD)
+                       or "").strip()
+        if not parent_pk or not child_pk:
+            return ""
+        try:
+            project_id = int(fields.get(pj.PROJECT_ID_FIELD))
+        except (TypeError, ValueError):
+            return ""
+        try:
+            project, auto_done, newly = self.projects.complete_subtasks(
+                project_id, parent_pk, [child_pk])
+        except (ValueError, TypeError) as e:
+            self.say("⚠ 更新项目子任务完成状态失败：%s" % e, "warn")
+            return ""
+        parent = pj.task_by_pk(project, parent_pk) or {}
+        parent_title = parent.get("title") or parent_pk
+        notes = []
+        if newly:
+            notes.append("项目「%s」子任务「%s」已记完成"
+                         % (project.get("title") or project_id,
+                            fields.get("title") or child_pk))
+        if auto_done:
+            notes.append("父任务「%s」的子任务全部完成 → 父任务自动完成"
+                         % parent_title)
+            if writeback:
+                if self.omnifocus_enabled():
+                    action = self.net_action(
+                        "omnifocus.complete",
+                        "OmniFocus 完成父任务 %s" % parent_pk[:8],
+                        {"pk": parent_pk, "at": None, "due": None},
+                        source=SRC_OMNIFOCUS)
+                    job = self.jobs.submit(
+                        action,
+                        on_fail=lambda error: self.say(
+                            "父任务「%s」自动完成了本地的，但 OmniFocus 写回失败：%s"
+                            % (parent_title, error), "warn"))
+                    if self.jobs.sync:
+                        outcome = job.outcome
+                        if outcome is None or not outcome.ok:
+                            notes.append("OmniFocus 父任务写回失败：%s"
+                                         % (outcome and outcome.error or "没跑"))
+                        else:
+                            notes.append("OmniFocus 父任务已完成")
+                    else:
+                        notes.append("OmniFocus 父任务完成写回丢后台了")
+                else:
+                    notes.append("OmniFocus 关着 → 父任务只完成了本地")
+        if notes:
+            self.rebuild_rows()
+            self.invalidate()
+        return "；".join(notes)
+
     def _complete_task(self, task, minutes=None, why="cmd-done"):
         """完成任务的那一段（``task done`` / ``-c`` 够数 / 收尾 F 共用）。
 
@@ -7133,11 +7267,13 @@ class Warden(object):
         self.task_store.archive_local(self.task_store.get(task["id"]))
         note_fm = self.fm_complete(task)
         note_of = self.omni_complete(task)
-        self.say("✓ 任务 %s「%s」完成%s%s%s"
+        note_sub = self._project_child_completed(task, writeback=True)
+        self.say("✓ 任务 %s「%s」完成%s%s%s%s"
                  % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                     ("（%d 分钟）" % minutes) if minutes else "",
                     ("；" + note_fm) if note_fm else "",
-                    ("；" + note_of) if note_of else ""), "ok")
+                    ("；" + note_of) if note_of else "",
+                    ("；" + note_sub) if note_sub else ""), "ok")
         return task
 
     def cmd_task_link(self, args):
@@ -7757,7 +7893,8 @@ class Warden(object):
                                      self._project_repeat_infos(payload, say))
             for note in payload.get("warnings") or ():
                 say("⚠ %s" % note, "warn")
-            if payload.get("missing") or payload.get("week_missing"):
+            if (payload.get("missing") or payload.get("week_missing")
+                    or payload.get("depth_errors")):
                 refused.append(payload)
                 continue
             projects.append(payload)
@@ -9035,7 +9172,10 @@ class Warden(object):
             "drop_omnifocus": lambda task: self.omni_drop(task),
             "complete_focusmate": lambda task: self.fm_complete(task),
             "delete_focusmate_task": lambda task: self.fm_delete_task(task),
-            "complete_omnifocus": lambda task, minutes=None: self.omni_complete(task),
+            "complete_omnifocus": lambda task, minutes=None: (
+                "；".join(x for x in (
+                    self.omni_complete(task, minutes=minutes),
+                    self._project_child_completed(task, writeback=True)) if x)),
             "next_session": lambda task: self.next_session_after(task),
             "assign_focusmate": lambda task, sess: self.assign_task_to(task, sess),
             "due_of": lambda task: self.omni_due_of(task),
@@ -9090,8 +9230,10 @@ class Warden(object):
                 self.task_store.set_status(task_id, ts.STATUS_COMPLETED,
                                            at=row.get("completed_at"),
                                            reason="omnifocus-completed")
-                self.say("✓ 任务 %s 在 OmniFocus 里已完成"
-                         % self.task_label(task), "ok")
+                note_sub = self._project_child_completed(task, writeback=False)
+                self.say("✓ 任务 %s 在 OmniFocus 里已完成%s"
+                         % (self.task_label(task),
+                            ("；" + note_sub) if note_sub else ""), "ok")
         self.writeback_completions()
         return rows
 
@@ -9308,6 +9450,7 @@ class Warden(object):
             project 1 refresh       重新去 OmniFocus 读一遍清单（时长不齐就拒绝）
             project 1 remove        从项目库撤掉（OmniFocus 一个字节都不动）
             project refresh         所有项目都刷一遍
+            project check           立刻做一次每日对账（新增自动拉；删除/修改问整包）
         """
         toks = [str(a).strip() for a in (args or []) if str(a).strip()]
         if not toks:
@@ -9326,6 +9469,10 @@ class Warden(object):
                             if row["allocated"] else ""), "info")
             return rows
         action = toks[0].lower()
+        if action in ("check", "对账", "daily", "每日检查"):
+            self._project_sync_day = None
+            started = self._start_project_sync_now()
+            return started
         if action in ("refresh", "sync", "reload", "更新"):
             made = [self._project_refresh(project) for project in self.projects.active()]
             return [p for p in made if p]
@@ -9417,9 +9564,11 @@ class Warden(object):
         payload = pj.attach_week(
             payload, self._project_repeat_infos(
                 payload, lambda text, kind="warn": self.say(text, kind)))
-        if payload.get("missing") or payload.get("week_missing"):
+        if (payload.get("missing") or payload.get("week_missing")
+                or payload.get("depth_errors")):
             self.had_error = True
-            self.say("✗ " + pj.format_missing(payload), "error")
+            self.say("✗ " + (pj.format_missing(payload)
+                             or pj.format_depth_errors(payload)), "error")
             self.say("🚫 这次刷新没写库（清单先按旧的算）。", "error")
             return None
         updated, _created = self.projects.upsert(payload)
@@ -9433,6 +9582,168 @@ class Warden(object):
         self.rebuild_rows()
         self.invalidate()
         return updated
+
+    # -- 每日项目对账：新增自动拉，删除/修改整包问 -------------------------
+
+    def _prompt_busy(self):
+        return bool(self.pending_import is not None or self.nostart is not None
+                    or self.planning is not None or self.review_active()
+                    or self.project_sync is not None)
+
+    def _maybe_daily_project_sync(self):
+        """每天第一次 TUI/refresh 时后台检查一次 OmniFocus 项目。"""
+        today = datetime.date.today()
+        if (not self.auto_project_sync or self.offline or not self.net_async
+                or self._project_sync_day == today
+                or pj.last_sync_day() == today.isoformat()
+                or self._prompt_busy()):
+            return False
+        try:
+            if not self.omnifocus_enabled():
+                return False
+        except Exception:                           # noqa: BLE001 - 检查失败不挡 TUI
+            return False
+        projects = self.projects.active()
+        if not projects:
+            return False
+        self._project_sync_day = today
+        pj.mark_sync_day(today)
+        action = self.net_action(
+            "omnifocus.project_sync",
+            "每日检查 %d 个 OmniFocus 项目" % len(projects),
+            {"projects": projects}, source=SRC_OMNIFOCUS)
+        self.jobs.submit(
+            action,
+            on_ok=lambda payload: self._apply_project_sync_result(payload),
+            on_fail=lambda error: self.say(
+                "每日项目检查失败（明天再试，或 `project 1 refresh`）：%s" % error,
+                "warn"))
+        return True
+
+    def _start_project_sync_now(self):
+        """手动触发一次项目对账（``project check``；也方便测试）。"""
+        projects = self.projects.active()
+        if not projects:
+            raise ValueError("项目库是空的：先 `task import` 一个 OmniFocus 项目。")
+        action = self.net_action(
+            "omnifocus.project_sync",
+            "检查 %d 个 OmniFocus 项目" % len(projects),
+            {"projects": projects}, source=SRC_OMNIFOCUS)
+        self.jobs.submit(
+            action,
+            on_ok=lambda payload: self._apply_project_sync_result(payload),
+            on_fail=lambda error: self.say("项目对账失败：%s" % error, "warn"))
+        if not self.jobs.sync:
+            self.say("正在后台检查 OmniFocus 项目…", "cmd")
+        return True
+
+    def _merge_project_additions(self, project_id, added):
+        """把 OmniFocus 新增任务并进本地清单；已有任务一个字不动。"""
+        project = self.projects.by_id(project_id)
+        if project is None:
+            return 0
+        tasks = [dict(item) for item in project.get("tasks") or []]
+        have = {str(item.get("pk") or "") for item in tasks}
+        n = 0
+        for item in added or ():
+            pk = str(item.get("pk") or "")
+            if not pk or pk in have:
+                continue
+            tasks.append(dict(item))
+            have.add(pk)
+            n += 1
+        if n:
+            self.projects.set_tasks(project_id, tasks)
+        return n
+
+    def _apply_project_sync_result(self, payload):
+        """主线程：自动拉新增；删除 / 修改按项目排队问用户。"""
+        records = (payload or {}).get("projects") or []
+        for rec in records:
+            title = rec.get("title") or rec.get("project_id") or "?"
+            if rec.get("invalid"):
+                self.say("⚠ 每日项目检查跳过「%s」：%s" % (title, rec["invalid"]),
+                         "warn")
+                continue
+            diff = rec.get("diff") or {}
+            added = diff.get("added") or []
+            if added:
+                n = self._merge_project_additions(rec.get("project_id"), added)
+                if n:
+                    self.say("📥 项目「%s」自动拉取 %d 条新增任务。" % (title, n), "ok")
+            if diff.get("removed") or diff.get("modified"):
+                self._project_sync_queue.append(rec)
+        if self._project_sync_queue:
+            self._maybe_start_project_sync_conflict()
+        self.rebuild_rows()
+        self.invalidate()
+        return payload
+
+    def _maybe_start_project_sync_conflict(self):
+        """没有别的问答在占地时，把下一个项目冲突顶上来。"""
+        if self.project_sync is not None or not self._project_sync_queue:
+            return False
+        if self._prompt_busy():
+            return False
+        self.project_sync = self._project_sync_queue.pop(0)
+        self.invalidate()
+        return True
+
+    def _answer_project_sync(self, line):
+        """项目对账冲突：l=本地覆盖 / o=OmniFocus 覆盖 / s=先不处理。"""
+        text = " ".join(str(line or "").strip().lower().split())
+        local = {"l", "local", "本地", "本地覆盖", "1"}
+        remote = {"o", "of", "omnifocus", "remote", "远端", "omnifocus覆盖", "2"}
+        skip = {"s", "skip", "稍后", "先不处理", "不处理", "q", "3"}
+        rec, self.project_sync = self.project_sync, None
+        title = (rec or {}).get("title") or "?"
+        if text in remote:
+            payload = (rec or {}).get("payload")
+            try:
+                if payload is None:
+                    raise ValueError("没有拿到 OmniFocus 清单")
+                self.projects.upsert(payload)
+                self.say("📁 项目「%s」已按 OmniFocus 覆盖本地清单。" % title, "ok")
+            except Exception as e:                  # noqa: BLE001 - 对账坏了别掀 TUI
+                self.had_error = True
+                self.say("项目「%s」没能用 OmniFocus 覆盖：%s" % (title, e), "error")
+        elif text in local:
+            self.say("📁 项目「%s」保留本地清单（OmniFocus 的删除/修改先不应用）。"
+                     % title, "ok")
+        elif text in skip:
+            self.say("📁 项目「%s」这次对账先不处理。" % title, "info")
+        else:
+            self.project_sync = rec
+            self.say("项目对账还在等回答：\n"
+                     "  [l] 保留本地覆盖  [o] 用 OmniFocus 覆盖  [s] 先不处理", "warn")
+            return True
+        self.rebuild_rows()
+        self.invalidate()
+        self._maybe_start_project_sync_conflict()
+        return True
+
+    def project_sync_panel(self):
+        """项目对账冲突的打断面板。"""
+        rec = self.project_sync or {}
+        diff = rec.get("diff") or {}
+        body = Text()
+        body.append("项目「%s」和 OmniFocus 不一致：\n"
+                    % (rec.get("title") or rec.get("project_id") or "?"),
+                    style="bold")
+        body.append("  " + pj.diff_text(diff) + "\n", style="cyan")
+        for item in (diff.get("removed") or [])[:5]:
+            body.append("  - 本地有、OmniFocus 没有：%s\n" % (item.get("title") or item.get("pk")),
+                        style="yellow")
+        for item in (diff.get("modified") or [])[:5]:
+            fields = "、".join(change.get("field") or "?"
+                              for change in item.get("changes") or [])
+            body.append("  ~ 两边不同：%s（%s）\n"
+                        % (item.get("title") or item.get("pk"), fields),
+                        style="yellow")
+        body.append("\n[l] 本地覆盖    [o] OmniFocus 覆盖    [s] 先不处理",
+                    style="bold")
+        return Panel(body, title="[bold cyan]📁 项目对账[/]",
+                     border_style="cyan", box=box.HEAVY)
 
     def _plan_slots(self, day):
         """这一天的**可用空场** → ``(slots, notes)``。
@@ -9662,18 +9973,35 @@ class Warden(object):
             slot = place["slot"]
             project = item["project"]
             url = of.task_url(item["pk"])
+            parent_pk = item.get("parent_pk") or place.get("parent", {}).get("pk")
+            parent_title = (item.get("parent_title")
+                            or place.get("parent", {}).get("title"))
             fields = {"title": item.get("title") or item["pk"],
                       pj.PROJECT_FIELD: project.get("title") or "",
                       pj.PROJECT_ID_FIELD: item["project_id"],
-                      pj.PROJECT_TASK_FIELD: item["pk"],
-                      "count": int(place["count"])}
+                      pj.PROJECT_TASK_FIELD: item["pk"]}
+            if item.get("note"):
+                fields["note"] = item["note"]
+            if parent_pk:
+                # session 里只放子任务；note 明确写它是谁的子。
+                parent_note = "父任务：%s" % (parent_title or parent_pk)
+                fields["note"] = ((fields.get("note") or "") + "\n"
+                                  + parent_note).strip()
+                fields["duration"] = int(place.get("duration")
+                                         or item.get("duration") or 0)
+            else:
+                fields["count"] = int(place["count"])
+            source = {"kind": "project", "id": item["pk"], "url": url,
+                      "title": item.get("title")}
+            if parent_pk:
+                source.update({"parent_id": parent_pk,
+                               "parent_title": parent_title})
             try:
                 task = self.task_store.create(
                     fields,
                     omnifocus={"id": item["pk"], "url": url,
                                "title": item.get("title")},
-                    source={"kind": "project", "id": item["pk"], "url": url,
-                            "title": item.get("title")})
+                    source=source)
             except ValueError as e:
                 failed += 1
                 self.say("⚠ 「%s」没建成本地任务：%s" % (item.get("title"), e), "error")
@@ -9681,7 +10009,9 @@ class Warden(object):
             made.setdefault(item["project_id"], []).append({
                 "pk": item["pk"], "task_id": task["id"],
                 "count": int(place["count"]), "start": slot.get("start") or "",
-                "duration": int(place["count"]) * pp.MINUTES_PER_COUNT})
+                "duration": int(place.get("duration")
+                                or int(place["count"]) * pp.MINUTES_PER_COUNT),
+                "parent_pk": parent_pk or ""})
             try:
                 self._assign_task(task, str(slot["index"]), refresh=False)
             except ValueError as e:
@@ -9698,10 +10028,15 @@ class Warden(object):
                     total_counts * pp.MINUTES_PER_COUNT), "ok")
         for place in placements:
             item = place["item"]
-            self.say("   %s(%d) ← %s / %s（%d count%s%s）"
+            dur = place.get("duration")
+            tail = ("，%d 分钟" % int(dur)) if dur else ""
+            parent = place.get("parent") or {}
+            if parent:
+                tail += "，父任务「%s」" % (parent.get("title") or parent.get("pk"))
+            self.say("   %s(%d) ← %s / %s（%d count%s%s%s）"
                      % (place["slot"].get("start"), int(place["slot"].get("duration") or 0),
                         item["project"].get("title") or "?",
-                        item.get("title") or item["pk"], int(place["count"]),
+                        item.get("title") or item["pk"], int(place["count"]), tail,
                         "，拆开的" if place.get("split") else "",
                         "，和别的任务同一场" if place.get("stacked") else ""), "info")
         for note in notes:
@@ -9792,8 +10127,8 @@ class Warden(object):
             return
         if self.nostart is not None:
             return                              # 「没开始」那一问还开着：先答它
-        if self.planning is not None:
-            return                              # plan 在等分配：别拿 A/B/C/D/E 抢它的输入
+        if self.planning is not None or self.project_sync is not None:
+            return                              # plan / 项目对账在等回答：别抢输入
         now = time.time()
         if now - self.review_at < 1.0:
             return
@@ -9841,8 +10176,8 @@ class Warden(object):
             return
         if self.review is not None or self.review_check is not None:
             return                              # 一次只问一件事（收尾优先）
-        if self.planning is not None:
-            return                              # plan 在等分配：别拿 p/x/s 抢它的输入
+        if self.planning is not None or self.project_sync is not None:
+            return                              # plan / 项目对账在等回答：别抢输入
         if self.pending_sins():
             return                              # 罪案区锁死：除了宣言什么都不受理
         entry = self._next_nostart_entry()
@@ -10036,6 +10371,8 @@ class Warden(object):
         """
         if self.pending_import is not None:
             return self.pending_import_panel()
+        if self.project_sync is not None:
+            return self.project_sync_panel()
         if self.nostart is not None:
             return self.nostart_panel()
         if self.planning is not None:
@@ -11450,10 +11787,11 @@ class Warden(object):
                             "会先问要不要把重复设置也复制到本地；-st / --single-task "
                             "= 只导入这一条，不问也不建 repeat"),
             ("task import（项目）", "剪贴板里是 **OmniFocus 项目**（omnifocus:///project/PK）"
-                                   "→ 进项目库：它手底下每条任务都要有「持续时间」，"
-                                   "缺一条就整批拒绝导入；清单只存不展示，等 plan 唤起"),
-            ("project [序号] [refresh|remove]", "看项目库 / 看 #1 的任务清单 / 重新去 "
-                                                "OmniFocus 读一遍 / 从项目库撤掉（OmniFocus 不动）"),
+                                   "→ 进项目库：任务最多父-子两层；子任务不可拆，"
+                                   "父任务空壳按剩余子任务排期；时长不齐整批拒绝"),
+            ("project [序号] [refresh|remove|check]", "看项目库 / 看 #1 的任务清单 / 重新去 "
+                                                       "OmniFocus 读一遍 / 从项目库撤掉"
+                                                       "（OmniFocus 不动）/ check = 每日对账"),
             ("plan [天数]", "把这一天剩下的空场切成 count（1 count = 25 分钟），逐个项目问"
                             "给多少，complete 之后自动挑任务、排进 session（一场一个任务、"
                             "尽量不拆）。**不带参数 = 今天**（和看板在看哪天无关）；"
@@ -11718,6 +12056,8 @@ class Warden(object):
         # y/n/q 就不派发任何命令，避免 prompt 被别的操作悄悄丢掉。
         if self.pending_import is not None:
             return self._answer_pending_import(line)
+        if self.project_sync is not None:
+            return self._answer_project_sync(line)
 
         # 「到点没开始」那一问开着：p / x / s 先给它吃（和收尾互斥，见 _maybe_start_*）。
         prompt = getattr(self, "nostart", None)

@@ -36,7 +36,7 @@ warden.py          接线                 task import 认项目、任务面板�
     "status": "active",                       // active / dropped（撤掉是删记录，不是标记）
     "imported_at": "…", "synced_at": "…",     // synced_at = 上次读 OmniFocus 的时间
     "tasks": [{                               // **全部**任务（含已完成的），按 OmniFocus 顺序
-      "pk": "t-intro", "title": "写引言", "parent": "论文",
+      "pk": "t-intro", "title": "写引言", "parent": "论文", "parent_id": "",
       "due": "2026-11-04T11:50:00",
       "count": 3, "duration": 75,             // estimated minutes ÷ 25（往上取整）
       "completed": false, "blocked": false, "rank": 0
@@ -86,6 +86,42 @@ warden.py          接线                 task import 认项目、任务面板�
 `warnings`），不假装没这回事。
 
 已完成的任务照样进清单（算进度要用），`project refresh` 时按最新状态覆盖。
+
+## 子任务：最多父-子两层
+
+项目导入按 OmniFocus 的 `parent_id` 保留任务层级，但**最多两层**：
+
+```
+父任务（空壳，不直接占 session）
+├─ 子任务 A（不可拆）
+├─ 子任务 B（不可拆）
+└─ 子任务 C（不可拆）
+```
+
+- 父任务 + 子任务之外再出现孙任务（三层）→ **整个项目拒绝导入**，并点名是哪条；
+- 父任务本身是空壳：不需要自己的 estimated_minutes，剩余时长 = 未完成子任务
+  时长之和；项目进度/本周任务预算只按叶子任务算一遍，不重复计父壳；
+- 子任务不可拆到两场 session。排期以父任务为单元选场次，但**session 里只建子
+  任务，不建父任务**；每条子任务 `note` 写「父任务：X」；
+- 25 分钟场遇到 10 + 13 + 27 分钟三条子任务：选 `10+13=23` 这一组排进去，
+  27 留给以后；如果一场放得下全部，就整组一起排；
+- 一条子任务完成后，项目库里记它完成；**所有直接子任务完成 → 父任务自动完成**。
+  普通 `task done` / 收尾完成会立刻把父任务写回 OmniFocus；`-m complete` 仍只
+  动本地账本，不立刻写外部。
+
+## 每日项目对账
+
+交互式 TUI 每天第一次打开（或当天第一次 `refresh` / 手动 `project check`）会
+后台读一次所有 active 项目的 OmniFocus 清单。判断口径：
+
+- **新增任务**：远端有、本地没有 → 自动拉进项目库，不打扰；
+- **删除 / 修改**：远端少了任务，或已有任务的标题 / 持续时间 / defer / due /
+  planned / 父任务关系变了 → 整个项目只问一次：
+  - `[l]` 保留本地覆盖（新增照拉，删除/修改不应用）；
+  - `[o]` 用 OmniFocus 覆盖本地清单；
+  - `[s]` 先不处理。
+- 同一天只自动检查一次，日期戳在项目库同目录的 `project-sync.json`；检查失败
+  也不挡 TUI。
 
 ## 项目表：挂在任务面板下面
 
@@ -232,6 +268,7 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `project <序号>` | 一个项目的清单 + 今天排了什么 |
 | `project <序号> refresh` | 重新读 OmniFocus（时长又缺了 → 拒绝，清单保持旧的） |
 | `project refresh` | 所有项目都刷一遍 |
+| `project check` | 立刻做一次每日对账：新增自动拉；删除/修改按项目问「本地 / OmniFocus / 先不处理」 |
 | `project <序号> remove` | 从项目库撤掉（**OmniFocus 不动**；已经排进 session 的任务照旧） |
 | `plan` / `plan +1` | 开始分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天，`+1` = 明天 |
 | `task <序号> <count>` / `task <序号> clear` / `complete` / `q` | plan 里的那几句 |
