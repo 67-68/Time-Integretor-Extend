@@ -1244,9 +1244,11 @@ _saved_rows = wd3.rows
 _now_ms = int(dt.datetime.now().timestamp() * 1000)
 
 
-def _row(label, off_start, off_end):
+def _row(label, off_start, off_end, sid="auto"):
     return {"startMs": _now_ms + off_start, "endMs": _now_ms + off_end,
-            "startLabel": label, "date": ISO}
+            "startLabel": label, "date": ISO,
+            "id": ("sess-" + label) if sid == "auto" else sid,
+            "planned": True}
 
 
 wd3.rows = [_row("X", -600000, -100000), _row("Y", -60000, 600000),
@@ -1254,6 +1256,19 @@ wd3.rows = [_row("X", -600000, -100000), _row("Y", -60000, 600000),
 check("current_session 优先「进行中」", wd3.current_session()[1]["startLabel"], "Y")
 wd3.rows = [_row("X", -600000, -100000), _row("Z", 3600000, 7200000)]
 check("没有进行中就取最近一场还没开始的", wd3.current_session()[1]["startLabel"], "Z")
+# 计划窗口覆盖现在、但 API 里没有 id 的幽灵场不能当「当前」；
+# 有 id 的 10:45 实际场次才是当前这一场。
+wd3.rows = [_row("ghost", -600000, 600000, sid=None),   # 10:30，只存在于 data.csv
+            _row("real", -300000, 900000, sid="sess-real")]  # 10:45，真订上了
+check("current_session 跳过没有 id 的幽灵计划行",
+      wd3.current_session()[1]["startLabel"], "real")
+wd3.rows = [_row("ghost", -600000, 600000, sid=None)]
+try:
+    wd3.current_session()
+except ValueError as e:
+    check_true("只有幽灵计划行时明说没有已订场次", "已订场次" in str(e))
+else:
+    check("只有幽灵计划行不能当当前 session", False, True)
 wd3.rows = [_row("X", -600000, -100000)]
 try:
     wd3.current_session()

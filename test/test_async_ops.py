@@ -222,6 +222,9 @@ def mkwarden(bridge=None, async_net=True):
     console = Console(file=io.StringIO(), width=200, force_terminal=False)
     wd = w.Warden(console, bridge or GateBridge(), no_clear=True, offline=False,
                   net_async=async_net)
+    # 这个文件只测一条命令自己的乐观写/异步队列；命令后的自动对账在
+    # test_task_ui.py 单独钉，不往这里的 GateBridge 队列里掺额外任务。
+    wd.auto_refresh_after_command = False
     wd.omnifocus = FakeOmni()
     wd.settings.set_bool("omnifocus", True) if hasattr(wd.settings, "set_bool") else None
     return wd
@@ -336,7 +339,8 @@ check("乐观结果已经落到本地",
       (wd.task_store.get(task["id"]).get("session") or {}).get("start"),
       wd.rows[0].get("startLabel"))
 check("add_task 真的排了", any(c[0] == "add_task" for c in bridge.calls), True)
-check("bridge 在 worker 线程里跑", bridge.threads[-1], "repl-kit-jobs")
+_add_at = next(i for i, c in enumerate(bridge.calls) if c[0] == "add_task")
+check("add_task 在 worker 线程里跑", bridge.threads[_add_at], "repl-kit-jobs")
 bridge.release()
 settle(wd)
 

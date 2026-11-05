@@ -259,6 +259,29 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 working 模式下表格左侧的 `ID` 仍然保留它在 `self.rows` 里的原始序号，所以
 `cancel N` / `mute N` / `task -a N` 不会因为收起行而指错。
 
+**「当前 session」只认实际场次**：API 数据权威时，必须同时满足
+「这一行有 Focusmate `session id`」和「now 落在这一行自己的 start/end 内」。
+取消掉旧场、15 分钟后另约一场时，旧 `data.csv` 计划窗口（10:30，API 里没有 id）
+不再被当成当前 session；真正有 id 的新场（10:45）才是。`task -ac`、专注视图的
+「当前 session」和专注模式绑定都走这一条判定。working 看板也不画这种
+「计划时间到了、但实际没订上」的进行中幽灵行。
+
+### 表头折叠：`open` / `close`
+
+契约表的列可以按表头名折叠；表头名支持中英文别名和带空格写法
+（`close 时段 ID` / `open "时段 ID"`）：
+
+- `close <表头> [--permanent]`：这一列不再渲染；
+- `open <表头> [--permanent]`：重新显示；
+- 被折叠的列在 table 下方用一行 caption 说明：`已折叠列：…（open <表头名> 打开）`；
+- `--permanent` 写进 `data/warden-ui.json`（跟 `settings.json` 同目录；测试用
+  `TI_SETTINGS_FILE` 一起隔离）。永久折叠/展开跨重启保留；不带 `--permanent`
+  只覆盖本次运行；
+- `open working` / `open detail` 仍然优先解释为切看板口径；列名不会和它们冲突。
+
+working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列；手动
+`open <表头>` 可以临时展开。`close` 不能把所有列都折掉，至少留一列。
+
 任意 session 行的 task 栏如果没有任何任务，会显示红色警告 `没有设定任务🔞`；
 不能留空，否则「空」和「没渲染」在界面上分不出来。
 
@@ -282,8 +305,8 @@ working 模式下表格左侧的 `ID` 仍然保留它在 `self.rows` 里的原�
 5. `--exec` / 测试 / 离线模式只做第 1 步的本地重算，不隐式发网络请求；真正的
    对账仍由显式 `refresh` 负责（避免脚本执行时凭空多出网络副作用）。
 
-- 通用命令（三个视图都认）：`Tab`（切视图）/ `open working|detail` /
-  `stat` / `status` / `help` / `quit`。
+- 通用命令（五个视图都认）：`Tab`（切视图）/ `open working|detail` /
+  `open|close <表头>` / `stat` / `status` / `help` / `quit`。
   注意：**罪案区锁死时 `stat` 也进不去**（和别的命令一样，除了敲宣言什么都不受理）——
   这是既有的锁语义，不是统计视图的特例。
 - **专注视图的 `stop` ≠ 契约视图的 `stop`**：前者是「消耗一次暂停」，

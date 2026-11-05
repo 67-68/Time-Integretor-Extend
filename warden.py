@@ -1432,11 +1432,17 @@ class View(object):
                  "下一个视图", ("tab", "switch"), "通用",
                  usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
             _cmd("open", w.cmd_open,
-                 "切换看板口径：working（实际为主、旧场次收起）/ detail（计划 + 实际）",
-                 ("看板",), "通用", usage="open working|detail",
-                 options=("working", "detail"),
-                 hint=_hint_actions("working", "detail",
-                                    note="working = 实际 session；detail = 计划 + 实际")),
+                 "open working|detail 切口径；open <表头> [--permanent] 打开一列",
+                 ("看板",), "通用", usage="open working|detail | open <列名> [--permanent]",
+                 options=("working", "detail") + tuple(h for h, _kw in SESSION_TABLE_COLUMNS),
+                 hint=_hint_actions("working", "detail", "时段类型", "契约",
+                                    note="open 表头名 = 展开列；--permanent 写入偏好")),
+            _cmd("close", w.cmd_close,
+                 "close <表头> [--permanent]：折叠一列（--permanent = 该口径永久折叠）",
+                 ("关闭",), "通用", usage="close <列名> [--permanent]",
+                 options=tuple(h for h, _kw in SESSION_TABLE_COLUMNS) + ("--permanent",),
+                 hint=_hint_actions("时段类型", "时段名称", "契约",
+                                    note="close 表头名 = 折叠列；--permanent 写入偏好")),
             _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
                  ("stats",), "通用", usage="stat [refresh [full]]",
                  options=("refresh", "full"), hint=_hint_stat),
@@ -1510,8 +1516,8 @@ class ContractView(View):
         return repl_kit.Hint(
             "命令",
             ("session", "period", "cancel", "mute", "title", "day", "sync",
-             "open working", "open detail", "help", "quit"),
-            note="Tab 切下一个视图（专注 → 统计 → 任务）；open 切换看板口径",
+             "open working", "open detail", "close 时段类型", "help", "quit"),
+            note="Tab 切下一个视图；open/close + 表头名折叠列；open working|detail 切口径",
         )
 
     def status_box(self):
@@ -1631,10 +1637,38 @@ class FocusView(View):
             note="消耗一次暂停 · Shift+Tab 切模式 · Tab 切回契约",
         )
 
+    def current_row(self):
+        """当前真正在进行的 session 行；没有就 None。
+
+        API 数据权威时只认**有 session id 且时间窗口覆盖现在**的行：
+        `data.csv` 里的计划窗口只是预约意图，用户取消后另约了别的时间时，
+        不能拿旧的计划窗口继续冒充「我正在这一场」。
+        离线/快照模式没有 id，才退回按契约时间判断。
+        """
+        w = self.w
+        if w.authoritative:
+            live = w.live_session()
+            return live[1] if live else None
+        sess = ks.current_session(w.entries, datetime.datetime.now())
+        if not sess:
+            return None
+        day, slot, start, end = sess
+        return {"date": day.isoformat(), "startLabel": slot["start"],
+                "endLabel": end.strftime("%H:%M"), "durationMin": slot["duration"],
+                "id": None, "phase": "进行中"}
+
     def current_session_key(self):
         """当前进行中的 session key；没有就 None（模式会设为下一场默认）。"""
-        sess = ks.current_session(self.w.entries, datetime.datetime.now())
-        return ks.key_of(sess[0], sess[1]) if sess else None
+        row = self.current_row()
+        if not row:
+            return None
+        day = row.get("date") or self.w.sel_date
+        if isinstance(day, str):
+            try:
+                day = datetime.date.fromisoformat(day)
+            except ValueError:
+                day = self.w.sel_date
+        return ks.key_of(day, row.get("startLabel"))
 
     def mode_key(self):
         return ks.get_idle_mode(self.current_session_key())
@@ -1675,19 +1709,27 @@ class FocusView(View):
         w = self.w
         now = datetime.datetime.now()        # naive 本地时间，和 schedule/daemon 同源
         ps = ks.pause_status(now)
-        sess = ks.current_session(w.entries, now)
+        row = self.current_row()
 
         t = Table.grid(padding=(0, 2))
         t.add_column(style="bold cyan", no_wrap=True)
         t.add_column()
 
         t.add_row("目标", Text(w.current_goal()))
-        if sess:
-            day, slot, start, end = sess
-            t.add_row("当前 session", Text(
-                "%s   %s–%s（%smin）" % (ks.key_of(day, slot), start.strftime("%H:%M"),
-                                         end.strftime("%H:%M"), slot["duration"]),
-                style="bold green"))
+        if row:
+            day = row.get("date") or w.sel_date
+            if isinstance(day, str):
+                try:
+                    day = datetime.date.fromisoformat(day)
+                except ValueError:
+                    day = w.sel_date
+            key = ks.key_of(day, row.get("startLabel"))
+            detail = "%s   %s–%s（%smin）" % (
+                key, row.get("startLabel"), row.get("endLabel") or "?",
+                row.get("durationMin") or "?")
+            if row.get("id"):
+                detail += "  id=%s" % row["id"]
+            t.add_row("当前 session", Text(detail, style="bold green"))
         else:
             t.add_row("当前 session", Text("（没有进行中的 session —— 看门狗也不上班）", style="dim"))
 
@@ -2356,6 +2398,49 @@ class WardenShell(repl_kit.ReplShell):
 #: 「现在/将来要干的 + 真的订上的」，并把过去的实际 session 折成最近一条。
 SESSION_UI_MODES = ("working", "detail")
 
+#: 契约表的列（顺序 = 渲染顺序；表头名称也用作 open/close 的列名）。
+SESSION_TABLE_COLUMNS = (
+    ("时段 ID", {"no_wrap": True}),
+    ("时段", {"no_wrap": True}),
+    ("时段类型", {"no_wrap": True}),
+    ("时段名称", {"no_wrap": True, "overflow": "crop"}),
+    ("ID", {"justify": "right", "style": "bold", "no_wrap": True}),
+    ("时间", {"no_wrap": True}),
+    ("时长", {"justify": "right", "no_wrap": True}),
+    ("状态", {"no_wrap": True}),
+    ("静音", {"justify": "center", "no_wrap": True}),
+    ("契约", {"no_wrap": True}),
+    ("标题", {"overflow": "crop", "no_wrap": True}),
+    ("task", {"no_wrap": True, "overflow": "crop"}),
+)
+
+#: working 口径下默认折叠的列（用户明确要求：类型 / 名称 / 契约）。
+WORKING_AUTO_HIDDEN_COLUMNS = ("时段类型", "时段名称", "契约")
+
+#: `open/close` 认的表头别名（去掉空白、转小写之后比较）。
+SESSION_COLUMN_ALIASES = {
+    "时段id": "时段 ID", "periodid": "时段 ID", "pid": "时段 ID",
+    "时段": "时段", "时间窗": "时段", "period": "时段",
+    "时段类型": "时段类型", "类型": "时段类型", "periodtype": "时段类型",
+    "时段名称": "时段名称", "名称": "时段名称", "periodname": "时段名称",
+    "id": "ID", "编号": "ID", "序号": "ID",
+    "时间": "时间", "time": "时间",
+    "时长": "时长", "duration": "时长",
+    "状态": "状态", "status": "状态",
+    "静音": "静音", "quiet": "静音", "mute": "静音",
+    "契约": "契约", "contract": "契约",
+    "标题": "标题", "title": "标题",
+    "task": "task", "任务": "task", "task列": "task",
+}
+
+
+def normalize_session_column(text):
+    """用户敲的表头名称 → 规范列名；认不出返回 None。"""
+    compact = re.sub(r"\s+", "", str(text or "")).strip().lower()
+    if not compact:
+        return None
+    return SESSION_COLUMN_ALIASES.get(compact)
+
 
 def visible_session_rows(rows, mode="detail"):
     """按看板口径筛 session 行 → ``(items, collapsed_past)``。
@@ -2383,6 +2468,11 @@ def visible_session_rows(rows, mode="detail"):
             if planned_only:
                 continue
             past_actual.append((idx, row))
+        elif planned_only and row.get("phase") == "进行中":
+            # 契约时间到了，但 API 里没有这一场：它不是一个真正在进行的
+            # session（常见于取消后另约了 15 分钟后的场）。working 只画事实，
+            # 不能拿「计划窗口」冒充「正在发生」。
+            continue
         else:
             current_future.append((idx, row))
     past_actual.sort(key=lambda pair: (pair[1].get("startMs") or 0, pair[0]))
@@ -2416,6 +2506,13 @@ class Warden(object):
         # 看板口径：detail = 计划 + 实际全量（默认，保持原行为）；
         # working = 实际为主并收起旧场次。
         self.session_ui_mode = "detail"
+        # 列折叠：每个口径单独记；--permanent 落盘到 settings.json 同目录的
+        # warden-ui.json。session_* 是本次运行里的临时 open/close 覆盖。
+        self.permanent_hidden_columns = {m: set() for m in SESSION_UI_MODES}
+        self.permanent_visible_columns = {m: set() for m in SESSION_UI_MODES}
+        self.session_hidden_columns = {m: set() for m in SESSION_UI_MODES}
+        self.session_visible_columns = {m: set() for m in SESSION_UI_MODES}
+        self._load_ui_prefs()
         # 视图（Shift+Tab 切换）：默认「契约」视图，第二个是「专注」视图。
         self.view_impls = [cls(self) for cls in VIEWS] or [ContractView(self)]
         # 生涯统计（统计视图 / stat 命令）：self.stat 是 stats.compute_stats 的结果，
@@ -2474,6 +2571,9 @@ class Warden(object):
         # 下一条命令完成时要主动对一次账（用户可能在外面改了任务/session）。
         self._last_command_input_at = None
         self._auto_refresh_pending = False
+        # 交互式 TUI 默认开；专门测「单条异步链路」的用例可以关掉，避免自动
+        # 对账把额外的 snapshot/task.pull 混进它正在观察的队列。
+        self.auto_refresh_after_command = True
         # 警告板：框架负责画在「状态」框里，这里只负责"有什么问题"。
         # 每次操作 / 每 5 秒重算一次（见 refresh_warnings）。
         self.warnings = repl_kit.WarningBoard()
@@ -3484,10 +3584,91 @@ class Warden(object):
             self.csv_fp, len(self.entries),
             self.review_signature(), pending_sig,
             self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
+            tuple(sorted(self.effective_hidden_columns())),
             id(getattr(self, "stat", None)),
             # 队列一动（进度条、日志、失败账）画面就得重排版
             self.jobs.signature(),
         )
+
+    # -- 表头折叠 -------------------------------------------------------
+
+    def ui_prefs_path(self):
+        """列折叠偏好落在设置文件同目录（测试跟着 TI_SETTINGS_FILE 隔离）。"""
+        return os.path.join(os.path.dirname(os.path.abspath(cfg.settings_path())),
+                            "warden-ui.json")
+
+    def _load_ui_prefs(self):
+        try:
+            with open(self.ui_prefs_path(), encoding="utf-8") as f:
+                raw = json.load(f) or {}
+        except (OSError, ValueError, TypeError):
+            return
+        for section, target in (("hidden", self.permanent_hidden_columns),
+                                ("visible", self.permanent_visible_columns)):
+            data = raw.get(section) or {}
+            if not isinstance(data, dict):
+                continue
+            for mode in SESSION_UI_MODES:
+                names = data.get(mode) or []
+                if not isinstance(names, list):
+                    continue
+                for name in names:
+                    col = normalize_session_column(name)
+                    if col:
+                        target[mode].add(col)
+
+    def _save_ui_prefs(self):
+        path = self.ui_prefs_path()
+        data = {
+            "hidden": {m: sorted(self.permanent_hidden_columns[m])
+                       for m in SESSION_UI_MODES},
+            "visible": {m: sorted(self.permanent_visible_columns[m])
+                        for m in SESSION_UI_MODES},
+        }
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(tmp, path)
+        except OSError as e:
+            self.say("列折叠偏好没存下来：%s" % e, "warn")
+
+    def auto_hidden_columns(self, mode=None):
+        mode = mode or self.session_ui_mode
+        if mode == "working":
+            return set(WORKING_AUTO_HIDDEN_COLUMNS)
+        return set()
+
+    def effective_hidden_columns(self, mode=None):
+        """当前口径实际不展示的列（自动 + 永久 + 本次 close - 手动 open）。"""
+        mode = mode or self.session_ui_mode
+        hidden = set(self.auto_hidden_columns(mode))
+        hidden |= self.permanent_hidden_columns.get(mode, set())
+        hidden |= self.session_hidden_columns.get(mode, set())
+        hidden -= self.permanent_visible_columns.get(mode, set())
+        hidden -= self.session_visible_columns.get(mode, set())
+        return {col for col in hidden
+                if any(col == header for header, _kw in SESSION_TABLE_COLUMNS)}
+
+    def _set_column_open(self, col, permanent=False):
+        mode = self.session_ui_mode
+        self.session_hidden_columns[mode].discard(col)
+        self.session_visible_columns[mode].add(col)
+        if permanent:
+            self.permanent_hidden_columns[mode].discard(col)
+            self.permanent_visible_columns[mode].add(col)
+            self._save_ui_prefs()
+
+    def _set_column_closed(self, col, permanent=False):
+        mode = self.session_ui_mode
+        self.session_visible_columns[mode].discard(col)
+        self.session_hidden_columns[mode].add(col)
+        if permanent:
+            self.permanent_visible_columns[mode].discard(col)
+            self.permanent_hidden_columns[mode].add(col)
+            self._save_ui_prefs()
 
     # -- 选中的那一天
 
@@ -4557,24 +4738,23 @@ class Warden(object):
             return empty
         t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold magenta",
                   title_justify="left", expand=False)
-        t.add_column("时段 ID", no_wrap=True)
-        t.add_column("时段", no_wrap=True)
-        t.add_column("时段类型", no_wrap=True)
-        t.add_column("时段名称", no_wrap=True, overflow="crop")
-        t.add_column("ID", justify="right", style="bold", no_wrap=True)
-        t.add_column("时间", no_wrap=True)
-        t.add_column("时长", justify="right", no_wrap=True)
-        t.add_column("状态", no_wrap=True)
-        t.add_column("静音", justify="center", no_wrap=True)
-        t.add_column("契约", no_wrap=True)
-        t.add_column("标题", overflow="crop", no_wrap=True)
-        t.add_column("task", no_wrap=True, overflow="crop")
+        hidden_cols = self.effective_hidden_columns()
+        visible_cols = [(i, header, kw) for i, (header, kw)
+                        in enumerate(SESSION_TABLE_COLUMNS) if header not in hidden_cols]
+        for _pos, header, kw in visible_cols:
+            t.add_column(header, **kw)
+        visible_positions = [i for i, _header, _kw in visible_cols]
 
         live_idx = None
         for idx, r in items:
-            if r["phase"] == "进行中":
-                live_idx = idx
-                break
+            # ▶ 只标真正在进行的场次：权威模式下计划窗口到了、但 API 没有 id
+            # 的行不是「正在发生」，不能抢当前标记。
+            if r.get("phase") != "进行中":
+                continue
+            if self.authoritative and not r.get("id"):
+                continue
+            live_idx = idx
+            break
         zone_tag = {"locked": ("锁", "bold red"), "draft": ("草", "bold green"),
                     "past": ("过", STYLE_MUTED)}
         for idx, r in items:
@@ -4633,7 +4813,7 @@ class Warden(object):
                 # 每一行都是一场要执行的 session（计划或实际）；没有任务就明确报警，
                 # 不要留空让用户以为只是「这一格没画东西」。
                 task_cell = Text("没有设定任务🔞", style="bold red")
-            t.add_row(
+            cells = [
                 Text(pid or "", style="bold magenta"),
                 Text(pspan, style="cyan"),
                 Text(ptype, style="cyan"),
@@ -4646,15 +4826,20 @@ class Warden(object):
                 Text(r.get("contract") or "—", style=STYLE_MUTED),
                 label,
                 task_cell,
-            )
+            ]
+            t.add_row(*(cells[i] for i in visible_positions))
+        captions = []
         if collapsed:
-            t.caption = Text(
-                "… 还有 %d 条过去 session 已收起（open detail 查看）" % collapsed,
-                style="dim")
-            t.caption_justify = "left"
-        elif not items:
-            t.caption = Text("working 模式没有可展示的实际 session（open detail 查看全部）",
-                             style="dim")
+            captions.append("… 还有 %d 条过去 session 已收起（open detail 查看）"
+                            % collapsed)
+        if hidden_cols:
+            captions.append("已折叠列：%s（open <表头名> 打开）"
+                            % "、".join(h for h, _kw in SESSION_TABLE_COLUMNS
+                                        if h in hidden_cols))
+        if not items:
+            captions.append("working 模式没有可展示的实际 session（open detail 查看全部）")
+        if captions:
+            t.caption = Text("\n".join(captions), style="dim")
             t.caption_justify = "left"
         return t
 
@@ -7551,25 +7736,52 @@ class Warden(object):
             return "current"
         return ""
 
+    def _actual_rows(self, rows):
+        """权威数据里只留**真的订上了**的行；快照/离线模式没法看 id，全留。"""
+        rows = list(rows or [])
+        if not self.authoritative:
+            return rows
+        return [r for r in rows if r.get("id")]
+
+    def live_session(self):
+        """当前**真正在进行**的 session → ``(表格编号, 行)``；没有就 None。
+
+        判定必须同时满足：
+        * 权威模式下有 Focusmate session id（不是只有 data.csv 计划窗口）；
+        * now 落在这一行自己的 ``startMs`` / ``endMs`` 内。
+        取消后另约一场时，旧的 10:30 计划行没有 id，不会被当成当前 session；
+        新订的 10:45 行有 id 且时间覆盖现在，才是当前这一场。
+        """
+        now_ms = int(time.time() * 1000)
+        live = [r for r in self._actual_rows(self.rows)
+                if r.get("startMs") is not None
+                and r["startMs"] <= now_ms < (r.get("endMs") or 0)]
+        if not live:
+            return None
+        # 若真的有两场重叠，取开始更晚的那一场（更接近「刚换到的新约」）。
+        live.sort(key=lambda r: (r.get("startMs") or 0, self.rows.index(r)))
+        row = live[-1]
+        return self.rows.index(row) + 1, row
+
     def current_session(self):
         """「当前这一场」→ ``(表格编号, 行)``：进行中的优先，其次最近一场还没开始的。
 
         需求（``task 8 -ac``）：正在干的那一场就是「当前」；一场都不在进行时，
-        取**最近一场还没开始**的（下一场马上就来，先挂上去就是为了别手忙脚乱）。
-        已经全结束、或者这一天一行都没有 —— 明说，不猜。
+        取**最近一场还没开始、而且真的订上了**的（下一场马上就来，先挂上去就是
+        为了别手忙脚乱）。已结束/取消掉、只剩计划窗口的幽灵场不参与判定。
         """
+        live = self.live_session()
+        if live:
+            return live
         now_ms = int(time.time() * 1000)
-        live = [r for r in self.rows
-                if r.get("startMs") is not None
-                and r["startMs"] <= now_ms < (r.get("endMs") or 0)]
-        if not live:
-            upcoming = [r for r in self.rows if (r.get("startMs") or 0) > now_ms]
-            live = upcoming[:1]
-        if not live:
-            raise ValueError("现在没有正在进行的 session，也没有还没开始的一场"
+        upcoming = [r for r in self._actual_rows(self.rows)
+                    if (r.get("startMs") or 0) > now_ms]
+        upcoming.sort(key=lambda r: (r.get("startMs") or 0, self.rows.index(r)))
+        if not upcoming:
+            raise ValueError("现在没有正在进行的 session，也没有还没开始的已订场次"
                              "（%s 只有 %d 行）；用表格编号挂吧。"
                              % (self.sel_date.isoformat(), len(self.rows)))
-        row = live[0]
+        row = upcoming[0]
         return self.rows.index(row) + 1, row
 
     def _resolve_assign_target(self, token):
@@ -9966,20 +10178,24 @@ class Warden(object):
             self.refresh()
         return True
 
-    def cmd_open(self, args=None):
-        """``open working`` / ``open detail``：切换 session 看板口径。
+    def _column_command_args(self, args):
+        """解析 open/close 的列名 + ``--permanent``。
 
-        working：只看实际为主的列表 —— 当前/将来的 session + 真订上的 session；
-        过去只留最近一场，其余折成 caption。detail：原来的计划 + 实际全量表。
+        列名允许带空格（``open 时段 ID`` / ``open "时段 ID"`` 都行），
+        所以不能只拿 args[0]。
         """
-        toks = [str(a).strip().lower() for a in (args or []) if str(a).strip()]
-        mode = toks[0] if toks else (
-            "detail" if self.session_ui_mode == "working" else "working")
-        aliases = {"w": "working", "work": "working", "d": "detail", "all": "detail"}
-        mode = aliases.get(mode, mode)
-        if mode not in SESSION_UI_MODES:
-            raise ValueError("open 只认 working / detail；你给的是 %r"
-                             % (toks[0] if toks else ""))
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        permanent = False
+        kept = []
+        for tok in toks:
+            low = tok.lower()
+            if low in ("--permanent", "-p", "永久"):
+                permanent = True
+            else:
+                kept.append(tok)
+        return " ".join(kept).strip(), permanent, toks
+
+    def _switch_session_mode(self, mode):
         self.session_ui_mode = mode
         if not isinstance(self.view, ContractView):
             self.go_to_view(ContractView)
@@ -9988,6 +10204,63 @@ class Warden(object):
                     if mode == "working" else "计划 + 实际全部内容"), "cmd")
         self.invalidate()
         return mode
+
+    def cmd_open(self, args=None):
+        """``open working|detail`` 切口径；``open <表头> [--permanent]`` 展开列。
+
+        working 默认自动折叠「时段类型 / 时段名称 / 契约」；手动 open 只是
+        本次运行的覆盖，加 ``--permanent`` 才会写进偏好、以后也不再自动折叠。
+        """
+        text, permanent, toks = self._column_command_args(args)
+        if not text:
+            if permanent:
+                raise ValueError("open --permanent 后面要跟一个表头名")
+            return self._switch_session_mode(
+                "detail" if self.session_ui_mode == "working" else "working")
+        aliases = {"w": "working", "work": "working", "d": "detail", "all": "detail"}
+        mode = aliases.get(text.lower(), text.lower())
+        if mode in SESSION_UI_MODES:
+            if permanent:
+                raise ValueError("open --permanent 只用于表头列；切口径不带 --permanent")
+            return self._switch_session_mode(mode)
+        col = normalize_session_column(text)
+        if not col:
+            raise ValueError(
+                "open 只认 working / detail 或表头名（%s）；你给的是 %r"
+                % ("、".join(h for h, _kw in SESSION_TABLE_COLUMNS), text))
+        self._set_column_open(col, permanent=permanent)
+        if not isinstance(self.view, ContractView):
+            self.go_to_view(ContractView)
+        self.say("已打开列「%s」%s（%s 口径）"
+                 % (col, "并写入偏好" if permanent else "（本次运行）",
+                    self.session_ui_mode), "cmd")
+        self.invalidate()
+        return col
+
+    def cmd_close(self, args=None):
+        """``close <表头> [--permanent]``：折叠一列；永久偏好写 warden-ui.json。"""
+        text, permanent, _toks = self._column_command_args(args)
+        if not text:
+            raise ValueError("用法：close <表头名> [--permanent]；表头名：%s"
+                             % "、".join(h for h, _kw in SESSION_TABLE_COLUMNS))
+        col = normalize_session_column(text)
+        if not col:
+            raise ValueError(
+                "close 只认表头名（%s）；你给的是 %r"
+                % ("、".join(h for h, _kw in SESSION_TABLE_COLUMNS), text))
+        # 至少留一列，否则 rich 会画一张没有列的表。
+        hidden = set(self.effective_hidden_columns())
+        hidden.add(col)
+        if len(hidden) >= len(SESSION_TABLE_COLUMNS):
+            raise ValueError("不能把所有列都折叠；至少留一列看。")
+        self._set_column_closed(col, permanent=permanent)
+        if not isinstance(self.view, ContractView):
+            self.go_to_view(ContractView)
+        self.say("已折叠列「%s」%s（%s 口径）"
+                 % (col, "并写入偏好" if permanent else "（本次运行）",
+                    self.session_ui_mode), "cmd")
+        self.invalidate()
+        return col
 
     def _period_row_is_stale(self, row, new_by_start):
         """这一行 API session 还符合新排布吗？（按起点 + 时长判断）"""
@@ -11077,6 +11350,8 @@ class Warden(object):
             ("Tab", "切换视图：契约 → 专注 → 统计 → 任务 → 设置 → 契约（循环）"),
             ("open working|detail", "切换 session 看板口径：working = 实际为主、"
                                      "过去只留最近一场；detail = 计划 + 实际全部"),
+            ("open/close <表头>", "展开/折叠契约表的一列；加 --permanent 写进偏好，"
+                                  "working 默认折叠 时段类型 / 时段名称 / 契约"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
             ("stat refresh full", "统计：丢掉缓存、全量重拉（默认只增量拉缺口 + 最近几天）"),
             ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),
@@ -11313,7 +11588,7 @@ class Warden(object):
             self.invalidate()
         if not (touches or stale):
             return False
-        if not self.net_async:
+        if not self.auto_refresh_after_command or not self.net_async:
             # --exec / 测试 / 离线走同步语义：本地重算已经完成，不额外发网络。
             return False
         if name == "refresh" and not stale:

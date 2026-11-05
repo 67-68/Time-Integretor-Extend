@@ -1,5 +1,5 @@
 """session 看板两口径：working（实际为主）/ detail（计划 + 实际）。"""
-import importlib.util, io, os, shutil, sys, tempfile
+import importlib.util, io, os, shutil, sys, tempfile, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 fails = []
 
@@ -94,6 +94,35 @@ check("working 将来未订上的计划行保留",
        and not r.get("id")], [5])
 check("working 保留最近一条过去的实际 session",
       [idx for idx, r in working if r.get("phase") == "已结束"], [3])
+ghost = row(8, "进行中", 8, planned=True, sid=None, start="10:30", end="11:20")
+working_ghost, _ = w.visible_session_rows(rows + [ghost], "working")
+check("working 不显示没有 id 的进行中计划幽灵行",
+      8 in [idx for idx, _r in working_ghost], False)
+
+print("\n== 当前 session：以实际 id + 时间窗为准 ==")
+now_ms = int(time.time() * 1000)
+ghost_live = {
+    "startMs": now_ms - 20 * 60 * 1000, "endMs": now_ms + 40 * 60 * 1000,
+    "startLabel": "10:30", "endLabel": "11:20", "durationMin": 50,
+    "id": None, "planned": True, "phase": "进行中", "date": "2026-11-04",
+    "title": "", "quiet": False, "matched": None, "period": {}, "period_first": False,
+    "task_text": "",
+}
+real_live = dict(ghost_live, id="sess-real", planned=False, startLabel="10:45",
+                 endLabel="11:35")
+wd_live = mkwarden()
+wd_live.rows_source = "bridge"
+wd_live.rows = [ghost_live, real_live]
+check("live_session 跳过没有 id 的幽灵计划行",
+      wd_live.live_session()[1]["id"], "sess-real")
+check("current_session 用实际 id 那一场",
+      wd_live.current_session()[1]["startLabel"], "10:45")
+fv = w.FocusView(wd_live)
+check("专注视图当前 row 也是实际场次", fv.current_row()["id"], "sess-real")
+check("专注视图 current_session_key 取实际场次时间",
+      fv.current_session_key(), "2026-11-04T10:45")
+wd_live.rows = [ghost_live]
+check("只有幽灵行时 live_session 为空", wd_live.live_session(), None)
 
 print("\n== 命令：open working / open detail + 指示条 ==")
 wd = mkwarden()
@@ -138,6 +167,61 @@ check("没任务的 session 明确写警告", str(task_cells[0]), "没有设定�
 check("警告是粗体红", task_cells[0].style, "bold red")
 check_true("有任务的 session 不误报", "没有设定任务" in str(task_cells[2]), False)
 check("有任务的 task 栏仍是绿色", task_cells[2].style, "bold green")
+
+print("\n== 表头折叠：open / close + --permanent + working 自动折叠 ==")
+
+
+def render_table(mode):
+    wd.session_ui_mode = mode
+    return wd.render_table()
+
+
+def headers_of(tbl):
+    return [col.header for col in tbl.columns]
+
+
+detail_tbl = render_table("detail")
+for header in ("时段类型", "时段名称", "契约"):
+    check_true("detail 默认显示列「%s」" % header,
+               header in headers_of(detail_tbl))
+
+working_tbl = render_table("working")
+for header in ("时段类型", "时段名称", "契约"):
+    check_true("working 自动折叠列「%s」" % header,
+               header in headers_of(working_tbl), False)
+check_true("working 下方一行说明折叠了哪些列",
+           "已折叠列：时段类型、时段名称、契约" in working_tbl.caption.plain)
+
+wd.session_ui_mode = "detail"
+check("close 时段类型 受理", wd.handle("close 时段类型"), True)
+detail_tbl = render_table("detail")
+check_true("手动 close 后 detail 不显示时段类型",
+           "时段类型" in headers_of(detail_tbl), False)
+check_true("折叠列说明放在 table caption",
+           "已折叠列：时段类型" in detail_tbl.caption.plain)
+check("open 时段类型 受理", wd.handle("open 时段类型"), True)
+detail_tbl = render_table("detail")
+check_true("手动 open 后时段类型回来",
+           "时段类型" in headers_of(detail_tbl))
+
+# 带空格的表头名：close 时段 ID
+check("close 带空格表头 时段 ID 受理", wd.handle("close 时段 ID"), True)
+detail_tbl = render_table("detail")
+check_true("时段 ID 列被折叠", "时段 ID" in headers_of(detail_tbl), False)
+check("open 时段 ID 受理", wd.handle("open 时段 ID"), True)
+
+# --permanent 写盘，新建 Warden 仍然记得（同一份 TI_SETTINGS_FILE 目录）
+check("close 契约 --permanent 受理", wd.handle("close 契约 --permanent"), True)
+check_true("永久折叠写进 warden-ui.json",
+           os.path.exists(wd.ui_prefs_path()))
+wd2 = mkwarden()
+check("新 warden 读到永久折叠", "契约" in wd2.effective_hidden_columns("detail"), True)
+check("open 契约 --permanent 受理", wd2.handle("open 契约 --permanent"), True)
+wd3 = mkwarden()
+check("永久展开也会被记住", "契约" in wd3.effective_hidden_columns("detail"), False)
+check_true("无效表头会报错不改状态", wd3.handle("close 不存在的列"), True)
+check_true("错误消息列出可选表头",
+           any("只认表头名" in m[2] for m in wd3.messages))
 
 shutil.rmtree(TMP, ignore_errors=True)
 print()
