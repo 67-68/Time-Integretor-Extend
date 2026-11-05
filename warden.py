@@ -2941,9 +2941,11 @@ class Warden(object):
             return {"items": [], "projects": [], "refused": refused,
                     "repeats": {}, "warnings": []}
         for payload in projects:
-            rep.log("项目「%s」：%d 条任务（其中 %d 条已完成）"
+            week = payload.get("week") or {}
+            rep.log("项目「%s」：%d 条任务（其中 %d 条已完成）· 本周会产出 %d 条"
                     % (payload.get("title"), len(payload.get("tasks") or []),
-                       int(payload.get("done") or 0)), "ok")
+                       int(payload.get("done") or 0), int(week.get("count") or 0)),
+                    "ok")
         rep.progress(0.5)
         repeats, warnings = {}, []
         checker = None if single_task else getattr(self.omnifocus, "repetition_info", None)
@@ -3354,6 +3356,13 @@ class Warden(object):
                      % (len(tasks), len(open_tasks), len(tasks) - len(open_tasks),
                         stat["total"], stat["total"] * pp.MINUTES_PER_COUNT,
                         stat["remaining"], stat["progress_text"]), "info")
+            week = pj.weekly_yield(tasks)
+            if week.get("count"):
+                self.say("   " + pj.week_summary(week), "info")
+            if week.get("missing"):
+                self.say("   ⚠ 本周任务里还有 %d 条没设持续时间（导入时本应被挡下，"
+                         "`project %d refresh` 再看一次）。"
+                         % (len(week["missing"]), num), "warn")
             self.say("   任务清单先躺着不占 session；`plan` 分给这个项目 count 时才会"
                      "把当天的任务挑出来。", "info")
         if made and (suffix or {}):
@@ -7649,6 +7658,32 @@ class Warden(object):
 
     # -- 导入：剪贴板里可能是一个 **项目** ---------------------------------
 
+    def _project_repeat_infos(self, payload, warn=None):
+        """查项目清单里每条任务的 OmniFocus 重复规则 → ``{pk: info}``。
+
+        重复任务的未来 occurrence 现在还不存在，``list_tasks`` 看不到；必须逐条
+        问 ``repetitionInfo``，才能在导入时把「本周会产生几条」算进去。查询失败
+        只警告、按普通任务算（和单条导入的既有约定一致），不拿网络故障冒充重复。
+        """
+        checker = getattr(self.omnifocus, "repetition_info", None)
+        if checker is None:
+            return {}
+        say = warn or (lambda text, kind="warn": self.say(text, kind))
+        infos = {}
+        for item in (payload or {}).get("tasks") or ():
+            pk = str(item.get("pk") or "")
+            if not pk or item.get("completed"):
+                continue
+            try:
+                info = checker(pk)
+            except Exception as e:              # noqa: BLE001 - 核对不了就按普通任务算
+                say("没法核对「%s」是不是重复任务：%s（先按普通任务算）"
+                    % (item.get("title") or pk, e), "warn")
+                continue
+            if isinstance(info, dict) and info.get("repeated"):
+                infos[pk] = info
+        return infos
+
     def _task_import_projects(self, items, warn=None):
         """把「剪贴板里其实是 OmniFocus 项目」的条目认出来。
 
@@ -7716,9 +7751,13 @@ class Warden(object):
                 say("认不出这个项目（%s）：先按普通任务导入。" % e, "warn")
                 kept.append(item)
                 continue
+            # 项目当前 active 的任务已经在清单里；重复任务 / 被推迟到本周开放的
+            # 任务要靠 repetitionInfo + defer 才能看到，统一算进本周账。
+            payload = pj.attach_week(payload,
+                                     self._project_repeat_infos(payload, say))
             for note in payload.get("warnings") or ():
                 say("⚠ %s" % note, "warn")
-            if payload.get("missing"):
+            if payload.get("missing") or payload.get("week_missing"):
                 refused.append(payload)
                 continue
             projects.append(payload)
@@ -9232,6 +9271,7 @@ class Warden(object):
         t.add_column("进度", justify="right", no_wrap=True)
         t.add_column("今天 plan", no_wrap=True)
         t.add_column("未完成", justify="right", no_wrap=True)
+        t.add_column("本周", justify="right", no_wrap=True)
         t.add_column("OmniFocus", no_wrap=True, style=STYLE_MUTED)
         for row in rows:
             plan_txt = "—"
@@ -9247,12 +9287,17 @@ class Warden(object):
                       Text(row["progress_text"], style=STYLE_MUTED),
                       Text(plan_txt, style="green" if row["allocated"] else STYLE_MUTED),
                       Text(str(row["tasks_open"]), style=STYLE_MUTED),
+                      Text(str(row["week_count"]),
+                           style="bold yellow" if row.get("week_missing")
+                           else STYLE_MUTED),
                       Text(str(row["pk"])[:10] or "—"))
         total_remaining = sum(r["remaining"] for r in rows)
-        t.caption = ("%d 个项目 · 剩余 %d count（%d 分钟）· 剩余 count = 未完成任务还差"
-                     "几块 25 分钟；进度 = 已完成 / 总共（按 count 算）· `plan` 分配今天的"
-                     "资源" % (len(rows), total_remaining,
-                              total_remaining * pp.MINUTES_PER_COUNT))
+        t.caption = ("%d 个项目 · 剩余 %d count（%d 分钟）· 本周 = 周一起这一周会产生的"
+                     "任务（含被推迟到本周开放的、重复任务的每个 occurrence）· 剩余 "
+                     "count = 未完成任务还差几块 25 分钟；进度 = 已完成 / 总共（按 count "
+                     "算）· `plan` 分配今天的资源"
+                     % (len(rows), total_remaining,
+                        total_remaining * pp.MINUTES_PER_COUNT))
         return t
 
     def cmd_project(self, args=None):
@@ -9272,9 +9317,10 @@ class Warden(object):
                          "warn")
                 return []
             for row in rows:
-                self.say("📁 #%d %s：剩余 %d count · 进度 %s · %d 条未完成%s"
+                self.say("📁 #%d %s：剩余 %d count · 进度 %s · %d 条未完成 · 本周 %d 条%s"
                          % (row["number"], row["title"], row["remaining"],
                             row["progress_text"], row["tasks_open"],
+                            int(row.get("week_count") or 0),
                             ("· 今天说好 %d count（已排 %d）"
                              % (row["allocated"], row["scheduled"]))
                             if row["allocated"] else ""), "info")
@@ -9307,6 +9353,14 @@ class Warden(object):
                     ((project.get("omnifocus") or {}).get("id") or "?"),
                     stat["remaining"], stat["progress_text"],
                     stat["done"], stat["total"]), "cmd")
+        week = pj.weekly_yield(project.get("tasks") or [])
+        if week.get("count"):
+            self.say("   " + pj.week_summary(week), "info")
+            if week.get("missing"):
+                self.say("   ⚠ 本周有 %d 条任务没设持续时间：%s"
+                         % (len(week["missing"]),
+                            "、".join("「%s」" % rec.get("title")
+                                     for rec in week["missing"][:6])), "warn")
         items = pj.remaining_tasks(project, invested)
         for item in items[:12]:
             bits = ["%d count" % int(item.get("count") or 0),
@@ -9360,16 +9414,22 @@ class Warden(object):
                      % pk, "warn")
             return None
         payload = pj.project_payload(row, rows)
-        if payload.get("missing"):
+        payload = pj.attach_week(
+            payload, self._project_repeat_infos(
+                payload, lambda text, kind="warn": self.say(text, kind)))
+        if payload.get("missing") or payload.get("week_missing"):
             self.had_error = True
             self.say("✗ " + pj.format_missing(payload), "error")
             self.say("🚫 这次刷新没写库（清单先按旧的算）。", "error")
             return None
         updated, _created = self.projects.upsert(payload)
         stat = pj.stats(updated, self.task_store)
+        week = pj.weekly_yield(updated.get("tasks") or [])
         self.say("🔄 项目 #%s「%s」刷新了：%d 条任务、剩余 %d count（进度 %s）"
                  % (num, updated.get("title"), len(updated.get("tasks") or []),
                     stat["remaining"], stat["progress_text"]), "ok")
+        if week.get("count"):
+            self.say(pj.week_summary(week), "info")
         self.rebuild_rows()
         self.invalidate()
         return updated

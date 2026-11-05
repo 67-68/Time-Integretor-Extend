@@ -155,8 +155,9 @@ ONROWS = [
 
 
 class FakeOmniFocus(object):
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, repetitions=None):
         self.rows = rows if rows is not None else [dict(r) for r in ONROWS]
+        self.repetitions = repetitions or {}
         self.calls = []
 
     def available(self):
@@ -176,7 +177,7 @@ class FakeOmniFocus(object):
         return None
 
     def repetition_info(self, pk, timeout=None):
-        return {"repeated": False}
+        return dict(self.repetitions.get(str(pk), {"repeated": False}))
 
     def complete(self, pk, at=None, due=None, yes=True, timeout=None):
         return {"after": {"completed": True}}
@@ -188,10 +189,10 @@ class FakeOmniFocus(object):
         pass
 
 
-def mkwarden(rows=None):
+def mkwarden(rows=None, repetitions=None):
     console = Console(file=io.StringIO(), width=250, force_terminal=False)
     wd = w.Warden(console, FakeBridge(), no_clear=True, offline=True)
-    wd.omnifocus = FakeOmniFocus(rows)
+    wd.omnifocus = FakeOmniFocus(rows, repetitions)
     return wd
 
 
@@ -207,11 +208,11 @@ def reset_projects():
     pj.save(pj.blank())
 
 
-def fresh(rows=None):
+def fresh(rows=None, repetitions=None):
     """干净的任务库 + 项目库 + 一个新的 warden（各段互不串味）。"""
     reset_tasks()
     reset_projects()
-    return mkwarden(rows)
+    return mkwarden(rows, repetitions)
 
 
 def by_num(wd, num=1):
@@ -277,6 +278,75 @@ check("100 分钟 = 4 count（往上取整）",
 check_true("拒绝的话里说清是哪几条",
            "「没设时长的」" in pj.format_missing(payload))
 
+print("== 本周任务预算：active / 被推迟 / 重复 occurrence / 叠加 ==")
+_fixed_now = datetime.datetime(2026, 11, 4, 12, 0)      # 周三；本周 = 11-02(一)–11-08(日)
+_week_tasks = [
+    {"pk": "active", "title": "现在就能做", "duration": 25},
+    {"pk": "defer-thu", "title": "周四才开放", "duration": 50,
+     "defer": "2026-11-05T09:00:00"},
+    {"pk": "defer-next", "title": "下下周才开放", "duration": None,
+     "defer": "2026-11-16T09:00:00"},
+    {"pk": "repeat-mw", "title": "周一和周三重复", "duration": 25,
+     "repeat": {"rule": "FREQ=WEEKLY;BYDAY=MO,WE",
+                "rule_anchor": "2026-11-02T10:00:00",
+                "next": "2026-11-09T10:00:00"}},
+    {"pk": "repeat-defer", "title": "推迟的每日重复", "duration": 25,
+     "defer": "2026-11-05T10:00:00",
+     "repeat": {"rule": "FREQ=DAILY",
+                "rule_anchor": "2026-11-05T10:00:00",
+                "next": "2026-11-05T10:00:00"}},
+    {"pk": "repeat-bad", "title": "重复但没时长", "duration": None,
+     "repeat": {"rule": "FREQ=WEEKLY;BYDAY=MO,WE",
+                "rule_anchor": "2026-11-04T10:00:00"}},
+    {"pk": "done", "title": "已完成", "duration": 25, "completed": True},
+]
+_week = pj.weekly_yield(_week_tasks, now=_fixed_now)
+check("周一固定为本周起点", (_week["start"], _week["end"]),
+      ("2026-11-02", "2026-11-08"))
+check("重复任务的周一 + 周三两次都算",
+      [x["date"] for x in _week["tasks"] if x["pk"] == "repeat-mw"],
+      ["2026-11-02", "2026-11-04"])
+check("本周四开放的推迟任务算一条",
+      [(x["pk"], x["date"]) for x in _week["tasks"] if x["pk"] == "defer-thu"],
+      [("defer-thu", "2026-11-05")])
+check("下周才开放的推迟任务不算",
+      [x for x in _week["tasks"] if x["pk"] == "defer-next"], [])
+check("重复 + 推迟同一条：周四到周日 4 次都算",
+      [x["date"] for x in _week["tasks"] if x["pk"] == "repeat-defer"],
+      ["2026-11-05", "2026-11-06", "2026-11-07", "2026-11-08"])
+check("重复且被推迟的 occurrence 有标记",
+      all(x["deferred"] for x in _week["tasks"] if x["pk"] == "repeat-defer"), True)
+check("已完成不产生本周任务", [x for x in _week["tasks"] if x["pk"] == "done"], [])
+check("本周总条数", _week["count"], 1 + 1 + 2 + 4 + 2)
+check("时长缺口按任务聚合，重复的两天都点名",
+      [(_x["pk"], _x["count"]) for _x in _week["missing"]],
+      [("repeat-bad", 2)])
+check_true("周总结说从周一开始", "周一开始" in pj.week_summary(_week))
+
+print("== project_payload：重复规则合进来后才算完整的本周账 ==")
+_payload = pj.project_payload(
+    {"id": "p-week", "name": "周项目", "kind": "project_root"},
+    [
+        {"id": "p-week", "name": "周项目", "kind": "project_root"},
+        {"id": "active", "name": "现在就能做", "kind": "action",
+         "project": "周项目", "estimated_minutes": 25},
+        {"id": "rep", "name": "周一和周三", "kind": "action",
+         "project": "周项目", "estimated_minutes": 25,
+         "defer": "2026-11-04T09:00:00"},
+    ],
+    repeat_infos={"rep": {"repeated": True,
+                          "rule_string": "FREQ=WEEKLY;BYDAY=MO,WE",
+                          "next": "2026-11-09T10:00:00",
+                          "estimated_minutes": 25}},
+    now=_fixed_now,
+)
+check("payload 里带本周账", _payload["week"]["count"], 3)
+check("active 1 + 重复 2", (_payload["week"]["active"],
+                            _payload["week"]["repeated"]), (1, 2))
+check("重复规则被保存进任务记录",
+      _payload["tasks"][1]["repeat"]["rule"], "FREQ=WEEKLY;BYDAY=MO,WE")
+check("本周没有时长缺口", pj.format_missing(_payload), "")
+
 print("== task import：时长不齐的项目被拒，一个字节都不落 ==")
 wd = fresh()
 check("import 受理", wd.handle("task import omnifocus:///project/p-lunwen"), True)
@@ -295,6 +365,64 @@ check("任务库也没被污染", wd_off.task_store.list(), [])
 check_true("说清是「项目链接 + 读不到」",
            any("项目" in t and "读不到" in t for t in texts(wd_off)))
 wd_off.settings.set("omnifocus", "on")
+
+print("== task import：重复 / 被推迟的本周任务没时长 → 整批拒绝 ==")
+_week_mon = TODAY - datetime.timedelta(days=TODAY.weekday())
+_thu = _week_mon + datetime.timedelta(days=3)
+_week_rows = [
+    {"id": "p-week-import", "name": "周导入项目", "kind": "project_root",
+     "completed": False, "dropped": False},
+    {"id": "w-active", "name": "正常 active", "kind": "action",
+     "project": "周导入项目", "estimated_minutes": 25, "completed": False},
+    {"id": "w-defer", "name": "周四开放但没时长", "kind": "action",
+     "project": "周导入项目", "estimated_minutes": 0, "completed": False,
+     "defer": _thu.isoformat() + "T09:00:00"},
+    {"id": "w-rep", "name": "重复但没时长", "kind": "action",
+     "project": "周导入项目", "estimated_minutes": 0, "completed": False},
+]
+_rep_infos = {"w-rep": {
+    "repeated": True,
+    "rule_string": "FREQ=WEEKLY;BYDAY=MO,WE",
+    "next": (_week_mon + datetime.timedelta(days=7)).isoformat() + "T10:00:00",
+    "estimated_minutes": 0,
+}}
+wd_week = fresh(_week_rows, repetitions=_rep_infos)
+check("含重复/被推迟任务的 import 受理",
+      wd_week.handle("task import omnifocus:///project/p-week-import"), True)
+check("项目没进库", wd_week.projects.list(), [])
+check_true("本周缺时长的被推迟任务点名",
+           any("周四开放但没时长" in t for t in texts(wd_week)))
+check_true("本周缺时长的重复任务点名",
+           any("重复但没时长" in t for t in texts(wd_week)))
+check_true("报错说的是「本周会产生」",
+           any("本周会产生" in t and "没有「持续时间」" in t
+               for t in texts(wd_week)))
+
+print("== task import：时长齐全时，重复规则和本周条数一起进库 ==")
+_week_rows_ok = [dict(r) for r in _week_rows
+                 if r["id"] not in ("w-defer", "w-rep")]
+_week_rows_ok.append({
+    "id": "w-rep-ok", "name": "周一和周三重复", "kind": "action",
+    "project": "周导入项目", "estimated_minutes": 25, "completed": False,
+})
+_rep_ok = {"w-rep-ok": {
+    "repeated": True,
+    "rule_string": "FREQ=WEEKLY;BYDAY=MO,WE",
+    "next": (_week_mon + datetime.timedelta(days=7)).isoformat() + "T10:00:00",
+    "estimated_minutes": 25,
+}}
+wd_week_ok = fresh(_week_rows_ok, repetitions=_rep_ok)
+check("时长齐全的 import 受理",
+      wd_week_ok.handle("task import omnifocus:///project/p-week-import"), True)
+_proj_week = wd_week_ok.projects.active()[0]
+check("重复规则落进项目库",
+      [t.get("repeat", {}).get("rule") for t in _proj_week["tasks"]
+       if t["pk"] == "w-rep-ok"],
+      ["FREQ=WEEKLY;BYDAY=MO,WE"])
+check("本周条数 = active 1 + 周三和周一重复 2",
+      wd_week_ok.project_rows()[0]["week_count"], 3)
+check_true("导入消息里报了本周会产出几条",
+           any("会产生 3 条" in t for t in texts(wd_week_ok)))
 
 print("== task import：时长齐了就进项目库（任务库一条都不建） ==")
 rows_ok = [r for r in ONROWS if r["id"] != "t-bad"]

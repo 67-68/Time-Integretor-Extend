@@ -167,6 +167,314 @@ def _one_line(text, limit=120):
     return " ".join(str(text or "").split())[:limit]
 
 
+# ---------------------------------------------------------------- 一周任务预算
+#
+# ``import project`` 不只看「现在能看到的未完成任务」：OmniFocus 里还有两类
+# 任务不会以普通 active 行的身份出现在项目视图中 ——
+#   * 被推迟（defer 在未来）但**没有放弃**的任务；
+#   * 重复任务（``repetitionRule``），本周还没发生的 occurrence 现在根本不存在。
+# 项目导入前要把这些人一周内会产生的任务一起数出来，并检查每一条都有持续时间。
+# 周的边界固定为**周一 00:00 到下周一 00:00**，不随导入当天滚动。
+
+
+def week_bounds(now=None):
+    """当前自然周 → ``(周一 date, 下周一 date)``（左闭右开）。
+
+    需求：无论导入时是周几，都按「从周一开始」的那一周算。
+    """
+    if isinstance(now, datetime.datetime):
+        day = now.date()
+    elif isinstance(now, datetime.date):
+        day = now
+    else:
+        day = datetime.date.today()
+    start = day - datetime.timedelta(days=day.weekday())
+    return start, start + datetime.timedelta(days=7)
+
+
+def _local_dt(raw):
+    """ISO 时间文本 / datetime / date → naive datetime；认不出返回 None。"""
+    if isinstance(raw, datetime.datetime):
+        return raw.replace(tzinfo=None) if raw.tzinfo else raw
+    if isinstance(raw, datetime.date):
+        return datetime.datetime.combine(raw, datetime.time(0, 0))
+    return ts.parse_iso_datetime(raw)
+
+
+def _norm_repeat_info(info):
+    """把 ``repetition_info()`` / 已存 task.repeat 收敛成可保存的重复信息。"""
+    if not isinstance(info, dict):
+        return None
+    rule = ts.normalize_rule(info.get("rule") or info.get("rule_string"))
+    if not rule:
+        return None
+    out = {"rule": rule}
+    for key in ("rule_anchor", "anchor", "next", "due", "planned", "defer",
+                "method", "schedule_type", "anchor_date_key"):
+        if info.get(key):
+            out[key] = info[key]
+    minutes = ts.parse_minutes(info.get("estimated_minutes"))
+    if minutes is not None:
+        out["estimated_minutes"] = minutes
+    return out
+
+
+def _task_repeat(item):
+    return _norm_repeat_info((item or {}).get("repeat"))
+
+
+def _repeat_dates(item, week_start, week_end, now=None):
+    """一条重复任务本周会落下的日期（``set[date]``，可能为空）。
+
+    OmniFocus 的 ``repetition_info`` 只给「下一次」和 RRULE，不给历史 occurrence。
+    为了把本周已经过去的那几天也数进去，先把 DTSTART 按规则间隔退到周一之前，
+    再用 dateutil 展开整周。WEEKLY 的 BYDAY / INTERVAL、DAILY、MONTHLY、
+    YEARLY 都按原规则走。
+    """
+    rep = _task_repeat(item)
+    if not rep:
+        return set()
+    rule = ts.normalize_rule(rep.get("rule"))
+    if not rule:
+        return set()
+    anchor = _local_dt(rep.get("rule_anchor") or rep.get("anchor")
+                       or rep.get("next") or rep.get("planned")
+                       or rep.get("due") or (item or {}).get("defer")
+                       or (item or {}).get("due") or (item or {}).get("planned"))
+    if anchor is None:
+        return set()
+    # 规则里 UNTIL 可能已经过期：把范围放到整周再交给 dateutil 判断。
+    start_dt = datetime.datetime.combine(week_start, datetime.time(0, 0))
+    end_dt = datetime.datetime.combine(week_end, datetime.time(0, 0))
+    try:
+        from dateutil.relativedelta import relativedelta
+        parts = {}
+        for piece in rule.split(";"):
+            if "=" in piece:
+                key, value = piece.split("=", 1)
+                parts[key.strip().upper()] = value.strip().upper()
+        freq = parts.get("FREQ", "")
+        try:
+            interval = max(1, int(parts.get("INTERVAL") or 1))
+        except ValueError:
+            interval = 1
+        if freq == "DAILY":
+            step = datetime.timedelta(days=interval)
+        elif freq == "WEEKLY":
+            step = datetime.timedelta(weeks=interval)
+        elif freq == "MONTHLY":
+            step = relativedelta(months=interval)
+        elif freq == "YEARLY":
+            step = relativedelta(years=interval)
+        elif freq == "HOURLY":
+            step = datetime.timedelta(hours=interval)
+        else:
+            step = None
+        if step is not None:
+            guard = 0
+            while anchor.date() >= week_start and guard < 1000:
+                anchor = anchor - step
+                guard += 1
+    except Exception:                       # noqa: BLE001 - 退成「不快进」也能跑
+        pass
+    rr = ts.rule_objects(rule, anchor)
+    if rr is None:
+        nxt = _local_dt(rep.get("next"))
+        if nxt is not None and week_start <= nxt.date() < week_end:
+            return {nxt.date()}
+        return set()
+    try:
+        found = rr.between(start_dt, end_dt, inc=True)
+    except (ValueError, OverflowError):
+        return set()
+    return {dt.date() for dt in found if week_start <= dt.date() < week_end}
+
+
+def _week_item_date(item, now_dt, week_start, week_end):
+    """非重复任务在本周算不算一条 → ``(date, deferred)``；不算返回 ``(None, False)``。"""
+    defer = _local_dt((item or {}).get("defer"))
+    if defer is not None:
+        if defer.date() >= week_end:
+            return None, False
+        if defer.date() > now_dt.date():
+            return defer.date(), True
+    # 没有 defer / defer 已经过去：这是一条当前就 active 的任务，本周算一条。
+    day = max(week_start, now_dt.date())
+    if day >= week_end:
+        return None, False
+    return day, False
+
+
+def weekly_yield(tasks, now=None):
+    """一组项目任务 → 本周会产生的任务清单 + 时长缺口（纯函数）。
+
+    计数口径：
+
+    * 当前 active（未完成、未放弃）的普通任务：1 条；
+    * 未来 defer 但落在本周的普通任务：1 条；
+    * 有 ``repeat.rule`` 的任务：本周每个 RRULE occurrence 各 1 条；一个 occurrence
+      同时被 defer 挡在后面时仍算重复任务，``deferred=True``；
+    * 已完成 / 已放弃：0 条；
+    * 重复任务本体本身**不额外**再加 1 —— 它本周的 occurrence 就是它产生的任务。
+
+    ``tasks`` 可以来自 :func:`project_payload`，也可以是项目库里已经规范化过的
+    task 记录。返回的 ``tasks`` 每一条都带 ``duration`` / ``missing_duration``；
+    ``missing`` 按任务聚合成人话需要的字段。
+    """
+    if isinstance(now, datetime.datetime):
+        now_dt = now.replace(tzinfo=None) if now.tzinfo else now
+    elif isinstance(now, datetime.date):
+        now_dt = datetime.datetime.combine(now, datetime.time(12, 0))
+    else:
+        now_dt = datetime.datetime.now()
+    week_start, week_end = week_bounds(now_dt)
+    produced, missing_by_pk = [], {}
+    seen = set()
+    for raw in tasks or ():
+        item = raw if isinstance(raw, dict) else {}
+        if item.get("completed") or item.get("dropped"):
+            continue
+        pk = str(item.get("pk") or item.get("id") or "")
+        title = _one_line(item.get("title") or item.get("name")) or pk or "?"
+        minutes = ts.parse_minutes(item.get("duration"))
+        if minutes is None:
+            minutes = ts.parse_minutes(item.get("estimated_minutes"))
+        repeat = _task_repeat(item)
+        # repetition_info 里的时长也可以补 row 里没写出来的情况。
+        if minutes is None and repeat:
+            minutes = ts.parse_minutes(repeat.get("estimated_minutes"))
+        defer = _local_dt(item.get("defer") or (repeat or {}).get("defer"))
+        dates = []
+        if repeat:
+            dates = sorted(_repeat_dates(item, week_start, week_end, now=now_dt))
+            # defer 在未来时，未来的重复 occurrence 还没开放；早于 defer 那天的
+            # 不算「本周会产生」。
+            if defer is not None and defer > now_dt:
+                dates = [d for d in dates if d >= defer.date()]
+        else:
+            day, deferred = _week_item_date(item, now_dt, week_start, week_end)
+            if day is not None:
+                dates = [day]
+        for day in dates:
+            key = (pk, day.isoformat())
+            if key in seen:
+                continue
+            seen.add(key)
+            is_deferred = bool(defer is not None and defer > now_dt
+                               and day >= defer.date())
+            produced.append({
+                "pk": pk,
+                "title": title,
+                "date": day.isoformat(),
+                "weekday": day.weekday(),
+                "duration": int(minutes or 0),
+                "count": ts.minutes_to_count(minutes) if minutes else 0,
+                "missing_duration": minutes is None,
+                "repeat": bool(repeat),
+                "deferred": is_deferred,
+            })
+            if minutes is None:
+                rec = missing_by_pk.setdefault(pk or title, {
+                    "pk": pk,
+                    "title": title,
+                    "dates": [],
+                    "count": 0,
+                    "repeat": bool(repeat),
+                    "deferred": bool(is_deferred),
+                })
+                rec["dates"].append(day.isoformat())
+                rec["count"] += 1
+    produced.sort(key=lambda item: (item.get("date") or "", item.get("pk") or ""))
+    repeated = [item for item in produced if item.get("repeat")]
+    deferred_only = [item for item in produced
+                     if item.get("deferred") and not item.get("repeat")]
+    active = [item for item in produced
+              if not item.get("repeat") and not item.get("deferred")]
+    return {
+        "start": week_start.isoformat(),
+        "end": (week_end - datetime.timedelta(days=1)).isoformat(),
+        "count": len(produced),
+        "active": len(active),
+        "deferred": len(deferred_only),
+        "repeated": len(repeated),
+        "repeated_deferred": len([item for item in repeated
+                                  if item.get("deferred")]),
+        "tasks": produced,
+        "missing": list(missing_by_pk.values()),
+    }
+
+
+def week_summary(payload_or_week):
+    """一句人话：``本周（11-02–11-08）会产生 5 条任务：…``。"""
+    week = ((payload_or_week or {}).get("week")
+            if isinstance(payload_or_week, dict) and "week" in payload_or_week
+            else payload_or_week)
+    if not isinstance(week, dict):
+        return ""
+    bits = ["当前 active %d" % int(week.get("active") or 0),
+            "本周开放的被推迟 %d" % int(week.get("deferred") or 0),
+            "重复任务 %d" % int(week.get("repeated") or 0)]
+    if week.get("repeated_deferred"):
+        bits.append("其中重复且被推迟 %d" % int(week["repeated_deferred"]))
+    return ("本周（%s–%s，周一开始）会产生 %d 条任务：%s"
+            % (week.get("start") or "?", week.get("end") or "?",
+               int(week.get("count") or 0), " · ".join(bits)))
+
+
+def format_week_missing(payload, limit=6):
+    """本周任务缺时长的报错句；没有缺口返回空串。"""
+    week = (payload or {}).get("week") or {}
+    missing = list(week.get("missing") or [])
+    if not missing:
+        # 兼容老的 payload（没有 week 字段）
+        names = list((payload or {}).get("missing") or [])
+        if not names:
+            return ""
+        head = "、".join("「%s」" % t for t in names[:limit])
+        if len(names) > limit:
+            head += " 等 %d 条" % len(names)
+        return ("项目「%s」里这 %d 条未完成任务没有「持续时间」：%s。去 OmniFocus "
+                "里给它们设上时长再导入。"
+                % ((payload or {}).get("title") or "?", len(names), head))
+    bits = []
+    for rec in missing[:limit]:
+        dates = "、".join(str(d)[5:] for d in (rec.get("dates") or []))
+        bits.append("「%s」%s" % (rec.get("title") or rec.get("pk") or "?",
+                                  ("（%s）" % dates) if dates else ""))
+    head = "、".join(bits)
+    total = sum(int(rec.get("count") or 0) for rec in missing)
+    if len(missing) > limit:
+        head += " 等 %d 条" % len(missing)
+    return ("项目「%s」本周会产生 %d 条任务，其中 %d 条没有「持续时间」"
+            "（OmniFocus 的 estimated duration）：%s。去 OmniFocus 里给它们设上"
+            "时长再导入 —— 没有时长就算不出要占几个 count。"
+            % ((payload or {}).get("title") or "?",
+               int(week.get("count") or total), total, head))
+
+
+def attach_week(payload, repeat_infos=None, now=None):
+    """把重复规则合并进项目 payload，并算出 ``payload["week"]``。
+
+    ``repeat_infos`` 是 ``{task_pk: repetition_info()}``；这也是 OmniFocus 里
+    “project 直接看不到、但没放弃”的重复任务的信息来源。
+    """
+    payload = dict(payload or {})
+    infos = repeat_infos or {}
+    tasks = []
+    for raw in payload.get("tasks") or ():
+        item = dict(raw or {})
+        rep = _norm_repeat_info(infos.get(str(item.get("pk") or "")))
+        if rep:
+            item["repeat"] = rep
+        tasks.append(item)
+    payload["tasks"] = tasks
+    week = weekly_yield(tasks, now=now)
+    payload["week"] = week
+    payload["week_count"] = week["count"]
+    payload["week_missing"] = week["missing"]
+    return payload
+
+
 def _norm_omnifocus(raw):
     if not isinstance(raw, dict):
         return None
@@ -191,17 +499,23 @@ def _norm_task(raw, rank=0):
         count = ts.minutes_to_count(minutes)
     if minutes is None and count:
         minutes = ts.count_to_minutes(count)
-    return {
+    out = {
         "pk": pk,
         "title": _one_line(raw.get("title") or raw.get("name")) or pk,
         "parent": _one_line(raw.get("parent")),
         "due": raw.get("due") or None,
+        "defer": raw.get("defer") or None,
+        "planned": raw.get("planned") or None,
         "count": int(count or 0),
         "duration": minutes,
         "completed": bool(raw.get("completed")),
         "blocked": bool(raw.get("blocked")),
         "rank": _as_int(raw.get("rank")) if raw.get("rank") is not None else int(rank),
     }
+    repeat = _norm_repeat_info(raw.get("repeat"))
+    if repeat:
+        out["repeat"] = repeat
+    return out
 
 
 def _norm_plan(raw):
@@ -276,11 +590,16 @@ def normalize(store):
 # ---------------------------------------------------------------- 从 OmniFocus 造 payload
 
 
-def project_payload(row, rows):
+def project_payload(row, rows, repeat_infos=None, now=None):
     """OmniFocus 的 ``project_root`` 行 + 全量行 → 项目 payload（纯函数）。
 
-    返回的 dict 里 ``missing`` 是「**没有设持续时间**的未完成任务」，``tasks`` 是
-    全部任务（含已完成的，界面算进度要用），``warnings`` 是归组时的疑点。
+    ``tasks`` 是全部任务（含已完成的，界面算进度要用）；``missing`` 是**全部**
+    未完成任务里没设持续时间的标题；``week`` 是本周（周一起）会产生的任务，
+    包含当前 active、被推迟到本周开放的、以及重复任务本周的 occurrence。
+
+    ``repeat_infos`` 是 ``{task_pk: repetition_info()}``。重复规则不在
+    ``omnifocus_tasks.py list`` 的字段里，所以由调用方查好传进来；纯函数本身不
+    联网。``now`` 可注入测试，默认当前时间。
 
     归组按 ``project`` 字段（OmniFocus 的「所属项目名」）—— 任务可能嵌套，光看
     ``parent`` 只拿得到第一层。同名项目是唯一会串的地方，所以这里**明确报警**，
@@ -292,6 +611,7 @@ def project_payload(row, rows):
     if not pk or not name:
         raise ValueError("这不是一个 OmniFocus 项目（没有 primary key 或名字）")
     rows = [r for r in (rows or []) if isinstance(r, dict)]
+    infos = repeat_infos or {}
     same_name = [r for r in rows
                  if r.get("kind") == "project_root" and _one_line(r.get("name")) == name]
     warnings = []
@@ -313,18 +633,24 @@ def project_payload(row, rows):
             done += 1
         elif not minutes:
             missing.append(title)
-        members.append({
+        item = {
             "pk": str(r.get("id") or ""),
             "title": title,
             "parent": _one_line(r.get("parent")),
             "due": r.get("due") or None,
+            "defer": r.get("defer") or None,
+            "planned": r.get("planned") or None,
             "duration": minutes,
             "count": ts.minutes_to_count(minutes) if minutes else 0,
             "completed": completed,
             "blocked": bool(r.get("blocked")),
             "rank": len(members),
-        })
-    return {
+        }
+        rep = _norm_repeat_info(infos.get(item["pk"]))
+        if rep:
+            item["repeat"] = rep
+        members.append(item)
+    payload = {
         "kind": "project",
         "id": pk,
         "title": name,
@@ -334,10 +660,15 @@ def project_payload(row, rows):
         "done": done,
         "warnings": warnings,
     }
+    # 重复规则已经全部在 members 里了，这里只负责算本周账。
+    return attach_week(payload, repeat_infos={}, now=now)
 
 
 def format_missing(payload, limit=6):
     """「这些任务没设持续时间」那一句话（导入被拒时原样念给用户听）。"""
+    week = (payload or {}).get("week")
+    if isinstance(week, dict) and (week.get("missing") or []):
+        return format_week_missing(payload, limit=limit)
     missing = list((payload or {}).get("missing") or [])
     if not missing:
         return ""
@@ -682,6 +1013,7 @@ class ProjectStore(object):
             mine = invested_all.get(project["id"]) or {}
             stat = stats(project, task_store, mine)
             plan = plan_of(project, day)
+            week = weekly_yield(project.get("tasks") or [])
             rows.append({
                 "number": index,
                 "id": project["id"],
@@ -695,6 +1027,9 @@ class ProjectStore(object):
                 "allocated": int((plan or {}).get("count") or 0),
                 "scheduled": planned_counts(project, day),
                 "tasks_open": len(remaining_tasks(project, mine)),
+                "week": week,
+                "week_count": int(week.get("count") or 0),
+                "week_missing": week.get("missing") or [],
                 "project": project,
                 "plan": plan,
             })

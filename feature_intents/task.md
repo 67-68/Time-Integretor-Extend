@@ -341,7 +341,10 @@ Focusmate 没有「把 task 挪到另一场」这个动作（只能建一条新�
 （`item["kind"]` 就是 `task` / `project`）。项目**不进任务库**：它的任务清单进
 `data/projects.json`（项目库），任务本身要等 `plan` 分了 count 才被「唤起」。
 判定只认 primary key 落在 `kind == "project_root"` 那一行上，不拿标题猜。
-整条流程、时长校验和「拒绝导入」的规则见 [`project.md`](project.md)。
+导入时还会用 `repetition_info` 展开每条任务的重复规则，把「本周（周一起）会
+产生几条」一起算进项目账；被推迟到本周开放的任务和重复 occurrence 都算，且
+同一条任务可以同时属于这两类。整条流程、时长校验和「拒绝导入」的规则见
+[`project.md`](project.md)。
 
 ### 导入时检查 OmniFocus 重复任务
 
