@@ -18,6 +18,8 @@ for key, name in (("TI_CALENDAR_DOWNLOAD", "download.json"),
                   ("TI_SESSION_RULES", "rules.json"),
                   ("TI_SETTINGS_FILE", "settings.json"),
                   ("TI_TASKS_FILE", "tasks.json"),
+                  ("TI_PROJECTS_FILE", "projects.json"),
+                  ("TI_PROJECT_SYNC_FILE", "project-sync.json"),
                   ("TI_TASK_ARCHIVE", "archive.json"),
                   ("TI_NOSTART_FILE", "nostart.json"),
                   ("TI_POSTSESSION_FILE", "postsession.json")):

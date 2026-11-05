@@ -33,6 +33,8 @@ ARCHIVE = os.path.join(TMP, "archive.json")
 # 会指向 data/tasks.json —— 那是用户的真任务库。把环境变量也钉到临时目录，
 # 以后谁手滑写了不带路径的 TaskStore()，也炸不到真数据（真炸过一次）。
 os.environ["TI_TASKS_FILE"] = TASKS
+os.environ["TI_PROJECTS_FILE"] = os.path.join(TMP, "projects.json")
+os.environ["TI_PROJECT_SYNC_FILE"] = os.path.join(TMP, "project-sync.json")
 os.environ["TI_TASK_ARCHIVE"] = ARCHIVE
 store = ts.TaskStore(TASKS, ARCHIVE)
 

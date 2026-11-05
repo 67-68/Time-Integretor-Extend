@@ -62,7 +62,10 @@
                              project_root 是 OmniFocus 里代表「项目自身」的根任务，
                              筛任务时一般要排掉：jq 'select(.kind != "project_root")'
     project            text  所属项目名；inbox 任务为空
+    project_id         text  所属项目 primary key；inbox 任务为空。
+                             项目归组必须认这个，不能靠 project 名字（会重名）
     parent             text  父任务名；顶层任务为空
+    parent_id          text  父任务 primary key；顶层任务为空
     in_inbox           bool  是否在收件箱
     tags               list  标签名列表（TSV 里用逗号连接）
     tag_ids            list  标签 primary key 列表，和 tags 一一对应

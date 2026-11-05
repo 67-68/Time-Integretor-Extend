@@ -272,15 +272,19 @@ def top_level_tasks(tasks):
     return out
 
 
-def hierarchy_errors(tasks):
+def hierarchy_errors(tasks, only_active=False):
     """检查「最多父-子两层」；返回 ``[{"pk", "title", "depth", "chain"}]``。
 
     0 = 顶层，1 = 子任务；2 就是孙任务（三层），严格禁止。
+    ``only_active=True`` 时只检查未完成、未放弃的任务；已完成/已放弃的旧层级
+    不参与导入校验。
     """
     index = _task_map(tasks)
     errors = []
     for item in tasks or ():
         if not isinstance(item, dict):
+            continue
+        if only_active and (item.get("completed") or item.get("dropped")):
             continue
         pk = str(item.get("pk") or item.get("id") or "").strip()
         chain = [pk]
@@ -846,15 +850,23 @@ def project_payload(row, rows, repeat_infos=None, now=None):
     infos = repeat_infos or {}
     same_name = [r for r in rows
                  if r.get("kind") == "project_root" and _one_line(r.get("name")) == name]
+    rows_with_project_id = [r for r in rows
+                            if r.get("kind") != "project_root"
+                            and str(r.get("project_id") or "").strip()]
     warnings = []
-    if len(same_name) > 1:
-        warnings.append("OmniFocus 里有 %d 个同名项目「%s」—— 任务清单按项目名归组，"
-                        "同名的那几个会串在一起。" % (len(same_name), name))
+    if len(same_name) > 1 and not rows_with_project_id:
+        warnings.append("OmniFocus 里有 %d 个同名项目「%s」—— 这份清单没有 project_id，"
+                        "只能按项目名归组，同名项目会串在一起。" % (len(same_name), name))
     members, done = [], 0
     for r in rows:
         if r.get("kind") == "project_root":
             continue
-        if _one_line(r.get("project")) != name:
+        remote_project_id = str(r.get("project_id") or "").strip()
+        if remote_project_id:
+            # 身份只认 OmniFocus 项目 primary key；同名项目不会再串。
+            if remote_project_id != pk:
+                continue
+        elif _one_line(r.get("project")) != name:
             continue
         if r.get("dropped"):
             continue
@@ -902,7 +914,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
             continue
         if ts.parse_minutes(item.get("duration")) is None:
             missing.append(item.get("title") or item.get("pk"))
-    depth_errors = hierarchy_errors(members)
+    depth_errors = hierarchy_errors(members, only_active=True)
     if depth_errors:
         warnings.append("有 %d 条任务超过父-子两层（严禁三层）：%s"
                         % (len(depth_errors),

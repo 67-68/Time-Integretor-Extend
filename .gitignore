@@ -7,3 +7,6 @@ data/settings.json
 data/tasks.json.bak
 # 网络失败账：每台机器自己那份（`re-action` 重放的就是它）
 data/failed-actions.json
+data/projects.json
+data/projects.json.bak
+data/project-sync.json

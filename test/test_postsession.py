@@ -49,6 +49,8 @@ def check_raises(label, fn):
 
 TMP = tempfile.mkdtemp(prefix="postsession-test-")
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
+os.environ["TI_PROJECTS_FILE"] = os.path.join(TMP, "projects.json")
+os.environ["TI_PROJECT_SYNC_FILE"] = os.path.join(TMP, "project-sync.json")
 os.environ["TI_TASK_ARCHIVE"] = os.path.join(TMP, "archive.json")
 os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
 os.environ["TI_POSTSESSION_FILE"] = os.path.join(TMP, "postsession.json")

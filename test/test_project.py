@@ -403,6 +403,65 @@ check("三层任务被点名", [e["title"] for e in _sub_bad["depth_errors"]],
 check_true("三层任务有明确拒绝话术",
            "严禁三层任务" in pj.format_depth_errors(_sub_bad))
 
+print("== 同名项目：按 OmniFocus 项目 primary key 分组，不串 ==")
+_dup_rows = [
+    {"id": "p-dup-a", "name": "同名项目", "kind": "project_root"},
+    {"id": "a-task", "name": "A 的任务", "kind": "action",
+     "project": "同名项目", "project_id": "p-dup-a",
+     "estimated_minutes": 25, "completed": False},
+    {"id": "p-dup-b", "name": "同名项目", "kind": "project_root"},
+    {"id": "b-task", "name": "B 的任务", "kind": "action",
+     "project": "同名项目", "project_id": "p-dup-b",
+     "estimated_minutes": 50, "completed": False},
+]
+_payload_a = pj.project_payload(_dup_rows[0], _dup_rows, now=_fixed_now)
+_payload_b = pj.project_payload(_dup_rows[2], _dup_rows, now=_fixed_now)
+check("同名项目 A 只拿自己的任务",
+      [t["pk"] for t in _payload_a["tasks"]], ["a-task"])
+check("同名项目 B 只拿自己的任务",
+      [t["pk"] for t in _payload_b["tasks"]], ["b-task"])
+check("有 project_id 时不再报同名串项目", _payload_a["warnings"], [])
+check("同名项目任务时长各自正确",
+      (_payload_a["tasks"][0]["duration"], _payload_b["tasks"][0]["duration"]),
+      (25, 50))
+
+wd_dup = fresh(_dup_rows)
+check("导入第一个同名项目", wd_dup.handle("task import omnifocus:///project/p-dup-a"), True)
+check("导入第二个同名项目", wd_dup.handle("task import omnifocus:///project/p-dup-b"), True)
+_dup_projects = wd_dup.projects.active()
+check("两个同名项目分别进库",
+      [(p["omnifocus"]["id"], [t["pk"] for t in p["tasks"]])
+       for p in _dup_projects],
+      [("p-dup-a", ["a-task"]), ("p-dup-b", ["b-task"])])
+
+print("== 导入校验只看活跃/推迟任务：完成/放弃的任务不参与层级和时长检查 ==")
+_done_deep = [dict(r) for r in _sub_grand]
+for item in _done_deep:
+    if item["id"] == "grand":
+        item["completed"] = True
+_done_payload = pj.project_payload(_done_deep[0], _done_deep, now=_fixed_now)
+check("已完成的孙任务不触发三层错误", _done_payload["depth_errors"], [])
+_done_missing = [
+    {"id": "p-donecheck", "name": "完成检查项目", "kind": "project_root"},
+    {"id": "done-bad", "name": "已完成但没时长", "kind": "action",
+     "project": "完成检查项目", "estimated_minutes": 0, "completed": True},
+    {"id": "defer-ok", "name": "推迟但有时长", "kind": "action",
+     "project": "完成检查项目", "estimated_minutes": 25, "completed": False,
+     "defer": "2026-11-05T09:00:00"},
+]
+_done_missing_payload = pj.project_payload(
+    _done_missing[0], _done_missing, now=_fixed_now)
+check("已完成但没时长的任务不挡导入", _done_missing_payload["missing"], [])
+_defer_bad = _done_missing + [
+    {"id": "defer-bad", "name": "推迟但没时长", "kind": "action",
+     "project": "完成检查项目", "estimated_minutes": 0, "completed": False,
+     "defer": "2026-11-05T10:00:00"},
+]
+_defer_bad_payload = pj.project_payload(
+    _defer_bad[0], _defer_bad, now=_fixed_now)
+check("推迟的活跃任务仍要检查时长",
+      _defer_bad_payload["missing"], ["推迟但没时长"])
+
 print("== 子任务完成：一条条勾，全部完成父任务自动完成 ==")
 reset_projects()
 _sub_store = pj.ProjectStore()
@@ -567,7 +626,7 @@ _week_rows = [
      "project": "周导入项目", "estimated_minutes": 25, "completed": False},
     {"id": "w-defer", "name": "周四开放但没时长", "kind": "action",
      "project": "周导入项目", "estimated_minutes": 0, "completed": False,
-     "defer": _thu.isoformat() + "T09:00:00"},
+     "defer": "2026-11-05T09:00:00"},
     {"id": "w-rep", "name": "重复但没时长", "kind": "action",
      "project": "周导入项目", "estimated_minutes": 0, "completed": False},
 ]

@@ -67,6 +67,8 @@ os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
 # data/tasks.json —— 任务一多，契约表就变宽，`已匹配` 会被压成 `已匹`，用例跟着红；
 # 更糟的是重复任务会在 refresh 里被 materialize，那是会**写**真库的。
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
+os.environ["TI_PROJECTS_FILE"] = os.path.join(TMP, "projects.json")
+os.environ["TI_PROJECT_SYNC_FILE"] = os.path.join(TMP, "project-sync.json")
 # 真实的 temp/keep_session-nostart.json 里可能正躺着 daemon 刚入队的「到点没开始」，
 # 不钉住的话 warden 一开就会弹那一问、把命令输入吃掉（p/x/s 才认）。
 os.environ["TI_NOSTART_FILE"] = os.path.join(TMP, "nostart.json")
