@@ -35,11 +35,11 @@ warden.py          接线                 task import 认项目、任务面板�
     "omnifocus": {"id": "p-abc", "url": "omnifocus:///project/p-abc", "title": "论文"},
     "status": "active",                       // active / dropped（撤掉是删记录，不是标记）
     "imported_at": "…", "synced_at": "…",     // synced_at = 上次读 OmniFocus 的时间
-    "tasks": [{                               // **全部**任务（含已完成的），按 OmniFocus 顺序
+    "tasks": [{                               // **全部**任务（含已完成/已放弃），按 OmniFocus 顺序
       "pk": "t-intro", "title": "写引言", "parent": "论文", "parent_id": "",
       "due": "2026-11-04T11:50:00",
       "count": 3, "duration": 75,             // estimated minutes ÷ 25（往上取整）
-      "completed": false, "blocked": false, "rank": 0
+      "completed": false, "dropped": false, "blocked": false, "rank": 0
     }],
     "plans": {                                // 按天记：这一天说好多少 count、真排了哪几条
       "2026-11-04": {
@@ -71,9 +71,11 @@ warden.py          接线                 task import 认项目、任务面板�
    周的口径固定为**周一 00:00 到下周一 00:00**，不从导入当天滚动七天。比如
    周三导入，周四才开放的被推迟任务算本周；重复任务本周一、周三各一次，就按
    **两条**算，哪怕 OmniFocus 现在只存在当前这一条。
-3. **时长是硬门槛（只查 active / deferred）**：项目里**每条未完成、未放弃的任务**
-   （含被推迟的）都必须有「持续时间」（OmniFocus 的 `estimated_minutes`）。
-   已完成 / 已放弃的任务不参与校验。少一条 → **整批拒绝导入**，列出是哪几条；
+3. **时长是硬门槛（只查有效 active / deferred）**：项目里**每条有效状态为
+   active 的任务**（含被推迟的）都必须有「持续时间」（OmniFocus 的
+   `estimated_minutes`）。子任务的有效状态会继承父任务：父任务已完成或已放弃时，
+   没有单独改过完成/放弃状态的子任务同样视为已完成/已放弃，不参与校验和排期。
+   少一条 → **整批拒绝导入**，列出是哪几条；
    本周会产出的重复 occurrence / 被推迟任务缺时长时，还会点名具体日期。这一次
    **一条任务、一个项目都不建**（用户要求：「报错并让用户去设置，拒绝导入」）。
    理由很简单：没有时长就算不出几个 count，而项目一旦被唤起就是满地 0 count 的任务。
@@ -86,8 +88,8 @@ warden.py          接线                 task import 认项目、任务面板�
 所以两个同名项目也不会串。旧版清单没有 `project_id` 时才退回按 `project` 名字
 分组，并在同名时明确报警。父任务层级同样优先用 `parent_id`。
 
-已完成的任务照样进清单（算进度要用），但**不参与层级 / 时长 / 本周任务校验**；
-`project refresh` 时按最新状态覆盖。
+已完成 / 已放弃的任务照样进清单（算进度和保留层级要用），但**不参与层级 /
+时长 / 本周任务校验**；`project refresh` 时按最新状态覆盖。
 
 ## 子任务：最多父-子两层
 
@@ -101,7 +103,11 @@ warden.py          接线                 task import 认项目、任务面板�
 ```
 
 - 父任务 + 子任务之外再出现孙任务（三层）→ **整个项目拒绝导入**，并点名是哪条。
-  只检查未完成、未放弃的 active / deferred 任务；已完成/已放弃的旧层级不挡导入；
+  只检查有效状态为 active 的任务；已完成/已放弃的旧层级不挡导入；
+- **状态继承**：子任务自己没标 completed / dropped 时，跟着父任务的有效状态走。
+  父任务完成 → 子任务按 completed 算；父任务放弃 → 子任务按 dropped 算。子任务
+  自己显式标了 completed / dropped 的，按子任务自己的状态优先。继承关闭的子任务
+  不计入本周预算、不进入 `plan` 的可用任务，也不要求 estimated_minutes；
 - 父任务本身是空壳：不需要自己的 estimated_minutes，剩余时长 = 未完成子任务
   时长之和；项目进度/本周任务预算只按叶子任务算一遍，不重复计父壳；
 - 子任务不可拆到两场 session。排期以父任务为单元选场次，但**session 里只建子

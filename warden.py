@@ -3488,16 +3488,20 @@ class Warden(object):
             made.append(project)
             num = self.projects.number_of(project["id"]) or project["id"]
             tasks = project.get("tasks") or []
-            open_tasks = [t for t in tasks if not t.get("completed")]
+            open_tasks = [t for t in tasks
+                          if not t.get("completed") and not t.get("dropped")]
+            done_tasks = [t for t in tasks if t.get("completed")]
+            dropped_tasks = [t for t in tasks if t.get("dropped")]
             stat = pj.stats(project, self.task_store)
             head = "📁 导入项目" if created else "🔄 刷新项目"
             self.say("%s #%d「%s」→ OmniFocus 项目 %s"
                      % (head, num, project.get("title"),
                         (project.get("omnifocus") or {}).get("id") or "?"), "ok")
-            self.say("   %d 条任务（%d 条未完成、%d 条已完成）· 共 %d count = %d 分钟"
-                     " · 剩余 %d count（进度 %s）"
-                     % (len(tasks), len(open_tasks), len(tasks) - len(open_tasks),
-                        stat["total"], stat["total"] * pp.MINUTES_PER_COUNT,
+            self.say("   %d 条任务（%d 条未完成、%d 条已完成、%d 条已放弃）"
+                     " · 共 %d count = %d 分钟 · 剩余 %d count（进度 %s）"
+                     % (len(tasks), len(open_tasks), len(done_tasks),
+                        len(dropped_tasks), stat["total"],
+                        stat["total"] * pp.MINUTES_PER_COUNT,
                         stat["remaining"], stat["progress_text"]), "info")
             week = pj.weekly_yield(tasks)
             if week.get("count"):
@@ -8220,7 +8224,7 @@ class Warden(object):
         infos = {}
         for item in (payload or {}).get("tasks") or ():
             pk = str(item.get("pk") or "")
-            if not pk or item.get("completed"):
+            if not pk or item.get("completed") or item.get("dropped"):
                 continue
             try:
                 info = checker(pk)

@@ -46,10 +46,13 @@ data/projects.json   项目母体：任务清单 + 每天分配了多少 count +
 
 | 数字 | 怎么来的 |
 | --- | --- |
-| 总 count | 清单里每条任务的 ``count`` 求和（``count`` 来自 OmniFocus 的 estimated minutes ÷ 25，往上取整） |
+| 总 count | 清单里每条有效 active / completed 叶子任务的 ``count`` 求和（``count`` 来自 OmniFocus 的 estimated minutes ÷ 25，往上取整） |
 | 已投入 | 本地任务库那条链上 ``count_invested`` 求和（被 plan 唤起过的活真干了多少） |
-| 已完成 | OmniFocus 那边 ``completed`` 的任务算满；其余按「已投入」封顶 |
+| 已完成 | OmniFocus 那边有效状态为 ``completed`` 的任务算满；其余按「已投入」封顶 |
 | 剩余 | 总 − 已完成（**已投入但没做完的也会减掉**：干了一半就是干了一半） |
+
+父任务完成/放弃后，没有单独改状态的子任务继承父任务的有效状态；``dropped``
+的任务不计入总账，也不进入 ``remaining_tasks`` / ``weekly_yield``。
 
 **没有第二本账**：项目库不记「我做掉了多少」，它只记清单和分配；进度由
 ``tasks.json`` 的 ``count_invested`` 现算。所以收尾里怎么记 count、这里就怎么显示，
@@ -80,7 +83,9 @@ DEFAULT_PROJECTS_FILE = os.path.join(DATA_DIR, "projects.json")
 VERSION = 1
 
 STATUS_ACTIVE = "active"
+STATUS_COMPLETED = "completed"
 STATUS_DROPPED = "dropped"
+#: 项目本身的 status（只有 active / dropped）；任务的有效状态还包含 completed。
 STATUSES = (STATUS_ACTIVE, STATUS_DROPPED)
 
 #: 唤起出来的本地任务用这几个 ``fields`` 键指回项目。字段名就是界面上显示的名字
@@ -272,6 +277,60 @@ def top_level_tasks(tasks):
     return out
 
 
+def effective_task_statuses(tasks):
+    """``pk -> active / completed / dropped``，把父任务状态传给未单独改状态的子任务。
+
+    OmniFocus 里父任务完成或放弃后，子任务有时仍会以 ``completed=False`` /
+    ``dropped=False`` 的原始行返回；它的真实状态由父任务继承。这里统一算出有效
+    状态，避免导入校验、周预算和 ``plan`` 把这种子任务当成还能干的活。
+
+    规则：任务自己的 ``completed`` / ``dropped`` 是显式状态，优先保留；自己没有
+    显式关闭时，继承最近一层父任务的有效状态。父任务不在清单里或层级成环时，
+    按 active 处理，交给层级校验去报错。
+    """
+    index = _task_map(tasks)
+    memo = {}
+
+    def resolve(pk, trail):
+        if pk in memo:
+            return memo[pk]
+        item = index.get(pk)
+        if not item or pk in trail:
+            return STATUS_ACTIVE
+        # 显式状态优先：子任务被单独完成/放弃后，不再被父任务反向覆盖。
+        if item.get("dropped"):
+            status = STATUS_DROPPED
+        elif item.get("completed"):
+            status = STATUS_COMPLETED
+        else:
+            parent_pk = str(item.get("parent_id") or "").strip()
+            parent = index.get(parent_pk)
+            if not parent or parent_pk == pk:
+                status = STATUS_ACTIVE
+            else:
+                status = resolve(parent_pk, trail | {pk})
+        memo[pk] = status
+        return status
+
+    for pk in index:
+        resolve(pk, set())
+    return memo
+
+
+def task_status(item, tasks=None, statuses=None):
+    """一条任务的有效状态；不传清单时只看它自己的字段。"""
+    if statuses is None:
+        statuses = effective_task_statuses(tasks or [item or {}])
+    key = str((item or {}).get("pk") or (item or {}).get("id") or "").strip()
+    if key:
+        return statuses.get(key, STATUS_ACTIVE)
+    if (item or {}).get("dropped"):
+        return STATUS_DROPPED
+    if (item or {}).get("completed"):
+        return STATUS_COMPLETED
+    return STATUS_ACTIVE
+
+
 def hierarchy_errors(tasks, only_active=False):
     """检查「最多父-子两层」；返回 ``[{"pk", "title", "depth", "chain"}]``。
 
@@ -280,13 +339,14 @@ def hierarchy_errors(tasks, only_active=False):
     不参与导入校验。
     """
     index = _task_map(tasks)
+    statuses = effective_task_statuses(tasks) if only_active else {}
     errors = []
     for item in tasks or ():
         if not isinstance(item, dict):
             continue
-        if only_active and (item.get("completed") or item.get("dropped")):
-            continue
         pk = str(item.get("pk") or item.get("id") or "").strip()
+        if only_active and statuses.get(pk, STATUS_ACTIVE) != STATUS_ACTIVE:
+            continue
         chain = [pk]
         cursor = item
         seen = {pk}
@@ -526,11 +586,12 @@ def weekly_yield(tasks, now=None):
     all_tasks = [dict(item) for item in (tasks or ()) if isinstance(item, dict)]
     index = _task_map(all_tasks)
     kids = child_map(all_tasks)
+    statuses = effective_task_statuses(all_tasks)
     for raw in all_tasks:
         item = raw if isinstance(raw, dict) else {}
-        if item.get("completed") or item.get("dropped"):
-            continue
         pk = str(item.get("pk") or item.get("id") or "")
+        if statuses.get(pk, STATUS_ACTIVE) != STATUS_ACTIVE:
+            continue
         # 子任务不单独计入「本周产生多少条」；父任务壳代表这一整套。
         parent_pk = str(item.get("parent_id") or "").strip()
         if parent_pk and parent_pk in index:
@@ -538,10 +599,11 @@ def weekly_yield(tasks, now=None):
         title = _one_line(item.get("title") or item.get("name")) or pk or "?"
         children = kids.get(pk) or []
         if children:
-            missing_children = [child for child in children
-                                if not child.get("completed")
-                                and ts.parse_minutes(child.get("duration")) is None]
-            good_children = [child for child in children if not child.get("completed")]
+            good_children = [child for child in children
+                             if statuses.get(str(child.get("pk") or child.get("id") or ""),
+                                             STATUS_ACTIVE) == STATUS_ACTIVE]
+            missing_children = [child for child in good_children
+                                if ts.parse_minutes(child.get("duration")) is None]
             minutes = (sum(_item_minutes(child) for child in good_children)
                        if good_children and not missing_children else None)
             if not good_children:
@@ -745,6 +807,7 @@ def _norm_task(raw, rank=0):
         "count": int(count or 0),
         "duration": minutes,
         "completed": bool(raw.get("completed")),
+        "dropped": bool(raw.get("dropped")),
         "blocked": bool(raw.get("blocked")),
         "rank": _as_int(raw.get("rank")) if raw.get("rank") is not None else int(rank),
     }
@@ -829,9 +892,11 @@ def normalize(store):
 def project_payload(row, rows, repeat_infos=None, now=None):
     """OmniFocus 的 ``project_root`` 行 + 全量行 → 项目 payload（纯函数）。
 
-    ``tasks`` 是全部任务（含已完成的，界面算进度要用）；``missing`` 是**全部**
-    未完成任务里没设持续时间的标题；``week`` 是本周（周一起）会产生的任务，
-    包含当前 active、被推迟到本周开放的、以及重复任务本周的 occurrence。
+    ``tasks`` 是全部任务（含已完成、已放弃的，界面算进度和层级继承要用）；
+    ``missing`` 是**全部有效状态为 active 的任务**里没设持续时间的标题；``week``
+    是本周（周一起）会产生的任务，包含当前 active、被推迟到本周开放的、以及重复
+    任务本周的 occurrence。父任务完成/放弃时，没有单独改状态的子任务继承同样
+    状态，不会被当成可用任务，也不参与时长/层级校验。
 
     ``repeat_infos`` 是 ``{task_pk: repetition_info()}``。重复规则不在
     ``omnifocus_tasks.py list`` 的字段里，所以由调用方查好传进来；纯函数本身不
@@ -857,7 +922,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
     if len(same_name) > 1 and not rows_with_project_id:
         warnings.append("OmniFocus 里有 %d 个同名项目「%s」—— 这份清单没有 project_id，"
                         "只能按项目名归组，同名项目会串在一起。" % (len(same_name), name))
-    members, done = [], 0
+    project_rows = []
     for r in rows:
         if r.get("kind") == "project_root":
             continue
@@ -868,15 +933,22 @@ def project_payload(row, rows, repeat_infos=None, now=None):
                 continue
         elif _one_line(r.get("project")) != name:
             continue
-        if r.get("dropped"):
-            continue
-        title = _one_line(r.get("name")) or str(r.get("id") or "?")
-        minutes = ts.parse_minutes(r.get("estimated_minutes"))
-        completed = bool(r.get("completed"))
+        project_rows.append(r)
+
+    # 先按完整清单（包含已放弃的父任务）算有效状态，再落成成员记录。
+    statuses = effective_task_statuses(project_rows)
+    members, done = [], 0
+    for r in project_rows:
+        raw_pk = str(r.get("id") or "").strip()
+        status = statuses.get(raw_pk, STATUS_ACTIVE)
+        completed = status == STATUS_COMPLETED
+        dropped = status == STATUS_DROPPED
         if completed:
             done += 1
+        title = _one_line(r.get("name")) or raw_pk or "?"
+        minutes = ts.parse_minutes(r.get("estimated_minutes"))
         item = {
-            "pk": str(r.get("id") or ""),
+            "pk": raw_pk,
             "title": title,
             "parent": _one_line(r.get("parent")),
             "parent_id": str(r.get("parent_id") or "").strip(),
@@ -887,6 +959,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
             "duration": minutes,
             "count": ts.minutes_to_count(minutes) if minutes else 0,
             "completed": completed,
+            "dropped": dropped,
             "blocked": bool(r.get("blocked")),
             "rank": len(members),
         }
@@ -906,9 +979,10 @@ def project_payload(row, rows, repeat_infos=None, now=None):
             item["count"] = ts.minutes_to_count(item["duration"]) if item["duration"] else 0
     # 父任务本身是空壳：有子任务时不要求它自己有 estimated_minutes；缺时长的是
     # 具体子任务。没有子任务的普通任务仍按原来的硬门槛检查。
+    statuses = effective_task_statuses(members)
     missing = []
     for item in members:
-        if item.get("completed"):
+        if statuses.get(item["pk"], STATUS_ACTIVE) != STATUS_ACTIVE:
             continue
         if kids.get(item["pk"]):
             continue
@@ -1041,22 +1115,28 @@ def stats(project, task_store=None, invested_map=None):
 
     父任务壳的 ``duration/count`` 由子任务派生，不能和子任务重复计账：
     ``total/done/remaining`` 只逐条算叶子任务。父任务本身已完成的，它的子任务
-    在 OmniFocus 里通常也已完成，仍按叶子算，不会把父壳再加一遍。
+    在 OmniFocus 里通常也已完成，仍按叶子算，不会把父壳再加一遍；继承后为
+    dropped 的子树整棵不计账。
     """
     if invested_map is None:
         invested_map = invested(task_store, project)
     tasks = project.get("tasks") or []
     kids = child_map(tasks)
+    statuses = effective_task_statuses(tasks)
     total = done = remaining = 0
     for item in tasks:
         if kids.get(item.get("pk")):
+            continue
+        pk = str(item.get("pk") or "")
+        status = statuses.get(pk, STATUS_ACTIVE)
+        if status == STATUS_DROPPED:
             continue
         minutes = _item_minutes(item)
         cap = int(item.get("count") or 0)
         if not cap and minutes:
             cap = ts.minutes_to_count(minutes)
         total += cap
-        if item.get("completed"):
+        if status == STATUS_COMPLETED:
             done += cap
             continue
         got = min(cap, int(invested_map.get(item["pk"], 0) or 0))
@@ -1081,15 +1161,18 @@ def remaining_tasks(project, invested_map=None):
     invested_map = invested_map or {}
     tasks = project.get("tasks") or []
     kids = child_map(tasks)
+    statuses = effective_task_statuses(tasks)
     out = []
     for item in top_level_tasks(tasks):
-        if item.get("completed"):
+        pk = str(item.get("pk") or "")
+        if statuses.get(pk, STATUS_ACTIVE) != STATUS_ACTIVE:
             continue
         children = kids.get(item.get("pk")) or []
         if children:
             open_children = []
             for child in children:
-                if child.get("completed"):
+                child_pk = str(child.get("pk") or "")
+                if statuses.get(child_pk, STATUS_ACTIVE) != STATUS_ACTIVE:
                     continue
                 minutes = _item_minutes(child)
                 if minutes <= 0:

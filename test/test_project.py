@@ -462,6 +462,85 @@ _defer_bad_payload = pj.project_payload(
 check("推迟的活跃任务仍要检查时长",
       _defer_bad_payload["missing"], ["推迟但没时长"])
 
+print("== 子任务继承父任务状态：父完成/放弃 → 未单独改状态的子任务也关闭 ==")
+_inherit_done_rows = [
+    {"id": "p-inherit-done", "name": "继承完成项目", "kind": "project_root"},
+    {"id": "done-parent", "name": "已完成的父任务", "kind": "action",
+     "project": "继承完成项目", "estimated_minutes": None,
+     "completed": True, "dropped": False},
+    {"id": "done-child", "name": "没有单独改状态的子任务", "kind": "action",
+     "project": "继承完成项目", "parent_id": "done-parent",
+     "estimated_minutes": 0, "completed": False, "dropped": False},
+    {"id": "done-grand", "name": "孙任务也不该挡导入", "kind": "action",
+     "project": "继承完成项目", "parent_id": "done-child",
+     "estimated_minutes": 0, "completed": False, "dropped": False},
+]
+_inherit_done = pj.project_payload(
+    _inherit_done_rows[0], _inherit_done_rows, now=_fixed_now)
+_inherit_tasks = {t["pk"]: t for t in _inherit_done["tasks"]}
+check("父任务完成 → 子任务有效状态 completed",
+      (_inherit_tasks["done-child"]["completed"],
+       _inherit_tasks["done-child"]["dropped"]), (True, False))
+check("父任务完成 → 孙任务也继承 completed",
+      (_inherit_tasks["done-grand"]["completed"],
+       _inherit_tasks["done-grand"]["dropped"]), (True, False))
+check("继承完成的任务不参与时长校验", _inherit_done["missing"], [])
+check("继承完成的任务不触发三层层级报错", _inherit_done["depth_errors"], [])
+check("继承完成的子任务不产生本周任务", _inherit_done["week"]["count"], 0)
+check("继承完成的子任务不进入可用任务", pj.remaining_tasks(
+    dict(_inherit_done, id=1), {}), [])
+
+_inherit_drop_rows = [
+    {"id": "p-inherit-drop", "name": "继承放弃项目", "kind": "project_root"},
+    {"id": "drop-parent", "name": "已放弃的父任务", "kind": "action",
+     "project": "继承放弃项目", "estimated_minutes": None,
+     "completed": False, "dropped": True},
+    {"id": "drop-child", "name": "跟着父任务放弃", "kind": "action",
+     "project": "继承放弃项目", "parent_id": "drop-parent",
+     "estimated_minutes": 0, "completed": False, "dropped": False},
+    {"id": "drop-grand", "name": "孙任务也一起放弃", "kind": "action",
+     "project": "继承放弃项目", "parent_id": "drop-child",
+     "estimated_minutes": 0, "completed": False, "dropped": False},
+]
+_inherit_drop = pj.project_payload(
+    _inherit_drop_rows[0], _inherit_drop_rows, now=_fixed_now)
+_inherit_drop_tasks = {t["pk"]: t for t in _inherit_drop["tasks"]}
+check("父任务放弃 → 子任务有效状态 dropped",
+      (_inherit_drop_tasks["drop-child"]["completed"],
+       _inherit_drop_tasks["drop-child"]["dropped"]), (False, True))
+check("父任务放弃 → 孙任务也继承 dropped",
+      (_inherit_drop_tasks["drop-grand"]["completed"],
+       _inherit_drop_tasks["drop-grand"]["dropped"]), (False, True))
+check("继承放弃的任务不参与时长校验", _inherit_drop["missing"], [])
+check("继承放弃的任务不触发三层层级报错", _inherit_drop["depth_errors"], [])
+check("继承放弃的子任务不产生本周任务", _inherit_drop["week"]["count"], 0)
+check("继承放弃的子任务不进入可用任务", pj.remaining_tasks(
+    dict(_inherit_drop, id=1), {}), [])
+
+_inherit_override_rows = _inherit_drop_rows + [
+    {"id": "drop-child-done", "name": "单独改过完成的子任务", "kind": "action",
+     "project": "继承放弃项目", "parent_id": "drop-parent",
+     "estimated_minutes": 25, "completed": True, "dropped": False},
+]
+_inherit_override = pj.project_payload(
+    _inherit_override_rows[0], _inherit_override_rows, now=_fixed_now)
+_override_tasks = {t["pk"]: t for t in _inherit_override["tasks"]}
+check("子任务显式完成不被父任务放弃覆盖",
+      (_override_tasks["drop-child-done"]["completed"],
+       _override_tasks["drop-child-done"]["dropped"]), (True, False))
+check("父放弃 + 子显式完成：仍没有可排的任务",
+      pj.remaining_tasks(dict(_inherit_override, id=1), {}), [])
+check("显式完成的子任务仍计入完成账",
+      pj.stats(dict(_inherit_override, id=1))["progress_text"], "1/1")
+
+reset_projects()
+_inherit_store = pj.ProjectStore()
+_inherit_project, _ = _inherit_store.upsert(_inherit_drop)
+_inherit_saved = pj.task_by_pk(_inherit_project, "drop-child")
+check("项目库刷新后仍保存继承的 dropped",
+      (_inherit_saved.get("completed"), _inherit_saved.get("dropped")),
+      (False, True))
+
 print("== 子任务完成：一条条勾，全部完成父任务自动完成 ==")
 reset_projects()
 _sub_store = pj.ProjectStore()
