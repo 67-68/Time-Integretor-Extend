@@ -1235,6 +1235,43 @@ class ProjectStore(object):
         raise ValueError("项目序号 %r 不在范围里：#1–#%d（`project` 看全部）"
                          % (raw, len(projects)))
 
+    def find(self, token):
+        """把设置里的值解析成一个 active 项目；认 #序号 / id:N / OF pk / 项目名。
+
+        和 :meth:`resolve` 的区别是它也认项目名，并且把「找不到 / 重名」说成
+        一句适合显示在警告板里的话。设置 ``chore-project`` 走这里。
+        """
+        raw = str(token or "").strip()
+        if not raw:
+            raise ValueError("没填项目")
+        low = raw.lower()
+        if low.startswith("#"):
+            raw = raw[1:].strip()
+            low = raw.lower()
+        if low.startswith("id:") or raw.isdigit():
+            return self.resolve(raw)
+        projects = self.active()
+        for project in projects:
+            if str((project.get("omnifocus") or {}).get("id") or "") == raw:
+                return project
+        exact = [p for p in projects
+                 if str(p.get("title") or "").strip().casefold() == raw.casefold()]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            nums = "、".join("#%d" % (self.number_of(p["id"]) or p["id"])
+                             for p in exact)
+            raise ValueError("项目名「%s」有 %d 个同名项目（%s）；请改用 #序号"
+                             "（project 先看列表）" % (raw, len(exact), nums))
+        fuzzy = [p for p in projects
+                 if raw.casefold() in str(p.get("title") or "").casefold()]
+        if len(fuzzy) == 1:
+            return fuzzy[0]
+        if len(fuzzy) > 1:
+            raise ValueError("「%s」匹配到多个项目；请改用 #序号" % raw)
+        raise ValueError("项目库里找不到「%s」；先 `project` 看序号或 "
+                         "`task import` 导入项目" % raw)
+
     # -- 写 -----------------------------------------------------------
     def upsert(self, payload):
         """把一个项目 payload 写进库（**同一个 OmniFocus 项目只留一条**）。
@@ -1336,6 +1373,45 @@ class ProjectStore(object):
                 project["synced_at"] = _now()
                 self.save(store)
             return project, auto_done, newly
+        raise ValueError("没有项目 %s" % project_id)
+
+    def complete_task(self, project_id, task_pk):
+        """把项目清单里的一条任务标完成；若是子任务，全部兄弟完成则父壳自动完成。
+
+        返回 ``(project, task, auto_parent)``。``auto_parent`` 是这次被顺带
+        完成的父任务（没有就是 None）。只改本地项目库；OmniFocus 写回由
+        warden 决定（和普通任务完成同一条单向联动规则）。
+        """
+        want = str(task_pk or "").strip()
+        if not want:
+            raise ValueError("没给项目任务 pk")
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            task = task_by_pk(project, want)
+            if task is None:
+                raise ValueError("项目「%s」里没有任务 %s"
+                                 % (project.get("title") or project_id, want))
+            newly = not bool(task.get("completed"))
+            if newly:
+                task["completed"] = True
+                task["completed_at"] = _now()
+            auto_parent = None
+            parent_pk = str(task.get("parent_id") or "").strip()
+            if parent_pk:
+                parent = task_by_pk(project, parent_pk)
+                direct = children_of(project, parent_pk)
+                all_done = bool(direct) and all(
+                    bool(child.get("completed")) for child in direct)
+                if parent is not None and all_done and not parent.get("completed"):
+                    parent["completed"] = True
+                    parent["completed_at"] = _now()
+                    auto_parent = parent
+            if newly or auto_parent is not None:
+                project["synced_at"] = _now()
+                self.save(store)
+            return project, task, auto_parent
         raise ValueError("没有项目 %s" % project_id)
 
     def set_allocation(self, project_id, day, count):

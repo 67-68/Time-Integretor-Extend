@@ -1026,6 +1026,80 @@ check_true("警告板里也没了",
            not any("今天还没 plan" in getattr(item, "text", "")
                    for item in wd9.collect_warnings()))
 
+print("== 琐事 Project：设置项 + ProjectStore.find / complete_task ==")
+reset_projects()
+_chore_store = pj.ProjectStore()
+_chore_store.upsert({
+    "id": "p-chores", "title": "琐事库",
+    "tasks": [
+        {"pk": "chore-parent", "title": "收拾房间", "duration": 50,
+         "completed": False},
+        {"pk": "chore-a", "title": "倒垃圾", "parent_id": "chore-parent",
+         "duration": 25, "completed": False},
+        {"pk": "chore-b", "title": "洗碗", "parent_id": "chore-parent",
+         "duration": 25, "completed": False},
+    ],
+})
+check("find 认 #序号", _chore_store.find("#1")["title"], "琐事库")
+check("find 认项目名", _chore_store.find("琐事库")["title"], "琐事库")
+check("find 认 OmniFocus pk",
+      _chore_store.find("p-chores")["title"], "琐事库")
+_chore_proj, _chore_done, _chore_parent = _chore_store.complete_task(1, "chore-a")
+check("complete_task 只完成指定子任务",
+      pj.task_by_pk(_chore_proj, "chore-a")["completed"], True)
+check("还有一个子任务 → 父任务不自动完成", _chore_parent, None)
+_chore_proj, _chore_done, _chore_parent = _chore_store.complete_task(1, "chore-b")
+check("最后一个子任务完成 → 父壳自动完成",
+      (pj.task_by_pk(_chore_proj, "chore-b")["completed"],
+       _chore_parent and _chore_parent["pk"]),
+      (True, "chore-parent"))
+
+print("== 空闲屏：没有 session 时只显示绑定项目的一条琐事；m/c/q ==")
+wd_chore = fresh()
+_check_payload = {
+    "id": "p-chore-ui", "title": "琐事库",
+    "tasks": [
+        {"pk": "ui-a", "title": "倒垃圾", "duration": 25, "completed": False},
+        {"pk": "ui-b", "title": "洗碗", "duration": 50, "completed": False},
+    ],
+}
+wd_chore.projects.upsert(_check_payload)
+check_true("没绑定琐事 Project → 警告板里有提醒",
+           any(getattr(item, "source", "") == "琐事"
+               for item in wd_chore.collect_warnings()))
+wd_chore.chore_now = datetime.datetime.combine(TODAY, datetime.time(3, 0))
+check("set chore-project #1 受理", wd_chore.handle("set chore-project #1"), True)
+check("空闲 + 已绑定 → 自动切到琐事屏", wd_chore.view.name, "琐事")
+check("绑好了就不再警告",
+      [item for item in wd_chore.collect_warnings()
+       if getattr(item, "source", "") == "琐事"], [])
+snap = wd_chore.chore_snapshot()
+check("屏幕上当前是第一条未完成琐事",
+      (snap["project"]["title"], snap["task"]["title"]), ("琐事库", "倒垃圾"))
+check("c 换一条", wd_chore.handle("c"), True)
+check("当前任务换成第二条", wd_chore.chore_snapshot()["task"]["title"], "洗碗")
+check("m 完成当前琐事", wd_chore.handle("m"), True)
+_after = wd_chore.projects.find("#1")
+check("项目库里的「洗碗」已完成",
+      pj.task_by_pk(_after, "ui-b")["completed"], True)
+check("完成之后自动显示下一条未完成琐事",
+      wd_chore.chore_snapshot()["task"]["title"], "倒垃圾")
+_chore_buf = io.StringIO()
+wd_chore.console = Console(file=_chore_buf, width=120, force_terminal=False)
+wd_chore.paint()
+_chore_out = _chore_buf.getvalue()
+check_true("琐事屏显示当前任务", "倒垃圾" in _chore_out)
+check_true("琐事屏带 m/c/q 提示",
+           all(x in _chore_out for x in ("m 完成", "c 换一个", "q 退出")))
+check_true("琐事屏不画正常契约表 / 视图栏",
+           ("契约（data.csv" not in _chore_out and "视图 " not in _chore_out))
+check("q 回到正常界面（不是退出 TUI）", wd_chore.handle("q"), True)
+check("q 后回到契约视图", wd_chore.view.name, "契约")
+check_true("q 压制到下一场 session / 明天",
+           wd_chore.chore_suppressed_until is not None)
+wd_chore.refresh_warnings(force=True)
+check("同一段空档不再自动弹回", wd_chore.view.name, "契约")
+
 print()
 if fails:
     print("FAILED %d" % len(fails))

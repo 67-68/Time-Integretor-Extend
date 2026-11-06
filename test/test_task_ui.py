@@ -1072,6 +1072,37 @@ wd.bridge.calls[:] = []
 check("已经 ON 的不会再动一次", wd.apply_mutes(), [])
 wd.offline = True
 
+print("== mute-universal：13:00 窗口只碰尾巴也算；命令解析 ==")
+_saved_mutes = sp.load_mutes()
+sp.save_mutes(sp.empty_mutes())
+w.forget_mute_cache()
+WD_UNI = sch.weekday_of_day(TODAY)
+wd.messages = []
+check("mute-universal 受理",
+      wd.handle("mute-universal 12:30 - 13:15 %s" % WD_UNI), True)
+check("写成通用静音记录（不绑 T 时段）",
+      [(m.get("universal"), m.get("period"), m.get("weekday"),
+        m.get("start"), m.get("end")) for m in sp.universal_mutes()],
+      [(True, "", WD_UNI, "12:30", "13:15")])
+check_true("消息说清「有重叠就算」",
+           any("有重叠" in m[2] for m in wd.messages))
+wd.rebuild_rows()
+by_start = {r.get("startLabel"): r for r in wd.rows}
+check("12:00–12:50 只碰到窗口开头 → 也算静音",
+      by_start.get("12:00", {}).get("period_muted"), True)
+check("11:00–11:50 完全不碰 → 不静音",
+      by_start.get("11:00", {}).get("period_muted"), False)
+check("15:00 那场不在窗口里",
+      by_start.get("15:00", {}).get("period_muted"), False)
+wd.messages = []
+check("mute-universal off 撤销",
+      wd.handle("mute-universal off 12:30 - 13:15 %s" % WD_UNI), True)
+check("通用静音清空", sp.universal_mutes(), [])
+# 恢复本节之前那张表（T1 的按日期 + 按星期几两条），后面 unmute/看门狗还要用。
+sp.save_mutes(_saved_mutes)
+w.forget_mute_cache()
+wd.rebuild_rows()
+
 buf = io.StringIO()
 wd.console = Console(file=buf, width=240, force_terminal=False)
 wd.paint()

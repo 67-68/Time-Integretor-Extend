@@ -227,7 +227,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 实现 `render()` / `handle()`，再用 `@register_view` 注册；`paint()` / 切换 / 提示
 都会自动跟上（`VIEWS` 列表驱动，顺序即 Tab 顺序）。
 
-现有五个视图：
+现有六个视图：
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
@@ -236,6 +236,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
 | 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` + `plan` / `project` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
+| 6 | 琐事 | **没有 session 时自动接管**：只显示绑定的「琐事 Project」里一条未完成任务 + m/c/q 提示 | `m` 完成 / `c` 换一条 / `q` 回进入前的视图（并压制到下一场 session） |
 
 - **统计视图的数据链在 `stats.py`**（只读公开 API，按 ≤365 天分块拉全量历史，
   口径与缓存见 [`stat.md`](./stat.md)）。它不写任何东西：不改 `data.csv`、
@@ -305,7 +306,7 @@ working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列
 5. `--exec` / 测试 / 离线模式只做第 1 步的本地重算，不隐式发网络请求；真正的
    对账仍由显式 `refresh` 负责（避免脚本执行时凭空多出网络副作用）。
 
-- 通用命令（五个视图都认）：`Tab`（切视图）/ `open working|detail` /
+- 通用命令（所有视图都认）：`Tab`（切视图）/ `open working|detail` /
   `open|close <表头>` / `stat` / `status` / `help` / `quit`。
   注意：**罪案区锁死时 `stat` 也进不去**（和别的命令一样，除了敲宣言什么都不受理）——
   这是既有的锁语义，不是统计视图的特例。
@@ -712,7 +713,14 @@ python3 warden.py install-deps
   `ks.clear_abandoned(新排布 key)`，把「永不重订」判决撤掉 —— 否则一次误判就让
   那几场永远补不回来。详见 `session_plan.md`。
 - 第五个视图 `设置 / 规则` + `set <id> <value>`；`edit-tomorrow` 让「明天」临时按
-  草稿区处理（`Warden.effective_zone`），`tomorrow-plan` 是「明日时间安排」的规格。
+  草稿区处理（`Warden.effective_zone`），`tomorrow-plan` 是「明日时间安排」的规格，
+  `chore-project` 绑定空闲屏要显示的琐事项目。
+- 第六个视图 `琐事` 是**自动**空闲屏：没有 session 时整屏只有一条绑定项目的任务
+  和 `m` / `c` / `q` 提示；`q` 回到进入前的正常视图并压到下一场 session。
+  详见 [`chore_idle.md`](./chore_idle.md)。
+- `mute-universal 13:00 - 15:00 Mon`：不绑 T 时段，每个指定星期几里凡是与这个
+  时间窗**有重叠**的 session 都切 Focusmate quiet；详见
+  [`session_mute.md`](./session_mute.md)。
 - 契约表格下面那块任务面板**按位置连号排**（还是原来那一张表，不拆）：`未挂 session`
   的排最前，之后一场 session 一段（按开始时间）、段内按任务 ID 升序，同类的挨在一起
   （详见 `task.md`）。

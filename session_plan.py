@@ -874,6 +874,11 @@ def load_mutes(path=None):
             "end": fmt_hhmm(*end),
             "permanent": bool(item.get("permanent")),
         }
+        # 通用静音不绑日历时段：只按「星期几 + 时间窗」生效。保留这个标记，
+        # 是为了让「session 与窗口有重叠」这条新语义只作用于通用静音，
+        # 不改变旧 period mute「session 起点落在时段内」的含义。
+        if item.get("universal"):
+            rec["universal"] = True
         weekday = _weekday_label(item.get("weekday"))
         date = str(item.get("date") or "").strip()
         if weekday:
@@ -941,6 +946,155 @@ def mute_period(day, period, permanent=False, path=None):
     data["mutes"] = keep
     save_mutes(data, path)
     return rec
+
+
+def mute_universal(start, end, weekdays, path=None):
+    """加一条「每周某几天 HH:MM–HH:MM 一律静音」的通用静音窗。
+
+    ``weekdays`` 可以是 ``["mon"]`` 或 ``["mon", "wed"]``（调用方先解析）。
+    同一个星期几 + 同一个起点视为同一个目标：再设一次会覆盖终点，不叠加。
+    返回实际写入的记录列表（每个星期几一条）。
+    """
+    got_s, got_e = parse_hhmm(start), parse_hhmm(end)
+    if got_s is None or got_e is None:
+        raise ValueError("通用静音的时间窗要写成 HH:MM–HH:MM；你给的是 %r–%r"
+                         % (start, end))
+    if got_s == got_e:
+        raise ValueError("通用静音的起止时间不能相同（%s）" % fmt_hhmm(*got_s))
+    labels = []
+    for raw in weekdays or ():
+        label = _weekday_label(raw)
+        if label is None:
+            raise ValueError("认不出星期几：%r" % (raw,))
+        if label not in labels:
+            labels.append(label)
+    if not labels:
+        raise ValueError("通用静音至少要给一个星期几（mon..sun / 周一..周日）")
+
+    data = load_mutes(path)
+    keep = []
+    for old in data.get("mutes") or []:
+        if (old.get("universal") and old.get("weekday") in labels
+                and old.get("start") == fmt_hhmm(*got_s)):
+            continue
+        keep.append(old)
+    made = []
+    for label in labels:
+        rec = {
+            "period": "",
+            "universal": True,
+            "weekday": label,
+            "start": fmt_hhmm(*got_s),
+            "end": fmt_hhmm(*got_e),
+            "permanent": True,
+            "created_at": _now(),
+        }
+        keep.append(rec)
+        made.append(rec)
+    keep.sort(key=lambda r: (r.get("weekday") or "", r.get("date") or "",
+                             r.get("start") or ""))
+    data["mutes"] = keep
+    save_mutes(data, path)
+    return made
+
+
+def unmute_universal(start=None, end=None, weekdays=None, path=None):
+    """撤销通用静音窗；不给过滤条件 = 清掉全部通用静音。返回删掉的记录。"""
+    labels = None
+    if weekdays is not None:
+        labels = []
+        for raw in weekdays or ():
+            label = _weekday_label(raw)
+            if label is None:
+                raise ValueError("认不出星期几：%r" % (raw,))
+            if label not in labels:
+                labels.append(label)
+    got_s = parse_hhmm(start) if start not in (None, "") else None
+    if start not in (None, "") and got_s is None:
+        raise ValueError("开始时间要写成 HH:MM；你给的是 %r" % (start,))
+    got_e = parse_hhmm(end) if end not in (None, "") else None
+    if end not in (None, "") and got_e is None:
+        raise ValueError("结束时间要写成 HH:MM；你给的是 %r" % (end,))
+    data = load_mutes(path)
+    gone = []
+    keep = []
+    for rec in data.get("mutes") or []:
+        hit = bool(rec.get("universal"))
+        if labels is not None:
+            hit = hit and rec.get("weekday") in labels
+        if got_s is not None:
+            hit = hit and rec.get("start") == fmt_hhmm(*got_s)
+        if got_e is not None:
+            hit = hit and rec.get("end") == fmt_hhmm(*got_e)
+        if hit:
+            gone.append(rec)
+        else:
+            keep.append(rec)
+    if gone:
+        data["mutes"] = keep
+        save_mutes(data, path)
+    return gone
+
+
+def universal_mutes(data=None):
+    """全部通用静音记录（给 list 命令用）。"""
+    data = data if isinstance(data, dict) else load_mutes(data)
+    return [rec for rec in data.get("mutes") or [] if rec.get("universal")]
+
+
+def _window_for_date(rec, day):
+    """一条记录锚定在 ``day`` 这天的绝对时间窗；不适用返回 None。"""
+    got_s, got_e = parse_hhmm(rec.get("start")), parse_hhmm(rec.get("end"))
+    if got_s is None or got_e is None:
+        return None
+    weekday = _weekday_label(day.weekday())
+    if rec.get("date"):
+        if rec.get("date") != _day_iso(day):
+            return None
+    elif rec.get("weekday") != weekday:
+        return None
+    begin = datetime.datetime.combine(day, datetime.time(got_s[0], got_s[1]))
+    finish = datetime.datetime.combine(day, datetime.time(got_e[0], got_e[1]))
+    if finish <= begin:
+        finish += datetime.timedelta(days=1)
+    return begin, finish
+
+
+def mute_overlaps_window(day, start, end, data=None, universal_only=True):
+    """``day start–end`` 与哪条静音窗**有重叠** → 那条记录；没有就是 None。
+
+    通用静音（``mute-universal``）按用户要求「只要涉及了就算」：哪怕 session
+    是 14:30–15:30，只要和 13:00–15:00 有交集就静音。``universal_only=True``
+    时旧的 ``period mute`` 不参与，保持它原来的「起点在窗内」语义。
+    跨午夜窗口会检查前一天锚定的那条。
+    """
+    got_s, got_e = parse_hhmm(start), parse_hhmm(end)
+    if got_s is None or got_e is None:
+        return None
+    begin = datetime.datetime.combine(day, datetime.time(got_s[0], got_s[1]))
+    finish = datetime.datetime.combine(day, datetime.time(got_e[0], got_e[1]))
+    if finish <= begin:
+        finish += datetime.timedelta(days=1)
+    data = data if isinstance(data, dict) else load_mutes(data)
+    # 窗口可能从前一天跨过来；也可能从当天跨到次日，检查前后各一天。
+    for delta in (-1, 0, 1):
+        base = day + datetime.timedelta(days=delta)
+        for rec in mutes_for_day(base, data):
+            if universal_only and not rec.get("universal"):
+                continue
+            window = _window_for_date(rec, base)
+            if not window:
+                continue
+            lo, hi = window
+            if lo < finish and begin < hi:
+                return rec
+    return None
+
+
+def is_universal_muted_session(day, start, end, data=None):
+    """给排障 / 测试：这一场是否被通用静音窗覆盖。"""
+    return mute_overlaps_window(day, start, end, data=data,
+                                universal_only=True) is not None
 
 
 def unmute_period(day, period_id, permanent=False, path=None):

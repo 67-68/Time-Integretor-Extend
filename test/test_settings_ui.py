@@ -137,19 +137,22 @@ def render(wd, width=120):
 
 print("== settings_store：注册表 / 取值 / 落盘 ==")
 rows = cfgs.SettingStore().rows()
-check("设置项齐全（含 OmniFocus / 收尾 / 到点没开始那几项）",
+check("设置项齐全（含 OmniFocus / 收尾 / 到点没开始 / 琐事项目）",
       [r["id"] for r in rows],
-      ["edit-tomorrow", "omnifocus", "postsession", "nostart", "tomorrow-plan"])
+      ["edit-tomorrow", "omnifocus", "postsession", "nostart", "tomorrow-plan",
+       "chore-project"])
 check("每项都有解释", all(r["desc"] for r in rows), True)
 check("没改过也列出来（并标出默认值）",
       [(r["value"], r["changed"]) for r in rows],
-      [("on", False), ("on", False), ("on", False), ("on", False), ("", False)])
+      [("on", False), ("on", False), ("on", False), ("on", False),
+       ("", False), ("", False)])
 store = cfgs.SettingStore()
 check("默认 edit-tomorrow = on", store.get_bool("edit-tomorrow"), True)
 check("set off", store.set("edit-tomorrow", "off"), "off")
 check("落盘了", store.get("edit-tomorrow"), "off")
 check("界面里标成「改过的」",
-      [r["changed"] for r in store.rows()], [True, False, False, False, False])
+      [r["changed"] for r in store.rows()],
+      [True, False, False, False, False, False])
 check("改回默认值 = 不算改过（跟着以后的默认走）",
       (store.set("edit-tomorrow", "on"), store.is_set("edit-tomorrow")), ("on", False))
 check("bool 只认 on/off",
@@ -168,6 +171,10 @@ check("重复规格：mon@22:15", cfgs.coerce_value("tomorrow-plan", "周一@22:
 check("重复规格：空 = 清掉", cfgs.coerce_value("tomorrow-plan", "off"), "")
 check("reset 回到默认", store.set("tomorrow-plan", "mon@22:15") and
       store.reset("tomorrow-plan"), "")
+check("琐事项目设置接受 #序号 / 项目名",
+      (cfgs.coerce_value("chore-project", "#1"),
+       cfgs.coerce_value("chore-project", " 琐事库 "), ""),
+      ("#1", "琐事库", ""))
 
 # ---------------------------------------------------------------- 设置视图
 
@@ -213,6 +220,9 @@ check("框线那行没有 ASCII 的 + - | 残留",
 check_true("框里有契约那行", "契约" in text and "data.csv" in text)
 check_true("框里有警告", "!" in text or "x" in text)
 check_true("框里有怎么修的提示", "→" in text)
+check_true("没绑定琐事 Project 时状态框明确提醒",
+           any("琐事 Project" in getattr(item, "text", "")
+               for item in wd.collect_warnings()))
 check_true("状态框只在「契约」视图显示", wd.shell.warnings_allowed())
 wd.go_to_view(w.StatsView)
 check("统计视图不显示警告", wd.shell.warnings_allowed(), False)

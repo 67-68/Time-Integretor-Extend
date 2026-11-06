@@ -70,7 +70,8 @@ check("合法排布落盘", len(sessions), 4)
 check("layout 文件已创建", os.path.exists(LP), True)
 layouts = sp.load_layouts(LP)
 check("layout 里是四个 25", [s["duration"] for s in sessions], [25, 25, 25, 25])
-csv = sp.render_data_csv(sp.load_download(DL), layouts)
+csv = sp.render_data_csv(sp.load_download(DL), layouts,
+                        extras=sp.empty_extras(), rules=sp.empty_rules())
 check("data.csv 写精确日期行",
       [l for l in csv.splitlines() if l and not l.startswith("#")],
       ["2026-10-26,11:00,25", "2026-10-26,11:30,25",
@@ -194,6 +195,39 @@ gone = sp.unmute_period(DAY, "T1", permanent=True)
 check("撤销按星期几那条", [g["period"] for g in gone], ["T1"])
 check("T2 还在", [m["period"] for m in sp.load_mutes()["mutes"]], ["T2"])
 check("撤销不存在的不报错", sp.unmute_period(DAY, "T9", permanent=True), [])
+
+print("== mute-universal：每周固定窗口，session 与窗口有重叠就算 ==")
+sp.save_mutes(sp.empty_mutes())
+_recs = sp.mute_universal("13:00", "15:00", ["mon"])
+check("写入一条星期一通用静音",
+      [(r.get("universal"), r.get("period"), r.get("weekday"),
+        r.get("start"), r.get("end")) for r in sp.universal_mutes()],
+      [(True, "", "mon", "13:00", "15:00")])
+MON = datetime.date(2026, 11, 2)          # 周一
+check("13:00–15:00 完整覆盖",
+      sp.is_universal_muted_session(MON, "13:30", "14:00"), True)
+check("14:30–15:30 只碰到尾巴也算",
+      sp.is_universal_muted_session(MON, "14:30", "15:30"), True)
+check("12:30–13:15 只碰到开头也算",
+      sp.is_universal_muted_session(MON, "12:30", "13:15"), True)
+check("刚好在终点结束不算重叠",
+      sp.is_universal_muted_session(MON, "15:00", "15:30"), False)
+check("刚好在起点前结束不算重叠",
+      sp.is_universal_muted_session(MON, "12:00", "13:00"), False)
+check("星期二不受影响",
+      sp.is_universal_muted_session(
+          datetime.date(2026, 11, 3), "14:30", "15:30"), False)
+check("通用静音不会被误当成某个 T 时段",
+      sp.muted_period_ids(MON), set())
+check("同一星期几 + 起点再设有覆盖，不叠加",
+      len(sp.mute_universal("13:00", "16:00", ["mon"])), 1)
+check("终点被覆盖",
+      [(r["start"], r["end"]) for r in sp.universal_mutes()], [("13:00", "16:00")])
+check("按时间窗撤销",
+      [(r["start"], r["end"], r["weekday"])
+       for r in sp.unmute_universal("13:00", "16:00", ["mon"])],
+      [("13:00", "16:00", "mon")])
+check("撤销后清空", sp.universal_mutes(), [])
 
 print("== 静音窗跨午夜 / 坏数据 ==")
 sp.save_mutes({"version": 1, "mutes": [

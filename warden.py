@@ -14,7 +14,7 @@
 
 视图（Tab 切换）
 ----------------
-按 **Tab** 在多个视图间循环切换，视图显示在命令提示上面。现有五个：
+按 **Tab** 在多个视图间循环切换，视图显示在命令提示上面。现有六个：
 
 1. **契约**（默认）：时段 / session / 任务表 + 命令。前面四列是日历下载层的
    时段 ID / 时段 / 类型 / 名称；同一时段只有第一行显示，后续行留空。
@@ -50,15 +50,22 @@
      分工固定：**动作归子命令**（import/link 自己读剪贴板），**后缀归分流**
      （`-a N` = `--assign N`，顺手挂到表格 #N）。
 6. **静音时段**：`period mute T1 [--permanent]` = 这个时段（或以后每个这个星期几）
-   的 session 自动打开 **Focusmate quiet**（「静音」只指这个）。本地看门狗/通知/
-   嘶吼一概照旧 —— daemon 里根本不读这张表。表在 `temp/session-mutes.json`，
-   判定在 `session_plan.mute_window_at()`，
-   见 [`feature_intents/session_mute.md`](feature_intents/session_mute.md)。
+   的 session 自动打开 **Focusmate quiet**（「静音」只指这个）。`mute-universal
+   13:00 - 15:00 Mon` 则不看 T 时段，只按星期几 + 时间窗判定，任何与窗口有重叠
+   的 session 都静音。本地看门狗/通知/嘶吼一概照旧 —— daemon 里根本不读这张表。
+   表在 `temp/session-mutes.json`，判定在 `session_plan.mute_window_at()` /
+   `mute_overlaps_window()`，见
+   [`feature_intents/session_mute.md`](feature_intents/session_mute.md)。
 5. **设置**：`settings_store.SETTINGS` 里注册的全部设置项（id / 当前值 / 默认值 /
-   解释），`set <id> <value>` 修改，不写 value = 恢复默认。现有四项：
+   解释），`set <id> <value>` 修改，不写 value = 恢复默认。现有六项：
    `edit-tomorrow`（今天可以先安排明天，过了凌晨回到 24 小时窗口）、
    `tomorrow-plan`（明日时间安排 = 一个每周重复任务）、`omnifocus`（和 OmniFocus
-   联动，**只单向**）、`postsession`（结束 15 秒后把 warden 拉到前台收尾）。
+   联动，**只单向**）、`postsession`（结束 15 秒后把 warden 拉到前台收尾）、
+   `nostart`（到点没开始就问一句）、`chore-project`（没有 session 时显示哪个
+   OmniFocus 项目里的琐事）。
+6. **琐事**（自动视图）：没有 session 时整屏只显示绑定项目的一条未完成任务；
+   `m` 完成 / `c` 换一条 / `q` 回正常界面。见
+   [`feature_intents/chore_idle.md`](feature_intents/chore_idle.md)。
 
 **收尾（session 结束 +15s）**：daemon 到点把 warden 拉到前台，warden 逐个问
 本场没做完的任务 —— A 延期 / B 放弃 / C 重议 / D 缺漏完成补充 / E 快捷推后。
@@ -928,6 +935,18 @@ def _hint_mute(parts):
                          note="不写 on/off 就是取反")
 
 
+def _hint_mute_universal(parts):
+    if len(parts) >= 2 and str(parts[1]).lower() in ("off", "unmute", "清空", "取消"):
+        return repl_kit.Hint("参数", ("13:00", "-", "15:00", "Mon", "清空"),
+                             note="按星期几 + 时间窗撤销；只写 off = 清空全部通用静音")
+    if parts:
+        return repl_kit.Hint("时间窗", ("13:00", "-", "15:00", "Mon", "Tue", "Wed"),
+                             note="每个指定星期几，凡与这个窗口有重叠的 session 都静音")
+    return repl_kit.Hint("参数", ("13:00 - 15:00 Mon", "off", "list"),
+                         note="例：mute-universal 13:00 - 15:00 Mon；"
+                              "14:30–15:30 这种只碰到尾巴的 session 也算")
+
+
 def _hint_title(parts):
     if len(parts) >= 2:
         return repl_kit.Hint("参数", ('"文本"',), note='"" = 清空')
@@ -1023,11 +1042,15 @@ def task_completer(w, prior):
     return []
 
 
-def mute_window_for(day, hhmm):
-    """``("11:15", 这一天)`` 落在哪条静音窗里 → 记录；不在就是 None。
+def mute_window_for(day, hhmm, end_hhmm=None):
+    """这一场的起点/区间落在哪条静音窗里 → 记录；没有就是 None。
 
-    口径只认 ``period mute``（:mod:`session_plan` 里那张表），别处不要自己算 ——
-    表格的「静音」列和自动 quiet 都问这一个函数。
+    口径只认 :mod:`session_plan` 里那张表，别处不要自己算 —— 表格的「静音」
+    列和自动 quiet 都问这一个函数。
+
+    - ``period mute``：旧语义，session **起点**在窗内就算；
+    - ``mute-universal``：只要 session 与窗口有重叠就算（14:30–15:30 对
+      13:00–15:00 也算）。后者必须给 ``end_hhmm``；没有终点时退化为起点判定。
     （daemon 的分心看门狗**不**问它：静音只改 Focusmate 那一场，本地该响还响。）
     """
     got = sp.parse_hhmm(hhmm)
@@ -1035,7 +1058,13 @@ def mute_window_for(day, hhmm):
         return None
     try:
         moment = datetime.datetime.combine(day, datetime.time(got[0], got[1]))
-        return sp.mute_window_at(moment, data=mute_data())
+        window = sp.mute_window_at(moment, data=mute_data())
+        if window is not None:
+            return window
+        if end_hhmm:
+            return sp.mute_overlaps_window(day, hhmm, end_hhmm,
+                                           data=mute_data(), universal_only=True)
+        return None
     except Exception:                       # noqa: BLE001 - 静音表坏了不该没表格
         return None
 
@@ -1515,8 +1544,9 @@ class ContractView(View):
     def idle_hint(self):
         return repl_kit.Hint(
             "命令",
-            ("session", "period", "cancel", "mute", "title", "day", "sync",
-             "open working", "open detail", "close 时段类型", "help", "quit"),
+            ("session", "period", "cancel", "mute", "mute-universal",
+             "title", "day", "sync", "open working", "open detail",
+             "close 时段类型", "help", "quit"),
             note="Tab 切下一个视图；open/close + 表头名折叠列；open working|detail 切口径",
         )
 
@@ -1581,6 +1611,13 @@ class ContractView(View):
             _cmd("mute", w.cmd_mute, "把 #N 静音：mute N on|off",
                  usage="mute <n> on|off", options=("on", "off"),
                  hint=_hint_mute),
+            _cmd("mute-universal", w.cmd_mute_universal,
+                 "每周固定时间窗静音：所有与窗口有重叠的 session（不绑 T 时段）",
+                 ("unmute-universal", "universal-mute"),
+                 usage="mute-universal 13:00 - 15:00 Mon | mute-universal off ... | list",
+                 options=("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+                          "off", "list"),
+                 hint=_hint_mute_universal),
             _cmd("title", w.cmd_title, '把 #N 的标题改成文本：title N "文本"', ("t",),
                  usage='title <n> "文本"', hint=_hint_title),
             _cmd("cancel", w.cmd_cancel, "取消 #N（执行区要敲宣言）",
@@ -2224,6 +2261,35 @@ class SettingsView(View):
         return [t, hint]
 
 
+@register_view
+class ChoreView(View):
+    """空闲屏：没有 session 时只显示绑定项目里的一条琐事。
+
+    这是**自动**视图：warden 每帧发现当前不在 session、且 ``chore-project``
+    已绑定，就切进来。屏幕上不画正常看板、状态框、消息和视图栏，只有一条任务
+    和 m/c/q 三行提示。``q`` 回到进入前的正常视图，并压制到下一场 session 开始。
+    """
+
+    key = "6"
+    name = "琐事"
+    label = "琐事 / 空闲"
+
+    def idle_hint(self):
+        return repl_kit.Hint("琐事", ("m 完成", "c 换一个 task", "q 退出"),
+                             note="q = 回到正常界面；这段空档里不再自动弹回来")
+
+    def unknown_hint(self):
+        return "琐事空闲屏只认 m / c / q。"
+
+    def commands(self):
+        # m / c / q 由 Warden.intercept 在命令派发之前先吃掉；q 不能落到
+        # 通用 quit（那会退出整个 TUI，而这里只退出空闲屏）。
+        return []
+
+    def render(self):
+        return self.w.render_chore_idle()
+
+
 # ---------------------------------------------------------------- 输入（Tab 切视图 / 原地刷新）
 
 
@@ -2568,6 +2634,16 @@ class Warden(object):
         self.mutes_at = 0.0
         self.mute_tries = {}
         self.mute_worker = None
+        # 琐事 Project 空闲屏：没有 session 时自动切到 ChoreView；q 退出后
+        # 一直压到下一场 session 开始（或明天），下一段空档再自动出现。
+        # chore_now 可在测试里钉死；None = 跟墙上时钟。
+        self.chore_now = None
+        self.chore_index = 0
+        self.chore_last_note = ""
+        self.chore_suppressed_until = None
+        self._chore_return_index = 0
+        self._chore_last_view_index = 0
+        self._chore_leaving = False
         # 「现在」是几点：None = 跟着墙上时钟走。测试/回放可以钉死它，
         # 否则「3 小时内才自动催」这条规则会让用例在钟点变了之后莫名其妙地红。
         self.review_now = None
@@ -2615,6 +2691,7 @@ class Warden(object):
             view_key="s-tab",          # Shift+Tab：切视图
             focus_key="c-o",           # Ctrl+O：循环专注模式
             on_focus=self.cycle_focus_mode,
+            on_view_change=self._on_view_change,
             intercept=self.intercept,
             # 注：警告默认显示、且只在「契约」视图显示（用户要求）。
             warnings=self.warnings,
@@ -3660,6 +3737,8 @@ class Warden(object):
             self.review_signature(), pending_sig,
             self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
             tuple(sorted(self.effective_hidden_columns())),
+            isinstance(self.view, ChoreView), self.chore_index,
+            self.chore_last_note,
             id(getattr(self, "stat", None)),
             # 队列一动（进度条、日志、失败账）画面就得重排版
             self.jobs.signature(),
@@ -3807,7 +3886,7 @@ class Warden(object):
         # 「这一行在不在静音时段里」——口径只有一个：`period mute T1 [--permanent]`
         # 写下的时间窗。quiet 是**结果**（Focusmate 那边设上了没），period_muted
         # 是**意图**；两个都摆出来，才知道是「本来就该静音」还是「该静音没设上」。
-        window = mute_window_for(day, row.get("startLabel"))
+        window = mute_window_for(day, row.get("startLabel"), row.get("endLabel"))
         row["period_muted"] = bool(window)
         if window:
             row["mute_window"] = dict(window)
@@ -4208,6 +4287,9 @@ class Warden(object):
         self.reload_entries()
         self.maybe_generate_repeat_occurrences()
         self.refresh_warnings()
+        # 琐事屏是整屏内容：正常看板、Recent、状态框、视图栏都让位。
+        if isinstance(self.view, ChoreView):
+            return self.view.render()
         parts = [self.render_header()]
         body = self.view.render()
         if body is not None:
@@ -4225,6 +4307,10 @@ class Warden(object):
         一起拼出来）。这里手动补上同一块框，保证 --status 看到的和交互时一样。
         """
         self.drain_net()
+        try:
+            self._maybe_sync_chore_mode()
+        except Exception:                          # noqa: BLE001
+            pass
         box = self.shell.status_box()
         if box is not None:
             self.console.print(box.renderable())
@@ -4251,7 +4337,9 @@ class Warden(object):
         return "宣言> " if self.pending_sins() else None
 
     def render_view_bar(self):
-        """看板口径 + 「当前在第几个视图」，当前项都染色。"""
+        """看板口径 + 「当前在第几个视图」，当前项都染色。琐事屏不显示。"""
+        if isinstance(self.view, ChoreView):
+            return None
         bar = Text()
         for mode in SESSION_UI_MODES:
             if mode != SESSION_UI_MODES[0]:
@@ -4996,6 +5084,314 @@ class Warden(object):
         start = sessions[-1]["start"] if sessions else "22:15"
         return "%s@%s" % (cfg.WEEKDAYS[day.weekday()], start)
 
+    # -- 琐事 Project 空闲屏 -------------------------------------------------
+
+    def _chore_now_dt(self):
+        return self.chore_now or datetime.datetime.now()
+
+    def _chore_active_session(self, now=None):
+        """现在是不是正处在 session 里；是就返回那一行/时段，否则 None。
+
+        权威模式（bridge 拉到了真数据）只认真的在进行、且有 session id 的场次；
+        离线/快照才退回 ``data.csv`` 的计划窗口 —— 和专注视图用同一套口径。
+        """
+        now = now or self._chore_now_dt()
+        if self.authoritative and self.sel_date == now.date():
+            now_ms = int(now.timestamp() * 1000)
+            try:
+                live = [row for row in self._actual_rows(self.rows)
+                        if row.get("startMs") is not None
+                        and row["startMs"] <= now_ms < (row.get("endMs") or 0)]
+            except Exception:                  # noqa: BLE001 - 画空闲屏不该被行数据弄崩
+                live = []
+            if live:
+                live.sort(key=lambda row: (row.get("startMs") or 0,
+                                           self.rows.index(row)))
+                return live[-1]
+            return None
+        try:
+            got = ks.current_session(self.entries, now)
+        except Exception:                      # noqa: BLE001
+            got = None
+        if not got:
+            return None
+        day, slot, start, end = got
+        return {"date": day.isoformat(), "startLabel": slot.get("start"),
+                "endLabel": end.strftime("%H:%M")}
+
+    def _next_session_start(self, now=None):
+        """下一场 session 的开始时间（用来决定 ``q`` 退出后压到什么时候）。
+
+        先看 data.csv 的计划窗口；当前选中的那一天若有 bridge 真数据，也把
+        只存在于 Focusmate 的场次算进去。找不到就压到明天零点。
+        """
+        now = now or self._chore_now_dt()
+        starts = []
+        for delta in range(0, 8):
+            day = now.date() + datetime.timedelta(days=delta)
+            try:
+                slots = self.plan_rows_for(day)
+            except Exception:                  # noqa: BLE001
+                slots = []
+            for slot in slots:
+                try:
+                    start = sch.slot_datetime(slot, day)
+                except Exception:              # noqa: BLE001
+                    continue
+                if start > now:
+                    starts.append(start)
+        if self.authoritative and self.sel_date == now.date():
+            now_ms = int(now.timestamp() * 1000)
+            for row in self.rows:
+                try:
+                    if row.get("id") and int(row.get("startMs") or 0) > now_ms:
+                        starts.append(datetime.datetime.fromtimestamp(
+                            row["startMs"] / 1000.0))
+                except (TypeError, ValueError, KeyError, OSError):
+                    continue
+        if starts:
+            return min(starts)
+        return datetime.datetime.combine(now.date() + datetime.timedelta(days=1),
+                                         datetime.time(0, 0))
+
+    def _suppress_chore_idle(self, now=None):
+        """``q`` 退出空闲屏：压到下一场 session 开始（没有就明天）。"""
+        now = now or self._chore_now_dt()
+        self.chore_suppressed_until = self._next_session_start(now)
+        self.chore_last_note = ""
+        self.invalidate()
+
+    def _on_view_change(self, view):
+        """记下用户什么时候手动离开琐事屏 —— 同一段空档别再自动弹回来。"""
+        try:
+            previous_index = self._chore_last_view_index
+            previous = (self.view_impls[previous_index]
+                        if 0 <= previous_index < len(self.view_impls) else None)
+            current_index = self.shell.view_index
+            if isinstance(view, ChoreView) and not isinstance(previous, ChoreView):
+                # 进入琐事屏时记住来路；q / 自动退出都回到这里。
+                self._chore_return_index = previous_index
+            if (isinstance(previous, ChoreView) and not isinstance(view, ChoreView)
+                    and not self._chore_leaving):
+                self._suppress_chore_idle()
+            self._chore_last_view_index = current_index
+        except Exception:                      # noqa: BLE001 - 切视图不能因为这里坏掉
+            pass
+
+    def chore_binding(self):
+        """设置里的琐事项目 → ``(project, error)``。"""
+        raw = str(self.settings.get("chore-project") or "").strip()
+        if not raw:
+            return None, ("还没绑定「琐事 Project」：先 `project` 看项目序号，"
+                          "再 `set chore-project #1`（或项目名 / OmniFocus pk）")
+        try:
+            return self.projects.find(raw), ""
+        except ValueError as e:
+            return None, str(e)
+
+    def chore_project_tasks(self, project=None):
+        """绑定项目里可做的一条条任务；父壳展开成其未完成子任务。"""
+        if project is None:
+            project, _err = self.chore_binding()
+        if not project:
+            return []
+        try:
+            invested = pj.invested(self.task_store, project)
+            items = pj.remaining_tasks(project, invested)
+        except Exception:                      # noqa: BLE001 - 坏项目不该炸空闲屏
+            return []
+        out = []
+        for item in items:
+            children = item.get("children") or []
+            if children:
+                for child in children:
+                    rec = dict(child)
+                    rec["_parent_title"] = item.get("title")
+                    out.append(rec)
+            else:
+                out.append(item)
+        return out
+
+    def chore_snapshot(self):
+        """空闲屏当前该显示什么：项目 / 任务列表 / 当前任务 / 错误说明。"""
+        project, error = self.chore_binding()
+        tasks = self.chore_project_tasks(project) if project else []
+        if project and not tasks:
+            error = ("琐事项目「%s」里没有未完成任务了 —— 去 OmniFocus 加一条，"
+                     "或换一个 `chore-project`" % (project.get("title") or project.get("id")))
+        if not tasks:
+            return {"project": project, "tasks": [], "task": None, "index": 0,
+                    "error": error}
+        index = self.chore_index % len(tasks)
+        return {"project": project, "tasks": tasks, "task": tasks[index],
+                "index": index, "error": error}
+
+    def render_chore_idle(self):
+        """琐事屏的全部内容：一条任务 + m/c/q 提示，不画正常看板。"""
+        snap = self.chore_snapshot()
+        body = Text()
+        if self.chore_last_note:
+            body.append(self.chore_last_note + "\n\n", style="bold green")
+        if not snap.get("task"):
+            body.append("琐事 Project\n\n", style="bold")
+            body.append((snap.get("error") or "现在没有可显示的琐事。") + "\n\n",
+                        style="yellow")
+            body.append("q 退出（回到正常界面）", style="cyan")
+            return body
+        task = snap["task"]
+        project = snap.get("project") or {}
+        body.append("琐事\n", style="dim")
+        body.append(str(task.get("title") or task.get("pk") or "（无标题）"),
+                    style="bold")
+        body.append("\n\n", style="")
+        body.append("项目：%s" % (project.get("title") or "?"), style="dim")
+        bits = []
+        if task.get("duration"):
+            bits.append("%d 分钟" % int(task["duration"]))
+        if task.get("count"):
+            bits.append("%d count" % int(task["count"]))
+        if task.get("due"):
+            bits.append("截止 %s" % str(task["due"]).replace("T", " ")[:16])
+        if task.get("_parent_title"):
+            bits.append("父任务：%s" % task["_parent_title"])
+        if bits:
+            body.append("\n" + " · ".join(bits), style="dim")
+        body.append("\n\n", style="")
+        body.append("m 完成    c 换一个 task    q 退出（回到正常界面）", style="cyan")
+        return body
+
+    def _enter_chore_view(self):
+        for index, view in enumerate(self.view_impls):
+            if isinstance(view, ChoreView):
+                self.chore_last_note = ""
+                self.invalidate()
+                self.shell.set_view(index)
+                return True
+        return False
+
+    def _leave_chore_view(self, suppress=False):
+        if not isinstance(self.view, ChoreView):
+            return False
+        if suppress:
+            self._suppress_chore_idle()
+        target = self._chore_return_index
+        if (target < 0 or target >= len(self.view_impls)
+                or isinstance(self.view_impls[target], ChoreView)):
+            target = 0
+        self._chore_leaving = True
+        try:
+            self.shell.set_view(target)
+        finally:
+            self._chore_leaving = False
+        self.chore_last_note = ""
+        self.invalidate()
+        return True
+
+    def _maybe_sync_chore_mode(self):
+        """每帧看一眼：进/出「没有 session」的琐事屏。
+
+        没有 session 时整屏接管（从哪个视图来都会接管，q 回原视图）；但收尾、
+        plan 问答、项目对账、导入问答、罪案锁死这些打断态优先，不抢输入。
+        """
+        now = self._chore_now_dt()
+        if isinstance(self.view, ChoreView):
+            if self._chore_active_session(now) is not None:
+                self._leave_chore_view(suppress=False)
+            return False
+        if (self.review_active() or self.nostart is not None
+                or self.planning is not None or self.pending_import is not None
+                or self.project_sync is not None or self.pending_sins()):
+            return False
+        if (self.chore_suppressed_until is not None
+                and now < self.chore_suppressed_until):
+            return False
+        if self._chore_active_session(now) is not None:
+            return False
+        project, _error = self.chore_binding()
+        if not project or not self.chore_project_tasks(project):
+            return False
+        return self._enter_chore_view()
+
+    def _chore_finish_writeback(self, project, task, kind="完成"):
+        """项目任务完成后写回 OmniFocus（单向联动；off 就只改本地）。"""
+        pk = str((task or {}).get("pk") or "").strip()
+        if not pk:
+            return ""
+        if not self.omnifocus_enabled():
+            return "OmniFocus 关着 → 只改了本地"
+        action = self.net_action(
+            "omnifocus.complete",
+            "OmniFocus %s琐事 %s" % (kind, pk[:8]),
+            {"pk": pk, "at": None, "due": task.get("due") or None},
+            source=SRC_OMNIFOCUS)
+        job = self.jobs.submit(action, on_fail=lambda error: self.say(
+            "琐事「%s」写回 OmniFocus 失败：%s"
+            % (task.get("title") or pk, error), "warn"))
+        if self.jobs.sync:
+            outcome = job.outcome
+            if outcome is None or not outcome.ok:
+                return "OmniFocus 写回失败：%s" % (
+                    outcome and outcome.error or "没跑")
+            return "OmniFocus 已写回"
+        return "OmniFocus 写回丢后台了"
+
+    def _chore_complete(self):
+        snap = self.chore_snapshot()
+        task, project = snap.get("task"), snap.get("project")
+        if not task or not project:
+            self.chore_last_note = "现在没有可完成的琐事。"
+            self.invalidate()
+            return False
+        try:
+            updated, done_task, auto_parent = self.projects.complete_task(
+                project["id"], task.get("pk"))
+        except (ValueError, TypeError) as e:
+            self.chore_last_note = "完成失败：%s" % e
+            self.invalidate()
+            return False
+        notes = ["✅ 已完成：%s" % (done_task.get("title") or done_task.get("pk"))]
+        note = self._chore_finish_writeback(updated, done_task)
+        if note:
+            notes.append(note)
+        if auto_parent is not None:
+            notes.append("父任务「%s」的子任务全部完成 → 父任务自动完成"
+                         % (auto_parent.get("title") or auto_parent.get("pk")))
+            note = self._chore_finish_writeback(updated, auto_parent, kind="父任务")
+            if note:
+                notes.append(note)
+        self.chore_last_note = "；".join(notes)
+        self.invalidate()
+        return True
+
+    def _chore_next(self):
+        snap = self.chore_snapshot()
+        count = len(snap.get("tasks") or [])
+        if count <= 1:
+            self.chore_last_note = "只有这一条琐事，没有别的可换。"
+        else:
+            self.chore_index = (self.chore_index + 1) % count
+            self.chore_last_note = ""
+        self.invalidate()
+        return True
+
+    def _handle_chore_input(self, line):
+        """琐事屏只吃 m / c / q；返回 True = 已处理。"""
+        if not isinstance(self.view, ChoreView):
+            return False
+        cmd = str(line or "").strip().lower()
+        if cmd in ("q", "quit", "exit"):
+            self._leave_chore_view(suppress=True)
+        elif cmd in ("m", "done", "完成"):
+            self._chore_complete()
+        elif cmd in ("c", "next", "换", "换一个"):
+            self._chore_next()
+        elif not cmd:
+            return True
+        else:
+            self.chore_last_note = "琐事屏只认 m（完成）/ c（换一个）/ q（退出）。"
+            self.invalidate()
+        return True
+
     def collect_warnings(self):
         """现在有哪些「问题」要显示在状态框里。纯本地计算，不联网、不写盘。"""
         out = []
@@ -5090,6 +5486,18 @@ class Warden(object):
                 level="warn", source="重复任务",
                 hint="task create title=明日时间安排 --repeat %s"
                      % self._suggest_repeat_spec(today, today_sessions)))
+        # 5) 琐事 Project：没绑定 / 绑定失效 / 项目里没活了都要说一声。
+        project, chore_error = self.chore_binding()
+        if chore_error:
+            out.append(repl_kit.Warning(
+                "琐事 Project 不可用：%s" % chore_error,
+                level="warn", source="琐事",
+                hint="project 看项目列表；set chore-project #1 绑定（空 = 恢复未绑定）"))
+        elif project and not self.chore_project_tasks(project):
+            out.append(repl_kit.Warning(
+                "琐事项目「%s」没有未完成任务了" % (project.get("title") or project.get("id")),
+                level="warn", source="琐事",
+                hint="去 OmniFocus 加一条任务并 project refresh；或 set chore-project 换项目"))
         return out
 
     def refresh_warnings(self, force=False, max_age=5.0):
@@ -5115,6 +5523,10 @@ class Warden(object):
             self._maybe_daily_project_sync()
             self._maybe_start_project_sync_conflict()
         except Exception:                          # noqa: BLE001 - 项目对账坏了也不能没帧
+            pass
+        try:
+            self._maybe_sync_chore_mode()
+        except Exception:                          # noqa: BLE001 - 空闲屏坏了也不能没帧
             pass
         now = time.time()
         if not force and self.warnings_at and now - self.warnings_at < max_age:
@@ -11077,6 +11489,101 @@ class Warden(object):
             self.refresh(quiet=True)
         return True
 
+    def cmd_mute_universal(self, args):
+        """``mute-universal 13:00 - 15:00 Mon`` —— 每周固定时间窗静音。
+
+        与 ``period mute`` 的区别：不绑定日历时段 T1/T2，也不要求 session 的
+        **起点**落在窗内。用户要求「只要涉及了就算」：14:30–15:30 与
+        13:00–15:00 有重叠，同样静音。可以一次给多个星期几（Mon,Wed / 周一 周三）。
+        """
+        raw = " ".join(str(a).strip() for a in (args or []) if str(a).strip())
+        low = raw.lower()
+        if not raw or low in ("list", "ls", "show", "列表", "查看"):
+            recs = sp.universal_mutes()
+            if not recs:
+                self.say("ℹ️ 还没有通用静音窗。例：mute-universal 13:00 - 15:00 Mon",
+                         "info")
+                return []
+            for rec in recs:
+                wd = cfg.parse_weekday(rec.get("weekday"))
+                label = ("每个" + cfg.WEEKDAY_CN[wd]) if wd is not None else "?"
+                self.say("🔇 %s %s–%s（与窗口有重叠的 session 都静音）"
+                         % (label, rec.get("start"), rec.get("end")), "info")
+            return recs
+
+        want_off = any(tok in low for tok in
+                       ("off", "unmute", "remove", "delete", "取消", "清空", "解除"))
+        # 先找时间窗；星期几可以在前面或后面。也接受 13:00~15:00 / 13:00–15:00。
+        match = re.search(r"(?<!\d)(\d{1,2}:\d{2})\s*[-–—~至]\s*(\d{1,2}:\d{2})(?!\d)",
+                          raw)
+        if not match:
+            if want_off:
+                gone = sp.unmute_universal()
+                forget_mute_cache()
+                self.rebuild_rows()
+                self.say("🔊 清空了 %d 条通用静音窗。" % len(gone), "ok")
+                return gone
+            raise ValueError("用法：mute-universal 13:00 - 15:00 Mon"
+                             "（撤销：mute-universal off 13:00 - 15:00 Mon；"
+                             "看列表：mute-universal list）")
+        start, end = match.group(1), match.group(2)
+        if sp.parse_hhmm(start) is None or sp.parse_hhmm(end) is None:
+            raise ValueError("时间要写成 HH:MM（00:00–23:59）；你给的是 %s–%s"
+                             % (start, end))
+        rest = (raw[:match.start()] + " " + raw[match.end():])
+        tokens = [tok.strip(" ,，/、") for tok in rest.split()]
+        weekdays = []
+        for tok in tokens:
+            part = tok.strip()
+            if not part:
+                continue
+            if part.lower() in ("off", "unmute", "remove", "delete", "取消",
+                                "清空", "解除", "mute", "on", "静音"):
+                continue
+            # Mon-Fri / 周一-周五 这种区间也顺手支持。
+            bits = [b for b in re.split(r"[-–—~至]", part) if b.strip()]
+            if len(bits) == 2:
+                lo, hi = cfg.parse_weekday(bits[0]), cfg.parse_weekday(bits[1])
+                if lo is None or hi is None:
+                    raise ValueError("认不出星期几区间：%r" % part)
+                if lo <= hi:
+                    weekdays.extend(cfg.WEEKDAYS[lo:hi + 1])
+                else:
+                    weekdays.extend(cfg.WEEKDAYS[lo:] + cfg.WEEKDAYS[:hi + 1])
+                continue
+            wd = cfg.parse_weekday(part)
+            if wd is None:
+                raise ValueError("认不出星期几：%r（可写 Mon / 周一 / Mon,Wed / Mon-Fri）"
+                                 % part)
+            weekdays.append(cfg.WEEKDAYS[wd])
+        # 去重，保留用户给的顺序。
+        weekdays = list(dict.fromkeys(weekdays))
+        if not weekdays:
+            raise ValueError("要指定星期几，例如 mute-universal 13:00 - 15:00 Mon")
+        cn = "、".join(cfg.WEEKDAY_CN[cfg.parse_weekday(wd)] for wd in weekdays)
+
+        if want_off:
+            gone = sp.unmute_universal(start, end, weekdays)
+            forget_mute_cache()
+            self.rebuild_rows()
+            if gone:
+                self.say("🔊 已撤销 %s %s–%s 的通用静音。" % (cn, start, end), "ok")
+            else:
+                self.say("ℹ️ %s %s–%s 本来就没有通用静音。" % (cn, start, end), "info")
+            return gone
+
+        made = sp.mute_universal(start, end, weekdays)
+        forget_mute_cache()
+        self.rebuild_rows()
+        self.say("🔇 已设通用静音：每个%s %s–%s —— 所有与这个窗口**有重叠**的 "
+                 "session 都会打开 Focusmate quiet。" % (cn, start, end), "ok")
+        self.say("   看全部：mute-universal list；撤销：mute-universal off %s - %s %s"
+                 % (start, end, weekdays[0]), "info")
+        applied = self.apply_mutes()
+        if applied:
+            self.refresh(quiet=True)
+        return made
+
     def cmd_period_layout(self, args):
         """period T1 50 50 / session T1 50 50 —— 改一个时段的 session 排布。
 
@@ -12050,6 +12557,11 @@ class Warden(object):
             self.had_error = True
             self.say("锁死中：%s" % (why or "把宣言一字不差地敲完才能做别的事。"), "error")
             self.emit(self.render_lockdown_panel())
+            return True
+
+        # 琐事空闲屏：m / c / q 是它的全部命令。q 走「退出空闲屏」，
+        # 不能落到通用 quit（那会退出整个 TUI）。
+        if self._handle_chore_input(line):
             return True
 
         # task import 问「复制重复设置吗？」时，下一行先当作回答吃；不回答

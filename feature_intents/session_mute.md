@@ -34,6 +34,29 @@ Focusmate 的 quiet 是**单场**开关：得一场一场点，而且明天新�
   的地方判 —— daemon 的分心看门狗只想知道「现在这个钟点该不该出声」。
 - 同一目标重复设置 = 覆盖时间窗（排班可能改过），不报错。
 
+## 通用静音：`mute-universal`（不绑 T 时段）
+
+`period mute` 绑的是日历下载层里的某个时段。用户还需要一种不依赖下载层、
+只看「星期几 + 时间窗」的静音规则：
+
+```text
+mute-universal 13:00 - 15:00 Mon
+```
+
+意思是：**每个周一，凡是与 13:00–15:00 有重叠的 session 全部静音**。和
+`period mute` 的「起点落在窗内」不同，这里按用户原话「只要涉及了就算」：
+14:30–15:30 碰到窗口尾巴也算；12:30–13:15 碰到窗口开头也算；刚好 13:00
+开始 / 15:00 结束的边界按半开区间处理。
+
+- 可一次给多个星期几：`Mon,Wed` / `周一 周三` / `Mon-Fri`；
+- 同一个星期几 + 同一个起点再设一次 = 覆盖终点，不叠加；
+- `mute-universal list` 看全部；`mute-universal off 13:00 - 15:00 Mon` 撤销；
+  `mute-universal off` 清空全部通用静音；
+- 仍然只改 Focusmate 的 quiet，本地通知 / 音量 / 嘶吼一概照旧。
+
+数据也落在 `temp/session-mutes.json`，通用记录带 `"universal": true` 且
+`"period": ""`。这样 `period mute` 的旧语义完全不变，两套规则可以并存。
+
 ## 判定（唯一实现）
 
 | 函数 | 谁在用 |
@@ -42,6 +65,7 @@ Focusmate 的 quiet 是**单场**开关：得一场一场点，而且明天新�
 | `sp.is_muted_at(moment)` | 排障 / 测试用（daemon **不**用它） |
 | `sp.muted_period_ids(day)` | 契约表 / 状态行 |
 | `sp.mutes_for_day(day)` | 上面几个的底层 |
+| `sp.mute_overlaps_window(day, start, end)` | `mute-universal` 的重叠判定（只认通用记录） |
 
 跨午夜的窗（`23:30–00:30`）按 +24h 算，并且**会算到第二天凌晨**（查昨天那条里
 跨午夜的部分）。
@@ -64,6 +88,10 @@ period mute T1               # 只静音今天/选中那天的 T1
 period mute T1 --permanent   # 以后每个这个星期几的 T1 都静音
 period mute T1 off           # 撤销（也认 period unmute T1）
 period unmute T1 --permanent # 撤销按星期几那条
+mute-universal 13:00 - 15:00 Mon          # 每个周一 13:00–15:00 有重叠就静音
+mute-universal list                      # 看通用静音窗
+mute-universal off 13:00 - 15:00 Mon     # 撤销这一条
+mute-universal off                       # 清空全部通用静音
 ```
 
 ## 测试
@@ -73,4 +101,7 @@ period unmute T1 --permanent # 撤销按星期几那条
 - `test/test_idle_watchdog.py`：「静音时段（period mute）**不**管这里」—— 静音窗里
   第 1 次违规照样发通知、第 3 次照样拉音量放嘶吼，并且钉住「看门狗里没有静音分支」。
 - `test/test_task_ui.py`：`period mute T1 --permanent` 写表、表格标 `静`、
-  `apply_mutes()` 只对「该静音且没静音」的行调 bridge、已经 ON 的不重复动。
+  `apply_mutes()` 只对「该静音且没静音」的行调 bridge、已经 ON 的不重复动；
+  以及 `mute-universal` 只碰尾巴也算、`off` 撤销、旧 period 规则不受影响。
+- `test/test_session_plan.py`：通用静音与窗口的重叠边界（含起止点）、按星期几、
+  多星期几、覆盖不叠加、撤销。

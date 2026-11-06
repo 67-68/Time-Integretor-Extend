@@ -17,6 +17,12 @@
     「明日时间安排」：一个**每周重复任务**（``mon@22:15`` 这种形状），到点了
     自动挂到那一周的对应 session 上。空 = 没设置（于是状态栏会提醒你设置）。
 
+``chore-project``
+    绑定的「琐事 Project」：没有 session 的时候，TUI 只显示这个项目里的一条
+    未完成任务，按 m 完成 / c 换一条 / q 回正常界面。值可以是项目表序号
+    （#1）、内部 id（id:3）、OmniFocus 项目 pk 或唯一的项目名。空 = 没绑定，
+    状态栏会提醒。
+
 ``omnifocus``
     和 OmniFocus 联动。**只有单向**（warden → OmniFocus）：完成/放弃写回去、
     收尾时读完成状态；OmniFocus 里的改动不会回流。off = 一个字节都不碰。
@@ -97,6 +103,15 @@ SETTINGS = [
         "summary": "明日时间安排（每周重复任务）",
         "desc": "形如 mon@22:15 = 每周一 22:15 那场 session 自动挂上「明日时间安排」。"
                 "空 = 没设置。改完用 task create title=明日时间安排 --repeat mon@22:15 建档。",
+    },
+    {
+        "id": "chore-project",
+        "type": "text",
+        "default": "",
+        "values": (),
+        "summary": "琐事 Project：没有 session 时只看这个项目里的一条任务",
+        "desc": "填项目表序号 #1 / id:3 / OmniFocus 项目 pk / 唯一项目名。"
+                "空闲时按 m 完成、c 换一条、q 回正常界面。空 = 没绑定（状态栏会提醒）。",
     },
 ]
 
