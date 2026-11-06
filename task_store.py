@@ -1455,6 +1455,10 @@ class TaskStore(object):
                 break
         stamp = _now()
         if found is not None:
+            # 已经 plan 唤起 / 已经收口的任务：绝不拿项目清单的整条时长去覆盖
+            # 它这次分到的 count、session 和 due —— 那是当天的真实账。
+            if found.get("session") or not TaskStore.is_open(found):
+                return found, False
             fields = found.setdefault("fields", {})
             changed = False
             for key, value in (("title", title),

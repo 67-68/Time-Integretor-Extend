@@ -656,6 +656,16 @@ check("本地任务时长是子任务原时长",
       sorted(t["fields"]["duration"] for t in _assigned), [10, 13])
 check("两个子任务挂在同一场 session",
       len({(t["session"]["date"], t["session"]["start"]) for t in _assigned}), 1)
+_before_sync = [(t["id"], t["fields"].get("count"), t["fields"].get("duration"),
+                 tuple(sorted((t.get("session") or {}).items())))
+                for t in _assigned]
+wd_sub.sync_project_tasks(wd_sub.projects.by_id(1), quiet=True)
+_after_sync = [(t["id"], t["fields"].get("count"), t["fields"].get("duration"),
+                tuple(sorted((t.get("session") or {}).items())))
+               for t in wd_sub.task_store.list()
+               if (t.get("session") or {}).get("start")]
+check("项目重新镜像不会覆盖已唤起任务的 count/session",
+      _after_sync, _before_sync)
 check("项目 plan 记账也按子任务落",
       sorted(x["pk"] for x in (pj.plan_of(wd_sub.projects.by_id(1),
                                           wd_sub.sel_date) or {}).get("items") or []),

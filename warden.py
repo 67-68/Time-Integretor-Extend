@@ -2099,7 +2099,7 @@ class TaskView(View):
             terminal_rows = int(self.w.shell._terminal_rows())
         except Exception:                             # noqa: BLE001 - 测试/离屏兜底
             terminal_rows = 30
-        return max(2, min(20, terminal_rows - 21))
+        return max(2, min(20, terminal_rows - 22))
 
     def _task_window(self, tasks):
         """返回 ``(当前页任务, 起始下标, 总数, 当前页码, 总页数)``。
@@ -2125,8 +2125,11 @@ class TaskView(View):
         start = (page - 1) * limit
         return tasks[start:start + limit], start, total, page, total_pages
 
-    def _compact_guidance(self):
-        """矮屏/窄屏时把说明压成短句，优先保证表头留在屏幕上。"""
+    def _guidance_mode(self):
+        """说明文字的三档密度：tiny（矮屏）/ compact（窄屏）/ full。
+
+        矮屏优先保证表头留在屏幕上，所以 tiny 会把词压到最短；信息仍然齐全。
+        """
         try:
             rows = int(self.w.shell._terminal_rows())
         except Exception:                             # noqa: BLE001
@@ -2135,21 +2138,32 @@ class TaskView(View):
             width = self.w.frame_width()
         except Exception:                             # noqa: BLE001
             width = 80
-        return rows < 40 or width < 100
+        if rows < 40 or width < 100:
+            return "tiny"
+        if rows < 50 or width < 120:
+            return "compact"
+        return "full"
 
     def _legend_text(self):
         """表下灰色小字：所有标记与备注缩写的含义。"""
-        if self._compact_guidance():
+        mode = self._guidance_mode()
+        if mode == "tiny":
             return Text(
-                "标记 🔁重复子任务 🔁*模板 🔗OmniFocus 🎯Focusmate ⏳挂载中 "
-                "⏱formatter ⚡trigger 🔒独占 · 状态 ·进行中 ✓完成 ✗放弃 ⤼转移走 · "
-                "备注 dur=分钟 cnt=进度 excl=独占 tag=标签 rep=重复 fmt=formatter "
-                "trig=trigger note=备注",
+                "标记：🔁重复子 🔁*模板 📁项目 🔗OF 🎯FM ⏳挂载 ⏱fmt ⚡trig 🔒独占 · "
+                "状态：·进行 ✓完成 ✗放弃 ⤼转移 · 备注：dur分 cnt进度 excl独占 "
+                "tag标签 rep重复 fmt格式 trig触发 note备注",
+                style="dim")
+        if mode == "compact":
+            return Text(
+                "标记：🔁=重复子任务 🔁*=模板 📁=项目 🔗=OmniFocus 🎯=Focusmate "
+                "⏳=挂载中 ⏱=formatter ⚡=trigger 🔒=独占 · 状态：·=进行中 ✓=完成 "
+                "✗=放弃 ⤼=转移走 · 备注：dur=分钟 cnt=进度 excl=独占 tag=标签 "
+                "rep=重复 fmt=formatter trig=trigger note=备注",
                 style="dim")
         text = Text(style="dim")
         text.append("标记：")
-        text.append("🔁=重复子任务 · 🔁*=重复模板 · 🔗=OmniFocus · 🎯=Focusmate · "
-                    "⏳=挂载中 · ⏱=formatter · ⚡=trigger · 🔒=独占\n")
+        text.append("🔁=重复子任务 · 🔁*=重复模板 · 📁=项目任务 · 🔗=OmniFocus · "
+                    "🎯=Focusmate · ⏳=挂载中 · ⏱=formatter · ⚡=trigger · 🔒=独占\n")
         text.append("状态：·=进行中 · ✓=完成 · ✗=放弃 · ⤼=转移走　")
         text.append("备注缩写：dur=分钟 · cnt=进度 · excl=独占 · tag=标签 · "
                     "rep=重复 · fmt=formatter · trig=trigger · note=备注")
@@ -2163,18 +2177,14 @@ class TaskView(View):
             ("group", "分组"), ("search", "搜索"), ("open", "翻页/展开"),
             ("close", "折叠"), ("task", "任务操作"), ("help --task", "详情"),
         )
-        if self._compact_guidance():
-            entries = tuple((cmd, desc) for cmd, desc in entries
-                            if cmd in ("refresh", "plan", "project", "sort",
-                                       "group", "search", "open", "task",
-                                       "help --task"))
+        mode = self._guidance_mode()
         text = Text(style="dim")
         text.append("命令：")
         for index, (cmd, desc) in enumerate(entries):
             if index:
-                text.append(" · ")
+                text.append("," if mode == "tiny" else " · ")
             text.append(cmd)
-            text.append(" " + desc)
+            text.append((" " if mode != "tiny" else "") + desc)
         return text
 
     def render(self):
@@ -2209,13 +2219,30 @@ class TaskView(View):
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
                   title_justify="left", expand=False, show_header=True)
         if group_col_header:
-            t.add_column(group_col_header, style="bold cyan", no_wrap=True, overflow="crop")
+            t.add_column(group_col_header, style="bold cyan", no_wrap=True,
+                         overflow="crop", max_width=group_max)
         specs = dict(TASK_TABLE_COLUMNS)
+        # 显式给每列 max_width / min_width：Rich 在总宽不够时会悄悄把前几列
+        # 压成空白；不钉住「序号/标记/状态」的话，表头看起来就像少了好几列。
+        max_widths = {
+            "序号": 7, "标记": 8, "title": title_max, "project": proj_max,
+            "状态": 4, "session": 11, "截止": 11, "备注": remark_max,
+            "id": 6, "重复": 18, "trigger": 12, "formatter": 14,
+            "Focusmate": 10, "OmniFocus": 12, "完成时间": 11, "标签": 14,
+            "duration": 7, "count": 10, "exclusive": 7,
+        }
+        min_widths = {"序号": 4, "标记": 4, "状态": 3}
         for header in visible_headers:
             if header in specs:
-                t.add_column(header, **specs[header])
+                kwargs = dict(specs[header])
+                if header in max_widths:
+                    kwargs["max_width"] = max_widths[header]
+                if header in min_widths:
+                    kwargs["min_width"] = min_widths[header]
+                t.add_column(header, **kwargs)
             else:
-                t.add_column(str(header), no_wrap=True, overflow="crop")
+                t.add_column(str(header), no_wrap=True, overflow="crop",
+                             max_width=remark_max)
 
         status_style = {ts.STATUS_COMPLETED: STYLE_DONE, ts.STATUS_DROPPED: STYLE_DROPPED}
         total_cols = (1 if group_col_header else 0) + len(visible_headers)
@@ -2670,7 +2697,7 @@ TASK_TABLE_COLUMNS = (
     ("exclusive", {"no_wrap": True}),
 )
 TASK_CONTENT_COLUMN = "内容"
-TASK_DYNAMIC_HIDDEN = {"due", "due_source", "count_invested", "project_id", "project_task"}
+TASK_DYNAMIC_HIDDEN = {"due", "due_source", "count_invested", "project_id", "project_task", "notes", "note"}
 
 #: 任务视图下默认折叠的列（汇总进「标记」和「备注」，仍可用 open <表头名> 展开）。
 TASK_AUTO_HIDDEN_COLUMNS = (
@@ -4260,6 +4287,8 @@ class Warden(object):
             marks += "🔁*"
         elif (task or {}).get("repeat_parent"):
             marks += "🔁"
+        if self.task_project_name(task):
+            marks += "📁"
         if ts.TaskStore.omnifocus_id(task):
             marks += "🔗"
         if self._fm_pending(task):
@@ -13352,7 +13381,7 @@ class Warden(object):
         t.add_row("默认列", "序号 · 标记 · title · project · 状态 · session · 截止 · 备注")
         t.add_row("默认折叠", "id · 重复 · trigger · formatter · Focusmate · OmniFocus · "
                               "完成时间 · 标签 · duration · count · exclusive（用 open <表头> 展开）")
-        t.add_row("标记", "🔁=重复子任务  🔁*=重复模板  🔗=OmniFocus  🎯=Focusmate  "
+        t.add_row("标记", "🔁=重复子任务  🔁*=重复模板  📁=项目任务  🔗=OmniFocus  🎯=Focusmate  "
                           "⏳=挂载中  ⏱=formatter  ⚡=trigger  🔒=独占")
         t.add_row("状态", "·=进行中  ✓=完成  ✗=放弃  ⤼=转移走")
         t.add_row("备注缩写", "dur=分钟  cnt=已投/上限  excl=独占  tag=标签  "

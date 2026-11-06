@@ -234,7 +234,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 | 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `project` / `open working|detail` |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
-| 4 | 任务 | 任务表（默认常驻：`序号` / `标记` / `title` / `project` / `状态` / `session` / `截止` / `备注`；其余列默认折叠并在底部提示）+ 完成归档 | `task ...` + `open <页码|任务表头>` / `close <任务表头>` + `sort` / `group` / `search` + `review` + `inspect-due` + `plan` / `project` |
+| 4 | 任务 | 任务表（默认常驻：`序号` / `标记` / `title` / `project` / `状态` / `session` / `截止` / `备注`；其余列默认折叠；表下灰色小字解释标记/缩写并给一行命令指引）+ 完成归档 | `task ...` + `open <页码|任务表头>` / `close <任务表头>` + `sort` / `group` / `search` + `help --task` + `review` + `inspect-due` + `plan` / `project` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 | 6 | 琐事 | **没有 session 时自动接管**：只显示绑定的「琐事 Project」里一条未完成任务 + m/c/q 提示 | `m` 完成 / `c` 换一条 / `q` 回进入前的视图（并压制到下一场 session） |
 

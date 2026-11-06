@@ -1930,6 +1930,47 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-06T23:43:35",
+      "task_id": 115,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-06T23:40:00",
+        "due_source": "session",
+        "exclusive": true,
+        "count_invested": 1
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-06",
+        "start": "23:15",
+        "end": "23:40",
+        "duration": 25,
+        "focusmate_session_id": "7a46b68d-357e-49a7-84c0-12472df01d38",
+        "previous_due": "2026-11-06T20:20:00"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 25,
+      "status_at": "2026-11-06T23:43:35",
+      "omnifocus": {
+        "id": "bXBKXt03Pgc",
+        "url": "omnifocus:///task/bXBKXt03Pgc",
+        "title": "flashcard review & new learn",
+        "linked_at": "2026-11-02T15:24:32"
+      },
+      "focusmate": {
+        "task_id": "47210446-2b0a-45e8-b2b8-c58912920862",
+        "title": "flashcard review & new learn",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

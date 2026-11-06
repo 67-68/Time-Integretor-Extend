@@ -2366,7 +2366,7 @@ wdt.messages = []
 wdt.shell._terminal_rows = lambda: 30
 wdt.invalidate()
 _tbl = wdt.view.render()[0]
-check("任务表按屏幕预算截行（30 行终端 → 9 条）", len(_tbl.rows), 9)
+check("任务表按屏幕预算截行（30 行终端 → 8 条）", len(_tbl.rows), 8)
 check("截行后表头还在", [str(c.header) for c in _tbl.columns][:3], ["序号", "标记", "title"])
 _buf = io.StringIO()
 Console(file=_buf, width=200, force_terminal=False).print(_tbl)
@@ -2408,6 +2408,65 @@ check("search off 清空搜索与分组", wdt.handle("search off"), True)
 check("sort duration desc 受理", wdt.handle("sort duration desc"), True)
 check("排序键为 duration 且降序", (wdt.task_sort_key, wdt.task_sort_desc), ("duration", True))
 check("sort off 恢复默认排序", wdt.handle("sort off"), True)
+
+print("== 任务视图：表下标记说明 + 命令指引 + help --task ==")
+wdp = fresh_warden()
+wdp.go_to_view(w.TaskView)
+wdp.shell._terminal_rows = lambda: 55
+wdp.frame_width = lambda: 140
+_guide_render = wdp.view.render()
+_gbuf = io.StringIO()
+_gconsole = Console(file=_gbuf, width=140, force_terminal=False)
+for _part in _guide_render:
+    _gconsole.print(_part)
+_gout = _gbuf.getvalue()
+check_true("表下说明每个标记的含义",
+           "🔁=重复子任务" in _gout and "📁=项目" in _gout and "🔒=独占" in _gout)
+check_true("表下说明备注缩写", "dur=分钟" in _gout and "cnt=进度" in _gout)
+check_true("表下有一行命令指引", "命令：" in _gout and "refresh 同步" in _gout)
+check_true("命令指引指向 help --task", "help --task 详情" in _gout)
+
+_hbuf = io.StringIO()
+_old_console = wdp.console
+wdp.console = Console(file=_hbuf, width=160, force_terminal=False)
+wdp.handle("help --task")
+wdp.console = _old_console
+_hout = _hbuf.getvalue()
+check_true("help --task 列出详细说明", "Task · 任务视图详细说明" in _hout)
+check_true("help --task 列出排序语法", "sort <字段>" in _hout)
+check_true("help --task 解释项目入库", "叶子任务镜像进任务库" in _hout)
+
+print("== 项目任务入库：任务视图可搜索/分组，但不淹掉契约面板 ==")
+_payload = {
+    "kind": "project", "id": "p-taskui", "title": "项目X",
+    "url": "omnifocus:///project/p-taskui",
+    "tasks": [
+        {"pk": "p1", "title": "项目任务甲", "parent": "", "parent_id": "",
+         "duration": 25, "count": 1, "completed": False, "dropped": False},
+        {"pk": "p2", "title": "项目任务乙", "parent": "", "parent_id": "",
+         "duration": 50, "count": 2, "completed": False, "dropped": False},
+        {"pk": "p3", "title": "项目里已完成的", "parent": "", "parent_id": "",
+         "duration": 25, "count": 1, "completed": True, "dropped": False},
+    ],
+}
+_project, _created = wdp.projects.upsert(_payload)
+wdp.sync_project_tasks(_project, quiet=False)
+_mirrored = wdp.task_store.list()
+check("只镜像未完成的叶子任务",
+      sorted(t["fields"]["title"] for t in _mirrored), ["项目任务乙", "项目任务甲"])
+check("镜像任务带着 project 字段",
+      sorted(t["fields"]["project"] for t in _mirrored), ["项目X", "项目X"])
+check("镜像任务都是项目备选",
+      all(ts.TaskStore.is_project_backlog(t) for t in _mirrored), True)
+check("项目备选不会淹掉契约任务面板", wdp.task_panel_tasks(), [])
+_matched = wdp.filter_and_sort_tasks(wdp.task_store.list())
+wdp.task_search_query = "项目X"
+check("任务视图能按项目搜索到", len(wdp.filter_and_sort_tasks(wdp.task_store.list())), 2)
+wdp.task_search_query = ""
+wdp.task_group_by = "project"
+_tbl_proj = wdp.view.render()[0]
+check("任务视图可按 project 分组", str(_tbl_proj.columns[0].header), "grouping(project)")
+wdp.task_group_by = None
 
 print("== TUI 在场证明（daemon 靠它判断「人叫得回来吗」）==")
 info = wd.write_tui_state()

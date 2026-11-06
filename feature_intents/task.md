@@ -216,6 +216,27 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
   - `group <字段>`（或 `group grouping(project)`） / `group off`：在表格最前面前置一列 `grouping(<字段>)`，同组任务聚拢显示，首行显示组名、后续同行留空；
   - `search <关键词> [--group <字段>]`（或 `search grouping(project) <关键词>`） / `search off`：搜索过滤任务并支持顺带按字段分组。
 
+## 任务视图的表下指引
+
+任务表下面固定显示灰色小字说明（按屏幕高度自动在 full / compact / tiny 三档间压缩，但信息不丢）：
+
+- **标记说明**：`🔁=重复子任务 🔁*=模板 📁=项目任务 🔗=OmniFocus 🎯=Focusmate ⏳=挂载中 ⏱=formatter ⚡=trigger 🔒=独占`；
+  状态记号 `·=进行中 ✓=完成 ✗=放弃 ⤼=转移走`；
+  备注缩写 `dur=分钟 cnt=进度 excl=独占 tag=标签 rep=重复 fmt=formatter trig=trigger note=备注`。
+- **命令指引**：`refresh 同步 · review 收尾 · inspect-due 查过期 · plan 排期 · project 项目 ·
+  sort 排序 · group 分组 · search 搜索 · open 翻页/展开 · close 折叠 · task 任务操作 · help --task 详情`。
+  每个命令的介绍不超过 7 个字，不展开参数；参数细节看 `help --task`。
+
+## 项目任务入库
+
+项目导入 / 刷新 / 每日对账时，项目库里的**叶子任务**会幂等镜像进任务库：
+
+- `fields.project` = 项目名，`fields.project_id` = 项目序号，`fields.project_task` = OmniFocus 任务 pk；
+- `source.kind == "project"`；没有 session 时 `TaskStore.is_project_backlog()` 为真；
+- 这些镜像**只进任务视图**（可搜索、可 `group project`、可排序），不会进契约视图的任务面板；
+- `plan` 挑中同一条任务时**复用镜像**并挂 session，不会建重复任务；
+- 项目任务完成后，项目库的 `invested` 仍按 `fields.project_task` 现算。
+
 ## 命令
 
 TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面板上的第几条：

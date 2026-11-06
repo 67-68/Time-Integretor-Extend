@@ -15,11 +15,13 @@ warden.py          接线                 task import 认项目、任务面板�
 
 | 文件 | 放什么 | 谁写 |
 |---|---|---|
-| `data/tasks.json` | **这一场（这一天）要干的活**：一条 = 一条挂得上 session 的本地任务 | `task create` / `plan` 唤起 / 重复任务生成 |
+| `data/tasks.json` | **这一场（这一天）要干的活** + 项目叶子任务的镜像（`fields.project` / `project_id` / `project_task`，没挂 session 的镜像只进任务视图，不进契约面板） | `task create` / 项目导入/刷新/对账镜像 / `plan` 唤起 / 重复任务生成 |
 | `data/projects.json` | **母体**：OmniFocus Project 的任务清单 + 每天分了多少 count + 唤起过哪几条本地任务 | `task import`（项目）/ `project refresh` / `plan` |
 
 用户原话就是这两句话，实现也照这个分：
 *「在项目入库的时候就应该获取他所有的 task，但不展示直到他们被 project 唤起」*、
+（实现上：项目导入时把**叶子任务**镜像进任务库，供任务视图搜索 / `group project`；
+镜像没有 session 时不会进契约视图的任务面板，`plan` 唤起时复用同一条镜像并挂 session。）
 *「你可以把 project 想象成为一个 repeated task 的母体（会在对应的时间产生 task
 指向他）的变体」*。所以项目**永远不挂 session**（和重复任务本体一样），挂 session 的
 永远是它唤起的本地任务。
