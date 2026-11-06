@@ -193,6 +193,25 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
 - 契约表格 task 列、任务面板编号列、收尾面板的「任务 #3」、Recent 里的每一句
   —— 全部用同一个 `task_label()`，所以屏幕上不会同时出现两套编号。
 
+## 任务视图（视图 4）的表头
+
+任务视图一直画一张带表头的表：固定列是 `序号 | id | 状态 | 重复 | trigger |
+formatter | session | 截止 | Focusmate | OmniFocus | 完成时间 | 标签`，后面按任务
+实际字段追加 `title` / `duration` / …；没有任何字段时保留 `内容` 列。空任务库也先画
+表头，不再只剩一个说明框。
+
+`open` / `close` 在任务视图里作用于这张任务表（不是契约表）：
+
+```text
+close id
+close title
+close 截止 --permanent
+open id
+open title
+```
+
+被折叠的表头名会显示在表下面：`已折叠列：id、title（open <表头名> 打开）`。
+
 ## 命令
 
 TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面板上的第几条：

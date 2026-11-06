@@ -27,9 +27,11 @@ data/projects.json   项目母体：任务清单 + 每天分配了多少 count +
   "omnifocus": {"id": "p-abc", "url": "omnifocus:///project/p-abc", "title": "论文"},
   "status": "active",                        // active / dropped
   "imported_at": "…", "synced_at": "…",
-  "tasks": [                                 // **全部**任务（含已完成的），按 OmniFocus 顺序
+  "tasks": [                                 // **全部**任务（含已完成/已放弃），按 OmniFocus 顺序
     {"pk": "t-1", "title": "写引言", "parent": "", "due": "…",
-     "count": 3, "duration": 75, "completed": false, "blocked": false, "rank": 0}
+     "count": 3, "duration": 75, "completed": false, "dropped": false,
+     "effective_completed": false, "effective_dropped": false,
+     "blocked": false, "rank": 0}
   ],
   "plans": {
     "2026-11-04": {"count": 4, "at": "…",     // 用户分给这一天的资源（count）
@@ -297,10 +299,11 @@ def effective_task_statuses(tasks):
         item = index.get(pk)
         if not item or pk in trail:
             return STATUS_ACTIVE
-        # 显式状态优先：子任务被单独完成/放弃后，不再被父任务反向覆盖。
-        if item.get("dropped"):
+        # OmniFocus 的 taskStatus / effective* 标记优先；旧清单没有这些字段时，
+        # 再看本地 completed/dropped，最后才走父任务继承。
+        if item.get("effective_dropped") or item.get("dropped"):
             status = STATUS_DROPPED
-        elif item.get("completed"):
+        elif item.get("effective_completed") or item.get("completed"):
             status = STATUS_COMPLETED
         else:
             parent_pk = str(item.get("parent_id") or "").strip()
@@ -808,6 +811,10 @@ def _norm_task(raw, rank=0):
         "duration": minutes,
         "completed": bool(raw.get("completed")),
         "dropped": bool(raw.get("dropped")),
+        "effective_completed": bool(raw.get("effective_completed",
+                                           raw.get("completed"))),
+        "effective_dropped": bool(raw.get("effective_dropped",
+                                          raw.get("dropped"))),
         "blocked": bool(raw.get("blocked")),
         "rank": _as_int(raw.get("rank")) if raw.get("rank") is not None else int(rank),
     }
@@ -960,6 +967,8 @@ def project_payload(row, rows, repeat_infos=None, now=None):
             "count": ts.minutes_to_count(minutes) if minutes else 0,
             "completed": completed,
             "dropped": dropped,
+            "effective_completed": completed,
+            "effective_dropped": dropped,
             "blocked": bool(r.get("blocked")),
             "rank": len(members),
         }

@@ -2294,6 +2294,73 @@ check("手动模式仍然可以排今天",
       w.th.resolve_target_day(TODAY, dt.datetime.combine(TODAY, dt.time(22, 0)),
                               {}, allow_today=True), TODAY)
 
+print("== 任务视图（4）：固定表头 + open/close 折叠任务表列 ==")
+wdt = fresh_warden()
+wdt.go_to_view(w.TaskView)
+_empty_tbl = wdt.view.render()[0]
+_empty_headers = [str(c.header) for c in _empty_tbl.columns]
+check("空任务库也先画表头", _empty_headers[:2], ["序号", "id"])
+check_true("空任务库仍有内容列表头", "内容" in _empty_headers)
+
+wdt.handle("task create title=表头测试 duration=25")
+wdt.handle("task create title=第二条")
+_tbl = wdt.view.render()[0]
+_headers = [str(c.header) for c in _tbl.columns]
+check_true("任务表有固定表头", "序号" in _headers and "状态" in _headers)
+check_true("任务表有字段列表头", "title" in _headers and "duration" in _headers)
+
+check("close id 受理", wdt.handle("close id"), True)
+check("close 后仍在任务视图", isinstance(wdt.view, w.TaskView), True)
+_tbl = wdt.view.render()[0]
+_headers = [str(c.header) for c in _tbl.columns]
+check("id 列已折叠", "id" in _headers, False)
+_buf = io.StringIO()
+Console(file=_buf, width=200, force_terminal=False).print(_tbl)
+_out = _buf.getvalue()
+check_true("被折叠的表头名显示在表下面", "已折叠列：id" in _out)
+
+check("open id 受理", wdt.handle("open id"), True)
+_tbl = wdt.view.render()[0]
+check("id 列重新出现", "id" in [str(c.header) for c in _tbl.columns], True)
+check("全部打开后没有折叠提示", "已折叠列" in str(_tbl.caption or ""), False)
+
+check("close title 受理", wdt.handle("close title"), True)
+_tbl = wdt.view.render()[0]
+check("字段列 title 已折叠",
+      "title" in [str(c.header) for c in _tbl.columns], False)
+_buf = io.StringIO()
+Console(file=_buf, width=200, force_terminal=False).print(_tbl)
+check_true("字段列表头名也显示在表下面", "已折叠列：title" in _buf.getvalue())
+check("open title 受理", wdt.handle("open title"), True)
+_tbl = wdt.view.render()[0]
+check("字段列 title 重新出现",
+      "title" in [str(c.header) for c in _tbl.columns], True)
+
+print("== 任务视图：长任务表按屏幕预算截行，表头不被顶出屏幕 ==")
+for i in range(30):
+    wdt.task_store.create({"title": "长列表 %02d" % i})
+wdt.messages = []
+wdt.shell._terminal_rows = lambda: 30
+wdt.invalidate()
+_tbl = wdt.view.render()[0]
+check("任务表按屏幕预算截行（30 行终端 → 10 条）", len(_tbl.rows), 10)
+check("截行后表头还在", [str(c.header) for c in _tbl.columns][:2], ["序号", "id"])
+_buf = io.StringIO()
+Console(file=_buf, width=200, force_terminal=False).print(_tbl)
+check_true("表下说明只显示了哪一段", "表内显示第 1–10 条，共 32 条" in _buf.getvalue())
+for _rows in (24, 30, 40, 50):
+    wdt.shell._terminal_rows = lambda rows=_rows: rows
+    wdt.invalidate()
+    _lines = wdt.shell.frame_text().splitlines()
+    if _rows == 30:
+        print("DEBUG FRAME BEGIN")
+        for _ln in _lines[:16]:
+            print(repr(_ln))
+        print("DEBUG FRAME END")
+    check_true("终端 %d 行时表头仍可见" % _rows,
+               any("序号" in line and "id" in line and "状态" in line
+                   for line in _lines))
+
 print("== TUI 在场证明（daemon 靠它判断「人叫得回来吗」）==")
 info = wd.write_tui_state()
 check("写了 pid", info["pid"], os.getpid())

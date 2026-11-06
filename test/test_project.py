@@ -481,6 +481,29 @@ _inherit_tasks = {t["pk"]: t for t in _inherit_done["tasks"]}
 check("父任务完成 → 子任务有效状态 completed",
       (_inherit_tasks["done-child"]["completed"],
        _inherit_tasks["done-child"]["dropped"]), (True, False))
+
+# OmniFocus 自己会给出 taskStatus / effective* 标记。优先用这个标记，
+# 不再要求子任务自己的 completed 也为 true。
+_marker_rows = [
+    {"id": "p-marker", "name": "OF 有效状态项目", "kind": "project_root"},
+    {"id": "marker-parent", "name": "父任务", "kind": "action",
+     "project": "OF 有效状态项目", "completed": False, "dropped": False},
+    {"id": "marker-child", "name": "OF 标记已完成的子任务", "kind": "action",
+     "project": "OF 有效状态项目", "parent_id": "marker-parent",
+     "completed": False, "dropped": False,
+     "effective_completed": True, "effective_dropped": False,
+     "estimated_minutes": None},
+]
+_marker_payload = pj.project_payload(
+    _marker_rows[0], _marker_rows, now=_fixed_now)
+_marker_tasks = {t["pk"]: t for t in _marker_payload["tasks"]}
+check("OmniFocus 有效完成标记 → 子任务按完成处理",
+      (_marker_tasks["marker-child"]["completed"],
+       _marker_tasks["marker-child"]["effective_completed"]), (True, True))
+check("OmniFocus 有效完成标记 → 不再检查子任务时长",
+      _marker_payload["missing"], [])
+check("OmniFocus 有效完成标记 → 子任务不进可用任务",
+      pj.remaining_tasks(dict(_marker_payload, id=1), {}), [])
 check("父任务完成 → 孙任务也继承 completed",
       (_inherit_tasks["done-grand"]["completed"],
        _inherit_tasks["done-grand"]["dropped"]), (True, False))
@@ -540,6 +563,25 @@ _inherit_saved = pj.task_by_pk(_inherit_project, "drop-child")
 check("项目库刷新后仍保存继承的 dropped",
       (_inherit_saved.get("completed"), _inherit_saved.get("dropped")),
       (False, True))
+
+wd_inherit_done = fresh(_inherit_done_rows)
+check("父完成 + 子任务没时长也能导入",
+      wd_inherit_done.handle("task import omnifocus:///project/p-inherit-done"), True)
+check("父完成项目确实进库", len(wd_inherit_done.projects.active()), 1)
+check_true("没有报子任务缺少持续时间",
+           not any("没有「持续时间」" in t for t in texts(wd_inherit_done)))
+wd_inherit_drop = fresh(_inherit_drop_rows)
+check("父放弃 + 子任务没时长也能导入",
+      wd_inherit_drop.handle("task import omnifocus:///project/p-inherit-drop"), True)
+check("父放弃项目确实进库", len(wd_inherit_drop.projects.active()), 1)
+check_true("父放弃时也没报子任务缺少持续时间",
+           not any("没有「持续时间」" in t for t in texts(wd_inherit_drop)))
+wd_marker = fresh(_marker_rows)
+check("OmniFocus 有效完成标记 + 子任务没时长也能导入",
+      wd_marker.handle("task import omnifocus:///project/p-marker"), True)
+check("有效完成标记项目确实进库", len(wd_marker.projects.active()), 1)
+check_true("有效完成标记路径没报缺少持续时间",
+           not any("没有「持续时间」" in t for t in texts(wd_marker)))
 
 print("== 子任务完成：一条条勾，全部完成父任务自动完成 ==")
 reset_projects()

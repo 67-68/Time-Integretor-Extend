@@ -234,7 +234,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 | 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `project` / `open working|detail` |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
-| 4 | 任务 | 任务表（含 `状态` / `截止` / `OmniFocus` / `标签` 列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` + `plan` / `project` |
+| 4 | 任务 | 任务表（固定表头：`序号` / `id` / `状态` / `重复` / `trigger` / `formatter` / `session` / `截止` / `Focusmate` / `OmniFocus` / `完成时间` / `标签`，后面接任务字段列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` + `plan` / `project` + `open|close <任务表头>` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 | 6 | 琐事 | **没有 session 时自动接管**：只显示绑定的「琐事 Project」里一条未完成任务 + m/c/q 提示 | `m` 完成 / `c` 换一条 / `q` 回进入前的视图（并压制到下一场 session） |
 
@@ -269,19 +269,23 @@ working 模式下表格左侧的 `ID` 仍然保留它在 `self.rows` 里的原�
 
 ### 表头折叠：`open` / `close`
 
-契约表的列可以按表头名折叠；表头名支持中英文别名和带空格写法
-（`close 时段 ID` / `open "时段 ID"`）：
+契约表和**任务视图（视图 4）的任务表**都支持按表头名折叠；表头名支持中英文别名
+和带空格写法（`close 时段 ID` / `open "时段 ID"`）。命令作用在**当前视图的表**：
 
+- 契约视图 → 契约 session 表；
+- 任务视图 → 任务表（固定列 + `title` / `duration` 等字段列都认）；
+- 从任务视图敲契约列名、或从契约视图敲任务专有列名，会切到对应视图再操作；
 - `close <表头> [--permanent]`：这一列不再渲染；
 - `open <表头> [--permanent]`：重新显示；
 - 被折叠的列在 table 下方用一行 caption 说明：`已折叠列：…（open <表头名> 打开）`；
+- 任务表即使一条任务都没有，也先画固定表头和 `内容` 列，不会只剩一个说明框；
 - `--permanent` 写进 `data/warden-ui.json`（跟 `settings.json` 同目录；测试用
   `TI_SETTINGS_FILE` 一起隔离）。永久折叠/展开跨重启保留；不带 `--permanent`
   只覆盖本次运行；
 - `open working` / `open detail` 仍然优先解释为切看板口径；列名不会和它们冲突。
 
 working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列；手动
-`open <表头>` 可以临时展开。`close` 不能把所有列都折掉，至少留一列。
+`open <表头>` 可以临时展开。任务表默认不自动折叠。两个表都要求至少留一列。
 
 任意 session 行的 task 栏如果没有任何任务，会显示红色警告 `没有设定任务🔞`；
 不能留空，否则「空」和「没渲染」在界面上分不出来。

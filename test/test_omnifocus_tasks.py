@@ -135,6 +135,10 @@ else:
 print("== OmniJS 源码完整性 ==")
 check("JS 是 IIFE", m.OMNIJS_SOURCE.strip().startswith("(()") and m.OMNIJS_SOURCE.strip().endswith("()"), True)
 check("JS 里 taskStatus 对比有 try 兜底", "Task.Status.Blocked" in m.OMNIJS_SOURCE, True)
+check("JS 里用 effectiveCompletedDate 判有效完成",
+      "effectiveCompletedDate" in m.OMNIJS_SOURCE, True)
+check("JS 里用 effectiveDropDate 判有效放弃",
+      "effectiveDropDate" in m.OMNIJS_SOURCE, True)
 check("JS 里 next 用 Project.nextTask", "nextTask" in m.OMNIJS_SOURCE, True)
 check("JS 里没有中文硬编码字段名", "项目" not in m.OMNIJS_SOURCE, True)
 
@@ -163,7 +167,8 @@ const mk = o => Object.assign({
   id: { primaryKey: "x" }, name: "x", project: null, containingProject: null,
   parent: null, inInbox: false, tags: [], flagged: false, completed: false,
   dropDate: null, dueDate: null, deferDate: null, plannedDate: null,
-  completionDate: null, added: null, modified: null, estimatedMinutes: null,
+  completionDate: null, effectiveCompletedDate: null, effectiveDropDate: null,
+  added: null, modified: null, estimatedMinutes: null,
   taskStatus: "available", children: []
 }, o);
 const proj = { name: "P", nextTask: null };
@@ -176,8 +181,14 @@ const child = mk({
   taskStatus: "blocked", children: [{}]
 });
 const inboxChild = mk({ id: { primaryKey: "c2" }, name: "ib child", parent: inboxParent });
+// 父任务完成时，OmniFocus 会在子任务上给出 taskStatus = completed，
+// 但子任务自己的 completed 仍可能是 false。导入必须按有效状态处理。
+const inheritedDone = mk({
+  id: { primaryKey: "c3" }, name: "inherited done", parent: root,
+  containingProject: proj, completed: false, taskStatus: "completed"
+});
 proj.nextTask = child;
-const flattenedTasks = [root, inboxParent, child, inboxChild];
+const flattenedTasks = [root, inboxParent, child, inboxChild, inheritedDone];
 const database = { flattenedTasks };
 const result = %s;
 console.log(result);
@@ -194,11 +205,17 @@ console.log(result);
         check(
             "Node mock：kind 分类",
             [row["kind"] for row in data],
-            ["project_root", "inbox", "action", "inbox"],
+            ["project_root", "inbox", "action", "inbox", "action"],
         )
         check("Node mock：inbox 子任务也算 inbox", data[3]["in_inbox"], True)
         check("Node mock：next 用 project.nextTask", data[2]["next"], True)
         check("Node mock：blocked 用 taskStatus", data[2]["blocked"], True)
+        check("Node mock：子任务自己 completed=false 但 taskStatus 完成",
+              (data[4]["completed"], data[4]["effective_completed"]),
+              (False, True))
+        check("Node mock：父任务完成 → 子任务有效完成", data[4]["effective_completed"], True)
+        check("Node mock：普通子任务有效完成=false",
+              data[2]["effective_completed"], False)
         check("Node mock：tags", data[2]["tags"], ["a", "b"])
         check("Node mock：tag_ids", data[2]["tag_ids"], ["ta", "tb"])
         check("Node mock：本地 ISO 日期", data[2]["due"], "2026-10-27T09:00:00")

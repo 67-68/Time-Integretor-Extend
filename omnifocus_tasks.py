@@ -70,8 +70,10 @@
     tags               list  标签名列表（TSV 里用逗号连接）
     tag_ids            list  标签 primary key 列表，和 tags 一一对应
     flagged            bool  是否 flagged
-    completed          bool  是否已完成
-    dropped            bool  是否已丢弃
+    completed          bool  OmniFocus 本任务自己的 completed 标记
+    dropped            bool  OmniFocus 本任务自己的 dropped 标记
+    effective_completed bool OmniFocus 的有效完成状态（含父任务/容器继承）
+    effective_dropped  bool  OmniFocus 的有效放弃状态（含父任务/容器继承）
     due                date  截止时间
     defer              date  推迟到（开始）时间
     planned            date  计划时间
@@ -156,6 +158,9 @@ FIELD_SPECS = (
     ("flagged", "bool", "flagged of t"),
     ("completed", "bool", "completed of t"),
     ("dropped", "bool", "dropped of t"),
+    # AppleScript 兜底只能拿到本地标记；父任务继承由 project_store 再补一次。
+    ("effective_completed", "bool", "completed of t"),
+    ("effective_dropped", "bool", "dropped of t"),
     ("due", "date", "due date of t"),
     ("defer", "date", "defer date of t"),
     ("planned", "date", "planned date of t"),
@@ -335,13 +340,21 @@ OMNIJS_SOURCE = r'''
       return null;
     }
   };
-  const isBlocked = t => {
+  const statusText = t => {
     try {
       const s = t.taskStatus;
-      try {
-        const text = String(s).toLowerCase();
-        if (text === "blocked" || text.indexOf("blocked") >= 0) return true;
-      } catch (e) {}
+      if (s === undefined || s === null) return "";
+      if (Array.isArray(s)) return s.map(x => String(x)).join(" ").toLowerCase();
+      return String(s).toLowerCase();
+    } catch (e) {
+      return "";
+    }
+  };
+  const statusHas = (t, name) => statusText(t).indexOf(name) >= 0;
+  const isBlocked = t => {
+    try {
+      if (statusHas(t, "blocked")) return true;
+      const s = t.taskStatus;
       if (typeof Task !== "undefined") {
         if (s === Task.Status.Blocked) return true;
         if (s && typeof s.contains === "function" && s.contains(Task.Status.Blocked)) return true;
@@ -350,6 +363,14 @@ OMNIJS_SOURCE = r'''
     } catch (e) {
       return null;
     }
+  };
+  const isEffectiveCompleted = t => {
+    try { if (t.completed || t.effectiveCompletedDate) return true; } catch (e) {}
+    return statusHas(t, "completed");
+  };
+  const isEffectiveDropped = t => {
+    try { if (t.dropDate || t.effectiveDropDate) return true; } catch (e) {}
+    return statusHas(t, "dropped");
   };
   const rows = [];
   for (const t of all) {
@@ -370,6 +391,8 @@ OMNIJS_SOURCE = r'''
       flagged: !!t.flagged,
       completed: !!t.completed,
       dropped: !!t.dropDate,
+      effective_completed: isEffectiveCompleted(t),
+      effective_dropped: isEffectiveDropped(t),
       due: iso(t.dueDate),
       defer: iso(t.deferDate),
       planned: iso(t.plannedDate),

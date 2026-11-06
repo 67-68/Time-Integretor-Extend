@@ -39,7 +39,10 @@ warden.py          接线                 task import 认项目、任务面板�
       "pk": "t-intro", "title": "写引言", "parent": "论文", "parent_id": "",
       "due": "2026-11-04T11:50:00",
       "count": 3, "duration": 75,             // estimated minutes ÷ 25（往上取整）
-      "completed": false, "dropped": false, "blocked": false, "rank": 0
+      "completed": false, "dropped": false,   // 任务自己的标记
+      "effective_completed": false,           // OmniFocus 的有效状态（含父任务继承）
+      "effective_dropped": false,
+      "blocked": false, "rank": 0
     }],
     "plans": {                                // 按天记：这一天说好多少 count、真排了哪几条
       "2026-11-04": {
@@ -104,10 +107,12 @@ warden.py          接线                 task import 认项目、任务面板�
 
 - 父任务 + 子任务之外再出现孙任务（三层）→ **整个项目拒绝导入**，并点名是哪条。
   只检查有效状态为 active 的任务；已完成/已放弃的旧层级不挡导入；
-- **状态继承**：子任务自己没标 completed / dropped 时，跟着父任务的有效状态走。
-  父任务完成 → 子任务按 completed 算；父任务放弃 → 子任务按 dropped 算。子任务
-  自己显式标了 completed / dropped 的，按子任务自己的状态优先。继承关闭的子任务
-  不计入本周预算、不进入 `plan` 的可用任务，也不要求 estimated_minutes；
+- **状态继承**：优先信 OmniFocus 的 `taskStatus` / `effective_completed` /
+  `effective_dropped`（它已经算好父任务继承）；旧清单或 AppleScript 兜底没有这些
+  标记时，再按 `parent_id` 推导。父任务完成 → 子任务按 completed 算；父任务放弃
+  → 子任务按 dropped 算。子任务自己显式标了 completed / dropped 的，按子任务
+  自己的状态优先。继承关闭的子任务不计入本周预算、不进入 `plan` 的可用任务，
+  也不要求 estimated_minutes；
 - 父任务本身是空壳：不需要自己的 estimated_minutes，剩余时长 = 未完成子任务
   时长之和；项目进度/本周任务预算只按叶子任务算一遍，不重复计父壳；
 - 子任务不可拆到两场 session。排期以父任务为单元选场次，但**session 里只建子

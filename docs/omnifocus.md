@@ -46,6 +46,10 @@ python3 omnifocus_tasks.py set --id <PK> --add-tag 写作 --yes
 - 标签操作和状态/截止时间操作**不能混在一条命令里**（要分两次跑）。
 - `kind` 字段区分 `action` / `inbox` / `project_root`；`project_root` 是「项目自身」的
   根任务，筛任务一般要排掉。
+- `completed` / `dropped` 是任务**自己的**标记；`effective_completed` /
+  `effective_dropped` 是 OmniFocus 计算的**有效状态**。父任务完成或放弃后，
+  子任务可能自己的 `completed=false`，但 `taskStatus` / `effective*` 已经是
+  Completed / Dropped。项目导入用有效状态判断任务能不能排、要不要检查时长。
 
 ## 2. `omnifocus.py`：链接解析 + 子进程
 

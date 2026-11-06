@@ -1461,17 +1461,24 @@ class View(object):
                  "下一个视图", ("tab", "switch"), "通用",
                  usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
             _cmd("open", w.cmd_open,
-                 "open working|detail 切口径；open <表头> [--permanent] 打开一列",
+                 "open working|detail 切口径；open <表头> [--permanent] 打开当前表的一列",
                  ("看板",), "通用", usage="open working|detail | open <列名> [--permanent]",
-                 options=("working", "detail") + tuple(h for h, _kw in SESSION_TABLE_COLUMNS),
-                 hint=_hint_actions("working", "detail", "时段类型", "契约",
-                                    note="open 表头名 = 展开列；--permanent 写入偏好")),
+                 options=tuple(dict.fromkeys(
+                     ("working", "detail")
+                     + tuple(h for h, _kw in SESSION_TABLE_COLUMNS)
+                     + tuple(h for h, _kw in TASK_TABLE_COLUMNS)
+                     + (TASK_CONTENT_COLUMN,))),
+                 hint=_hint_actions("working", "detail", "时段类型", "id", "状态",
+                                    note="open 表头名 = 展开列；任务视图操作任务表")),
             _cmd("close", w.cmd_close,
-                 "close <表头> [--permanent]：折叠一列（--permanent = 该口径永久折叠）",
+                 "close <表头> [--permanent]：折叠当前表的一列（--permanent = 永久折叠）",
                  ("关闭",), "通用", usage="close <列名> [--permanent]",
-                 options=tuple(h for h, _kw in SESSION_TABLE_COLUMNS) + ("--permanent",),
-                 hint=_hint_actions("时段类型", "时段名称", "契约",
-                                    note="close 表头名 = 折叠列；--permanent 写入偏好")),
+                 options=tuple(dict.fromkeys(
+                     tuple(h for h, _kw in SESSION_TABLE_COLUMNS)
+                     + tuple(h for h, _kw in TASK_TABLE_COLUMNS)
+                     + (TASK_CONTENT_COLUMN, "--permanent"))),
+                 hint=_hint_actions("时段类型", "id", "状态",
+                                    note="close 表头名 = 折叠列；任务视图操作任务表")),
             _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
                  ("stats",), "通用", usage="stat [refresh [full]]",
                  options=("refresh", "full"), hint=_hint_stat),
@@ -2027,7 +2034,8 @@ class TaskView(View):
                      "task 3 -f end", "task -f", "inspect-due", "review"),
             note="数字 = 面板上的序号（1 起连续）· task 3 ≡ task select 3"
                  " · -an 下架 / -ac 当前这一场 · -c 5 设 count / -c +2 加进度"
-                 " · -f end 排到当天最后一段 · 面板外的用 id:N · Tab 切视图",
+                 " · -f end 排到当天最后一段 · 面板外的用 id:N"
+                 " · open/close <表头> 折叠任务表列 · Tab 切视图",
         )
 
     def status_line(self):
@@ -2077,61 +2085,62 @@ class TaskView(View):
                                     note="序号 = 项目表上的 #")),
         ]
 
+    def _row_budget(self):
+        """任务表最多画几行 —— 留出头部/归档/Recent/提示行，别把表头挤出屏幕。"""
+        try:
+            terminal_rows = int(self.w.shell._terminal_rows())
+        except Exception:                             # noqa: BLE001 - 测试/离屏兜底
+            terminal_rows = 30
+        return max(3, min(20, terminal_rows - 20))
+
+    def _task_window(self, tasks):
+        """返回 ``(要画的任务, 起始下标, 总数)``；选中任务尽量保持在窗口中间。"""
+        total = len(tasks)
+        limit = self._row_budget()
+        if total <= limit:
+            return tasks, 0, total
+        selected = self.w.selected_task_id
+        start = 0
+        for index, task in enumerate(tasks):
+            if task.get("id") == selected:
+                start = max(0, min(index - limit // 2, total - limit))
+                break
+        return tasks[start:start + limit], start, total
+
     def render(self):
         w = self.w
-        tasks = w.task_store.list()
+        all_tasks = w.task_store.list()
+        tasks, start, total = self._task_window(all_tasks)
         selected = w.selected_task_id
-        if not tasks:
-            return Panel(
-                Text("还没有任务。\n"
-                     "  task create title=写论文 due=明天\n"
-                     "  task create 3 title=复习数学          ← 显式 ID\n"
-                     "  task modify 3 due 后天\n"
-                     "  task note 3 材料在这 https://example.com/x   ← 完成后会显示（可点）\n"
-                     "  task assign 2                        ← 挂到表格里的 #2 session\n"
-                     "  task 3 -a 2                          ← 同上（裸 ID = select）\n"
-                     "  task create title=明日时间安排 --repeat mon@22:15"
-                     "   ← 每周一 22:15 那场自动挂上\n"
-                     "  task create title=闪卡 duration=25 -f end"
-                     "   ← 排到当天最后一段（25 分钟 + 5 分钟休息）\n"
-                     "  task -t / task -f                    ← 看 trigger / formatter 预设\n"
-                     "  inspect-due                          ← 主动看「过期还没做完」的任务",
-                     style="dim"),
-                title="[bold]Task · 任务[/]", border_style="magenta", box=box.ROUNDED)
+        keys = task_dynamic_keys(all_tasks)
+        headers = task_table_headers(all_tasks)
+        hidden = w.effective_task_hidden_columns(all_tasks)
+        visible_headers = [h for h in headers if h not in hidden]
+        # close 已经保证至少留一列；这里只是防御坏偏好文件。
+        if not visible_headers:
+            visible_headers = [headers[0]]
 
-        # due / due_source 有专门的「截止」列，别在右边再列一遍
-        hidden = {"due", "due_source"}
-        keys = []
-        for t in tasks:
-            for k in (t.get("fields") or {}):
-                if k not in keys and k not in hidden:
-                    keys.append(k)
-        t = Table(title="Task · 本地 JSON 任务库（序号 = 契约视图面板上的第几条；"
-                        "不在面板上的用 `id:N` 指定）",
+        t = Table(title="Task · 任务表（open/close 折叠列；序号 = 契约面板上的第几条）",
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
-                  title_justify="left", expand=False)
-        t.add_column("序号", justify="right", style="bold", no_wrap=True)
-        t.add_column("id", justify="right", style=STYLE_MUTED, no_wrap=True)
-        t.add_column("状态", no_wrap=True)
-        t.add_column("重复", no_wrap=True)
-        t.add_column("trigger", no_wrap=True)
-        t.add_column("formatter", no_wrap=True)
-        t.add_column("session", no_wrap=True)
-        t.add_column("截止", no_wrap=True)
-        t.add_column("Focusmate", no_wrap=True)
-        t.add_column("OmniFocus", no_wrap=True)
-        t.add_column("完成时间", no_wrap=True)
-        t.add_column("标签", no_wrap=True, overflow="crop")
-        for k in keys:
-            t.add_column(str(k), no_wrap=True, overflow="crop")
-        if not keys:
-            t.add_column("内容", no_wrap=True, overflow="crop")
+                  title_justify="left", expand=False, show_header=True)
+        specs = dict(TASK_TABLE_COLUMNS)
+        for header in visible_headers:
+            if header in specs:
+                t.add_column(header, **specs[header])
+            else:
+                t.add_column(str(header), no_wrap=True, overflow="crop")
+
         status_style = {ts.STATUS_COMPLETED: STYLE_DONE, ts.STATUS_DROPPED: STYLE_DROPPED}
+        if not tasks:
+            row = [Text("") for _ in visible_headers]
+            row[0] = Text("（还没有任务；task create title=写论文 开始）", style="dim")
+            t.add_row(*row)
         for task in tasks:
             status = w.task_store.status_of(task)
             style = "bold reverse" if task.get("id") == selected else ""
             if status != ts.STATUS_ACTIVE:
-                style = status_style.get(status, "") + (" reverse" if task.get("id") == selected else "")
+                style = status_style.get(status, "") + (
+                    " reverse" if task.get("id") == selected else "")
             sess = task.get("session") or {}
             sess_txt = ("%s %s" % (sess.get("date") or "?", sess.get("start") or "?"
                                   )) if sess else "—"
@@ -2144,12 +2153,6 @@ class TaskView(View):
             done = fm.get("completed_at") or task.get("status_at") or "—"
             if isinstance(done, str) and len(done) > 16:
                 done = done.replace("T", " ")[:16]
-            vals = []
-            if keys:
-                for k in keys:
-                    vals.append(w.task_store._one_line((task.get("fields") or {}).get(k)))
-            else:
-                vals.append(w.task_store.summarize(task))
             rep = task.get("repeat") or {}
             rep_txt = ("🔁 " + ts.repeat_summary(rep)) if rep else "—"
             trig = task.get("trigger") or {}
@@ -2170,20 +2173,38 @@ class TaskView(View):
                 num_txt = "id:%s" % task["id"]
             else:
                 num_txt = "—"
-            t.add_row(num_txt,
-                      str(task["id"]),
-                      Text(status_txt, style=status_style.get(status, "")),
-                      Text(rep_txt, style="magenta" if rep else STYLE_MUTED),
-                      Text(trig_txt, style="cyan" if trig else STYLE_MUTED),
-                      Text(fmt_txt, style="green" if fmt else STYLE_MUTED),
-                      Text(sess_txt, style=style),
-                      Text(due_txt, style=STYLE_MUTED if due else style),
-                      Text(fm_txt, style=style),
-                      Text(omni_txt, style="cyan" if omni_id else STYLE_MUTED),
-                      Text(done, style=style),
-                      Text(" · ".join(tags) if tags else "—",
-                           style="yellow" if tags else STYLE_MUTED),
-                      *[Text(v, style=style) for v in vals])
+            fields = task.get("fields") or {}
+            cells = {
+                "序号": Text(num_txt, style=style),
+                "id": Text(str(task["id"]), style=style),
+                "状态": Text(status_txt, style=status_style.get(status, "")),
+                "重复": Text(rep_txt, style="magenta" if rep else STYLE_MUTED),
+                "trigger": Text(trig_txt, style="cyan" if trig else STYLE_MUTED),
+                "formatter": Text(fmt_txt, style="green" if fmt else STYLE_MUTED),
+                "session": Text(sess_txt, style=style),
+                "截止": Text(due_txt, style=STYLE_MUTED if due else style),
+                "Focusmate": Text(fm_txt, style=style),
+                "OmniFocus": Text(omni_txt, style="cyan" if omni_id else STYLE_MUTED),
+                "完成时间": Text(done, style=style),
+                "标签": Text(" · ".join(tags) if tags else "—",
+                            style="yellow" if tags else STYLE_MUTED),
+                TASK_CONTENT_COLUMN: Text(w.task_store.summarize(task), style=style),
+            }
+            for key in keys:
+                cells[key] = Text(w.task_store._one_line(fields.get(key)), style=style)
+            t.add_row(*[cells.get(header, Text("")) for header in visible_headers])
+
+        caption_bits = []
+        if total > len(tasks):
+            # 行也要截：任务表比屏幕还长时，若整块交给上层裁屏，表头会被裁掉。
+            caption_bits.append("表内显示第 %d–%d 条，共 %d 条（task select id:N 移动窗口）"
+                                % (start + 1, start + len(tasks), total))
+        if hidden:
+            # 被折叠的表头名字放在表下面，方便随时知道还有什么列 / 怎么打开。
+            caption_bits.append("已折叠列：%s（open <表头名> 打开）" % "、".join(
+                header for header in headers if header in hidden))
+        if caption_bits:
+            t.caption = " · ".join(caption_bits)
 
         # 收尾面板在 repl_kit 的打断栏位里（见 render_interrogate），不在这儿。
         out = [t]
@@ -2196,7 +2217,7 @@ class TaskView(View):
         if not arch:
             at.add_row("", Text("（还没有完成归档；task sync 会读 GET /v1/tasks 的 "
                                 "completedAt）", style="dim"))
-        for rec in arch[-8:]:
+        for rec in arch[-5:]:
             fm = rec.get("focusmate") or {}
             sess = rec.get("session") or {}
             note = rec.get("notes") or w.task_store.notes({"fields": rec.get("fields")})
@@ -2483,6 +2504,46 @@ SESSION_TABLE_COLUMNS = (
 #: working 口径下默认折叠的列（用户明确要求：类型 / 名称 / 契约）。
 WORKING_AUTO_HIDDEN_COLUMNS = ("时段类型", "时段名称", "契约")
 
+#: 任务视图（Tab 第 4 个）的固定列表头。字段列（title / duration / …）
+#: 会按任务实际出现的顺序追加在后面。
+TASK_TABLE_COLUMNS = (
+    ("序号", {"justify": "right", "style": "bold", "no_wrap": True}),
+    ("id", {"justify": "right", "style": STYLE_MUTED, "no_wrap": True}),
+    ("状态", {"no_wrap": True}),
+    ("重复", {"no_wrap": True}),
+    ("trigger", {"no_wrap": True}),
+    ("formatter", {"no_wrap": True}),
+    ("session", {"no_wrap": True}),
+    ("截止", {"no_wrap": True}),
+    ("Focusmate", {"no_wrap": True}),
+    ("OmniFocus", {"no_wrap": True}),
+    ("完成时间", {"no_wrap": True}),
+    ("标签", {"no_wrap": True, "overflow": "crop"}),
+)
+TASK_CONTENT_COLUMN = "内容"
+TASK_DYNAMIC_HIDDEN = {"due", "due_source"}
+
+#: 任务表 open/close 认的表头别名（去掉空白、转小写之后比较）。
+TASK_COLUMN_ALIASES = {
+    "序号": "序号", "number": "序号", "num": "序号", "no": "序号",
+    "id": "id", "内部id": "id", "taskid": "id",
+    "状态": "状态", "status": "状态",
+    "重复": "重复", "repeat": "重复", "重复任务": "重复",
+    "trigger": "trigger", "触发": "trigger", "触发器": "trigger",
+    "formatter": "formatter", "格式": "formatter", "格式化": "formatter",
+    "session": "session", "场次": "session",
+    "截止": "截止", "due": "截止", "截止时间": "截止",
+    "focusmate": "Focusmate",
+    "omnifocus": "OmniFocus", "of": "OmniFocus",
+    "完成时间": "完成时间", "done": "完成时间", "completedat": "完成时间",
+    "标签": "标签", "tags": "标签", "tag": "标签",
+    "内容": TASK_CONTENT_COLUMN, "content": TASK_CONTENT_COLUMN,
+}
+
+#: 任务视图的列折叠状态也落同一个 warden-ui.json，mode 用这个名字。
+TASK_UI_MODE = "task"
+UI_PREF_MODES = SESSION_UI_MODES + (TASK_UI_MODE,)
+
 #: `open/close` 认的表头别名（去掉空白、转小写之后比较）。
 SESSION_COLUMN_ALIASES = {
     "时段id": "时段 ID", "periodid": "时段 ID", "pid": "时段 ID",
@@ -2506,6 +2567,38 @@ def normalize_session_column(text):
     if not compact:
         return None
     return SESSION_COLUMN_ALIASES.get(compact)
+
+
+def task_dynamic_keys(tasks):
+    """任务里出现的自定义字段列（due / due_source 已有专门列，不再重复）。"""
+    out = []
+    for task in tasks or ():
+        for key in ((task or {}).get("fields") or {}):
+            if key not in out and key not in TASK_DYNAMIC_HIDDEN:
+                out.append(str(key))
+    return out
+
+
+def task_table_headers(tasks):
+    """任务表当前可显示的完整表头（固定列 + 自定义字段列）。"""
+    fixed = [header for header, _kw in TASK_TABLE_COLUMNS]
+    keys = [key for key in task_dynamic_keys(tasks) if key not in fixed]
+    return fixed + (keys or [TASK_CONTENT_COLUMN])
+
+
+def normalize_task_column(text, tasks=None):
+    """用户敲的任务表表头 → 规范列名；认不出返回 None。"""
+    raw = str(text or "").strip()
+    compact = re.sub(r"\s+", "", raw).strip().lower()
+    if not compact:
+        return None
+    col = TASK_COLUMN_ALIASES.get(compact)
+    if col:
+        return col
+    for key in task_dynamic_keys(tasks):
+        if key == raw or re.sub(r"\s+", "", key).lower() == compact:
+            return key
+    return None
 
 
 def visible_session_rows(rows, mode="detail"):
@@ -2574,10 +2667,10 @@ class Warden(object):
         self.session_ui_mode = "detail"
         # 列折叠：每个口径单独记；--permanent 落盘到 settings.json 同目录的
         # warden-ui.json。session_* 是本次运行里的临时 open/close 覆盖。
-        self.permanent_hidden_columns = {m: set() for m in SESSION_UI_MODES}
-        self.permanent_visible_columns = {m: set() for m in SESSION_UI_MODES}
-        self.session_hidden_columns = {m: set() for m in SESSION_UI_MODES}
-        self.session_visible_columns = {m: set() for m in SESSION_UI_MODES}
+        self.permanent_hidden_columns = {m: set() for m in UI_PREF_MODES}
+        self.permanent_visible_columns = {m: set() for m in UI_PREF_MODES}
+        self.session_hidden_columns = {m: set() for m in UI_PREF_MODES}
+        self.session_visible_columns = {m: set() for m in UI_PREF_MODES}
         self._load_ui_prefs()
         # 视图（Shift+Tab 切换）：默认「契约」视图，第二个是「专注」视图。
         self.view_impls = [cls(self) for cls in VIEWS] or [ContractView(self)]
@@ -3741,6 +3834,7 @@ class Warden(object):
             self.review_signature(), pending_sig,
             self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
             tuple(sorted(self.effective_hidden_columns())),
+            tuple(sorted(self.effective_task_hidden_columns())),
             isinstance(self.view, ChoreView), self.chore_index,
             self.chore_last_note,
             id(getattr(self, "stat", None)),
@@ -3766,12 +3860,15 @@ class Warden(object):
             data = raw.get(section) or {}
             if not isinstance(data, dict):
                 continue
-            for mode in SESSION_UI_MODES:
+            for mode in UI_PREF_MODES:
                 names = data.get(mode) or []
                 if not isinstance(names, list):
                     continue
                 for name in names:
-                    col = normalize_session_column(name)
+                    if mode == TASK_UI_MODE:
+                        col = normalize_task_column(name) or str(name).strip()
+                    else:
+                        col = normalize_session_column(name)
                     if col:
                         target[mode].add(col)
 
@@ -3779,9 +3876,9 @@ class Warden(object):
         path = self.ui_prefs_path()
         data = {
             "hidden": {m: sorted(self.permanent_hidden_columns[m])
-                       for m in SESSION_UI_MODES},
+                       for m in UI_PREF_MODES},
             "visible": {m: sorted(self.permanent_visible_columns[m])
-                        for m in SESSION_UI_MODES},
+                        for m in UI_PREF_MODES},
         }
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -3810,8 +3907,8 @@ class Warden(object):
         return {col for col in hidden
                 if any(col == header for header, _kw in SESSION_TABLE_COLUMNS)}
 
-    def _set_column_open(self, col, permanent=False):
-        mode = self.session_ui_mode
+    def _set_column_open(self, col, permanent=False, mode=None):
+        mode = mode or self.session_ui_mode
         self.session_hidden_columns[mode].discard(col)
         self.session_visible_columns[mode].add(col)
         if permanent:
@@ -3819,14 +3916,27 @@ class Warden(object):
             self.permanent_visible_columns[mode].add(col)
             self._save_ui_prefs()
 
-    def _set_column_closed(self, col, permanent=False):
-        mode = self.session_ui_mode
+    def _set_column_closed(self, col, permanent=False, mode=None):
+        mode = mode or self.session_ui_mode
         self.session_visible_columns[mode].discard(col)
         self.session_hidden_columns[mode].add(col)
         if permanent:
             self.permanent_visible_columns[mode].discard(col)
             self.permanent_hidden_columns[mode].add(col)
             self._save_ui_prefs()
+
+    def effective_task_hidden_columns(self, tasks=None):
+        """任务表当前不展示的任务表头（自动无折叠；都是 open/close 的结果）。
+
+        ``tasks=None`` 时不读任务库，只返回偏好里记的列名（frame signature 用）；
+        渲染和 close 校验会传入当前任务，于是还能过滤掉已经不存在的动态字段。
+        """
+        headers = set(task_table_headers(tasks)) if tasks is not None else None
+        hidden = set(self.permanent_hidden_columns.get(TASK_UI_MODE, set()))
+        hidden |= set(self.session_hidden_columns.get(TASK_UI_MODE, set()))
+        hidden -= set(self.permanent_visible_columns.get(TASK_UI_MODE, set()))
+        hidden -= set(self.session_visible_columns.get(TASK_UI_MODE, set()))
+        return {col for col in hidden if headers is None or col in headers}
 
     # -- 选中的那一天
 
@@ -11018,11 +11128,38 @@ class Warden(object):
         self.invalidate()
         return mode
 
+    def _resolve_open_close_column(self, text, task_mode):
+        """当前视图优先：任务视图找任务表头，其他视图找契约表头。
+
+        返回 ``(col, mode, headers, table_name)``；找不到返回 ``(None, ...)``。
+        这样两个表里都有「状态」时不会串，同时从别的视图敲任务表头也能切过去。
+        """
+        tasks = self.task_store.list()
+        task_headers = task_table_headers(tasks)
+        session_headers = [h for h, _kw in SESSION_TABLE_COLUMNS]
+        if task_mode:
+            col = normalize_task_column(text, tasks)
+            if col:
+                return col, TASK_UI_MODE, task_headers, "任务表"
+            col = normalize_session_column(text)
+            if col:
+                return col, self.session_ui_mode, session_headers, "契约表"
+        else:
+            col = normalize_session_column(text)
+            if col:
+                return col, self.session_ui_mode, session_headers, "契约表"
+            col = normalize_task_column(text, tasks)
+            if col:
+                return col, TASK_UI_MODE, task_headers, "任务表"
+        return None, None, task_headers if task_mode else session_headers, (
+            "任务表" if task_mode else "契约表")
+
     def cmd_open(self, args=None):
         """``open working|detail`` 切口径；``open <表头> [--permanent]`` 展开列。
 
         working 默认自动折叠「时段类型 / 时段名称 / 契约」；手动 open 只是
         本次运行的覆盖，加 ``--permanent`` 才会写进偏好、以后也不再自动折叠。
+        在任务视图里，``open/close`` 作用于任务表的表头。
         """
         text, permanent, toks = self._column_command_args(args)
         if not text:
@@ -11036,42 +11173,64 @@ class Warden(object):
             if permanent:
                 raise ValueError("open --permanent 只用于表头列；切口径不带 --permanent")
             return self._switch_session_mode(mode)
-        col = normalize_session_column(text)
+        task_mode = isinstance(self.view, TaskView)
+        col, target_mode, headers, table_name = self._resolve_open_close_column(
+            text, task_mode=task_mode)
         if not col:
             raise ValueError(
-                "open 只认 working / detail 或表头名（%s）；你给的是 %r"
-                % ("、".join(h for h, _kw in SESSION_TABLE_COLUMNS), text))
-        self._set_column_open(col, permanent=permanent)
-        if not isinstance(self.view, ContractView):
-            self.go_to_view(ContractView)
-        self.say("已打开列「%s」%s（%s 口径）"
-                 % (col, "并写入偏好" if permanent else "（本次运行）",
-                    self.session_ui_mode), "cmd")
+                "open 只认 working / detail 或表头名（当前表：%s）；你给的是 %r"
+                % ("、".join(headers), text))
+        self._set_column_open(col, permanent=permanent, mode=target_mode)
+        if target_mode == TASK_UI_MODE:
+            if not isinstance(self.view, TaskView):
+                self.go_to_view(TaskView)
+            detail = "（任务表）"
+        else:
+            if not isinstance(self.view, ContractView):
+                self.go_to_view(ContractView)
+            detail = "（%s 口径）" % self.session_ui_mode
+        self.say("已打开列「%s」%s%s"
+                 % (col, "并写入偏好" if permanent else "（本次运行）", detail), "cmd")
         self.invalidate()
         return col
 
     def cmd_close(self, args=None):
-        """``close <表头> [--permanent]``：折叠一列；永久偏好写 warden-ui.json。"""
+        """``close <表头> [--permanent]``：折叠一列；永久偏好写 warden-ui.json。
+
+        在任务视图里折叠任务表列；其他视图折叠契约表列。
+        """
         text, permanent, _toks = self._column_command_args(args)
         if not text:
-            raise ValueError("用法：close <表头名> [--permanent]；表头名：%s"
-                             % "、".join(h for h, _kw in SESSION_TABLE_COLUMNS))
-        col = normalize_session_column(text)
+            raise ValueError("用法：close <表头名> [--permanent]；当前表头名：%s"
+                             % "、".join(task_table_headers(self.task_store.list())
+                                         if isinstance(self.view, TaskView)
+                                         else [h for h, _kw in SESSION_TABLE_COLUMNS]))
+        task_mode = isinstance(self.view, TaskView)
+        col, target_mode, headers, table_name = self._resolve_open_close_column(
+            text, task_mode=task_mode)
         if not col:
             raise ValueError(
-                "close 只认表头名（%s）；你给的是 %r"
-                % ("、".join(h for h, _kw in SESSION_TABLE_COLUMNS), text))
+                "close 只认表头名（当前表：%s）；你给的是 %r"
+                % ("、".join(headers), text))
         # 至少留一列，否则 rich 会画一张没有列的表。
-        hidden = set(self.effective_hidden_columns())
+        if target_mode == TASK_UI_MODE:
+            hidden = set(self.effective_task_hidden_columns(self.task_store.list()))
+        else:
+            hidden = set(self.effective_hidden_columns())
         hidden.add(col)
-        if len(hidden) >= len(SESSION_TABLE_COLUMNS):
+        if len(hidden) >= len(headers):
             raise ValueError("不能把所有列都折叠；至少留一列看。")
-        self._set_column_closed(col, permanent=permanent)
-        if not isinstance(self.view, ContractView):
-            self.go_to_view(ContractView)
-        self.say("已折叠列「%s」%s（%s 口径）"
-                 % (col, "并写入偏好" if permanent else "（本次运行）",
-                    self.session_ui_mode), "cmd")
+        self._set_column_closed(col, permanent=permanent, mode=target_mode)
+        if target_mode == TASK_UI_MODE:
+            if not isinstance(self.view, TaskView):
+                self.go_to_view(TaskView)
+            detail = "（任务表）"
+        else:
+            if not isinstance(self.view, ContractView):
+                self.go_to_view(ContractView)
+            detail = "（%s 口径）" % self.session_ui_mode
+        self.say("已折叠列「%s」%s%s"
+                 % (col, "并写入偏好" if permanent else "（本次运行）", detail), "cmd")
         self.invalidate()
         return col
 
