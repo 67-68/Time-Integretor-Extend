@@ -1560,10 +1560,10 @@ check("mark 和 -s 批量混用 → 受理但报错",
 check_true("提示 mark 是单条动作",
            any("不能和 `-s/--from` 批量一起用" in m[2] for m in wd6.messages))
 
-# 任务视图（视图 4）里两列都在：序号 + 内部 id
+# 任务视图（视图 4）默认顺序：序号 + 标记（boolean flags） + title + project + 状态 + session + 截止 + 备注
 _view4 = [v for v in w.VIEWS if v.key == "4"][0](wd6).render()[0]
-check("任务视图有「序号」列", [str(c.header) for c in _view4.columns][:2],
-      ["序号", "id"])
+check("任务视图有「序号」和「标记」列", [str(c.header) for c in _view4.columns][:3],
+      ["序号", "标记", "title"])
 
 print("== 任务面板排序：先状态分段（进行中/完成/放弃），段内按位置连号 ==")
 wd3 = fresh_warden()
@@ -2294,35 +2294,57 @@ check("手动模式仍然可以排今天",
       w.th.resolve_target_day(TODAY, dt.datetime.combine(TODAY, dt.time(22, 0)),
                               {}, allow_today=True), TODAY)
 
-print("== 任务视图（4）：固定表头 + open/close 折叠任务表列 ==")
+print("== 任务视图（4）：默认收敛 + 标记/title/project/备注 + open/close 折叠列 ==")
 wdt = fresh_warden()
 wdt.go_to_view(w.TaskView)
 _empty_tbl = wdt.view.render()[0]
 _empty_headers = [str(c.header) for c in _empty_tbl.columns]
-check("空任务库也先画表头", _empty_headers[:2], ["序号", "id"])
+check("空任务库也先画默认表头", _empty_headers[:4], ["序号", "标记", "title", "project"])
 check_true("空任务库仍有内容列表头", "内容" in _empty_headers)
 
-wdt.handle("task create title=表头测试 duration=25")
-wdt.handle("task create title=第二条")
+t_a = wdt.task_store.create(
+    {"title": "表头测试", "duration": 25, "project": "SuperLongProjectAlpha", "exclusive": True},
+    tags=["未完成转移"],
+    omnifocus={"id": "of-1", "url": "omnifocus:///task/of-1", "title": "表头测试"})
+wdt.handle("task create title=第二条 project=ProjB duration=50")
 _tbl = wdt.view.render()[0]
 _headers = [str(c.header) for c in _tbl.columns]
-check_true("任务表有固定表头", "序号" in _headers and "状态" in _headers)
-check_true("任务表有字段列表头", "title" in _headers and "duration" in _headers)
+check("任务表默认可见列顺序",
+      _headers,
+      ["序号", "标记", "title", "project", "状态", "session", "截止", "备注"])
+for _auto_col in ("id", "重复", "trigger", "formatter", "Focusmate", "OmniFocus",
+                  "完成时间", "标签", "duration", "count", "exclusive"):
+    check("默认折叠列 %s 不在表上" % _auto_col, _auto_col in _headers, False)
+    check_true("默认折叠列 %s 出现在表下提示" % _auto_col,
+               _auto_col in str(_tbl.caption or ""))
 
-check("close id 受理", wdt.handle("close id"), True)
-check("close 后仍在任务视图", isinstance(wdt.view, w.TaskView), True)
-_tbl = wdt.view.render()[0]
-_headers = [str(c.header) for c in _tbl.columns]
-check("id 列已折叠", "id" in _headers, False)
 _buf = io.StringIO()
 Console(file=_buf, width=200, force_terminal=False).print(_tbl)
 _out = _buf.getvalue()
-check_true("被折叠的表头名显示在表下面", "已折叠列：id" in _out)
+check_true("标记列显示 🔗 和 🔒", "🔗🔒" in _out)
+check("task_remark_text 包含 dur=/cnt=/excl=/tag= 缩写",
+      wdt.task_remark_text(t_a),
+      "dur=25m, cnt=1, excl=1, tag=未完成转移")
+check_true("表格备注列渲染 dur=/cnt=/excl=",
+           "dur=25m, cnt=1" in _out)
+check_true("project 列超长自动裁剪", "SuperLo…" in _out or "SuperLongPr…" in _out)
 
-check("open id 受理", wdt.handle("open id"), True)
+check("紧凑时间戳：同一天只显示 HH:MM",
+      w.format_compact_timestamp(TODAY.isoformat() + "T23:40:00", TODAY), "23:40")
+check("紧凑时间戳：明天显示 +1 HH:MM",
+      w.format_compact_timestamp((TODAY + datetime.timedelta(days=1)).isoformat() + "T11:50:00", TODAY),
+      "+1 11:50")
+check("紧凑时间戳：昨天显示 -1 HH:MM",
+      w.format_compact_timestamp((TODAY - datetime.timedelta(days=1)).isoformat() + "T09:15:00", TODAY),
+      "-1 09:15")
+
+check("open id 受理（打开默认折叠列）", wdt.handle("open id"), True)
+check("open 后仍在任务视图", isinstance(wdt.view, w.TaskView), True)
 _tbl = wdt.view.render()[0]
-check("id 列重新出现", "id" in [str(c.header) for c in _tbl.columns], True)
-check("全部打开后没有折叠提示", "已折叠列" in str(_tbl.caption or ""), False)
+check("id 列展开出现", "id" in [str(c.header) for c in _tbl.columns], True)
+check("close id 受理（重新折叠）", wdt.handle("close id"), True)
+_tbl = wdt.view.render()[0]
+check("id 列重新折叠", "id" in [str(c.header) for c in _tbl.columns], False)
 
 check("close title 受理", wdt.handle("close title"), True)
 _tbl = wdt.view.render()[0]
@@ -2330,36 +2352,62 @@ check("字段列 title 已折叠",
       "title" in [str(c.header) for c in _tbl.columns], False)
 _buf = io.StringIO()
 Console(file=_buf, width=200, force_terminal=False).print(_tbl)
-check_true("字段列表头名也显示在表下面", "已折叠列：title" in _buf.getvalue())
+check_true("字段列表头名也显示在表下面", "title" in _buf.getvalue())
 check("open title 受理", wdt.handle("open title"), True)
 _tbl = wdt.view.render()[0]
 check("字段列 title 重新出现",
       "title" in [str(c.header) for c in _tbl.columns], True)
 
-print("== 任务视图：长任务表按屏幕预算截行，表头不被顶出屏幕 ==")
+print("== 任务视图：分页显示 + open 1/2/3 翻页 + 80 列窄终端表头可见 ==")
 for i in range(30):
-    wdt.task_store.create({"title": "长列表 %02d" % i})
+    wdt.task_store.create({"title": "长列表 %02d" % i,
+                           "project": "ProjA" if i % 2 == 0 else "ProjB"})
 wdt.messages = []
 wdt.shell._terminal_rows = lambda: 30
 wdt.invalidate()
 _tbl = wdt.view.render()[0]
-check("任务表按屏幕预算截行（30 行终端 → 10 条）", len(_tbl.rows), 10)
-check("截行后表头还在", [str(c.header) for c in _tbl.columns][:2], ["序号", "id"])
+check("任务表按屏幕预算截行（30 行终端 → 9 条）", len(_tbl.rows), 9)
+check("截行后表头还在", [str(c.header) for c in _tbl.columns][:3], ["序号", "标记", "title"])
 _buf = io.StringIO()
 Console(file=_buf, width=200, force_terminal=False).print(_tbl)
-check_true("表下说明只显示了哪一段", "表内显示第 1–10 条，共 32 条" in _buf.getvalue())
+check_true("表下说明显示页码与 open 1 / 2 / 3 提示",
+           "第 1/4 页，共 32 条（open 1 / 2 / 3" in _buf.getvalue())
+check("open 2 直接翻到第 2 页", wdt.handle("open 2"), True)
+check("当前页码变为 2", wdt.task_view_page, 2)
+_tbl_p2 = wdt.view.render()[0]
+check_true("表下说明更新为第 2/4 页", "第 2/4 页，共 32 条" in str(_tbl_p2.caption or ""))
+check("open 1 翻回第 1 页", wdt.handle("open 1"), True)
+
 for _rows in (24, 30, 40, 50):
     wdt.shell._terminal_rows = lambda rows=_rows: rows
     wdt.invalidate()
     _lines = wdt.shell.frame_text().splitlines()
-    if _rows == 30:
-        print("DEBUG FRAME BEGIN")
-        for _ln in _lines[:16]:
-            print(repr(_ln))
-        print("DEBUG FRAME END")
     check_true("终端 %d 行时表头仍可见" % _rows,
-               any("序号" in line and "id" in line and "状态" in line
+               any("序号" in line and "标记" in line and "title" in line and "状态" in line
                    for line in _lines))
+
+print("== 任务视图：sort 排序 + group(project) 分组 + search 搜索 ==")
+check("group project 受理", wdt.handle("group project"), True)
+_gtbl = wdt.view.render()[0]
+_gheaders = [str(c.header) for c in _gtbl.columns]
+check("最前面引入 grouping(project) 列", _gheaders[0], "grouping(project)")
+_gbuf = io.StringIO()
+Console(file=_gbuf, width=200, force_terminal=False).print(_gtbl)
+_gout = _gbuf.getvalue()
+check_true("同组第一行显示组名，后续行合并留空", "ProjB" in _gout)
+check("group off 取消分组", wdt.handle("group off"), True)
+
+check("search grouping(project) 长列表 受理",
+      wdt.handle("search grouping(project) 长列表"), True)
+check("search 设置了分组为 project", wdt.task_group_by, "project")
+check("search 设置了关键词", wdt.task_search_query, "长列表")
+_stbl = wdt.view.render()[0]
+check_true("搜索后只剩匹配的 30 条", "共 30 条" in str(_stbl.caption or ""))
+check("search off 清空搜索与分组", wdt.handle("search off"), True)
+
+check("sort duration desc 受理", wdt.handle("sort duration desc"), True)
+check("排序键为 duration 且降序", (wdt.task_sort_key, wdt.task_sort_desc), ("duration", True))
+check("sort off 恢复默认排序", wdt.handle("sort off"), True)
 
 print("== TUI 在场证明（daemon 靠它判断「人叫得回来吗」）==")
 info = wd.write_tui_state()

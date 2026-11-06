@@ -1400,6 +1400,167 @@ class TaskStore(object):
             copy = self.assign(copy["id"], session)
         return copy
 
+    # -- 项目任务（项目库里的叶子任务 ↔ 本地任务） -----------------------
+
+    @staticmethod
+    def project_task_fields(task):
+        """项目任务的三元身份：``(project_id, project_title, project_task_pk)``。"""
+        fields = (task or {}).get("fields") or {}
+        return (fields.get("project_id"), fields.get("project"),
+                str(fields.get("project_task") or "").strip())
+
+    @staticmethod
+    def is_project_backlog(task):
+        """项目库里**还没被 plan 唤起**的叶子任务（只进任务视图，不进契约面板）。
+
+        判据故意只认「source.kind == project + project_task 非空 + 没有 session」：
+        plan 唤起之后同一条任务会挂上 session，从此按正常任务处理。这样契约视图
+        的任务面板不会被几十条项目备选任务淹掉，而任务视图里搜 project / 分组
+        又都能看到它们。
+        """
+        task = task or {}
+        source = task.get("source") or {}
+        fields = task.get("fields") or {}
+        return (TaskStore.is_open(task)
+                and str(source.get("kind") or "") == "project"
+                and bool(str(fields.get("project_task") or "").strip())
+                and not task.get("session"))
+
+    def ensure_project_task(self, project_id, project_title, item):
+        """把项目库的一条叶子任务**幂等**落成本地任务（按 project_id+pk 认）。
+
+        返回 ``(task, created)``。已经存在就只同步标题/项目名/时长等展示字段，
+        **不动**本地状态、session 和用户自己加的字段。这是「项目任务入库」的
+        唯一入口：导入项目、刷新项目、每日对账都走它。
+        """
+        if not isinstance(item, dict):
+            raise ValueError("项目任务必须是一个 dict")
+        pk = str(item.get("pk") or "").strip()
+        if not pk:
+            raise ValueError("项目任务缺少 primary key")
+        try:
+            pid = int(project_id)
+        except (TypeError, ValueError):
+            raise ValueError("项目序号不合法：%r" % (project_id,))
+        title = TaskStore._one_line(item.get("title") or item.get("name")) or pk
+        project_title = TaskStore._one_line(project_title) or ""
+        duration = parse_minutes(item.get("duration"))
+        count = parse_count(item.get("count"))
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if (TaskStore.project_task_fields(task)[2] == pk
+                    and str(TaskStore.project_task_fields(task)[0]) == str(pid)):
+                found = task
+                break
+        stamp = _now()
+        if found is not None:
+            fields = found.setdefault("fields", {})
+            changed = False
+            for key, value in (("title", title),
+                               ("project", project_title),
+                               ("project_id", pid),
+                               ("project_task", pk)):
+                if value not in (None, "") and fields.get(key) != value:
+                    fields[key] = value
+                    changed = True
+            if duration is not None:
+                if fields.get(DURATION_KEYS[0]) != duration:
+                    fields[DURATION_KEYS[0]] = duration
+                    link_count_fields(fields, changed=DURATION_KEYS[0])
+                    changed = True
+            elif count is not None and parse_count(fields.get(COUNT_KEY)) != count:
+                fields[COUNT_KEY] = count
+                link_count_fields(fields, changed=COUNT_KEY)
+                changed = True
+            if item.get("due") and not fields.get("due"):
+                fields["due"] = str(item["due"])
+                fields.setdefault("due_source", "omnifocus")
+                changed = True
+            if not fields.get("notes"):
+                note = str(item.get("note") or "").strip()
+                parent_pk = str(item.get("parent_id") or "").strip()
+                if parent_pk:
+                    parent_title = str(item.get("parent") or "").strip() or parent_pk
+                    note = (note + "\n父任务：" + parent_title).strip()
+                if note:
+                    fields["notes"] = note
+                    changed = True
+            if changed:
+                found["updated_at"] = stamp
+                self.save(store)
+            return found, False
+        fields = {"title": title, "project": project_title,
+                  "project_id": pid, "project_task": pk}
+        if duration is not None:
+            # 只写 duration：create() 会按 ceil(duration/25) 补 count，
+            # 但不会把用户真实的 45 分钟偷偷改成 50。
+            fields[DURATION_KEYS[0]] = duration
+        elif count is not None:
+            fields[COUNT_KEY] = count
+        if item.get("due"):
+            fields["due"] = str(item["due"])
+            fields["due_source"] = "omnifocus"
+        note = str(item.get("note") or "").strip()
+        parent_pk = str(item.get("parent_id") or "").strip()
+        if parent_pk:
+            parent_title = str(item.get("parent") or "").strip() or parent_pk
+            note = (note + "\n父任务：" + parent_title).strip()
+        if note:
+            fields["notes"] = note
+        url = "omnifocus:///task/%s" % pk
+        source = {"kind": "project", "id": pk, "url": url, "title": title,
+                  "project_id": pid, "project_title": project_title}
+        if parent_pk:
+            source.update({"parent_id": parent_pk,
+                           "parent_title": str(item.get("parent") or "").strip()
+                           or parent_pk})
+        task = self.create(
+            fields,
+            omnifocus={"id": pk, "url": url, "title": title},
+            source=source,
+        )
+        return task, True
+
+    def apply_project_plan(self, task_id, fields, source=None):
+        """plan 唤起一条**已入库**的项目任务：把这次排期的字段/来源写上去。
+
+        和 ``create`` 不同，这条任务已经存在（见 :meth:`ensure_project_task`），
+        这里只更新这次分到的 count / duration / 标题等，避免同一 pk 又建一条
+        重复任务。``source`` 会整体替换（父任务信息也在这儿）。
+        """
+        def apply(task):
+            target = task.setdefault("fields", {})
+            for key, value in (fields or {}).items():
+                target[key] = value
+            changed = "count" if COUNT_KEY in (fields or {}) else (
+                DURATION_KEYS[0] if DURATION_KEYS[0] in (fields or {}) else None)
+            if changed:
+                link_count_fields(target, changed=changed)
+            if source is not None:
+                task["source"] = dict(source)
+        return self._mutate(task_id, apply)
+
+    def remove_project_backlog(self, project_id):
+        """撤掉一个项目时，删掉它还没被 plan 唤起、也没挂 session 的本地镜像。"""
+        try:
+            pid = int(project_id)
+        except (TypeError, ValueError):
+            return 0
+        store = self.load()
+        removed = 0
+        kept = []
+        for task in store["tasks"]:
+            if (TaskStore.is_project_backlog(task)
+                    and str(TaskStore.project_task_fields(task)[0]) == str(pid)):
+                removed += 1
+                continue
+            kept.append(task)
+        if removed:
+            store["tasks"] = kept
+            self.save(store)
+        return removed
+
     # -- 状态查询 -----------------------------------------------------
     @staticmethod
     def status_of(task):

@@ -234,7 +234,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 | 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `project` / `open working|detail` |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
-| 4 | 任务 | 任务表（固定表头：`序号` / `id` / `状态` / `重复` / `trigger` / `formatter` / `session` / `截止` / `Focusmate` / `OmniFocus` / `完成时间` / `标签`，后面接任务字段列）+ 完成归档 | `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync` + `review` + `inspect-due` + `plan` / `project` + `open|close <任务表头>` |
+| 4 | 任务 | 任务表（默认常驻：`序号` / `标记` / `title` / `project` / `状态` / `session` / `截止` / `备注`；其余列默认折叠并在底部提示）+ 完成归档 | `task ...` + `open <页码|任务表头>` / `close <任务表头>` + `sort` / `group` / `search` + `review` + `inspect-due` + `plan` / `project` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 | 6 | 琐事 | **没有 session 时自动接管**：只显示绑定的「琐事 Project」里一条未完成任务 + m/c/q 提示 | `m` 完成 / `c` 换一条 / `q` 回进入前的视图（并压制到下一场 session） |
 
@@ -285,7 +285,7 @@ working 模式下表格左侧的 `ID` 仍然保留它在 `self.rows` 里的原�
 - `open working` / `open detail` 仍然优先解释为切看板口径；列名不会和它们冲突。
 
 working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列；手动
-`open <表头>` 可以临时展开。任务表默认不自动折叠。两个表都要求至少留一列。
+`open <表头>` 可以临时展开。任务表默认折叠 `id / 重复 / trigger / formatter / Focusmate / OmniFocus / 完成时间 / 标签 / duration / count / exclusive`（浓缩进 `标记` 与 `备注` 列），并在任务视图支持 `open 1 / 2 / 3` 直接翻页。两个表都要求至少留一列。
 
 任意 session 行的 task 栏如果没有任何任务，会显示红色警告 `没有设定任务🔞`；
 不能留空，否则「空」和「没渲染」在界面上分不出来。

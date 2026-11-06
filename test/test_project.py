@@ -629,33 +629,39 @@ check("导入含子任务的项目", wd_sub.handle("task import omnifocus:///pro
 wd_sub.handle("day 1")
 wd_sub.handle("session T1 25")          # 明天：T1 25 分钟 + T2 50 分钟
 book_all(wd_sub)
-workspace_ids = [t["id"] for t in wd_sub.task_store.list()]
-check("plan 前任务库是空的", workspace_ids, [])
+_backlog = wd_sub.task_store.list()
+check("plan 前任务库已有项目镜像（叶子任务）",
+      sorted(t["fields"]["title"] for t in _backlog), ["子 10", "子 13", "子 27"])
+check("plan 前镜像都还没挂 session",
+      [t.get("session") for t in _backlog], [None, None, None])
+check("plan 前镜像都是项目备选（不进契约面板）",
+      all(ts.TaskStore.is_project_backlog(t) for t in _backlog), True)
 wd_sub.handle("plan +1")
 check_true("plan 打开", wd_sub.planning is not None)
 wd_sub.planning.handle("task 1 1")       # 只分 1 count = 25 分钟
 wd_sub.handle("complete")
 _sub_locals = wd_sub.task_store.list()
-check("session 里只建了子任务，没有父任务空壳",
-      sorted(t["fields"]["title"] for t in _sub_locals), ["子 10", "子 13"])
+_assigned = [t for t in _sub_locals if (t.get("session") or {}).get("start")]
+check("session 里只挂子任务，没有父任务空壳",
+      sorted(t["fields"]["title"] for t in _assigned), ["子 10", "子 13"])
 check("每个子任务都记着父任务来源",
       {((t.get("source") or {}).get("parent_id"),
-        (t.get("source") or {}).get("parent_title")) for t in _sub_locals},
+        (t.get("source") or {}).get("parent_title")) for t in _assigned},
       {("parent", "父任务")})
 check("note 写明是谁的子",
       all("父任务：父任务" in ((t["fields"].get("note")
                                or t["fields"].get("notes") or ""))
-          for t in _sub_locals), True)
+          for t in _assigned), True)
 check("本地任务时长是子任务原时长",
-      sorted(t["fields"]["duration"] for t in _sub_locals), [10, 13])
+      sorted(t["fields"]["duration"] for t in _assigned), [10, 13])
 check("两个子任务挂在同一场 session",
-      len({(t["session"]["date"], t["session"]["start"]) for t in _sub_locals}), 1)
+      len({(t["session"]["date"], t["session"]["start"]) for t in _assigned}), 1)
 check("项目 plan 记账也按子任务落",
       sorted(x["pk"] for x in (pj.plan_of(wd_sub.projects.by_id(1),
                                           wd_sub.sel_date) or {}).get("items") or []),
       ["c10", "c13"])
 
-_first = next(t for t in _sub_locals if t["fields"]["title"] == "子 10")
+_first = next(t for t in _assigned if t["fields"]["title"] == "子 10")
 wd_sub.handle("task id:%d done" % _first["id"])
 _sub_proj_after = wd_sub.projects.by_id(1)
 check("完成一个 session 子任务会更新项目库",
@@ -807,7 +813,14 @@ check("项目挂的是 OmniFocus 项目 pk",
 check("清单里 4 条任务",
       [t["title"] for t in projects[0]["tasks"]],
       ["写引言", "跑数据", "读文献", "写完的"])
-check("**没有**建本地任务（没被唤起就不展示）", wd.task_store.list(), [])
+_backlog = wd.task_store.list()
+check("叶子任务已镜像进任务库",
+      sorted(t["fields"]["title"] for t in _backlog),
+      sorted(["写引言", "跑数据", "读文献"]))
+check("镜像都还没挂 session、属于项目备选",
+      all(t.get("session") is None and ts.TaskStore.is_project_backlog(t)
+          for t in _backlog), True)
+check("没被唤起的不进契约任务面板", wd.task_panel_tasks(), [])
 check("项目序号是 1", wd.projects.number_of(projects[0]["id"]), 1)
 check_true("说了「先躺着不占 session」",
            any("先躺着" in t for t in texts(wd)))
@@ -901,26 +914,28 @@ check("没被唤起的任务原样不动",
       sorted(t["fields"]["title"] for t in wd.task_store.list()
              if "project" not in (t.get("fields") or {})),
       ["别的活", "顺手一条"])
-check("唤起了任务（一共 8 count → 至少 2 条）", len(tasks) >= 2, True)
-check("每条任务都记着来源项目",
-      sorted({t["fields"]["project"] for t in tasks}), ["论文", "读书"])
+check("项目叶子任务已镜像进任务库", len(tasks) >= 2, True)
 assigned = [t for t in tasks if (t.get("session") or {}).get("start")]
-check("每条任务都挂到了 session 上", len(assigned), len(tasks))
+check("唤起了任务（一共 8 count → 至少 2 条）", len(assigned) >= 2, True)
+check("每条被唤起的任务都记着来源项目",
+      sorted({t["fields"]["project"] for t in assigned}), ["论文", "读书"])
+check("被唤起的任务都挂到了 session 上", len(assigned), len(assigned))
 check("一场只放了一个任务（尽量独立 session）",
-      len({(t["session"]["date"], t["session"]["start"]) for t in tasks}), len(tasks))
+      len({(t["session"]["date"], t["session"]["start"]) for t in assigned}),
+      len(assigned))
 check("一条任务的 count 和时长对得上",
-      [(t["fields"]["count"], t["fields"]["duration"]) for t in tasks
+      [(t["fields"]["count"], t["fields"]["duration"]) for t in assigned
        if t["fields"]["count"] != t["fields"]["duration"] // 25], [])
 check("count 相加 = 分出去的资源",
-      sum(int(t["fields"]["count"]) for t in tasks), total)
+      sum(int(t["fields"]["count"]) for t in assigned), total)
 check("都走 Focusmate 建了 task", len([c for c in wd.bridge.calls
-                                     if c[0] == "add_task"]), len(tasks))
+                                     if c[0] == "add_task"]), len(assigned))
 plan1 = pj.plan_of(by_num(wd), wd.sel_date)
 check("项目库记下了这一天说好的 count", int(plan1["count"]), total - 1)
 check("项目库记下了排下去的每一条",
-      len(plan1["items"]), len([t for t in tasks if t["fields"]["project_id"] == 1]))
+      len(plan1["items"]), len([t for t in assigned if t["fields"]["project_id"] == 1]))
 check("due 跟着 session 终点走（第二天）",
-      all(t["fields"].get("due", "").startswith(TOMORROW) for t in tasks), True)
+      all(t["fields"].get("due", "").startswith(TOMORROW) for t in assigned), True)
 
 print("== plan：分配数超过项目剩余 count 时如实报少排 ==")
 wd2 = fresh(rows_ok)

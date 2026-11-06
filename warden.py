@@ -1455,8 +1455,8 @@ class View(object):
             _cmd("quit", lambda a: w.exit_tui(),
                  "退出（bridge 和浏览器一起收掉）", ("exit", "q"), "通用",
                  usage="quit", hint=_hint_actions("quit", note="bridge 和浏览器一起收掉")),
-            _cmd("help", lambda a: w.cmd_help(), "命令列表", ("?", "h"), "通用",
-                 usage="help", hint=_hint_actions("help", note="当前视图的全部命令")),
+            _cmd("help", w.cmd_help, "命令列表（help --task = 任务视图详细说明）", ("?", "h"), "通用",
+                 usage="help [--task]", hint=_hint_actions("help", "--task", note="当前视图的全部命令")),
             _cmd("view", lambda a: w.cycle_view(),
                  "下一个视图", ("tab", "switch"), "通用",
                  usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
@@ -2001,26 +2001,16 @@ class TaskView(View):
         task 3 -c -1                        # 进度 -1（最低 0）
         task sync                           # GET /v1/tasks → 把 completedAt 归档
         task archive [N]                    # 看归档（data/task-archive.json）
+        sort <字段> [asc|desc] / sort off   # 按字段排序
+        group <字段> / group off            # 按字段分组（前置分组列，同组后续留空）
+        search <关键词> [--group <字段>]    # 搜索过滤（可顺带分组）
+        open 1 / 2 / 3                      # 直接翻到第 N 页
 
     **编号有两套，别混**：
       * **序号** = 契约视图那块任务面板上的第几条（1 起、连续、refresh/收工后重排）。
         命令里直接写它：``task 3 -an`` 就是「面板第 3 条下架」。
       * **内部 id** = 任务库里那个不变的 id（`task list` 里那一列）。面板上没有的任务
         （别的天处理过的、归档里的）用 ``id:15`` 显式指定。
-
-    任何子命令都能带 ``--assign N``（表格里的 session ID）：命令跑完顺手挂上去，
-    例如 ``task create title=写论文 --assign 3``、``task 3 -a 1``。
-    ``-a`` 还有两个特殊取值：``none``（下架：删掉 Focusmate 那条 task，本地断绑定）
-    和 ``current``（当前这一场，进行中的优先）；紧凑写法 ``-an`` / ``-ac`` 由
-    repl_kit 的短选项表统一展开，补全和提示都跟着走。
-    ``-s/--from N`` 是批量：那一场上的**全部**任务一起办事，和 ``-a`` 搭配就是
-    「全量转移」，``-a none`` 就是「全量下架」。
-
-    任务字段不校验：想记 due / priority / notes / 任何 key 都行。
-    备注（``task note`` / ``note=`` / ``备注=``，统一存成 ``notes``）会跟着完成归档
-    一起显示，里面塞网址就能在完成后直接点开去干活。
-    给 session 挂任务时会**自动**走 bridge 在 Focusmate 那一场建同名 task，
-    成功后才把 Focusmate 的 task id 记回本地，失败就什么都不写。
     """
 
     key = "4"
@@ -2030,12 +2020,10 @@ class TaskView(View):
     def idle_hint(self):
         return repl_kit.Hint(
             "命令", ("task create", "task 3 -a 1", "task 3 -an", "task 3 -ac",
-                     "task 3 -c +2", "task 3 swap 5", "task -s 5 -a 6",
-                     "task 3 -f end", "task -f", "inspect-due", "review"),
-            note="数字 = 面板上的序号（1 起连续）· task 3 ≡ task select 3"
-                 " · -an 下架 / -ac 当前这一场 · -c 5 设 count / -c +2 加进度"
-                 " · -f end 排到当天最后一段 · 面板外的用 id:N"
-                 " · open/close <表头> 折叠任务表列 · Tab 切视图",
+                     "task 3 -c +2", "open 1", "sort", "group project", "search",
+                     "inspect-due", "review"),
+            note="数字 = 面板上的序号 · open 1/2/3 翻页 · open/close <表头> 折叠列"
+                 " · sort <字段> 排序 · group <字段> 分组 · search <词> 搜索 · Tab 切视图",
         )
 
     def status_line(self):
@@ -2043,9 +2031,9 @@ class TaskView(View):
 
     def unknown_hint(self):
         return ("「任务」视图认 task create/delete/modify/assign/select/duplicate/"
-                "drop/done/link/import/sync/swap、trigger/formatter、review、inspect-due"
-                "（也可以直接写序号，如 task 3 -a 1 / task 3 -an / task 3 -c +2 / "
-                "task 3 swap 5 / task 3 -f end / task -s 5 -a 6；"
+                "drop/done/link/import/sync/swap、sort、group、search、open <页码|表头>、"
+                "close <表头>、review、inspect-due"
+                "（也可以直接写序号，如 task 3 -a 1 / task 3 -an / task 3 -c +2；"
                 "序号 = 面板上的第几条，面板外的任务用 id:N）；Shift+Tab 切回去再干别的。")
 
     def commands(self):
@@ -2055,6 +2043,26 @@ class TaskView(View):
                  "拉 GET /v1/tasks，把已完成任务的 completedAt 归档",
                  ("r", "reload"), usage="refresh",
                  hint=_hint_actions("refresh", note="同步 Focusmate task 完成时间")),
+            _cmd("sort", w.cmd_task_sort,
+                 "任务表排序：sort <字段> [asc|desc] | sort off",
+                 ("排序",), usage="sort <字段> [asc|desc] | sort off",
+                 options=("id", "序号", "title", "project", "状态", "session", "截止",
+                          "duration", "count", "asc", "desc", "off"),
+                 hint=_hint_actions("project", "截止", "session", "状态", "duration", "off",
+                                    note="默认升序；加 desc 降序；sort off 恢复默认")),
+            _cmd("group", w.cmd_task_group,
+                 "任务表按字段分组（前置分组列，同组任务聚拢）：group <字段> | group off",
+                 ("grouping", "分组"), usage="group <字段> | group off",
+                 options=("project", "状态", "session", "截止", "标签", "off"),
+                 hint=_hint_actions("project", "状态", "session", "off",
+                                    note="前置分组列，同组首行显示组名，后续行留空")),
+            _cmd("search", w.cmd_task_search,
+                 "搜索任务（支持按字段分组显示）：search <关键词> [--group <字段>] | search off",
+                 ("find", "filter", "搜索"),
+                 usage="search [<关键词>] [-g|--group <字段>] | search off",
+                 options=("--group", "-g", "project", "off"),
+                 hint=_hint_actions("project", "--group project", "off",
+                                    note="搜 title/project/备注/标签/状态；search off 清空过滤")),
             _cmd("review", w.cmd_review,
                  "手动开始一场 session 的收尾（逐个问没做完的任务）", ("收尾",),
                  usage="review [HH:MM | 日期T时刻]",
@@ -2086,43 +2094,122 @@ class TaskView(View):
         ]
 
     def _row_budget(self):
-        """任务表最多画几行 —— 留出头部/归档/Recent/提示行，别把表头挤出屏幕。"""
+        """任务表每页画几行 —— 留出头部/归档/Recent/提示行，别把表头挤出屏幕。"""
         try:
             terminal_rows = int(self.w.shell._terminal_rows())
         except Exception:                             # noqa: BLE001 - 测试/离屏兜底
             terminal_rows = 30
-        return max(3, min(20, terminal_rows - 20))
+        return max(2, min(20, terminal_rows - 21))
 
     def _task_window(self, tasks):
-        """返回 ``(要画的任务, 起始下标, 总数)``；选中任务尽量保持在窗口中间。"""
+        """返回 ``(当前页任务, 起始下标, 总数, 当前页码, 总页数)``。
+
+        支持 ``open 1 / 2 / 3`` 显式翻页；未指定页码时跟随 ``selected_task_id``
+        自动落到它所在的那一页（默认第 1 页）。
+        """
         total = len(tasks)
         limit = self._row_budget()
+        total_pages = max(1, (total + limit - 1) // limit)
+        page = getattr(self.w, "task_view_page", None)
+        if page is None:
+            selected = self.w.selected_task_id
+            page = 1
+            if selected is not None:
+                for index, task in enumerate(tasks):
+                    if task.get("id") == selected:
+                        page = (index // limit) + 1
+                        break
+        page = max(1, min(int(page), total_pages))
         if total <= limit:
-            return tasks, 0, total
-        selected = self.w.selected_task_id
-        start = 0
-        for index, task in enumerate(tasks):
-            if task.get("id") == selected:
-                start = max(0, min(index - limit // 2, total - limit))
-                break
-        return tasks[start:start + limit], start, total
+            return tasks, 0, total, 1, 1
+        start = (page - 1) * limit
+        return tasks[start:start + limit], start, total, page, total_pages
+
+    def _compact_guidance(self):
+        """矮屏/窄屏时把说明压成短句，优先保证表头留在屏幕上。"""
+        try:
+            rows = int(self.w.shell._terminal_rows())
+        except Exception:                             # noqa: BLE001
+            rows = 30
+        try:
+            width = self.w.frame_width()
+        except Exception:                             # noqa: BLE001
+            width = 80
+        return rows < 40 or width < 100
+
+    def _legend_text(self):
+        """表下灰色小字：所有标记与备注缩写的含义。"""
+        if self._compact_guidance():
+            return Text(
+                "标记 🔁重复子任务 🔁*模板 🔗OmniFocus 🎯Focusmate ⏳挂载中 "
+                "⏱formatter ⚡trigger 🔒独占 · 状态 ·进行中 ✓完成 ✗放弃 ⤼转移走 · "
+                "备注 dur=分钟 cnt=进度 excl=独占 tag=标签 rep=重复 fmt=formatter "
+                "trig=trigger note=备注",
+                style="dim")
+        text = Text(style="dim")
+        text.append("标记：")
+        text.append("🔁=重复子任务 · 🔁*=重复模板 · 🔗=OmniFocus · 🎯=Focusmate · "
+                    "⏳=挂载中 · ⏱=formatter · ⚡=trigger · 🔒=独占\n")
+        text.append("状态：·=进行中 · ✓=完成 · ✗=放弃 · ⤼=转移走　")
+        text.append("备注缩写：dur=分钟 · cnt=进度 · excl=独占 · tag=标签 · "
+                    "rep=重复 · fmt=formatter · trig=trigger · note=备注")
+        return text
+
+    def _command_guide_text(self):
+        """表下一行灰色命令指引：每条 ≤7 字，参数细节交给 help --task。"""
+        entries = (
+            ("refresh", "同步"), ("review", "收尾"), ("inspect-due", "查过期"),
+            ("plan", "排期"), ("project", "项目"), ("sort", "排序"),
+            ("group", "分组"), ("search", "搜索"), ("open", "翻页/展开"),
+            ("close", "折叠"), ("task", "任务操作"), ("help --task", "详情"),
+        )
+        if self._compact_guidance():
+            entries = tuple((cmd, desc) for cmd, desc in entries
+                            if cmd in ("refresh", "plan", "project", "sort",
+                                       "group", "search", "open", "task",
+                                       "help --task"))
+        text = Text(style="dim")
+        text.append("命令：")
+        for index, (cmd, desc) in enumerate(entries):
+            if index:
+                text.append(" · ")
+            text.append(cmd)
+            text.append(" " + desc)
+        return text
 
     def render(self):
         w = self.w
-        all_tasks = w.task_store.list()
-        tasks, start, total = self._task_window(all_tasks)
+        raw_tasks = w.task_store.list()
+        filtered_tasks = w.filter_and_sort_tasks(raw_tasks)
+        tasks, start, total, page, total_pages = self._task_window(filtered_tasks)
         selected = w.selected_task_id
-        keys = task_dynamic_keys(all_tasks)
-        headers = task_table_headers(all_tasks)
-        hidden = w.effective_task_hidden_columns(all_tasks)
+        keys = task_dynamic_keys(raw_tasks)
+        headers = task_table_headers(raw_tasks)
+        hidden = w.effective_task_hidden_columns(raw_tasks)
         visible_headers = [h for h in headers if h not in hidden]
         # close 已经保证至少留一列；这里只是防御坏偏好文件。
         if not visible_headers:
             visible_headers = [headers[0]]
 
-        t = Table(title="Task · 任务表（open/close 折叠列；序号 = 契约面板上的第几条）",
+        group_by = getattr(w, "task_group_by", None)
+        group_col_header = None
+        if group_by:
+            group_col_header = "grouping(%s)" % group_by
+            # 分组列前置在最前面，原本同名列就不必重复占地方
+            visible_headers = [h for h in visible_headers if h != group_by]
+
+        width = w.frame_width()
+        proj_max = 7 if width < 95 else TASK_PROJECT_MAX_LEN
+        avail = max(18, width - (52 + proj_max))
+        title_max = max(8, min(32, avail * 2 // 5))
+        remark_max = max(10, min(48, avail - title_max))
+        group_max = 10 if width < 95 else 16
+
+        t = Table(title="Task · 任务表（open/close 折叠列 · open 1/2/3 翻页 · 序号 = 契约面板上的第几条）",
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
                   title_justify="left", expand=False, show_header=True)
+        if group_col_header:
+            t.add_column(group_col_header, style="bold cyan", no_wrap=True, overflow="crop")
         specs = dict(TASK_TABLE_COLUMNS)
         for header in visible_headers:
             if header in specs:
@@ -2131,10 +2218,15 @@ class TaskView(View):
                 t.add_column(str(header), no_wrap=True, overflow="crop")
 
         status_style = {ts.STATUS_COMPLETED: STYLE_DONE, ts.STATUS_DROPPED: STYLE_DROPPED}
+        total_cols = (1 if group_col_header else 0) + len(visible_headers)
         if not tasks:
-            row = [Text("") for _ in visible_headers]
-            row[0] = Text("（还没有任务；task create title=写论文 开始）", style="dim")
+            row = [Text("") for _ in range(total_cols)]
+            msg = ("（没有匹配「%s」的任务；`search off` 清除过滤）" % w.task_search_query
+                   if getattr(w, "task_search_query", "")
+                   else "（还没有任务；task create title=写论文 开始）")
+            row[0] = Text(msg, style="dim")
             t.add_row(*row)
+        prev_group_val = object()
         for task in tasks:
             status = w.task_store.status_of(task)
             style = "bold reverse" if task.get("id") == selected else ""
@@ -2142,17 +2234,19 @@ class TaskView(View):
                 style = status_style.get(status, "") + (
                     " reverse" if task.get("id") == selected else "")
             sess = task.get("session") or {}
-            sess_txt = ("%s %s" % (sess.get("date") or "?", sess.get("start") or "?"
-                                  )) if sess else "—"
+            if sess:
+                sess_raw = "%s %s" % (sess.get("date") or "", sess.get("start") or "")
+                sess_txt = format_compact_timestamp(sess_raw.strip(), w.sel_date)
+            else:
+                sess_txt = "—"
             due = w.omni_due_of(task)
-            due_txt = due.replace("T", " ")[:16] if due else "—"
+            due_txt = format_compact_timestamp(due, w.sel_date) if due else "—"
             fm = task.get("focusmate") or {}
             fm_txt = str(fm.get("task_id") or "")[:8] or "—"
             omni_id = ts.TaskStore.omnifocus_id(task)
             omni_txt = str(omni_id)[:12] if omni_id else "—"
-            done = fm.get("completed_at") or task.get("status_at") or "—"
-            if isinstance(done, str) and len(done) > 16:
-                done = done.replace("T", " ")[:16]
+            done_raw = fm.get("completed_at") or task.get("status_at") or ""
+            done = format_compact_timestamp(done_raw, w.sel_date) if done_raw else "—"
             rep = task.get("repeat") or {}
             rep_txt = ("🔁 " + ts.repeat_summary(rep)) if rep else "—"
             trig = task.get("trigger") or {}
@@ -2163,42 +2257,80 @@ class TaskView(View):
                 fmt_txt += "@" + str(fmt["reservation"].get("start") or "?")
             elif fmt and ts.TaskStore.is_repeat_template(task):
                 fmt_txt += "（模板）"
-            status_txt = "%s %s" % (w.task_mark(task) or "·", status)
+            mark_sym = w.task_mark(task) or "·"
             tags = task.get("tags") or []
             panel_no = w.task_no(task)
             if panel_no:
                 num_txt = str(panel_no)
-            elif ts.TaskStore.is_repeat_template(task):
-                # 本体不在契约面板上；任务视图里直接把可敲的写法摆出来。
+            elif (ts.TaskStore.is_repeat_template(task)
+                  or ts.TaskStore.is_project_backlog(task)):
+                # 不在契约面板上；任务视图里直接把可敲的写法摆出来。
                 num_txt = "id:%s" % task["id"]
             else:
                 num_txt = "—"
             fields = task.get("fields") or {}
+            flags_txt = w.task_flags_text(task)
+            title_raw = w.task_store._one_line(
+                fields.get("title") or fields.get("name") or "")
+            title_txt = _crop_display(title_raw, title_max)
+            proj_raw = w.task_project_name(task)
+            proj_txt = _crop_display(proj_raw, proj_max) if proj_raw else "—"
+            remark_raw = w.task_remark_text(task)
+            remark_txt = _crop_display(remark_raw, remark_max) if remark_raw else "—"
+            dur_val = ts.task_minutes(task)
+            cnt_val = ts.count_text(task, w.task_count_delta(task))
+            if not cnt_val and ts.task_count(task) is not None:
+                cnt_val = str(ts.task_count(task))
+            excl_val = "true" if th.is_exclusive(task) else "—"
             cells = {
                 "序号": Text(num_txt, style=style),
+                "标记": Text(flags_txt, style=style if flags_txt != "·" else STYLE_MUTED),
+                "title": Text(title_txt, style=style),
+                "project": Text(proj_txt, style="cyan" if proj_raw else STYLE_MUTED),
+                "状态": Text(mark_sym, style=status_style.get(status, "") or style),
+                "session": Text(sess_txt, style=style if sess else STYLE_MUTED),
+                "截止": Text(due_txt, style=STYLE_MUTED if due else style),
+                "备注": Text(remark_txt, style=style if remark_raw else STYLE_MUTED),
                 "id": Text(str(task["id"]), style=style),
-                "状态": Text(status_txt, style=status_style.get(status, "")),
                 "重复": Text(rep_txt, style="magenta" if rep else STYLE_MUTED),
                 "trigger": Text(trig_txt, style="cyan" if trig else STYLE_MUTED),
                 "formatter": Text(fmt_txt, style="green" if fmt else STYLE_MUTED),
-                "session": Text(sess_txt, style=style),
-                "截止": Text(due_txt, style=STYLE_MUTED if due else style),
                 "Focusmate": Text(fm_txt, style=style),
                 "OmniFocus": Text(omni_txt, style="cyan" if omni_id else STYLE_MUTED),
                 "完成时间": Text(done, style=style),
                 "标签": Text(" · ".join(tags) if tags else "—",
                             style="yellow" if tags else STYLE_MUTED),
-                TASK_CONTENT_COLUMN: Text(w.task_store.summarize(task), style=style),
+                "duration": Text(str(dur_val) if dur_val is not None else "—",
+                                 style=style if dur_val is not None else STYLE_MUTED),
+                "count": Text(cnt_val or "—", style=style if cnt_val else STYLE_MUTED),
+                "exclusive": Text(excl_val,
+                                  style="yellow" if excl_val == "true" else STYLE_MUTED),
+                TASK_CONTENT_COLUMN: Text(
+                    _crop_display(w.task_store.summarize(task), title_max), style=style),
             }
             for key in keys:
-                cells[key] = Text(w.task_store._one_line(fields.get(key)), style=style)
-            t.add_row(*[cells.get(header, Text("")) for header in visible_headers])
+                if key not in cells:
+                    cells[key] = Text(
+                        _crop_display(w.task_store._one_line(fields.get(key)), remark_max),
+                        style=style)
+            row_cells = [cells.get(header, Text("")) for header in visible_headers]
+            if group_col_header:
+                gval = w.task_group_label(task, group_by)
+                show_gval = _crop_display(gval, group_max) if gval != prev_group_val else ""
+                prev_group_val = gval
+                row_cells = [Text(show_gval, style="bold cyan")] + row_cells
+            t.add_row(*row_cells)
 
         caption_bits = []
-        if total > len(tasks):
-            # 行也要截：任务表比屏幕还长时，若整块交给上层裁屏，表头会被裁掉。
-            caption_bits.append("表内显示第 %d–%d 条，共 %d 条（task select id:N 移动窗口）"
-                                % (start + 1, start + len(tasks), total))
+        page_examples = " / ".join(str(i) for i in range(1, min(total_pages, 3) + 1))
+        if total_pages > 3:
+            page_examples += " / …"
+        caption_bits.append(
+            "第 %d/%d 页，共 %d 条（open %s 直接翻页）"
+            % (page, total_pages, total, page_examples or "1"))
+        active_filters = w.task_filter_summary()
+        if active_filters:
+            caption_bits.append(active_filters)
         if hidden:
             # 被折叠的表头名字放在表下面，方便随时知道还有什么列 / 怎么打开。
             caption_bits.append("已折叠列：%s（open <表头名> 打开）" % "、".join(
@@ -2207,8 +2339,13 @@ class TaskView(View):
             t.caption = " · ".join(caption_bits)
 
         # 收尾面板在 repl_kit 的打断栏位里（见 render_interrogate），不在这儿。
-        out = [t]
+        out = [t, self._legend_text(), self._command_guide_text()]
+        try:
+            terminal_rows = int(w.shell._terminal_rows())
+        except Exception:                             # noqa: BLE001
+            terminal_rows = 30
         arch = w.task_store.load_archive().get("records") or []
+        archive_limit = 2 if terminal_rows < 50 else 5
         at = Table.grid(padding=(0, 1))
         at.add_column(style="dim", no_wrap=True)
         at.add_column(no_wrap=True)
@@ -2217,7 +2354,7 @@ class TaskView(View):
         if not arch:
             at.add_row("", Text("（还没有完成归档；task sync 会读 GET /v1/tasks 的 "
                                 "completedAt）", style="dim"))
-        for rec in arch[-5:]:
+        for rec in arch[-archive_limit:]:
             fm = rec.get("focusmate") or {}
             sess = rec.get("session") or {}
             note = rec.get("notes") or w.task_store.notes({"fields": rec.get("fields")})
@@ -2436,7 +2573,11 @@ class WardenShell(repl_kit.ReplShell):
 
     def _build_frame_text(self):
         """真正排版一次（贵：rich 要测量 / 换行 / 裁切整块看板）。"""
-        raw = super().frame_text()
+        self._in_frame_text = True
+        try:
+            raw = super().frame_text()
+        finally:
+            self._in_frame_text = False
         if not raw:
             return raw
         reserved = 1                                  # 提示行
@@ -2504,39 +2645,64 @@ SESSION_TABLE_COLUMNS = (
 #: working 口径下默认折叠的列（用户明确要求：类型 / 名称 / 契约）。
 WORKING_AUTO_HIDDEN_COLUMNS = ("时段类型", "时段名称", "契约")
 
-#: 任务视图（Tab 第 4 个）的固定列表头。字段列（title / duration / …）
-#: 会按任务实际出现的顺序追加在后面。
+#: 任务视图（Tab 第 4 个）的固定列表头。
+#: ``标记`` 是 boolean flags 专列，``title`` 紧随其后排第二，``project`` 默认常驻，
+#: ``备注`` 用紧凑记号（dur=… / cnt=… / tag=…）汇总被默认折叠的各列。
 TASK_TABLE_COLUMNS = (
     ("序号", {"justify": "right", "style": "bold", "no_wrap": True}),
-    ("id", {"justify": "right", "style": STYLE_MUTED, "no_wrap": True}),
+    ("标记", {"no_wrap": True}),
+    ("title", {"no_wrap": True, "overflow": "crop"}),
+    ("project", {"no_wrap": True, "overflow": "crop"}),
     ("状态", {"no_wrap": True}),
+    ("session", {"no_wrap": True}),
+    ("截止", {"no_wrap": True}),
+    ("备注", {"no_wrap": True, "overflow": "crop"}),
+    ("id", {"justify": "right", "style": STYLE_MUTED, "no_wrap": True}),
     ("重复", {"no_wrap": True}),
     ("trigger", {"no_wrap": True}),
     ("formatter", {"no_wrap": True}),
-    ("session", {"no_wrap": True}),
-    ("截止", {"no_wrap": True}),
     ("Focusmate", {"no_wrap": True}),
     ("OmniFocus", {"no_wrap": True}),
     ("完成时间", {"no_wrap": True}),
     ("标签", {"no_wrap": True, "overflow": "crop"}),
+    ("duration", {"no_wrap": True}),
+    ("count", {"no_wrap": True}),
+    ("exclusive", {"no_wrap": True}),
 )
 TASK_CONTENT_COLUMN = "内容"
-TASK_DYNAMIC_HIDDEN = {"due", "due_source"}
+TASK_DYNAMIC_HIDDEN = {"due", "due_source", "count_invested", "project_id", "project_task"}
+
+#: 任务视图下默认折叠的列（汇总进「标记」和「备注」，仍可用 open <表头名> 展开）。
+TASK_AUTO_HIDDEN_COLUMNS = (
+    "id", "重复", "trigger", "formatter",
+    "Focusmate", "OmniFocus", "完成时间", "标签",
+    "duration", "count", "exclusive",
+)
+
+#: project 列默认裁剪长度（窄屏还会进一步按窗口宽度收紧）。
+TASK_PROJECT_MAX_LEN = 12
 
 #: 任务表 open/close 认的表头别名（去掉空白、转小写之后比较）。
 TASK_COLUMN_ALIASES = {
     "序号": "序号", "number": "序号", "num": "序号", "no": "序号",
-    "id": "id", "内部id": "id", "taskid": "id",
+    "标记": "标记", "flag": "标记", "flags": "标记", "标识": "标记",
+    "title": "title", "标题": "title", "name": "title",
+    "project": "project", "项目": "project", "proj": "project",
     "状态": "状态", "status": "状态",
+    "session": "session", "场次": "session",
+    "截止": "截止", "due": "截止", "截止时间": "截止",
+    "备注": "备注", "remark": "备注", "remarks": "备注", "note": "备注", "notes": "备注",
+    "id": "id", "内部id": "id", "taskid": "id",
     "重复": "重复", "repeat": "重复", "重复任务": "重复",
     "trigger": "trigger", "触发": "trigger", "触发器": "trigger",
     "formatter": "formatter", "格式": "formatter", "格式化": "formatter",
-    "session": "session", "场次": "session",
-    "截止": "截止", "due": "截止", "截止时间": "截止",
-    "focusmate": "Focusmate",
+    "focusmate": "Focusmate", "fm": "Focusmate",
     "omnifocus": "OmniFocus", "of": "OmniFocus",
     "完成时间": "完成时间", "done": "完成时间", "completedat": "完成时间",
     "标签": "标签", "tags": "标签", "tag": "标签",
+    "duration": "duration", "dur": "duration", "时长": "duration",
+    "count": "count", "cnt": "count",
+    "exclusive": "exclusive", "excl": "exclusive", "独占": "exclusive",
     "内容": TASK_CONTENT_COLUMN, "content": TASK_CONTENT_COLUMN,
 }
 
@@ -2569,8 +2735,69 @@ def normalize_session_column(text):
     return SESSION_COLUMN_ALIASES.get(compact)
 
 
+def _crop_display(text, max_width):
+    """按终端显示宽度裁剪文本，超长末尾换 ``…``。"""
+    raw = str(text or "")
+    if not max_width or max_width <= 0:
+        return raw
+    if repl_kit.display_width(raw) <= max_width:
+        return raw
+    out = []
+    width = 0
+    for ch in raw:
+        cw = repl_kit.display_width(ch)
+        if width + cw > max_width:
+            if max_width > 1 and out:
+                out[-1] = "…"
+            break
+        out.append(ch)
+        width += cw
+    return "".join(out)
+
+
+def format_compact_timestamp(raw, base_date=None):
+    """方案 A 紧凑时间戳：同天 ``HH:MM`` / 明昨 ``+1/-1 HH:MM`` / 同年 ``MM/DD HH:MM``。"""
+    text = str(raw or "").strip()
+    if not text or text == "—":
+        return "—"
+    if isinstance(base_date, datetime.datetime):
+        base_date = base_date.date()
+    elif not isinstance(base_date, datetime.date):
+        base_date = datetime.date.today()
+    dt = ts.parse_iso_datetime(text)
+    if dt is not None:
+        day_diff = (dt.date() - base_date).days
+        hm = dt.strftime("%H:%M")
+        if day_diff == 0:
+            return hm
+        if day_diff in (-1, 1):
+            return "%+d %s" % (day_diff, hm)
+        if dt.date().year == base_date.year:
+            return "%02d/%02d %s" % (dt.date().month, dt.date().day, hm)
+        return "%02d/%02d/%02d %s" % (dt.date().year % 100, dt.date().month,
+                                      dt.date().day, hm)
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[T\s]+(\d{1,2}:\d{2}))?", text)
+    if m:
+        try:
+            d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            hm = m.group(4) or ""
+            if hm and len(hm) == 4:
+                hm = "0" + hm
+            day_diff = (d - base_date).days
+            if day_diff == 0 and hm:
+                return hm
+            if day_diff in (-1, 1):
+                return ("%+d %s" % (day_diff, hm)).strip()
+            if d.year == base_date.year:
+                return ("%02d/%02d %s" % (d.month, d.day, hm)).strip()
+            return ("%02d/%02d/%02d %s" % (d.year % 100, d.month, d.day, hm)).strip()
+        except ValueError:
+            pass
+    return text.replace("T", " ")[:16]
+
+
 def task_dynamic_keys(tasks):
-    """任务里出现的自定义字段列（due / due_source 已有专门列，不再重复）。"""
+    """任务里出现的自定义字段列（due / due_source 等内部字段不重复展开）。"""
     out = []
     for task in tasks or ():
         for key in ((task or {}).get("fields") or {}):
@@ -2583,7 +2810,9 @@ def task_table_headers(tasks):
     """任务表当前可显示的完整表头（固定列 + 自定义字段列）。"""
     fixed = [header for header, _kw in TASK_TABLE_COLUMNS]
     keys = [key for key in task_dynamic_keys(tasks) if key not in fixed]
-    return fixed + (keys or [TASK_CONTENT_COLUMN])
+    if not tasks:
+        return fixed + [TASK_CONTENT_COLUMN]
+    return fixed + keys
 
 
 def normalize_task_column(text, tasks=None):
@@ -2683,6 +2912,11 @@ class Warden(object):
         self.task_store = ts.TaskStore()
         self.selected_task_id = None
         self.task_sync_at = 0.0
+        self.task_view_page = None
+        self.task_sort_key = None
+        self.task_sort_desc = False
+        self.task_group_by = None
+        self.task_search_query = ""
         # task import 发现 OmniFocus 重复任务时，先不建本地任务：把候选放进这里，
         # 由打断栏位问「复制重复设置吗？」；用户答 y/n/q 后才真正导入。
         self.pending_import = None
@@ -2713,6 +2947,8 @@ class Warden(object):
         # 项目库（OmniFocus Project）：导入的是「活的母体」，任务清单躺着不动，
         # 等 `plan` 给它分了 count 才唤起当天的任务（见 project_store.py）。
         self.projects = pj.ProjectStore()
+        # 项目库里的叶子任务镜像进任务库（老用户升级后也能直接在任务视图搜到）。
+        self.sync_all_project_tasks(quiet=True)
         # `plan` 的分资源问答（project_plan.Allocator）：和收尾 / 到点没开始一样
         # 是「一次只问一件事」—— 它开着的时候那两个都不会弹。
         self.planning = None
@@ -3561,12 +3797,78 @@ class Warden(object):
         self._last_import_result = task
         return task
 
-    def _apply_project_imports(self, payloads, suffix=None):
-        """把项目 payload 写进**项目库**（同一个 OmniFocus 项目只留一条）。
+    def _project_local_task(self, project_id, project_task_pk):
+        """按 ``(项目序号, 项目任务 pk)`` 找本地镜像任务；没有返回 None。"""
+        want_pk = str(project_task_pk or "").strip()
+        if not want_pk:
+            return None
+        for task in self.task_store.list():
+            pid, _title, pk = ts.TaskStore.project_task_fields(task)
+            if pk == want_pk and str(pid) == str(project_id):
+                return task
+        return None
 
-        项目**不**进任务库、不上任务面板：它的任务清单先在库里躺着，等 `plan`
-        给它分了 count 才「唤起」成当天的任务（用户原话：*不展示直到他们被 project
-        唤起*）。第二次导入同一个项目 = 刷新它的任务清单。
+    def sync_project_tasks(self, project, quiet=True):
+        """把项目库里的**叶子任务**镜像进本地任务库（幂等）。
+
+        这样任务视图的搜索 / ``group project`` / 排序里能直接找到项目任务，而
+        契约视图的任务面板不会因此被几十条备选任务淹掉：这些镜像任务带
+        ``source.kind == "project"``、``fields.project_task``、且没有 session，
+        会被 :meth:`task_panel_tasks` 当成「项目备选」跳过；等 ``plan`` 真正
+        唤起它们时，就复用同一条本地任务并挂上 session。
+        """
+        project = project or {}
+        try:
+            pid = int(project.get("id"))
+        except (TypeError, ValueError):
+            return []
+        title = project.get("title") or ""
+        tasks = project.get("tasks") or []
+        kids = pj.child_map(tasks)
+        statuses = pj.effective_task_statuses(tasks)
+        made = []
+        for item in tasks:
+            pk = str(item.get("pk") or "").strip()
+            if not pk or kids.get(pk):
+                continue
+            status = statuses.get(pk, pj.STATUS_ACTIVE)
+            local = self._project_local_task(pid, pk)
+            if status == pj.STATUS_ACTIVE:
+                task, created = self.task_store.ensure_project_task(pid, title, item)
+                made.append((task, created))
+                continue
+            # OmniFocus 那边已经完成/放弃了：本地还开着的镜像跟着收口，
+            # 但已经挂过 session 的任务不动（那是当天的真实账）。
+            if local is not None and ts.TaskStore.is_open(local) and not local.get("session"):
+                target = (ts.STATUS_COMPLETED if status == pj.STATUS_COMPLETED
+                          else ts.STATUS_DROPPED)
+                self.task_store.set_status(local["id"], target, reason="project-sync")
+        if made and not quiet:
+            created = sum(1 for _task, is_new in made if is_new)
+            self.say("📥 项目「%s」任务已入库：%d 条叶子任务%s（任务视图可 "
+                     "`group project` / `search 项目名` 找到）"
+                     % (title, len(made),
+                        "（新建 %d）" % created if created else ""), "ok")
+        return made
+
+    def sync_all_project_tasks(self, quiet=True):
+        """所有 active 项目都镜像一遍（TUI 启动时补历史项目）。"""
+        made = []
+        try:
+            projects = self.projects.active()
+        except Exception:                             # noqa: BLE001 - 坏项目库不挡启动
+            return []
+        for project in projects:
+            made.extend(self.sync_project_tasks(project, quiet=quiet))
+        return made
+
+    def _apply_project_imports(self, payloads, suffix=None):
+        """把项目 payload 写进**项目库**，并把叶子任务镜像进任务库。
+
+       项目库仍是「母体」；任务库里的镜像只用于任务视图的搜索 / 分组 / 排序，
+        没有 session 时不会进契约视图的任务面板。等 `plan` 给项目分了 count、
+        真正唤起任务时，复用同一条镜像并挂上 session。
+        第二次导入同一个项目 = 刷新它的任务清单。
         """
         made = []
         for payload in payloads or []:
@@ -3603,8 +3905,10 @@ class Warden(object):
                 self.say("   ⚠ 本周任务里还有 %d 条没设持续时间（导入时本应被挡下，"
                          "`project %d refresh` 再看一次）。"
                          % (len(week["missing"]), num), "warn")
-            self.say("   任务清单先躺着不占 session；`plan` 分给这个项目 count 时才会"
-                     "把当天的任务挑出来。", "info")
+            self.sync_project_tasks(project, quiet=False)
+            self.say("   任务清单已镜像进任务库（任务视图可按项目分组/搜索）；"
+                     "没挂 session 前先躺着、不占契约面板，`plan` 分给这个项目 count "
+                     "时才会挑出来挂 session。", "info")
         if made and (suffix or {}):
             # 项目自己不挂 session（母体永远是母体），-a / -f 这些后缀对它没有意义。
             self.say("· 项目不吃后缀（%s）：它自己不占 session，等 `plan` 唤起任务时再"
@@ -3835,6 +4139,8 @@ class Warden(object):
             self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
             tuple(sorted(self.effective_hidden_columns())),
             tuple(sorted(self.effective_task_hidden_columns())),
+            self.task_view_page, self.task_sort_key, self.task_sort_desc,
+            self.task_group_by, self.task_search_query,
             isinstance(self.view, ChoreView), self.chore_index,
             self.chore_last_note,
             id(getattr(self, "stat", None)),
@@ -3926,17 +4232,291 @@ class Warden(object):
             self._save_ui_prefs()
 
     def effective_task_hidden_columns(self, tasks=None):
-        """任务表当前不展示的任务表头（自动无折叠；都是 open/close 的结果）。
+        """任务表当前不展示的任务表头（默认收敛 + 永久 + 本次 close - 手动 open）。
 
         ``tasks=None`` 时不读任务库，只返回偏好里记的列名（frame signature 用）；
         渲染和 close 校验会传入当前任务，于是还能过滤掉已经不存在的动态字段。
         """
         headers = set(task_table_headers(tasks)) if tasks is not None else None
-        hidden = set(self.permanent_hidden_columns.get(TASK_UI_MODE, set()))
-        hidden |= set(self.session_hidden_columns.get(TASK_UI_MODE, set()))
-        hidden -= set(self.permanent_visible_columns.get(TASK_UI_MODE, set()))
-        hidden -= set(self.session_visible_columns.get(TASK_UI_MODE, set()))
+        hidden = set(TASK_AUTO_HIDDEN_COLUMNS)
+        hidden |= self.permanent_hidden_columns.get(TASK_UI_MODE, set())
+        hidden |= self.session_hidden_columns.get(TASK_UI_MODE, set())
+        hidden -= self.permanent_visible_columns.get(TASK_UI_MODE, set())
+        hidden -= self.session_visible_columns.get(TASK_UI_MODE, set())
         return {col for col in hidden if headers is None or col in headers}
+
+    def task_flags_text(self, task):
+        """任务表 boolean flags 专列（``标记`` 列）：沿用契约界面记号并补齐。
+
+        🔁 = 重复任务子任务（🔁* = 重复任务模板本体）
+        🔗 = 关联 OmniFocus
+        🎯 = 关联 Focusmate task（⏳ = 异步挂载在途）
+        ⏱ = 挂了 formatter
+        ⚡ = 挂了 trigger
+        🔒 = 独占场次（exclusive）
+        """
+        marks = ""
+        if ts.TaskStore.is_repeat_template(task):
+            marks += "🔁*"
+        elif (task or {}).get("repeat_parent"):
+            marks += "🔁"
+        if ts.TaskStore.omnifocus_id(task):
+            marks += "🔗"
+        if self._fm_pending(task):
+            marks += "⏳"
+        elif ((task or {}).get("focusmate") or {}).get("task_id"):
+            marks += "🎯"
+        if (task or {}).get("formatter"):
+            marks += "⏱"
+        if (task or {}).get("trigger"):
+            marks += "⚡"
+        if th.is_exclusive(task):
+            marks += "🔒"
+        return marks or "·"
+
+    def task_project_name(self, task):
+        """任务所属项目名称（优先 ``fields.project``，其次项目库匹配）。"""
+        fields = (task or {}).get("fields") or {}
+        proj = str(fields.get(pj.PROJECT_FIELD) or fields.get("项目") or "").strip()
+        if proj:
+            return proj
+        source = (task or {}).get("source") or {}
+        if str(source.get("kind") or "") == "project":
+            src_title = str(source.get("project_title") or "").strip()
+            if src_title:
+                return src_title
+        try:
+            projects = self.projects.list()
+        except Exception:                             # noqa: BLE001
+            projects = []
+        pid = fields.get(pj.PROJECT_ID_FIELD)
+        if pid is not None:
+            for p in projects:
+                if str(p.get("id")) == str(pid):
+                    return str(p.get("title") or "").strip()
+        pk = ts.TaskStore.omnifocus_id(task)
+        if pk:
+            for p in projects:
+                for pt in (p.get("tasks") or ()):
+                    if str(pt.get("pk") or "") == str(pk):
+                        return str(p.get("title") or "").strip()
+        return ""
+
+    def task_remark_text(self, task):
+        """任务表「备注」列：一行 ``k=v`` 紧凑汇总被折叠字段与备注。"""
+        fields = (task or {}).get("fields") or {}
+        parts = []
+        dur = ts.task_minutes(task)
+        if dur is not None:
+            parts.append("dur=%dm" % dur)
+        cap = ts.task_count(task)
+        inv = ts.task_count_invested(task)
+        delta = self.task_count_delta(task)
+        if cap is not None or inv > 0:
+            if cap is not None:
+                if delta > 0:
+                    parts.append("cnt=%d+%d/%d" % (inv, delta, cap))
+                elif inv > 0:
+                    parts.append("cnt=%d/%d" % (inv, cap))
+                else:
+                    parts.append("cnt=%d" % cap)
+            else:
+                parts.append("cnt=%d" % inv)
+        if th.is_exclusive(task):
+            parts.append("excl=1")
+        tags = (task or {}).get("tags") or []
+        if tags:
+            parts.append("tag=" + "/".join(str(t) for t in tags))
+        rep = (task or {}).get("repeat") or {}
+        if rep:
+            parts.append("rep=🔁 " + ts.repeat_summary(rep))
+        fmt = (task or {}).get("formatter") or {}
+        if fmt.get("name"):
+            f_txt = str(fmt.get("name"))
+            if fmt.get("reservation"):
+                f_txt += "@" + str(fmt["reservation"].get("start") or "?")
+            parts.append("fmt=" + f_txt)
+        trig = (task or {}).get("trigger") or {}
+        if trig.get("name"):
+            parts.append("trig=" + str(trig.get("name")))
+        note = self.task_store.notes(task)
+        if note:
+            parts.append("note=" + self.task_store._one_line(note))
+        skip_keys = (set(ts.DURATION_KEYS) | set(ts.NOTES_KEYS) | set(th.EXCLUSIVE_KEYS)
+                     | {"title", "name", pj.PROJECT_FIELD, "项目",
+                        pj.PROJECT_ID_FIELD, pj.PROJECT_TASK_FIELD,
+                        ts.COUNT_KEY, ts.COUNT_INVESTED_KEY, "due", "due_source"})
+        for k, v in fields.items():
+            if k in skip_keys:
+                continue
+            val = self.task_store._one_line(v)
+            if val:
+                parts.append("%s=%s" % (k, val))
+        return ", ".join(parts)
+
+    def task_group_label(self, task, group_by):
+        """分组列显示的标签值。"""
+        col = normalize_task_column(group_by, [task]) or str(group_by or "").strip()
+        if col == "project":
+            return self.task_project_name(task) or "（无项目）"
+        if col == "状态":
+            return "%s %s" % (self.task_mark(task) or "·", self.task_store.status_of(task))
+        if col == "session":
+            sess = (task or {}).get("session") or {}
+            if not sess:
+                return "（未排场次）"
+            raw = "%s %s" % (sess.get("date") or "", sess.get("start") or "")
+            return format_compact_timestamp(raw.strip(), self.sel_date)
+        if col == "截止":
+            due = self.omni_due_of(task)
+            return format_compact_timestamp(due, self.sel_date) if due else "（无截止）"
+        if col == "标签":
+            tags = (task or {}).get("tags") or []
+            return "·".join(tags) if tags else "（无标签）"
+        if col == "标记":
+            return self.task_flags_text(task)
+        if col == "duration":
+            dur = ts.task_minutes(task)
+            return ("%dm" % dur) if dur is not None else "（无时长）"
+        if col == "count":
+            cap = ts.task_count(task)
+            return ("cnt=%d" % cap) if cap is not None else "（无 count）"
+        fields = (task or {}).get("fields") or {}
+        val = self.task_store._one_line(fields.get(col) or fields.get(group_by))
+        return val or ("（无 %s）" % col)
+
+    def _task_sort_tuple(self, task, key):
+        """返回可比较的排序键元组 ``(是否空值, 排序值, id)``。"""
+        col = normalize_task_column(key, [task]) or str(key or "").strip()
+        tid = int((task or {}).get("id") or 0)
+        if col == "id":
+            return (0, tid, tid)
+        if col == "序号":
+            no = self.task_no(task)
+            return (0 if no else 1, no or 999999, tid)
+        if col == "状态":
+            rank = {ts.STATUS_ACTIVE: 0, ts.STATUS_COMPLETED: 1, ts.STATUS_DROPPED: 2}
+            st = self.task_store.status_of(task)
+            return (0, rank.get(st, 9), tid)
+        if col == "title":
+            fields = (task or {}).get("fields") or {}
+            t = str(fields.get("title") or fields.get("name") or "").strip().lower()
+            return (0 if t else 1, t, tid)
+        if col == "project":
+            p = self.task_project_name(task).lower()
+            return (0 if p else 1, p, tid)
+        if col == "session":
+            sess = (task or {}).get("session") or {}
+            s = ("%s %s" % (sess.get("date") or "", sess.get("start") or "")).strip()
+            return (0 if s else 1, s, tid)
+        if col == "截止":
+            due = self.omni_due_of(task) or ""
+            return (0 if due else 1, due, tid)
+        if col == "duration":
+            dur = ts.task_minutes(task)
+            return (0 if dur is not None else 1, dur or 0, tid)
+        if col == "count":
+            cap = ts.task_count(task)
+            return (0 if cap is not None else 1, cap or 0, tid)
+        if col == "完成时间":
+            fm = (task or {}).get("focusmate") or {}
+            done = str(fm.get("completed_at") or (task or {}).get("status_at") or "")
+            return (0 if done else 1, done, tid)
+        fields = (task or {}).get("fields") or {}
+        raw = self.task_store._one_line(fields.get(col) or fields.get(key)).lower()
+        return (0 if raw else 1, raw, tid)
+
+    def _task_matches_query(self, task, query):
+        """任务是否命中搜索词（支持 ``field=val`` / ``field:val`` 或全文子串匹配）。"""
+        tokens = [t.strip() for t in str(query or "").split() if t.strip()]
+        if not tokens:
+            return True
+        fields = (task or {}).get("fields") or {}
+        haystack_parts = [
+            str((task or {}).get("id") or ""),
+            str(self.task_no(task) or ""),
+            str(fields.get("title") or fields.get("name") or ""),
+            self.task_project_name(task),
+            self.task_store.status_of(task),
+            self.task_mark(task) or "",
+            self.task_flags_text(task),
+            self.task_remark_text(task),
+            " ".join(str(t) for t in ((task or {}).get("tags") or [])),
+            str(ts.TaskStore.omnifocus_id(task) or ""),
+        ]
+        for k, v in fields.items():
+            haystack_parts.append("%s=%s" % (k, self.task_store._one_line(v)))
+        haystack = " ".join(haystack_parts).lower()
+        for tok in tokens:
+            m = re.match(r"^([A-Za-z0-9_一-鿿]+)[:=](.+)$", tok)
+            if m:
+                k_raw, v_want = m.group(1), m.group(2).strip().lower()
+                col = normalize_task_column(k_raw, [task]) or k_raw
+                if col == "project":
+                    got = self.task_project_name(task).lower()
+                elif col == "状态":
+                    got = (self.task_store.status_of(task) + " " + (self.task_mark(task) or "")).lower()
+                elif col == "标签":
+                    got = " ".join((task or {}).get("tags") or []).lower()
+                elif col == "id":
+                    got = str((task or {}).get("id") or "").lower()
+                else:
+                    got = self.task_store._one_line(fields.get(col) or fields.get(k_raw)).lower()
+                if v_want not in got:
+                    return False
+            else:
+                if tok.lower() not in haystack:
+                    return False
+        return True
+
+    def filter_and_sort_tasks(self, tasks):
+        """按当前搜索、排序和分组规则处理任务列表。"""
+        out = list(tasks or [])
+        query = getattr(self, "task_search_query", "")
+        if query:
+            out = [t for t in out if self._task_matches_query(t, query)]
+        sort_key = getattr(self, "task_sort_key", None)
+        sort_desc = bool(getattr(self, "task_sort_desc", False))
+        if sort_key:
+            non_empty = [t for t in out if self._task_sort_tuple(t, sort_key)[0] == 0]
+            empty = [t for t in out if self._task_sort_tuple(t, sort_key)[0] != 0]
+            non_empty.sort(key=lambda t: self._task_sort_tuple(t, sort_key)[1:],
+                           reverse=sort_desc)
+            out = non_empty + empty
+        group_by = getattr(self, "task_group_by", None)
+        if group_by:
+            # 同一分组聚拢在一起，保留首次出现的分组顺序（或排完序后的顺序），无值的排在末尾
+            groups = {}
+            order = []
+            tail_key = None
+            for t in out:
+                g = self.task_group_label(t, group_by)
+                if g not in groups:
+                    groups[g] = []
+                    if g.startswith("（无"):
+                        tail_key = g
+                    else:
+                        order.append(g)
+                groups[g].append(t)
+            if tail_key is not None:
+                order.append(tail_key)
+            grouped = []
+            for g in order:
+                grouped.extend(groups[g])
+            out = grouped
+        return out
+
+    def task_filter_summary(self):
+        """表尾 caption 里的当前排序 / 分组 / 搜索提示。"""
+        bits = []
+        if getattr(self, "task_search_query", ""):
+            bits.append("搜索：%s" % self.task_search_query)
+        if getattr(self, "task_group_by", None):
+            bits.append("分组：grouping(%s)" % self.task_group_by)
+        if getattr(self, "task_sort_key", None):
+            bits.append("排序：%s %s" % (
+                self.task_sort_key, "↓" if self.task_sort_desc else "↑"))
+        return " · ".join(bits)
 
     # -- 选中的那一天
 
@@ -4097,10 +4677,16 @@ class Warden(object):
         跟着「现在窗口开多大」乱跳。
         """
         width = getattr(self.console, "width", None)
-        try:
-            cols = shutil.get_terminal_size((80, 24)).columns
-        except Exception:                             # noqa: BLE001
-            cols = width if isinstance(width, int) else 80
+        if getattr(getattr(self, "shell", None), "_in_frame_text", False):
+            try:
+                cols = shutil.get_terminal_size((80, 24)).columns
+            except Exception:                         # noqa: BLE001
+                cols = width if isinstance(width, int) else 80
+        else:
+            try:
+                cols = os.get_terminal_size().columns
+            except Exception:                         # noqa: BLE001
+                cols = width if isinstance(width, int) else 80
         if not isinstance(cols, int) or cols < 24:
             cols = width if isinstance(width, int) and width >= 24 else 80
         return cols
@@ -4141,6 +4727,10 @@ class Warden(object):
             sess = task.get("session") or {}
             sess_day = sess.get("date") or ""
             attached_today = sess_day == iso
+            # 项目库镜像进来的「备选叶子任务」（还没被 plan 唤起）：只给任务视图
+            # 搜索/分组用，不占契约面板；一旦挂了 session 或当天处理过就走正常路径。
+            if ts.TaskStore.is_project_backlog(task) and not records and not attached_today:
+                continue
             if self.task_store.is_open(task):
                 # 已经排到某一天的任务只在那一天的面板里出现（除非那天处理过它，
                 # 那是历史账）。没挂 session 的才是「随时可干」的待办。
@@ -7439,6 +8029,14 @@ class Warden(object):
         if action in ("list", "ls", "show"):
             self.say("任务 %d 条；看本视图表格即可。" % len(self.task_store.list()), "info")
             return False
+        if action in ("sort", "排序"):
+            return self.cmd_task_sort(rest)
+        if action in ("group", "grouping", "分组"):
+            return self.cmd_task_group(rest)
+        if action in ("search", "find", "filter", "搜索"):
+            return self.cmd_task_search(rest)
+        if action in ("page", "翻页"):
+            return self.cmd_task_page(rest)
         # 裸序号就是 select：`task 3` ≡ `task select 3`，
         # 于是 `task 3 -a 1` = 「选中第 3 条再挂到表格 #1」。
         if numeric:
@@ -7626,6 +8224,7 @@ class Warden(object):
             raise ValueError("用法：task select <任务序号>")
         task = self.resolve_task(args[0])
         self.selected_task_id = task["id"]
+        self.task_view_page = None
         self.say("已选中任务 %s：%s"
                  % (self.task_label(task), self.task_store.summarize(task)), "cmd")
         return task
@@ -8004,6 +8603,8 @@ class Warden(object):
                     break
             if minutes and minutes > 0:
                 fields["duration"] = str(minutes)
+            if item.get("project") and not fields.get(pj.PROJECT_FIELD):
+                fields[pj.PROJECT_FIELD] = str(item["project"]).strip()
             omnifocus = None
             if item.get("id"):
                 omnifocus = {"id": item["id"], "url": item.get("url"),
@@ -8257,6 +8858,9 @@ class Warden(object):
                 minutes = row.get("estimated_minutes")
                 if minutes not in (None, "", 0, "0"):
                     item["estimated_minutes"] = minutes
+                proj_name = str(row.get("project") or "").strip()
+                if proj_name and not item.get("project"):
+                    item["project"] = proj_name
         return of.drop_duplicate_titles(items)
 
     def _task_import_skip_known(self, items):
@@ -10008,11 +10612,14 @@ class Warden(object):
             return self._project_refresh(project)
         if rest and rest[0] in ("remove", "rm", "delete", "撤掉", "删除"):
             num = self.projects.number_of(project["id"]) or project["id"]
+            removed = self.task_store.remove_project_backlog(project["id"])
             self.projects.remove(project["id"])
             self.rebuild_rows()
             self.invalidate()
             self.say("🗑 项目 #%d「%s」从项目库撤掉了（OmniFocus 那边没动；已经排进 "
-                     "session 的任务照旧）。" % (num, project.get("title")), "ok")
+                     "session 的任务照旧%s）。"
+                     % (num, project.get("title"),
+                        "；清掉 %d 条未唤起的镜像任务" % removed if removed else ""), "ok")
             return project
         return self._project_detail(project)
 
@@ -10098,6 +10705,7 @@ class Warden(object):
             self.say("🚫 这次刷新没写库（清单先按旧的算）。", "error")
             return None
         updated, _created = self.projects.upsert(payload)
+        self.sync_project_tasks(updated, quiet=False)
         stat = pj.stats(updated, self.task_store)
         week = pj.weekly_yield(updated.get("tasks") or [])
         self.say("🔄 项目 #%s「%s」刷新了：%d 条任务、剩余 %d count（进度 %s）"
@@ -10199,6 +10807,9 @@ class Warden(object):
                     self.say("📥 项目「%s」自动拉取 %d 条新增任务。" % (title, n), "ok")
             if diff.get("removed") or diff.get("modified"):
                 self._project_sync_queue.append(rec)
+            project = self.projects.by_id(rec.get("project_id"))
+            if project is not None:
+                self.sync_project_tasks(project, quiet=True)
         if self._project_sync_queue:
             self._maybe_start_project_sync_conflict()
         self.rebuild_rows()
@@ -10228,7 +10839,8 @@ class Warden(object):
             try:
                 if payload is None:
                     raise ValueError("没有拿到 OmniFocus 清单")
-                self.projects.upsert(payload)
+                updated, _created = self.projects.upsert(payload)
+                self.sync_project_tasks(updated, quiet=False)
                 self.say("📁 项目「%s」已按 OmniFocus 覆盖本地清单。" % title, "ok")
             except Exception as e:                  # noqa: BLE001 - 对账坏了别掀 TUI
                 self.had_error = True
@@ -10522,12 +11134,20 @@ class Warden(object):
             if parent_pk:
                 source.update({"parent_id": parent_pk,
                                "parent_title": parent_title})
+            existing = self._project_local_task(item["project_id"], item["pk"])
             try:
-                task = self.task_store.create(
-                    fields,
-                    omnifocus={"id": item["pk"], "url": url,
-                               "title": item.get("title")},
-                    source=source)
+                if (existing is not None and ts.TaskStore.is_open(existing)
+                        and not existing.get("session")):
+                    # 项目导入时已经把叶子任务镜像进任务库了：plan 唤起时复用
+                    # 同一条，并把这次分到的 count / duration / 父任务来源写上去。
+                    task = self.task_store.apply_project_plan(
+                        existing["id"], fields, source=source)
+                else:
+                    task = self.task_store.create(
+                        fields,
+                        omnifocus={"id": item["pk"], "url": url,
+                                   "title": item.get("title")},
+                        source=source)
             except ValueError as e:
                 failed += 1
                 self.say("⚠ 「%s」没建成本地任务：%s" % (item.get("title"), e), "error")
@@ -11174,6 +11794,11 @@ class Warden(object):
                 raise ValueError("open --permanent 只用于表头列；切口径不带 --permanent")
             return self._switch_session_mode(mode)
         task_mode = isinstance(self.view, TaskView)
+        if task_mode and re.match(r"^(?:page\s*|p)?(\d+)$", text.lower()):
+            if permanent:
+                raise ValueError("open <页码> 翻页不带 --permanent")
+            page_no = int(re.match(r"^(?:page\s*|p)?(\d+)$", text.lower()).group(1))
+            return self.cmd_task_page([str(page_no)])
         col, target_mode, headers, table_name = self._resolve_open_close_column(
             text, task_mode=task_mode)
         if not col:
@@ -11233,6 +11858,183 @@ class Warden(object):
                  % (col, "并写入偏好" if permanent else "（本次运行）", detail), "cmd")
         self.invalidate()
         return col
+
+    def cmd_task_page(self, args=None):
+        """``open <页码>`` / ``task page <页码>``：直接翻到任务表第 N 页。"""
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks or not re.match(r"^\d+$", toks[0]):
+            raise ValueError("用法：open <页码>（例如 open 1 / open 2）")
+        want = int(toks[0])
+        if want < 1:
+            raise ValueError("页码从 1 开始；你给的是 %d" % want)
+        if not isinstance(self.view, TaskView):
+            self.go_to_view(TaskView)
+        filtered = self.filter_and_sort_tasks(self.task_store.list())
+        limit = self.view._row_budget() if isinstance(self.view, TaskView) else 10
+        total_pages = max(1, (len(filtered) + limit - 1) // limit)
+        if want > total_pages:
+            raise ValueError("当前只有 %d 页（共 %d 条任务），没有第 %d 页"
+                             % (total_pages, len(filtered), want))
+        self.task_view_page = want
+        self.say("已翻到第 %d/%d 页（共 %d 条）" % (want, total_pages, len(filtered)), "cmd")
+        self.invalidate()
+        return want
+
+    def cmd_task_sort(self, args=None):
+        """``sort <字段> [asc|desc]`` / ``sort off``：任务表排序。"""
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks:
+            if self.task_sort_key:
+                self.say("当前排序：%s %s（`sort off` 取消）"
+                         % (self.task_sort_key, "降序" if self.task_sort_desc else "升序"),
+                         "info")
+            else:
+                self.say("当前未排序（默认按内部 id 顺序；用法：sort <字段> [asc|desc]）", "info")
+            return self.task_sort_key
+        first = toks[0].lower()
+        if first in ("off", "none", "clear", "reset", "取消", "默认"):
+            self.task_sort_key = None
+            self.task_sort_desc = False
+            self.task_view_page = 1
+            self.say("已恢复默认排序", "cmd")
+            self.invalidate()
+            return None
+        desc = False
+        key_tok = toks[0]
+        if key_tok.startswith("-"):
+            desc = True
+            key_tok = key_tok[1:]
+        elif key_tok.startswith("+"):
+            key_tok = key_tok[1:]
+        if len(toks) > 1:
+            dir_tok = toks[1].lower()
+            if dir_tok in ("desc", "down", "reverse", "d", "降序", "倒序"):
+                desc = True
+            elif dir_tok in ("asc", "up", "a", "升序", "正序"):
+                desc = False
+            else:
+                raise ValueError("排序方向只认 asc / desc；你给的是 %r" % toks[1])
+        tasks = self.task_store.list()
+        col = normalize_task_column(key_tok, tasks)
+        if not col:
+            headers = task_table_headers(tasks)
+            raise ValueError("sort 只认任务字段或表头名（%s）；你给的是 %r"
+                             % ("、".join(headers), key_tok))
+        self.task_sort_key = col
+        self.task_sort_desc = desc
+        self.task_view_page = 1
+        if not isinstance(self.view, TaskView):
+            self.go_to_view(TaskView)
+        self.say("任务表按「%s」%s排列（`sort off` 恢复默认）"
+                 % (col, "降序" if desc else "升序"), "cmd")
+        self.invalidate()
+        return col
+
+    def cmd_task_group(self, args=None):
+        """``group <字段>`` / ``group off``：任务表按字段前置分组显示。"""
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks:
+            if self.task_group_by:
+                self.say("当前分组：grouping(%s)（`group off` 取消）" % self.task_group_by, "info")
+            else:
+                self.say("当前未分组（用法：group <字段>，如 `group project`）", "info")
+            return self.task_group_by
+        raw = " ".join(toks).strip()
+        m = re.match(r"^grouping\((.+)\)$", raw, flags=re.I)
+        if m:
+            raw = m.group(1).strip()
+        if raw.lower() in ("off", "none", "clear", "reset", "取消"):
+            self.task_group_by = None
+            self.task_view_page = 1
+            self.say("已取消任务表分组", "cmd")
+            self.invalidate()
+            return None
+        tasks = self.task_store.list()
+        col = normalize_task_column(raw, tasks)
+        if not col:
+            headers = task_table_headers(tasks)
+            raise ValueError("group 只认任务字段或表头名（%s）；你给的是 %r"
+                             % ("、".join(headers), raw))
+        self.task_group_by = col
+        self.task_view_page = 1
+        if not isinstance(self.view, TaskView):
+            self.go_to_view(TaskView)
+        self.say("任务表已按「grouping(%s)」分组显示（同组首行显示，后续留空；`group off` 取消）"
+                 % col, "cmd")
+        self.invalidate()
+        return col
+
+    def cmd_task_search(self, args=None):
+        """``search <关键词> [--group <字段>]`` / ``search off``：搜索并可选分组。"""
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks:
+            if self.task_search_query or self.task_group_by:
+                self.say("当前搜索：%r · 分组：%s（`search off` 清空）"
+                         % (self.task_search_query or "（无）",
+                            ("grouping(%s)" % self.task_group_by) if self.task_group_by else "（无）"),
+                         "info")
+            else:
+                self.say("用法：search <关键词> [--group <字段>] | search grouping(project) [关键词] | search off",
+                         "info")
+            return self.task_search_query
+        if len(toks) == 1 and toks[0].lower() in ("off", "none", "clear", "reset", "取消"):
+            self.task_search_query = ""
+            self.task_group_by = None
+            self.task_view_page = 1
+            self.say("已清除任务搜索与分组过滤", "cmd")
+            self.invalidate()
+            return ""
+        group_arg = None
+        query_parts = []
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            low = tok.lower()
+            m_grp = re.match(r"^(?:grouping|group)\((.+)\)$", tok, flags=re.I)
+            if m_grp:
+                group_arg = m_grp.group(1).strip()
+                i += 1
+                continue
+            if low in ("--group", "-g", "by", "--by"):
+                if i + 1 >= len(toks):
+                    raise ValueError("%s 后面要跟分组字段名（例如 --group project）" % tok)
+                group_arg = toks[i + 1]
+                i += 2
+                continue
+            if low.startswith("--group=") or low.startswith("-g="):
+                group_arg = tok.split("=", 1)[1].strip()
+                i += 1
+                continue
+            query_parts.append(tok)
+            i += 1
+        tasks = self.task_store.list()
+        # 如果只敲了 `search project` 这类恰好是字段名的单token，而且没带别的词，
+        # 既当搜索也可当按该字段分组？按用户说的：「比如说搜索的时候，在最前面引入一个 field，
+        # 然后一个这个 field 对应很多 task，比如说 grouping(project)」。
+        # 如果第一个词是已知可分组字段名（如 project）且用户写了 `search grouping(project)`
+        # 或 `search -g project` 已经识别；若用户写 `search by project` 也能识别。
+        if group_arg is not None:
+            if group_arg.lower() in ("off", "none", "clear"):
+                self.task_group_by = None
+            else:
+                col = normalize_task_column(group_arg, tasks)
+                if not col:
+                    raise ValueError("未知分组字段 %r" % group_arg)
+                self.task_group_by = col
+        self.task_search_query = " ".join(query_parts).strip()
+        self.task_view_page = 1
+        if not isinstance(self.view, TaskView):
+            self.go_to_view(TaskView)
+        matched = self.filter_and_sort_tasks(tasks)
+        msg_bits = []
+        if self.task_search_query:
+            msg_bits.append("搜索「%s」" % self.task_search_query)
+        if self.task_group_by:
+            msg_bits.append("分组 grouping(%s)" % self.task_group_by)
+        self.say("%s：命中 %d/%d 条任务（`search off` 清除）"
+                 % (" · ".join(msg_bits) or "全部任务", len(matched), len(tasks)), "cmd")
+        self.invalidate()
+        return matched
 
     def _period_row_is_stale(self, row, new_by_start):
         """这一行 API session 还符合新排布吗？（按起点 + 时长判断）"""
@@ -12409,7 +13211,10 @@ class Warden(object):
             return bool(job.outcome is not None and job.outcome.ok)
         return True
 
-    def cmd_help(self):
+    def cmd_help(self, args=None):
+        toks = [str(a).strip().lower() for a in (args or [])]
+        if any(tok in ("--task", "-t", "task", "任务") for tok in toks):
+            return self.cmd_help_task()
         t = Table.grid(padding=(0, 2))
         t.add_column(style="bold", no_wrap=True, justify="right")
         t.add_column()
@@ -12536,6 +13341,68 @@ class Warden(object):
             "时段 ID（T1/T2）来自下载层 temp/calendar-download.json；"
             "同段后续行留空是正常的。[/]"
         )
+        return False
+
+    def cmd_help_task(self):
+        """``help --task``：任务视图的详细说明（列、标记、缩写、全部命令）。"""
+        from rich.table import Table as _Table
+        t = _Table.grid(padding=(0, 2))
+        t.add_column(style="bold cyan", no_wrap=True, justify="right")
+        t.add_column()
+        t.add_row("默认列", "序号 · 标记 · title · project · 状态 · session · 截止 · 备注")
+        t.add_row("默认折叠", "id · 重复 · trigger · formatter · Focusmate · OmniFocus · "
+                              "完成时间 · 标签 · duration · count · exclusive（用 open <表头> 展开）")
+        t.add_row("标记", "🔁=重复子任务  🔁*=重复模板  🔗=OmniFocus  🎯=Focusmate  "
+                          "⏳=挂载中  ⏱=formatter  ⚡=trigger  🔒=独占")
+        t.add_row("状态", "·=进行中  ✓=完成  ✗=放弃  ⤼=转移走")
+        t.add_row("备注缩写", "dur=分钟  cnt=已投/上限  excl=独占  tag=标签  "
+                              "rep=重复  fmt=formatter  trig=trigger  note=备注")
+        t.add_row("时间戳", "同天 HH:MM · 明天/昨天 +1/-1 HH:MM · 同年 MM/DD HH:MM")
+        t.add_row("分页", "open 1 / open 2 / open 3 直接翻页；表下会显示 第 X/Y 页")
+        t.add_row("排序", "sort <字段> [asc|desc] · sort off；字段可用 id/title/project/"
+                          "状态/session/截止/duration/count")
+        t.add_row("分组", "group <字段> 或 group grouping(project) · group off；"
+                          "分组列在最前面，同组首行显示组名、后续留空")
+        t.add_row("搜索", "search <词> [--group <字段>] · search grouping(project) <词> · "
+                          "search off；支持 field=value")
+        t.add_row("关联项目", "项目导入/刷新会把叶子任务镜像进任务库（fields.project），"
+                              "任务视图可搜索、可 group project；plan 唤起时复用同一条。")
+        t.add_row("任务库", self.task_store.path)
+        self.emit(Panel(t, title="[bold]Task · 任务视图详细说明[/]",
+                        border_style="cyan", box=box.ROUNDED))
+
+        c = _Table.grid(padding=(0, 2))
+        c.add_column(style="bold", no_wrap=True, justify="right")
+        c.add_column()
+        for cmd, desc in [
+            ("task create [id] [字段=值 ...]", "新建任务；字段不校验"),
+            ("task delete <序号|id:N>", "删除任务"),
+            ("task modify <序号|id:N> <字段> <值>", "改任意字段"),
+            ("task select <序号|id:N>", "选中任务"),
+            ("task <序号>", "等价 task select"),
+            ("task assign [序号] <session编号>", "挂到 session（自动建 Focusmate task）"),
+            ("task <序号> -a <session|none|current>", "挂上/下架/挂当前场"),
+            ("task <序号> -n <备注>", "顺手写备注"),
+            ("task <序号> -c 5|+2|-1", "设 count / 加进度 / 减进度"),
+            ("task <序号> -e true|false", "独占 / 取消独占"),
+            ("task <序号> -m complete|discard", "只改本地状态（不碰外部系统）"),
+            ("task <序号> done [分钟]", "完成（勾 Focusmate + 写回 OmniFocus）"),
+            ("task <序号> drop [--local]", "放弃（默认也放弃 OmniFocus）"),
+            ("task <序号> duplicate [-a N]", "复制一条任务"),
+            ("task <序号> link [链接|PK]", "关联 OmniFocus"),
+            ("task import [-st]", "读剪贴板导入 OmniFocus 任务/项目"),
+            ("task <序号> -f end", "formatter：排到当天最后一段并自动挂"),
+            ("task <序号> -t <preset> [参数]", "挂 trigger 预设"),
+            ("task sync / archive [N]", "同步完成时间 / 看归档"),
+            ("sort / group / search", "任务表排序 / 分组 / 搜索"),
+            ("open <页码|表头> / close <表头>", "翻页 / 展开列 / 折叠列"),
+            ("help --task", "本页"),
+        ]:
+            c.add_row(cmd, desc)
+        self.emit(Panel(c, title="[bold]Task · 命令[/]",
+                        border_style="cyan", box=box.ROUNDED))
+        self.emit("[dim]更多细节见 feature_intents/task.md；任务库字段不校验，"
+                  "内部簿记见 store 文件。[/]")
         return False
 
     # -- 循环

@@ -193,24 +193,28 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
 - 契约表格 task 列、任务面板编号列、收尾面板的「任务 #3」、Recent 里的每一句
   —— 全部用同一个 `task_label()`，所以屏幕上不会同时出现两套编号。
 
-## 任务视图（视图 4）的表头
+## 任务视图（视图 4）的表头、紧凑表示、分页与排序/分组/搜索
 
-任务视图一直画一张带表头的表：固定列是 `序号 | id | 状态 | 重复 | trigger |
-formatter | session | 截止 | Focusmate | OmniFocus | 完成时间 | 标签`，后面按任务
-实际字段追加 `title` / `duration` / …；没有任何字段时保留 `内容` 列。空任务库也先画
-表头，不再只剩一个说明框。
-
-`open` / `close` 在任务视图里作用于这张任务表（不是契约表）：
-
-```text
-close id
-close title
-close 截止 --permanent
-open id
-open title
-```
-
-被折叠的表头名会显示在表下面：`已折叠列：id、title（open <表头名> 打开）`。
+任务视图一直画一张带表头的表：
+- **默认常驻列顺序**：`序号 | 标记 | title | project | 状态 | session | 截止 | 备注`（空任务库额外保留 `内容` 列）。
+- **默认收敛（折叠）列**：`id`、`重复`、`trigger`、`formatter`、`Focusmate`、`OmniFocus`、`完成时间`、`标签`、`duration`、`count`、`exclusive`。这些列默认不展开，全部列在表下方 `已折叠列：…（open <表头名> 打开）`，随时可用 `open <表头名>` 展开。
+- **`标记`（Boolean flags 专列）**：沿用契约界面记号并补齐：
+  - `🔁` = 重复任务子任务（`🔁*` = 重复任务模板本体）
+  - `🔗` = 关联 OmniFocus
+  - `🎯` = 关联 Focusmate task（`⏳` = 异步挂载在途）
+  - `⏱` = 挂了 formatter
+  - `⚡` = 挂了 trigger
+  - `🔒` = `exclusive`（独占场次）
+- **`title` 列**：紧跟在 `标记` 列之后排第二。
+- **`project` 列**：默认常驻列，显示任务所属项目名（超长按宽度自动 trim 截断为 `…`）。
+- **`状态` 列**：单独一列，只用标识记号（`·` 进行中 / `✓` 完成 / `✗` 放弃 / `⤼` 未完成转移）。
+- **`session` / `截止` / `完成时间` 紧凑时间戳（方案 A）**：以当前选中日期为基准，同一天只显示 `HH:MM`，明天/昨天显示 `+1 HH:MM` / `-1 HH:MM`，同年其他日期显示 `MM/DD HH:MM`。
+- **`备注` 列**：用一行 `k=v` 紧凑汇总收敛项与自定义字段，例如 `dur=25m, cnt=1/2, excl=1, tag=未完成转移, rep=每天 11:00, fmt=end@23:15, note=…`。
+- **分页与 `open 1 / 2 / 3`**：表下方显示 `第 1/3 页，共 96 条（open 1 / 2 / 3 直接翻页）`，在任务视图直接敲 `open 1`、`open 2`、`open 3` 即可翻页。
+- **排序 / 分组 / 搜索**：
+  - `sort <字段> [asc|desc]` / `sort off`：按字段排序；
+  - `group <字段>`（或 `group grouping(project)`） / `group off`：在表格最前面前置一列 `grouping(<字段>)`，同组任务聚拢显示，首行显示组名、后续同行留空；
+  - `search <关键词> [--group <字段>]`（或 `search grouping(project) <关键词>`） / `search off`：搜索过滤任务并支持顺带按字段分组。
 
 ## 命令
 
