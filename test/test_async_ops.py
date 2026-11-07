@@ -514,11 +514,34 @@ bridge.release()
 settle(wd)
 check("title 落地", wd.rows[0].get("title"), "SAT 冲刺")
 
-before_rows = [r["startLabel"] for r in wd.rows]
+# cancel：执行区要敲宣言，但敲完不能等浏览器。这里把宣言闸门换成直接放行，
+# 只测「命令立刻返回 + 后台有进度条 + 取消成功之后行消失」。
+bridge = GateBridge()
+wd = mkwarden(bridge)
+seed_rows(wd)
+wd.require_declaration = lambda reason: True
+row = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
+row["zone"] = "locked"
+idx = wd.rows.index(row) + 1
 bridge.hold()
-wd.handle("cancel 2")                            # 执行区要敲宣言 —— 见下一条
+started = time.time()
+wd.handle("cancel %d" % idx)
+elapsed = time.time() - started
+check("cancel 命令不在提示符线程等 bridge", elapsed < 1.0, True)
+check("取消是乐观的：行立刻从表格消失",
+      [r.get("startLabel") for r in wd.rows if r.get("id") == "sess-11:00"], [])
+wait_for(lambda: wd.jobs.busy)
+check("取消进了后台队列", wd.jobs.busy, True)
+check_true("取消有进度面板（不是 console.status 转圈）",
+           wd.shell.progress_value() is not None)
+check_true("进度标题说在取消", "取消" in wd.jobs.title_text())
 bridge.release()
 settle(wd)
+check("Focusmate 真的收到 cancel",
+      [c for c in bridge.calls if c[0] == "cancel"][0][1].get("meetingId"),
+      "sess-11:00")
+check("取消成功后队列清空", wd.jobs.busy, False)
+check("取消没有进失败账", wd.jobs.failures, [])
 
 print("\n== 5.5 OmniFocus 也走同一条管道（乐观 + 回滚 + [标签]）==")
 bridge = GateBridge()

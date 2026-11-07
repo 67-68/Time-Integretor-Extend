@@ -1971,6 +1971,41 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-06T23:46:27",
+      "task_id": 115,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-06T23:40:00",
+        "due_source": "session",
+        "exclusive": true,
+        "count_invested": 1
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-06",
+        "start": "23:15",
+        "end": "23:40",
+        "duration": 25,
+        "focusmate_session_id": "7a46b68d-357e-49a7-84c0-12472df01d38",
+        "previous_due": "2026-11-06T20:20:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "47210446-2b0a-45e8-b2b8-c58912920862",
+        "title": "flashcard review & new learn",
+        "description": "",
+        "completed_at": "2026-11-06T15:40:19.962404+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "7a46b68d-357e-49a7-84c0-12472df01d38"
+          }
+        ]
+      }
     }
   ]
 }

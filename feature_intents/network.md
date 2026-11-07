@@ -41,6 +41,16 @@ warden 里**所有不在软件内部自己完成的事**都不在提示符线程
 `task sync`、formatter 切出来的旧场取消、`refresh`、
 `sync`（[calendar] download → [calendar] populate）、`daemon start/stop`。
 
+**取消 session 的所有入口**也走这条队列，不再在提示符线程上用
+`console.status` 等浏览器：
+
+- `cancel N` → `session.cancel`（乐观拿掉行，失败自动放回）
+- 到点没开始敲 `x 不去了` → `session.missed`（状态落盘在后台，输入立刻进收尾）
+- 认罪后复查 daemon 是否重订回来 → `session.confess_cancel`（查快照 + 取消，
+  逐场更新进度；失败进失败账可 `re-action`）
+- 改排布 / 临时挪动旧场 → `session.relocate_cancel`，
+  随后的 `keep_session.py check` 也是 `keep_session.run` 后台动作
+
 ## 两种操作，两种待遇
 
     读（session 列表 / Focusmate task / 生涯统计 / OmniFocus 任务列表）

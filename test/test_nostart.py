@@ -22,6 +22,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -141,10 +143,30 @@ class FakeBridge(object):
         pass
 
 
-def mkwarden(day_offset=0, bridge=None):
+def mkwarden(day_offset=0, bridge=None, async_net=None):
     console = Console(file=io.StringIO(), width=120, force_terminal=False)
     return w.Warden(console, bridge or FakeBridge(), no_clear=True, offline=True,
-                    day_offset=day_offset)
+                    day_offset=day_offset, net_async=async_net)
+
+
+def wait_for(predicate, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def settle(wd, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        wd.jobs.wait(max(0.1, deadline - time.time()))
+        wd.drain_net()
+        if not wd.jobs.busy:
+            wd.drain_net()
+            if not wd.jobs.busy:
+                return
 
 
 def write_csv(lines):
@@ -516,6 +538,45 @@ wd2.rows_source = "bridge"
 wd2.rebuild_rows()
 wd2._maybe_start_nostart()
 check("答过就不再弹", wd2.nostart, None)
+
+print("== x 不去了：写状态放后台，输入线程不等磁盘，面板有进度 ==")
+reset_all()
+START = (FIXED - datetime.timedelta(minutes=6)).replace(second=0, microsecond=0)
+HHMM = hhmm_of(START)
+write_csv(["%s,%s,50" % (ISO, HHMM)])
+wd = mkwarden(day_offset=0, bridge=FakeBridge(), async_net=True)
+wd.reload_entries()
+wd.api_rows = []
+wd.rows_source = "bridge"
+wd.rebuild_rows()
+task = ts.TaskStore().create({"title": "x 不能卡住输入"})
+ts.TaskStore().assign(task["id"], {"date": ISO, "start": HHMM, "duration": 50})
+entry = psv.nostart_entry(TODAY, HHMM, 50, now=FIXED, period_id="T1")
+wd.nostart = psv.NostartReview(entry, hooks=wd.nostart_hooks())
+original_mark = ks.mark_abandoned
+gate = threading.Event()
+
+def slow_mark(*args, **kwargs):
+    gate.wait(5)
+    return original_mark(*args, **kwargs)
+
+ks.mark_abandoned = slow_mark
+started = time.time()
+wd.handle("x")
+elapsed = time.time() - started
+check("x 立刻返回（不跟着后台写盘一起等）", elapsed < 1.0, True)
+check("x 的本地提示已经收掉", wd.nostart, None)
+check_true("x 的任务进了收尾", wd.review is not None)
+wait_for(lambda: wd.jobs.busy)
+check_true("x 有后台进度条", wd.shell.progress_value() is not None)
+gate.set()
+settle(wd)
+ks.mark_abandoned = original_mark
+check("后台最终记下 abandoned",
+      sch.key_of(TODAY, HHMM) in (ks.load_verdicts()["abandoned"]), True)
+check("后台最终记下 missed",
+      (ks.load_state()["slots"].get(sch.key_of(TODAY, HHMM)) or {}).get("status"),
+      "missed")
 
 _frozen.stop()
 shutil.rmtree(TMP, ignore_errors=True)

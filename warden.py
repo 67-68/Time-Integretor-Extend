@@ -3179,6 +3179,12 @@ class Warden(object):
                            apply=self._apply_task_complete)
         self.jobs.register("session.cancel", self.net_session_cancel,
                            apply=self._apply_session_cancel)
+        # 取消/认罪/「不去了」这些动作以前有几条路会在提示符线程上直接等
+        # 浏览器（console.status 转圈不算进度条，输入也一起冻住）。现在它们
+        # 全走同一个后台队列：面板里有标题、步骤和进度，失败照样进失败账。
+        self.jobs.register("session.missed", self.net_session_missed)
+        self.jobs.register("session.confess_cancel", self.net_session_confess_cancel)
+        self.jobs.register("session.relocate_cancel", self.net_session_relocate_cancel)
         self.jobs.register("session.mute", self.net_session_mute,
                            apply=self._apply_session_mute)
         self.jobs.register("session.title", self.net_session_title,
@@ -3291,16 +3297,129 @@ class Warden(object):
                 "already": bool(res.get("already"))}
 
     def net_session_cancel(self, args, rep):
-        """取消一场 session。**写**操作。"""
+        """取消一场 session。**写**操作（浏览器可能冷启动几十秒，全在 worker 上）。"""
         rep.label("取消 %s %s" % (str(args.get("date") or "")[5:], args.get("start") or "?"))
         rep.progress(0.05)
         res = self.bridge.call("cancel", startMs=args.get("startMs"),
                                meetingId=args.get("meeting_id"))
+        rep.progress(0.9)
         if not res.get("verified"):
             raise ValueError("取消后复核：该 session 还在")
         rep.progress(1.0)
         rep.log("%s 那场已取消" % (args.get("start") or "?"), "ok")
         return {"cancelled": args.get("meeting_id")}
+
+    def net_session_missed(self, args, rep):
+        """把一场「到点没开始」记成 missed + abandoned（纯本地落盘，也放后台）。
+
+        这个动作本身很快；放队列里是为了两件事：一是输入线程永远不等文件锁/磁盘，
+        二是如果哪天 state 文件在慢盘/被杀进程卡住，面板至少明确显示在做哪一步。
+        """
+        key = str(args.get("key") or "")
+        day_iso = str(args.get("date") or "")
+        start = str(args.get("start") or "?")
+        why = str(args.get("why") or
+                  ("到点没开始，我选了「不去了」（%s %s）" % (day_iso, start)))
+        rep.label("记录缺失 %s %s" % (day_iso[5:], start))
+        rep.progress(0.1)
+        try:
+            ks.mark_abandoned(key, why="nostart", note=why)
+        except Exception as e:                  # noqa: BLE001 - 记不上也别挡住下一步
+            rep.log("记「已放弃」失败：%s" % e, "warn")
+        rep.progress(0.55)
+        try:
+            ks.mark_slot(key, "missed", note="nostart")
+        except Exception as e:                  # noqa: BLE001
+            rep.log("记 missed 失败：%s" % e, "warn")
+        rep.progress(1.0)
+        rep.log("%s 已记为缺失（daemon 不再重订）" % start, "ok")
+        return {"key": key, "why": why}
+
+    def net_session_confess_cancel(self, args, rep):
+        """认罪后把 daemon 已经重订回来的场次再取消掉。
+
+        以前这一段在 ``confess()`` 里直接 ``bridge.call``，还要在一个
+        ``console.status`` 里等浏览器 —— 宣言刚敲完画面像死了。现在拆成
+        一个可重放的后台动作：逐场查快照、命中就取消、每步更新进度。
+        """
+        keys = [str(k) for k in (args.get("keys") or []) if str(k).strip()]
+        now = datetime.datetime.now()
+        checked = cancelled = past = missing = 0
+        failed = []
+        total = max(1, len(keys))
+        for index, key in enumerate(keys, 1):
+            rep.progress((index - 1) / total)
+            try:
+                day = datetime.date.fromisoformat(key[:10])
+                hhmm = key[11:]
+                got = sch.parse_hhmm(hhmm)
+            except (ValueError, TypeError):
+                rep.log("%s 不是合法场次 key，跳过" % key, "warn")
+                continue
+            if not got:
+                rep.log("%s 不是合法场次 key，跳过" % key, "warn")
+                continue
+            start = datetime.datetime(day.year, day.month, day.day, got[0], got[1])
+            if start <= now:
+                past += 1
+                rep.log("%s 已经过去：只判放弃，不动 API" % key, "info")
+                continue
+            rep.label("查 %s 是否被重订" % key)
+            try:
+                res = self.bridge.call("snapshot", timeout=180, date=day.isoformat())
+            except BridgeError as e:
+                failed.append("%s 查不到现状：%s" % (key, e))
+                rep.log("%s 查不到现状：%s" % (key, e), "warn")
+                continue
+            checked += 1
+            hit = None
+            for sess in res.get("sessions") or []:
+                if sess.get("startLabel") == hhmm:
+                    hit = sess
+                    break
+            if not hit:
+                missing += 1
+                rep.log("%s 现在 API 里没有（还没重订回来）" % key, "info")
+                continue
+            rep.label("取消重订的 %s" % key)
+            try:
+                out = self.bridge.call("cancel", startMs=hit.get("startMs"),
+                                       meetingId=hit.get("id"))
+            except BridgeError as e:
+                failed.append("%s 取消失败：%s" % (key, e))
+                rep.log("%s 取消失败：%s" % (key, e), "warn")
+                continue
+            if not out.get("verified"):
+                failed.append("%s 取消后复核还在" % key)
+                rep.log("%s 取消后复核还在" % key, "warn")
+                continue
+            cancelled += 1
+            rep.log("%s 已真的取消（API 复核：没了）" % key, "ok")
+            rep.progress(index / total)
+        if failed:
+            raise ValueError("；".join(failed))
+        rep.progress(1.0)
+        return {"keys": keys, "checked": checked, "cancelled": cancelled,
+                "past": past, "missing": missing}
+
+    def net_session_relocate_cancel(self, args, rep):
+        """挪场次时批量取消旧 API session（一个动作 = 一条进度条）。"""
+        moves = list(args.get("moves") or [])
+        total = max(1, len(moves))
+        done = []
+        for index, move in enumerate(moves, 1):
+            label = str(move.get("start") or "?")
+            rep.label("取消旧 session %s" % label)
+            rep.progress((index - 1) / total)
+            res = self.bridge.call("cancel", timeout=180,
+                                   startMs=move.get("startMs"),
+                                   meetingId=move.get("meeting_id"))
+            if not res.get("verified"):
+                raise ValueError("旧 session %s 取消后复核还在" % label)
+            done.append(move.get("meeting_id"))
+            rep.log("旧 session %s 已取消" % label, "ok")
+            rep.progress(index / total)
+        return {"cancelled": done}
 
     def net_session_mute(self, args, rep):
         """改 quiet mode。**写**操作。"""
@@ -3531,8 +3650,23 @@ class Warden(object):
     # -- worker 侧：别的进程（keep_session / 日历）---------------------
 
     def net_keep_session(self, args, rep):
-        """跑一次 ``keep_session.py``（下单/对账/启停 daemon）。**外部**操作。"""
+        """跑一次 ``keep_session.py``（下单/对账/启停 daemon）。**外部**操作。
+
+        ``release_browser``：在跑子进程前先让 bridge 放开 Chromium profile。
+        这一步以前在主线程用 ``_release_browser()`` 做，浏览器卡住时输入也卡住；
+        现在和真正的 check 一起在 worker 上，进度条会依次显示两步。
+        """
         argv = [str(a) for a in (args.get("argv") or [])]
+        if args.get("release_browser"):
+            rep.label("释放浏览器给 daemon")
+            rep.progress(0.05)
+            try:
+                up, browser, _ = self.bridge.browser_state()
+                if up and browser:
+                    self.bridge.call("release", timeout=60)
+                    rep.log("浏览器已释放", "ok")
+            except BridgeError as e:
+                rep.log("释放浏览器失败（继续跑，可能撞锁）：%s" % e, "warn")
         rep.label("keep_session %s" % (" ".join(argv) or "check"))
         rep.progress(0.1)
         rc, out, err = run_keep_session(*argv, timeout=int(args.get("timeout") or 600))
@@ -6336,42 +6470,36 @@ class Warden(object):
             ks.mark_abandoned(key, why="walk-of-shame", note="TUI 里敲完宣言后放弃")
         self.say("已判 %d 场为「已放弃」：daemon 不会再重订。" % len(keys), "ok")
 
-        now = datetime.datetime.now()
-        for key in keys:
-            try:
-                day = datetime.date.fromisoformat(key[:10])
-                hhmm = key[11:]
-                got = sch.parse_hhmm(hhmm)
-            except ValueError:
-                continue
-            if not got:
-                continue
-            start = datetime.datetime(day.year, day.month, day.day, got[0], got[1])
-            if start <= now:
-                self.say("  %s 已经过去了，只判放弃，不动 API。" % key, "info")
-                continue
-            # 已经被 daemon 重订回来了吗？有就再取消掉
-            try:
-                res = self.bridge.call("snapshot", timeout=180, date=day.isoformat())
-            except BridgeError as e:
+        # 已经被 daemon 重订回来吗？查快照 + 取消都在后台队列里做：
+        # 浏览器冷启动时输入线程不能跟着一起冻住，进度条会写清楚在做哪一场。
+        action = self.net_action(
+            "session.confess_cancel",
+            "认罪后取消已重订的场次（%d 场）" % len(keys),
+            {"keys": keys}, source=SRC_FOCUSMATE)
+
+        def done(payload):
+            payload = payload or {}
+            if payload.get("cancelled"):
+                self.say("  ✅ 后台复查：%d 场被重订回来的 session 已真的取消。"
+                         % payload["cancelled"], "ok")
+            if payload.get("missing"):
+                self.say("  %d 场 API 里还没有（daemon 还没重订回来）。"
+                         % payload["missing"], "info")
+            if payload.get("past"):
+                self.say("  %d 场已经过去：只判放弃，没动 API。" % payload["past"], "info")
+
+        def failed(error):
+            self.had_error = True
+            self.say("  ❌ 复查/取消失败：%s（判决已落，daemon 不会重订；"
+                     "失败账可用 re-action 重放）" % error, "error")
+
+        job = self.jobs.submit(action, on_ok=done, on_fail=failed)
+        if self.jobs.sync:
+            # 同步模式（测试 / --exec）：submit 已经跑完，让错误照旧表现为失败。
+            if job.outcome is None or not job.outcome.ok:
                 self.had_error = True
-                self.say("  %s 查不到现状（%s），你自己去 Focusmate 看一眼。" % (key, e), "error")
-                continue
-            hit = None
-            for s in res.get("sessions") or []:
-                if s.get("startLabel") == hhmm:
-                    hit = s
-                    break
-            if not hit:
-                self.say("  %s 现在 API 里没有（daemon 还没重订回来）。" % key, "info")
-                continue
-            with self.console.status("[red]取消 %s…[/]" % key, spinner="dots"):
-                out = self.bridge.call("cancel", startMs=hit["startMs"], meetingId=hit["id"])
-            if out.get("verified"):
-                self.say("  ✅ %s 已真的取消（API 复核：没了）" % key, "ok")
-            else:
-                self.had_error = True
-                self.say("  ❌ %s 取消后复核：它还在" % key, "error")
+        else:
+            self.say("  正在后台复查并取消已被重订的场次（进度看面板）。", "cmd")
         n = ks.clear_sins(keys)
         self.say("罪已归档 %d 笔（temp/warden-sins.jsonl，只增不删）。" % n, "ok")
 
@@ -6689,11 +6817,13 @@ class Warden(object):
                      % (len(moved), "、".join(self.task_label(t) for t in moved)), "ok")
         return moved
 
-    def _apply_relocate(self, day, moves, delta, later_scope=None, reason="relocate"):
-        """落临时挪动 → 取消旧 API session → 任务绑定跟着挪 → 立刻跑一轮 check。
+    def _apply_relocate(self, day, moves, delta, later_scope=None, reason="relocate",
+                        on_done=None):
+        """落临时挪动，取消旧 API session；成功后挪任务绑定、再执行 ``on_done``。
 
-        顺序是有讲究的：**先落盘再取消**，取消失败就整批回滚（保证「取消 + 挪动」
-        不会只做一半）；绑定挪在取消之后（不然 tasks_for_session 找不到旧场次了）。
+        取消失败时把 relocation 文件整批回滚。取消请求现在走后台队列
+        （``session.relocate_cancel``），提示符线程不会等浏览器；面板里能看到
+        「取消旧 session X」的进度。同步模式（测试 / --exec）仍是当场完成。
         """
         stamp = datetime.datetime.now().isoformat(timespec="seconds")
         before = sch.load_relocations()
@@ -6725,35 +6855,56 @@ class Warden(object):
             }
         sch.save_relocations(after)
 
-        # 1) 取消原 API session（有的话）。取消失败 → 整批回滚，不留半套。
-        for m in moves:
-            row = m["row"]
-            if row.get("id") is None:
-                continue
-            self.say("取消原 session %s…" % m["cur"], "cmd")
+        live = [m for m in moves if m["row"].get("id") is not None]
+
+        def finish_local():
+            # 本地表也把旧 session 拿掉：成功取消之后，表格立刻只显示新时间。
+            for m in live:
+                row = m["row"]
+                self.api_rows = [r for r in self.api_rows
+                                 if not (r.get("id") == row.get("id")
+                                         and r.get("startMs") == row.get("startMs"))]
+            # 旧 booked state 清掉：不清的话，等你哪天把挪动撤回去，daemon 会看到
+            # 「state 说 booked 但 API 没有」→ 记一笔罪（其实是 warden 自己干的活）。
+            self._forget_layout_state(
+                [{"date": day.isoformat(), "startLabel": m["cur"]} for m in moves])
+            # 任务绑定跟着挪（绑定 + 截止时间）。
+            self._migrate_task_bindings(day, moves)
+            self.reload_entries()
+            self.rebuild_rows()
+            self.invalidate()
+            if callable(on_done):
+                on_done()
+
+        def failed(error):
             try:
-                with self.console.status("[red]取消原 session…[/]", spinner="dots"):
-                    res = self.bridge.call("cancel", startMs=row["startMs"],
-                                           meetingId=row["id"])
-            except BridgeError:
                 sch.save_relocations(before)
-                raise
-            if not res.get("verified"):
-                sch.save_relocations(before)
-                raise ValueError("原 session %s 取消后复核还在；临时挪动已整批回滚。"
-                                 % m["cur"])
-            # 本地表也把旧 session 拿掉，离线/测试环境不用等下一次 refresh 才看不到它。
-            self.api_rows = [r for r in self.api_rows
-                             if not (r.get("id") == row.get("id")
-                                     and r.get("startMs") == row.get("startMs"))]
+            except Exception as exc:               # noqa: BLE001 - 回滚失败也要说实话
+                self.say("⚠ 回滚临时挪动失败：%s" % exc, "warn")
+            self.reload_entries()
+            self.rebuild_rows()
+            self.invalidate()
+            self.had_error = True
+            self.say("↩ 取消原 session 失败：%s；临时挪动已整批回滚（任务绑定没动）。"
+                     % error, "warn")
 
-        # 2) 旧 booked state 清掉：不清的话，等你哪天把挪动撤回去，daemon 会看到
-        #    「state 说 booked 但 API 没有」→ 记一笔罪（其实是 warden 自己干的活）。
-        self._forget_layout_state([{"date": day.isoformat(), "startLabel": m["cur"]}
-                                   for m in moves])
+        if not live:
+            finish_local()
+            return len(moves)
 
-        # 3) 任务绑定跟着挪（绑定 + 截止时间）
-        self._migrate_task_bindings(day, moves)
+        action = self.net_action(
+            "session.relocate_cancel",
+            "取消旧 session 以改排布（%d 场）" % len(live),
+            {"moves": [{"start": m["cur"], "startMs": m["row"].get("startMs"),
+                        "meeting_id": m["row"].get("id")} for m in live]},
+            source=SRC_FOCUSMATE)
+        job = self.jobs.submit(action, on_ok=lambda payload: finish_local(),
+                               on_fail=failed)
+        if self.jobs.sync:
+            if job.outcome is None or not job.outcome.ok:
+                return False
+            return len(moves)
+        self.say("已落临时计划；旧 session 的取消在后台跑（进度看面板）。", "cmd")
         return len(moves)
 
     def _relocate_say(self, day, moves, delta, period_id=None, label=""):
@@ -6777,31 +6928,51 @@ class Warden(object):
         moves = self._relocate_moves(day, rows, delta, allow_past=allow_past)
         for m in moves:
             m["scope"] = period_id
-        self._apply_relocate(day, moves, delta, later_scope=period_id, reason=reason)
-        self._relocate_say(day, moves, delta, period_id=period_id)
-        self._relocate_after(day, moves)
-        return True
+
+        def done():
+            self._relocate_say(day, moves, delta, period_id=period_id)
+            self._relocate_after(day, moves)
+
+        ok = self._apply_relocate(day, moves, delta, later_scope=period_id,
+                                  reason=reason, on_done=done)
+        return ok is not False
 
     def _relocate_after(self, day, moves):
-        """挪完之后收尾：重读契约、重画表格、（执行区里的场次）立刻跑一轮 check。"""
+        """挪完之后收尾：重读契约、重画表格，并把 check 放进后台队列。
+
+        check 会开 keep_session 子进程、可能还要浏览器；以前它在提示符线程上
+        ``run_keep_session``，一挪场次整个 TUI 就冻住。现在它是一条有进度条的
+        后台动作（同时让 bridge 先放开 Chromium profile）。
+        """
         self.reload_entries()
         self.rebuild_rows()
         live = [m for m in moves if m["row"].get("zone") != "draft"]
         if not live:
             return True
-        self._release_browser("daemon 下单要独占同一个 Chromium profile")
-        self.say("立刻触发一轮 check（keep_session.py check）…", "cmd")
-        rc, out, err = run_keep_session("check", timeout=600)
-        for line in (out or "").splitlines()[-20:]:
-            self.say(line)
-        if rc == 0:
-            self.say("✅ check 跑完。", "ok")
-        else:
+
+        def done(payload):
+            out = (payload or {}).get("out") or ""
+            for line in str(out).splitlines()[-20:]:
+                self.say(line)
+            self.say("✅ 重排后的 check 跑完。", "ok")
+            self.reload_entries()
+            self.rebuild_rows()
+
+        def failed(error):
             self.had_error = True
-            self.say("❌ check 退出码 %d%s（临时计划已落盘，daemon 后续还会补）"
-                     % (rc, ("：" + err) if err else ""), "error")
-        self.reload_entries()
-        self.rebuild_rows()
+            self.say("❌ 重排后的 check 失败：%s（临时计划已落盘，daemon 后续还会补）"
+                     % error, "error")
+
+        action = self.net_action(
+            "keep_session.run", "重排后 check（补订/对账）",
+            {"argv": ["check"], "timeout": 600, "release_browser": True},
+            source=SRC_KEEP)
+        job = self.jobs.submit(action, on_ok=done, on_fail=failed)
+        if self.jobs.sync and (job.outcome is None or not job.outcome.ok):
+            self.reload_entries()
+            self.rebuild_rows()
+            return False
+        self.say("重排后的 check 已排进后台（进度看面板）。", "cmd")
         if not self.offline:
             self.refresh(quiet=True)
         return True
@@ -6834,10 +7005,14 @@ class Warden(object):
             raise ValueError("%s 已经往后挪过一次了；一天只能往后挪一次。"
                              % day.isoformat())
         moves = self._relocate_moves(day, [row], delta)
-        self._apply_relocate(day, moves, delta, later_scope=None)
-        self._relocate_say(day, moves, delta, label="#%d" % idx)
-        self._relocate_after(day, moves)
-        return True
+
+        def done():
+            self._relocate_say(day, moves, delta, label="#%d" % idx)
+            self._relocate_after(day, moves)
+
+        ok = self._apply_relocate(day, moves, delta, later_scope=None,
+                                  on_done=done)
+        return ok is not False
 
     # -- 任务系统 ------------------------------------------------------
 
@@ -11455,27 +11630,41 @@ class Warden(object):
         if row is None:
             row = self._synth_planned_row(day, entry)
         moves = self._relocate_moves(day, [row], delta, allow_past=True)
-        self._apply_relocate(day, moves, delta, later_scope=None,
-                             reason="nostart-postpone")
-        self._relocate_say(day, moves, delta, label="这一场")
-        self._relocate_after(day, moves)
+
+        def done():
+            self._relocate_say(day, moves, delta, label="这一场")
+            self._relocate_after(day, moves)
+
+        ok = self._apply_relocate(day, moves, delta, later_scope=None,
+                                  reason="nostart-postpone", on_done=done)
+        if ok is False:
+            raise ValueError("原 session 取消失败；这一场的推迟已经回滚。")
         return {"target": moves[0]["to"]}
 
     def _nostart_mark_missed(self, entry, note=None):
-        """这一场算缺失：state 记 missed + 判「已放弃」（daemon 不重订、也不记罪）。"""
+        """这一场算缺失：state 记 missed + 判「已放弃」（daemon 不重订、也不记罪）。
+
+        **不在输入线程上写盘**：x 这一下要立刻把面板收掉、马上进入收尾；
+        两个状态文件交给后台队列，进度条会显示「记录缺失」。
+        """
         key = str(entry.get("key")
                   or psv.session_key(entry.get("date"), entry.get("start")))
         why = "到点没开始，我选了「不去了」（%s %s）" % (entry.get("date"),
                                                         entry.get("start"))
-        try:
-            ks.mark_abandoned(key, why="nostart", note=why)
-        except Exception as e:                  # noqa: BLE001 - 记不上也别挡住下一步
-            self.say("⚠ 记「已放弃」失败：%s" % e, "warn")
-        try:
-            ks.mark_slot(key, "missed", note="nostart")
-        except Exception as e:                  # noqa: BLE001
-            self.say("⚠ 记 missed 失败：%s" % e, "warn")
-        return why
+        action = self.net_action(
+            "session.missed",
+            "记录缺失 %s %s" % (entry.get("date") or "?", entry.get("start") or "?"),
+            {"key": key, "date": entry.get("date"), "start": entry.get("start"),
+             "why": why},
+            source=SRC_KEEP)
+        job = self.jobs.submit(action, on_fail=lambda error: self.say(
+            "⚠ 后台记「缺失」失败：%s（这次收尾照常进行）" % error, "warn"))
+        if self.jobs.sync:
+            outcome = job.outcome
+            if outcome is not None and not outcome.ok:
+                return "后台记录失败"
+            return why
+        return "正在后台记录（进度看面板）"
 
     def close_nostart(self, note=None, action="deferred"):
         """把「没开始」那一问收掉（没收过的记成 deferred，免得下次又弹）。"""
@@ -11697,17 +11886,44 @@ class Warden(object):
         if row.get("relocation"):
             rec = row.get("relocation") or {}
             from_hhmm = rec.get("from") or row.get("relocated_from") or row["startLabel"]
-            if row.get("id") is not None:
-                self.say("#%d 取消临时挪动目标 %s…" % (idx, row["startLabel"]), "cmd")
-                with self.console.status("[red]取消中…[/]", spinner="dots"):
-                    res = self.bridge.call("cancel", startMs=row["startMs"], meetingId=row["id"])
-                if not res.get("verified"):
-                    self.had_error = True
-                    self.say("❌ #%d 取消后复核：临时目标还在；挪动没撤销。" % idx, "error")
-                    return False
+            # 先乐观撤销本地挪动，再把「取消已订上的临时目标」丢后台。
+            # 失败时把 relocation 文件和表格行一起放回去 —— 用户不用等浏览器。
+            before_relocations = sch.load_relocations()
+            before_row = dict(row)
+            removed = self._forget_api_row(row.get("id")) if row.get("id") else None
+            removed_at = removed[0] if removed else None
             sch.remove_relocation(self.sel_date, from_hhmm)
-            self.say("✅ 已撤销 #%d 的临时挪动：恢复 data.csv 原时间 %s。"
-                     % (idx, from_hhmm), "ok")
+            self.rebuild_rows()
+            self.invalidate()
+            if row.get("id") is not None:
+                action = self.net_action(
+                    "session.cancel",
+                    "取消临时目标 %s %s" % (self.sel_date.isoformat(),
+                                           row["startLabel"]),
+                    {"date": self.sel_date.isoformat(),
+                     "start": row.get("startLabel"),
+                     "startMs": row.get("startMs"),
+                     "meeting_id": row.get("id")})
+                def failed(error, _before=before_relocations, _row=before_row,
+                           _idx=removed_at):
+                    try:
+                        sch.save_relocations(_before)
+                    except Exception as e:         # noqa: BLE001 - 回滚失败也要说话
+                        self.say("⚠ 回滚临时挪动失败：%s" % e, "warn")
+                    self._row_op_failed("#%d 取消临时目标 %s"
+                                        % (idx, _row.get("startLabel")),
+                                        _row, error, index=_idx)
+                    self.refresh(quiet=True)
+                job = self.jobs.submit(action, on_fail=failed)
+                if self.jobs.sync and (job.outcome is None or not job.outcome.ok):
+                    return False
+                self.say("✅ 已撤销 #%d 的临时挪动：恢复原时间 %s；%s"
+                         % (idx, from_hhmm,
+                            "临时目标已取消" if self.jobs.sync
+                            else "取消临时目标已排进后台（失败会自动放回）"), "ok")
+            else:
+                self.say("✅ 已撤销 #%d 的临时挪动：恢复 data.csv 原时间 %s。"
+                         % (idx, from_hhmm), "ok")
             self.refresh(quiet=True)
             return True
 
@@ -12286,17 +12502,32 @@ class Warden(object):
                 self.say("取消旧 session %s–%s（%smin）…"
                          % (row.get("startLabel"), row.get("endLabel") or "?",
                             row.get("durationMin") or "?"), "cmd")
-                res = self.bridge.call("cancel", timeout=180,
-                                       startMs=row["startMs"], meetingId=row["id"])
-                if not res.get("verified"):
+                # 乐观 + 后台：旧行立刻从表格消失，取消请求交给单 worker。
+                # 这里以前直接 bridge.call("cancel")，改排布会在提示符线程上
+                # 等浏览器几十秒 —— 和「外部操作全异步」的约定不符。
+                before_row = dict(row)
+                before_index, _ = self._forget_api_row(row.get("id")) or (None, None)
+                action = self.net_action(
+                    "session.cancel",
+                    "取消旧 session %s %s" % (row.get("date"),
+                                              row.get("startLabel") or "?"),
+                    {"date": row.get("date"), "start": row.get("startLabel"),
+                     "startMs": row.get("startMs"), "meeting_id": row.get("id")})
+                job = self.jobs.submit(
+                    action,
+                    on_fail=lambda error, _row=before_row, _idx=before_index:
+                    self._row_op_failed("旧 session %s 取消"
+                                        % _row.get("startLabel"),
+                                        _row, error, index=_idx))
+                if self.jobs.sync and (job.outcome is None or not job.outcome.ok):
                     self.had_error = True
-                    raise ValueError("旧 session %s 取消后复核还在；排布没改，避免两套 session 并存。"
-                                     % row.get("startLabel"))
-                self.say("✅ 已取消旧 session %s" % row.get("startLabel"), "ok")
-                self.api_rows = [r for r in self.api_rows
-                                 if not (r.get("id") == row.get("id")
-                                         and r.get("startMs") == row.get("startMs"))]
+                    continue
                 cancelled.append(row)
+                self.say("✅ %s旧 session %s"
+                         % ("已取消" if self.jobs.sync else "已排进后台取消",
+                            row.get("startLabel")), "ok")
+            if cancelled and not self.jobs.sync:
+                self.rebuild_rows()
         finally:
             # 关键：旧 session 是 warden 主动取消的，不是用户手动搞丢的。
             # 清掉 state 里的旧 booked 记录，否则 daemon 下一轮会记一笔 sin 并锁死 TUI。
