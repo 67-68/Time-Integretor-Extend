@@ -94,7 +94,7 @@ def slots_text(slots, limit=8):
 # ---------------------------------------------------------------- 分资源
 
 
-def distribute(allocations, projects, invested_map=None):
+def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=None):
     """把「每个项目多少 count」摊成具体的任务（每条还带要几个 count）。
 
     ``allocations``：``[{"project_id": 1, "count": 4}, ...]``（**顺序就是排的顺序**）；
@@ -106,6 +106,7 @@ def distribute(allocations, projects, invested_map=None):
     项目清单的事实，不是命令错了）。
     """
     invested_map = invested_map or {}
+    exclude_pks = exclude_pks or {}
     out, notes = [], []
     for alloc in allocations or []:
         project = alloc.get("project") or {}
@@ -114,7 +115,10 @@ def distribute(allocations, projects, invested_map=None):
         if need <= 0:
             continue
         took = 0
-        for item in pj.remaining_tasks(project, invested_map.get(pid) or {}):
+        excluded = (exclude_pks.get(pid) or exclude_pks.get(str(pid))
+                    if isinstance(exclude_pks, dict) else exclude_pks)
+        for item in pj.remaining_tasks(project, invested_map.get(pid) or {},
+                                       now=now, exclude_pks=excluded):
             if need <= 0:
                 break
             take = min(int(item.get("remaining") or 0), need)
@@ -551,10 +555,31 @@ class Allocator(object):
         self._set(project, count)
         return {"action": "handled"}
 
+    def _queue_exclusions(self, project):
+        """这个项目里不该再进 plan 候选队列的 pk。
+
+        formatter 任务已经有自己的时间占位；defer 未到点的任务现在还不能做。
+        项目 plan 的分配预览和真正 distribute 必须看同一份队列。
+        """
+        if self.task_store is None:
+            return set()
+        out = set()
+        now = datetime.datetime.now()
+        for task in self.task_store.list():
+            pid, _title, pk = ts.TaskStore.project_task_fields(task)
+            if not pk or str(pid) != str(project.get("id")):
+                continue
+            if not ts.TaskStore.is_open(task):
+                continue
+            if task.get("formatter") or ts.task_is_deferred(task, now=now):
+                out.add(str(pk))
+        return out
+
     def _show(self, project):
         invested = (pj.invested_by_project(self.task_store).get(project["id"]) or {}
                     if self.task_store else {})
-        items = pj.remaining_tasks(project, invested)
+        items = pj.remaining_tasks(project, invested,
+                                   exclude_pks=self._queue_exclusions(project))
         stat = pj.stats(project, self.task_store, invested)
         self.say("📁 #%d %s：剩余 %d count（进度 %s），分到 %d count"
                  % (self.projects.index(project) + 1, project.get("title"),

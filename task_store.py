@@ -93,6 +93,12 @@ COUNT_CREDITS_KEY = "count_credits"
 DURATION_KEYS = ("duration", "duration_minutes", "estimated_minutes",
                  "estimated_duration", "minutes", "时长", "预计时长")
 
+#: 「推迟到」的字段别名。OmniFocus 用 ``defer``；本地任务也可能手写成中文。
+#: 语义统一为「到点之前不进入任何自动排期队列」，不是「继续占着旧 session」。
+DEFER_KEYS = ("defer", "deferred", "defer_until", "deferred_until",
+              "推迟", "推迟到", "延后到")
+
+
 # 「备注」：一个普通字段（不是保留字段，字段仍然不校验），但有一套固定别名，
 # 因为它是**有意设计**的：可以往里面塞网址，任务完成后照着去对应地方把活干完。
 NOTES_KEYS = ("notes", "note", "备注")
@@ -171,6 +177,37 @@ def task_minutes(task):
             if got is not None:
                 return got
     return None
+
+
+def task_defer_at(task):
+    """这条任务被推迟到什么时候；没设 / 认不出返回 ``None``。
+
+    只认时间点，不猜语义：``defer`` / ``deferred`` / 中文别名都行。
+    ``date``-only 值按当天零点算，跨时区字符串转成本地 naive 时间（和
+    OmniFocus 的其它日期处理一致）。
+    """
+    fields = (task or {}).get("fields") or {}
+    for key in DEFER_KEYS:
+        if key not in fields:
+            continue
+        got = parse_iso_datetime(fields.get(key))
+        if got is not None:
+            return got
+    return None
+
+
+def task_is_deferred(task, now=None):
+    """推迟时间还没到 → ``True``。自动排期 / 项目候选队列必须跳过这种任务。"""
+    got = task_defer_at(task)
+    if got is None:
+        return False
+    now = now or datetime.datetime.now()
+    return got > now
+
+
+def is_deferred(task, now=None):
+    """兼容短名：同 :func:`task_is_deferred`。"""
+    return task_is_deferred(task, now)
 
 
 def task_count(task):
@@ -1481,6 +1518,9 @@ class TaskStore(object):
                 fields["due"] = str(item["due"])
                 fields.setdefault("due_source", "omnifocus")
                 changed = True
+            if item.get("defer") and not fields.get("defer"):
+                fields["defer"] = str(item["defer"])
+                changed = True
             if not fields.get("notes"):
                 note = str(item.get("note") or "").strip()
                 parent_pk = str(item.get("parent_id") or "").strip()
@@ -1505,6 +1545,8 @@ class TaskStore(object):
         if item.get("due"):
             fields["due"] = str(item["due"])
             fields["due_source"] = "omnifocus"
+        if item.get("defer"):
+            fields["defer"] = str(item["defer"])
         note = str(item.get("note") or "").strip()
         parent_pk = str(item.get("parent_id") or "").strip()
         if parent_pk:

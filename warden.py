@@ -7810,11 +7810,333 @@ class Warden(object):
         if [int(d) for d in durations] != current:
             self._apply_cut_layout(day, period, durations)
         if exact:
+            # 以前“补一场”的一次性 session 现在已经被正式 layout 覆盖，
+            # 必须删掉；否则同一时刻会同时存在 layout 场和 extra 场。
+            removed = 0
+            for sess in planned:
+                try:
+                    if sp.remove_extra(day, sess.get("start")):
+                        removed += 1
+                except Exception:              # noqa: BLE001 - 坏 extra 不该挡住切割
+                    pass
+            if removed:
+                self.rewrite_data_csv_from_plan()
+                self.reload_periods()
+                self.reload_entries()
             body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
                              for s in planned)
             return "时段 %s 已经剪断成 %s" % (period_id, body)
         return (self._ensure_carved_session(day, chosen, task=task)
                 or "时段 %s 的前半截留在 %s" % (period_id, iso))
+
+    # -- refresh 排期流水线：formatter 先占位，项目 plan 后校验 -------------
+
+    @staticmethod
+    def _formatter_dates_of(task):
+        """一条 formatter 任务所有可能的落点日期（reservation/session/repeat_date）。"""
+        fmt = (task or {}).get("formatter") or {}
+        reservation = fmt.get("reservation") or {}
+        sess = (task or {}).get("session") or {}
+        out = set()
+        for raw in (reservation.get("date"), sess.get("date"),
+                    (task or {}).get("repeat_date")):
+            text = str(raw or "").strip()
+            if text:
+                out.add(text)
+        return out
+
+    @staticmethod
+    def _formatter_date_of(task):
+        """兼容旧接口：返回第一个已知落点日期；没有就 None。"""
+        dates = WardenShell._formatter_dates_of(task)
+        return sorted(dates)[0] if dates else None
+
+    def formatter_tasks_for_day(self, day=None):
+        """``day`` 上需要跑 formatter 的 active 任务（稳定按 id 排序）。"""
+        day = day or self.sel_date
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        out = []
+        now = datetime.datetime.now()
+        for task in self.task_store.list():
+            if not ts.TaskStore.is_open(task):
+                continue
+            if ts.TaskStore.is_repeat_template(task):
+                continue
+            spec = task.get("formatter") or {}
+            if not spec.get("name"):
+                continue
+            if ts.task_is_deferred(task, now=now):
+                # defer 还没到：不进这一轮排期队列，也不动它旧的位置。
+                continue
+            own_days = self._formatter_dates_of(task)
+            try:
+                own_days.add(th.resolve_target_day(
+                    self.sel_date, now, spec.get("args") or {},
+                    allow_today=True).isoformat())
+            except Exception:                  # noqa: BLE001 - 坏 args 不挡整条流水线
+                pass
+            if iso in own_days:
+                out.append(task)
+        out.sort(key=lambda t: (t.get("id") or 0))
+        return out
+
+    def _formatter_apply_valid(self, task, day):
+        """这条 formatter 的账和当前 layout 是否已经一致（一致就绝不再切一次）。
+
+        只看「任务还挂在同一起点」不够：同一起点但时段 layout 已经不是
+        ``cut_prefix + 任务场``（例如用户/别的流程把 75 分钟改回了 50），
+        必须判为失效并重切。反过来，正常 refresh 里多条 formatter 任务共用
+        一个时段时，第一条不能因为自己重跑就把后面的任务清掉 —— 所以这份
+        快速校验必须在调用 formatter 算法之前做。
+        """
+        day = day if hasattr(day, "isoformat") else self.sel_date
+        iso = day.isoformat()
+        fmt = (task or {}).get("formatter") or {}
+        if not fmt.get("name"):
+            return False
+        res = fmt.get("reservation") or {}
+        sess = (task or {}).get("session") or {}
+        if str(res.get("date") or "") != iso:
+            return False
+        if not str(res.get("session_start") or "").strip():
+            return False
+        try:
+            if int(res.get("duration") or 0) != int(ts.task_minutes(task) or 0):
+                return False
+            if (str(sess.get("start")) != str(res.get("session_start"))
+                    or int(sess.get("duration") or 0)
+                    != int(res.get("session_duration") or 0)):
+                return False
+        except (TypeError, ValueError):
+            return False
+        period_id = str(res.get("period_id") or "").strip()
+        result = fmt.get("result") or {}
+        result_session = result.get("session") or {}
+        prefix = list(result_session.get("cut_prefix")
+                      or result.get("cut_prefix") or [])
+        exact = bool(result_session.get("cut_prefix_exact",
+                                        result.get("cut_prefix_exact", True)))
+        if not period_id:
+            # 没有时段（手写 csv / 一次性 session 模式）：只检查那一场还在。
+            return any(str(s.get("start")) == str(sess.get("start"))
+                       and int(s.get("duration") or 0) == int(sess.get("duration") or 0)
+                       for s in self.sessions_for_day_plan(day))
+        period = next((p for p in self.periods_for_day(day)
+                       if str(p.get("id")) == period_id), None)
+        if period is None:
+            return False
+        try:
+            planned = sp.plan_period(period, prefix + [int(sess.get("duration") or 0)])
+        except (TypeError, ValueError):
+            return False
+        if not planned or str(planned[-1].get("start")) != str(sess.get("start")):
+            return False
+        try:
+            actual = sp.sessions_for_period(period, self.layouts)
+        except (TypeError, ValueError):
+            return False
+        expected = [(str(s.get("start")), int(s.get("duration") or 0)) for s in planned]
+        current = [(str(s.get("start")), int(s.get("duration") or 0)) for s in actual]
+        if exact:
+            if expected != current:
+                return False
+            # 精确排布下不应该再有同一时刻的 extra 兜底场。
+            try:
+                extras = {str(s.get("start")) for s in
+                          sp.extras_for_date(sp.load_extras(), day)}
+            except Exception:                  # noqa: BLE001
+                extras = set()
+            if extras.intersection(start for start, _dur in expected):
+                return False
+            return True
+        # 兜底路径：layout 只保留前缀，任务那一场在 extras 里。
+        if current != expected[:len(prefix)] and current != expected[:-1]:
+            return False
+        try:
+            return any(str(s.get("start")) == str(sess.get("start"))
+                       and int(s.get("duration") or 0)
+                       == int(sess.get("duration") or 0)
+                       for s in sp.extras_for_date(sp.load_extras(), day))
+        except Exception:                      # noqa: BLE001
+            return False
+
+    def _project_plan_invalid_reasons(self, project, day):
+        """项目今天的 plan 为什么和当前资源对不上；空列表 = 对得上。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        plan = pj.plan_of(project, day)
+        if not plan:
+            return []
+        items = list(plan.get("items") or [])
+        if not items:
+            # 只有“说好的 count”、没有任何落地场次 = 没有真正的安排；
+            # 不在这里制造假失败，留给用户重新 plan。
+            return []
+        try:
+            sessions = self.sessions_for_day_plan(day)
+        except Exception:                          # noqa: BLE001
+            sessions = []
+        by_key = {}
+        for sess in sessions:
+            try:
+                by_key[(str(sess.get("start")), int(sess.get("duration") or 0))] = sess
+            except (TypeError, ValueError):
+                continue
+        rows_by_start = {}
+        for row in self.rows or ():
+            if row.get("date") != iso or not row.get("planned"):
+                continue
+            rows_by_start.setdefault(str(row.get("startLabel") or ""), row)
+        try:
+            reservations = th.collect_reservations(self.task_store.list(), iso)
+        except Exception:                          # noqa: BLE001
+            reservations = []
+        reasons = []
+        for item in items:
+            start = str(item.get("start") or "")
+            try:
+                duration = int(item.get("duration") or 0)
+            except (TypeError, ValueError):
+                duration = 0
+            title = item.get("pk") or "?"
+            task = None
+            try:
+                task = self.task_store.get(item.get("task_id"))
+            except (ValueError, TypeError):
+                pass
+            if task is None or not ts.TaskStore.is_open(task):
+                reasons.append("任务 %s 已不存在/已收工" % title)
+                continue
+            if task.get("formatter"):
+                reasons.append("任务 %s 已改由 formatter 独立占时间" % title)
+                continue
+            if ts.task_is_deferred(task):
+                reasons.append("任务 %s 的 defer 还没到" % title)
+                continue
+            sess = task.get("session") or {}
+            if (sess.get("date") != iso or str(sess.get("start")) != start
+                    or int(sess.get("duration") or 0) != duration):
+                reasons.append("任务 %s 的绑定和 plan 不一致" % title)
+                continue
+            if not start or (start, duration) not in by_key:
+                reasons.append("%s %s 这场已不在当前排布里" % (start or "?", duration))
+                continue
+            row = rows_by_start.get(start)
+            if row is None:
+                reasons.append("%s 这场没有对应的契约行" % start)
+                continue
+            if self.rows_source == "bridge" and not row.get("id"):
+                reasons.append("%s 这场没有订上/已被取消" % start)
+                continue
+            start_min = th._clock_minutes(start)
+            end_min = start_min + duration if start_min is not None else None
+            if (start_min is not None and end_min is not None
+                    and not th.is_free({"start_min": start_min, "end_min": end_min},
+                                       reservations)):
+                reasons.append("%s 这场和 formatter 的硬占位重叠" % start)
+        return reasons
+
+    def _invalidate_project_plan(self, project, day, reasons):
+        """清空项目当天的 plan，并把相关非 formatter 任务从失效场次下架。
+
+        返回被清掉的计划条数。formatter 任务绝不在这里被下架/改写 —— 它是
+        流水线第一阶段占好的资源，后续阶段只能绕开。
+        """
+        day = day if hasattr(day, "isoformat") else self.sel_date
+        plan = pj.plan_of(project, day) or {}
+        items = list(plan.get("items") or [])
+        self.projects.set_allocation(project.get("id"), day, 0)
+        dropped = 0
+        for item in items:
+            try:
+                task = self.task_store.get(item.get("task_id"))
+            except (ValueError, TypeError):
+                continue
+            if task.get("formatter"):
+                continue
+            sess = task.get("session") or {}
+            if (sess.get("date") == day.isoformat()
+                    and str(sess.get("start")) == str(item.get("start"))):
+                try:
+                    self.task_store.unassign(task["id"], reason="project-plan-invalid")
+                    dropped += 1
+                except ValueError:
+                    pass
+        self.say("⚠ 项目「%s」%s 的 plan 和当前时间资源对不上：%s。已清空，"
+                 "请重新 `plan` 安排。"
+                 % (project.get("title") or project.get("id"),
+                    day.isoformat(), "；".join(reasons[:3])
+                    + (" 等" if len(reasons) > 3 else "")), "warn")
+        return len(items), dropped
+
+    def reconcile_schedule_pipeline(self, day=None, quiet=False):
+        """refresh 的排期流水线：**formatter 先、项目 plan 后**。
+
+        1. formatter 阶段：每条 active formatter 任务都按当前可用场次重新核对/
+           重跑。它们占掉的区间是硬约束，后面的项目 plan 只能看到剩余空场，
+           绝不会改这些场次。
+        2. 项目阶段：只检查**今天已经 plan 过**的项目。plan 的每个 item 必须还
+           对得上当前场次、本地绑定和未取消的 API session；对不上就清空 plan，
+           让用户重新 `plan`。没有 plan 的项目直接跳过。
+        3. defer 还没到点的任务不进入任何排期队列；本地任务 / 项目清单两边都查。
+
+        返回 ``{"formatters": n, "invalidated": n, "detached": n, "errors": n}``。
+        """
+        day = day or self.sel_date
+        if hasattr(day, "datetime"):
+            day = day.date()
+        result = {"formatters": 0, "invalidated": 0, "detached": 0, "errors": 0}
+        try:
+            self.reload_periods()
+            self.reload_entries()
+            self.rebuild_rows()
+        except Exception as e:                     # noqa: BLE001 - 先用上一份账
+            self.say("排期流水线：重读本地排布失败（先用上一份）：%s" % e, "warn")
+        for task in self.formatter_tasks_for_day(day):
+            spec = dict(task.get("formatter") or {})
+            try:
+                if self._formatter_apply_valid(task, day):
+                    # 已经正确：只算“检查过”，绝不重写场次，避免第一条
+                    # formatter 重跑时把后面 formatter 的绑定清掉。
+                    result["formatters"] += 1
+                    continue
+                self._apply_formatter_to_task(task, spec, action="hook",
+                                              day=day, quiet=True)
+                result["formatters"] += 1
+            except Exception as e:                 # noqa: BLE001 - 一条坏任务不挡别的
+                result["errors"] += 1
+                self.had_error = True
+                self.say("⚠ formatter 任务 %s「%s」没能重排：%s"
+                         % (self.task_label(task),
+                            self.task_store.focusmate_title(task, 28), e), "warn")
+        try:
+            self.rebuild_rows()
+        except Exception:                          # noqa: BLE001
+            pass
+        try:
+            projects = self.projects.active()
+        except Exception as e:                     # noqa: BLE001 - 项目库坏了不挡 formatter
+            projects = []
+            self.had_error = True
+            self.say("排期流水线：项目库读不了，跳过项目 plan 校验：%s" % e, "warn")
+        for project in projects:
+            reasons = self._project_plan_invalid_reasons(project, day)
+            if not reasons:
+                continue
+            cleared, detached = self._invalidate_project_plan(project, day, reasons)
+            result["invalidated"] += cleared
+            result["detached"] += detached
+        if result["formatters"] or result["invalidated"]:
+            try:
+                self.rebuild_rows()
+            except Exception:                      # noqa: BLE001
+                pass
+            self.invalidate()
+        if not quiet and (result["formatters"] or result["invalidated"]):
+            self.say("🧭 排期流水线：formatter %d 条、失效项目计划 %d 条%s"
+                     % (result["formatters"], result["invalidated"],
+                        ("、下架 %d 条旧绑定" % result["detached"])
+                        if result["detached"] else ""), "info")
+        return result
 
     def _apply_formatter(self, result, spec, action):
         """``-f/--formatter`` 的收尾：记下 preset，并**当场调用它**。
@@ -7980,10 +8302,13 @@ class Warden(object):
         # （11:00–12:00 的时段 + 25 分钟任务 → 11:30–11:55），并**剪断**那个时段：
         # 原来那场 50 分钟会真的被取消/从计划里拿掉，只剩「前半截 + 这一场」。
         carved_note = None
-        if chosen.get("carved") and not chosen.get("existing"):
+        # 即使 `existing=True` 也要检查切割排布：例如旧排布是 [50] + 23:30
+        # 一次性补场，任务虽然“在 23:30”，但那个时段并没有被真正切成
+        # [75, 25]；refresh 必须把它掰回来，而不是看见同起点就跳过。
+        if chosen.get("carved"):
             if chosen.get("cut_period_id"):
                 carved_note = self._cut_period_for_carve(day, chosen, task=task)
-            else:
+            elif not chosen.get("existing"):
                 carved_note = self._ensure_carved_session(day, chosen, task=task)
             if carved_note:
                 sessions = self._formatter_sessions(day)
@@ -8000,8 +8325,13 @@ class Warden(object):
                 "hour": hour, "minute": minute}
         session_info = self.session_info_for(day, slot)
         previous = task.get("session") or {}
-        moved = bool(previous) and ((previous.get("date"), previous.get("start"))
-                                    != (session_info.get("date"), session_info.get("start")))
+        # 场次身份不只看起点：同一时刻时长被 formatter 改成另一档，也必须重挂。
+        # 只看 date/start 会把「25 分钟任务还挂在旧的 50 分钟场上」当成已正确。
+        moved = bool(previous) and (
+            (previous.get("date"), previous.get("start"),
+             int(previous.get("duration") or 0))
+            != (session_info.get("date"), session_info.get("start"),
+                int(session_info.get("duration") or 0)))
         if moved:
             self.say("任务 %s 原来在 %s %s；formatter 要先下架旧位置再挂新位置。"
                      % (self.task_label(task), previous.get("date"), previous.get("start")),
@@ -11099,7 +11429,12 @@ class Warden(object):
         slots, notes = [], []
         now_ms = int(time.time() * 1000)
         is_today = (day == datetime.date.today())
-        unbooked, busy, past = [], 0, 0
+        unbooked, busy, past, reserved = [], 0, 0, 0
+        try:
+            reservations = th.collect_reservations(
+                self.task_store.list(), day.isoformat())
+        except Exception:                          # noqa: BLE001 - 坏任务不该挡 plan
+            reservations = []
         for index, row in enumerate(self.rows, 1):
             if not row.get("planned") or row.get("date") != day.isoformat():
                 continue
@@ -11111,6 +11446,18 @@ class Warden(object):
             if self.task_store.tasks_for_session(row.get("date"), row.get("startLabel")):
                 busy += 1
                 continue
+            # formatter 已经占掉的时间是**硬约束**：项目 plan 只能看剩下的空场，
+            # 绝不能把这条场次再分给项目、更不能回头改 formatter 的切割。
+            start_min = th._clock_minutes(row.get("startLabel"))
+            end_min = th._clock_minutes(row.get("endLabel"))
+            if start_min is None:
+                continue
+            if end_min is None:
+                end_min = start_min + int(row.get("durationMin") or 0)
+            if not th.is_free({"start_min": start_min, "end_min": end_min},
+                              reservations):
+                reserved += 1
+                continue
             if row.get("id") is None:
                 unbooked.append(row.get("startLabel") or "?")
                 continue
@@ -11121,6 +11468,8 @@ class Warden(object):
             notes.append("今天已经过去的 %d 场不算空闲。" % past)
         if busy:
             notes.append("%d 场已经挂着任务了，不算空闲。" % busy)
+        if reserved:
+            notes.append("%d 场已经被 formatter 占掉，项目 plan 不会碰。" % reserved)
         if unbooked:
             notes.append("%s 还没订上 Focusmate（`refresh --check` 订上之后再 plan），"
                          "先不算空闲。" % "、".join(unbooked))
@@ -11245,6 +11594,10 @@ class Warden(object):
             sessions = self.sessions_for_day_plan(day)
         except Exception:                          # noqa: BLE001 - 下载层坏了不该没帧
             return out
+        try:
+            reservations = th.collect_reservations(self.task_store.list(), iso)
+        except Exception:                          # noqa: BLE001
+            reservations = []
         for sess in sessions:
             label = sess.get("start")
             try:
@@ -11255,6 +11608,15 @@ class Warden(object):
             if start <= now:
                 continue
             if self.task_store.tasks_for_session(iso, label):
+                continue
+            start_min = th._clock_minutes(label)
+            end_min = th._clock_minutes(sess.get("end"))
+            if start_min is None:
+                continue
+            if end_min is None:
+                end_min = start_min + int(sess.get("duration") or 0)
+            if not th.is_free({"start_min": start_min, "end_min": end_min},
+                              reservations):
                 continue
             try:
                 if mute_window_for(day, label):
@@ -11304,7 +11666,18 @@ class Warden(object):
         """
         day = allocator.day
         invested = pj.invested_by_project(self.task_store)
-        items, notes = pp.distribute(allocs, [a["project"] for a in allocs], invested)
+        # formatter 任务 / 尚未到 defer 点的本地任务都不该被项目 plan 再算一遍。
+        # 前者已经有自己的时间占位，后者现在根本还没进入可安排队列。
+        excluded = {}
+        for task in self.task_store.list():
+            pid, _title, pk = ts.TaskStore.project_task_fields(task)
+            if not pk or pid is None or not ts.TaskStore.is_open(task):
+                continue
+            if task.get("formatter") or ts.task_is_deferred(task):
+                excluded.setdefault(pid, set()).add(str(pk))
+        items, notes = pp.distribute(
+            allocs, [a["project"] for a in allocs], invested,
+            now=datetime.datetime.now(), exclude_pks=excluded)
         placements, unscheduled, more = pp.schedule(items, allocator.slots)
         notes = list(notes) + list(more)
         for alloc in allocs:
@@ -13064,6 +13437,13 @@ class Warden(object):
         self.wait_net()
         self.refresh_task_state()
         self.wait_net()
+        # refresh 的排期流水线：formatter 先占时间，项目 plan 后校验。
+        # 必须在刚拉回的 session 账上跑，否则会把已取消的场次当成资源。
+        try:
+            self.reconcile_schedule_pipeline(day=self.sel_date, quiet=True)
+        except Exception as e:                     # noqa: BLE001 - 一块坏不挡整次刷新
+            self.had_error = True
+            self.say("排期流水线失败（界面其余部分照常刷新）：%s" % e, "warn")
         self.refresh_stat_state()
         self.refresh_review_state()
         self.forget_caches()

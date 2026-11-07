@@ -141,8 +141,15 @@ plan [天数]         把这一天剩下的空场切成 count 分给项目，com
 且一个 session 都没切出来时会拒绝覆盖）。和 cancel/stop 不同，sync 不需要敲宣言 ——
 它是「重新拉目标」，不是「放弃目标」。
 
-`refresh`（`r`）是**纯读**：只调 bridge 的 `snapshot` 拉选中那天的 session，再和
-data.csv 的契约合并重排表格（所以 ID 会重编号），**不会订任何东西**。
+`refresh`（`r`）先调 bridge 的 `snapshot` 拉选中那天的 session，再和 data.csv
+的契约合并重排表格（所以 ID 会重编号）。它**不会订任何东西**，但已经不是纯只读：
+
+- **排期流水线**会先按当前可用场次重跑所有 active formatter（尤其 `end` 的
+  精准切割），再校验今天已有的项目 plan。formatter 是第一阶段，占好的时间段
+  后面项目阶段绝不能改；项目 plan 和当前资源/绑定对不上就整条清空，提示用户
+  重新 `plan`。
+- 这些动作只改本地排期账（layout / extras / data.csv / 任务绑定）和必要时排进
+  后台的旧场取消，**不创建新 session 订单、不在 Focusmate 建 task**。
 "缺"那几行刷一万遍也还是"缺"。订场只有一条路径 —— `keep_session.py` 的 daemon
 （`book_session` + API 复核），warden 里没有任何预订入口，也不该有：
 TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后触发一轮 `check`
@@ -152,9 +159,10 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 ### `refresh`：看板上每块组件都重新对一次账
 
 `refresh` 不只是「重拉 session 列表」——它是**刷新这界面**，所以一条命令把每块组件都
-拆开对一遍（`refresh_all()`），而且**只读外面世界**：不订场、不挂任务、不改 data.csv、
-不落「每周重复」（那会在 Focusmate 上真建 task，走 `task sync`）、不写回 OmniFocus
-（完成状态只读 `GET /v1/tasks`，见 `sync_task_completions()`）：
+拆开对一遍（`refresh_all()`）。对外**不订场、不挂 Focusmate task、不写回 OmniFocus**；
+对内会跑排期流水线（formatter 重查 + 项目 plan 校验），必要时重写本地 layout /
+data.csv 和后台取消已经不在计划里的旧场。不落「每周重复」（那会在 Focusmate 上真建
+task，走 `task sync`）：
 
 | 组件 | 刷什么 |
 | --- | --- |
@@ -164,13 +172,14 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 | 统计视图 | 已经加载过、且超过 TTL 的那份数字重算一次（没看过就不替用户拉） |
 | 收尾面板 | 正在问的那一轮从任务库重读（`Review.reload()`，不把人问回去） |
 | 警告 / 静音 / 日志 | mute 缓存、快照缓存、日志尾巴缓存一律作废 |
+| 排期流水线 | formatter 先按当前资源重查/重切；项目 plan 后校验，资源对不上就清空并提示重新 `plan` |
 | 画帧缓存 | `invalidate()` → 下一帧按新状态重排版，不会停在旧画面上 |
 
 任何一块刷不动就记一句警告、其余照刷 —— refresh 是「再对一次账」，不是「全有或全无」。
 
 ### `refresh --check`：对账并修正
 
-`refresh` 本身仍然是**纯读**（不碰外面任何东西）。加 `--check`（`-c`）才多走一步
+`refresh` 本身仍不会新订场/新挂 task；加 `--check`（`-c`）才多走一步
 `check_and_fix()` —— 它只做两件事，而且两件都是「先看外面的世界，再掰回来」：
 
 1. **该订没订上的 session**（`check_bookings()`）：执行区里「契约有、API 没有」的行

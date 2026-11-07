@@ -1049,20 +1049,22 @@ wd.rows_source = "bridge"
 wd.rebuild_rows()
 t1_rows = [r for r in wd.rows if r.get("period_id") == "T1"]
 check("T1 的行都标了「时段静音」", [r.get("period_muted") for r in t1_rows],
-      [True, True])
+      [True] * len(t1_rows))
 check("T2 的行没标", sorted({r.get("period_muted") for r in wd.rows
                               if r.get("period_id") == "T2"}), [False])
 targets = wd.mute_targets()
-check("要静音的就是这两场", [r["startLabel"] for r in targets], ["11:00", "12:00"])
+expected_starts = [r["startLabel"] for r in t1_rows]
+check("T1 当前所有场次都要静音",
+      [r["startLabel"] for r in targets], expected_starts)
 wd.offline = False
 wd.bridge.calls[:] = []
 wd.messages = []
 applied = wd.apply_mutes()
-check("bridge 收到两次 mute quiet=True",
+check("bridge 收到每场一次 mute quiet=True",
       [(c[0], c[1].get("quiet"), c[1].get("meetingId")) for c in wd.bridge.calls
        if c[0] == "mute"],
-      [("mute", True, "sess-11:00"), ("mute", True, "sess-12:00")])
-check("两场都确认了", [ok for _l, ok, _d in applied], [True, True])
+      [("mute", True, "sess-" + start) for start in expected_starts])
+check("每场都确认了", [ok for _l, ok, _d in applied], [True] * len(expected_starts))
 check_true("消息说「已静音」", any("已静音" in m[2] for m in wd.messages))
 # 已经是 ON 的不再重复动
 for r in wd.rows:

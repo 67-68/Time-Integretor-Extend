@@ -1160,28 +1160,50 @@ def stats(project, task_store=None, invested_map=None):
     }
 
 
-def remaining_tasks(project, invested_map=None):
+def _item_deferred(item, now=None):
+    """项目清单项是否还没到 defer 时间（到点前不进自动排期候选）。"""
+    if not isinstance(item, dict) or not item.get("defer"):
+        return False
+    return ts.task_is_deferred({"fields": {"defer": item.get("defer")}}, now=now)
+
+
+def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None):
     """还没做完、而且还有内容可干的**顶层任务**（按清单顺序）。
 
     有子任务的父任务返回成一条派生单元：``duration`` 是剩余子任务分钟数之和，
     ``count`` 是它的 ceil(minutes/25)，``children`` 里是每个剩余子任务（子任务
     不可再拆）。没有子任务的普通任务行为和以前一样。
+
+    两类任务**不进入队列**：
+
+    * ``defer`` 还没到点的（父任务 defer 挡住整棵子树；子任务各自也检查）；
+    * ``exclude_pks`` 里的任务 —— 已经挂了 formatter 的项目任务由 formatter
+      自己占时间，项目 plan 不能再把它当成待分配资源。
     """
     invested_map = invested_map or {}
+    exclude = {str(pk) for pk in (exclude_pks or ())}
     tasks = project.get("tasks") or []
     kids = child_map(tasks)
     statuses = effective_task_statuses(tasks)
     out = []
     for item in top_level_tasks(tasks):
         pk = str(item.get("pk") or "")
+        if pk in exclude:
+            continue
         if statuses.get(pk, STATUS_ACTIVE) != STATUS_ACTIVE:
+            continue
+        if _item_deferred(item, now=now):
             continue
         children = kids.get(item.get("pk")) or []
         if children:
             open_children = []
             for child in children:
                 child_pk = str(child.get("pk") or "")
+                if child_pk in exclude:
+                    continue
                 if statuses.get(child_pk, STATUS_ACTIVE) != STATUS_ACTIVE:
+                    continue
+                if _item_deferred(child, now=now):
                     continue
                 minutes = _item_minutes(child)
                 if minutes <= 0:
