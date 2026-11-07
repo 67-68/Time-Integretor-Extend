@@ -65,6 +65,8 @@ ks.fetch_sessions = lambda *a, **k: (_ for _ in ()).throw(
     RuntimeError("测试里不许真连 Focusmate API"))
 
 TODAY = datetime.date.today()
+TOMORROW = TODAY + datetime.timedelta(days=1)
+TOMORROW_ISO = TOMORROW.isoformat()
 ISO = TODAY.isoformat()
 
 
@@ -329,6 +331,152 @@ check("refresh 后排布保持原样",
 check("refresh 没产生清绑定/剪断消息",
       [m[2] for m in wd_multi.messages
        if "清掉任务" in m[2] or "剪断成" in m[2]], [])
+
+
+print("== enlist formatter：优先孤立且正好同长的 session，不动大时间块 ==")
+wd_en = fresh([
+    {"id": "T1", "date": ISO, "start": "09:00", "end": "09:25",
+     "type": "工作", "name": "孤立", "calendar": "工作", "title": "孤立"},
+    {"id": "T2", "date": ISO, "start": "11:00", "end": "13:00",
+     "type": "工作", "name": "大块", "calendar": "工作", "title": "大块"},
+])
+check("大块先排 50+50", wd_en.handle("period T2 50 50"), True)
+wd_en.reload_entries()
+sync_api(wd_en)
+check("enlist 任务创建受理",
+      wd_en.handle("task create title=收拾 duration=25 -f enlist"), True)
+_en_task = [t for t in wd_en.task_store.list()
+            if (t.get("fields") or {}).get("title") == "收拾"][0]
+_en_res = (_en_task.get("formatter") or {}).get("reservation") or {}
+check("选中孤立且正好 25 分钟的 09:00 场",
+      [_en_res.get("start"), _en_res.get("end"),
+       _en_res.get("session_duration"), _en_res.get("exact_fit"),
+       _en_res.get("isolated")],
+      ["09:00", "09:30", 25, True, True])
+check("enlist 挂的是整场已有 session",
+      [_en_task["session"]["start"], _en_task["session"]["duration"]], ["09:00", 25])
+check("enlist 不改任何 layout",
+      sp.get_layout(sp.load_layouts(), TODAY, "T2"), [50, 50])
+wd_en.bridge.calls = []
+check("enlist 后 refresh 受理", wd_en.handle("refresh"), True)
+_en_after = wd_en.task_store.get(_en_task["id"])
+check("refresh 幂等：reservation 不动",
+      ((_en_after.get("formatter") or {}).get("reservation") or {}).get("start"),
+      "09:00")
+check("refresh 幂等：没有重挂/取消",
+      [c[0] for c in wd_en.bridge.calls if c[0] in ("add_task", "cancel")], [])
+
+print("== enlist formatter：只剩大块时只从块的开头/结尾塞，保整块连贯 ==")
+wd_en2 = fresh([
+    {"id": "T1", "date": ISO, "start": "11:00", "end": "13:00",
+     "type": "工作", "name": "大块", "calendar": "工作", "title": "大块"},
+])
+check("大块先排 50+50", wd_en2.handle("period T1 50 50"), True)
+wd_en2.reload_entries()
+sync_api(wd_en2)
+check("enlist 任务创建受理",
+      wd_en2.handle("task create title=大块里的活 duration=25 -f enlist"), True)
+_en2 = [t for t in wd_en2.task_store.list()
+        if (t.get("fields") or {}).get("title") == "大块里的活"][0]
+_res2 = (_en2.get("formatter") or {}).get("reservation") or {}
+check("只在整块开头放，不切中间场",
+      [_res2.get("start"), _res2.get("placement"), _res2.get("isolated")],
+      ["11:00", "start", False])
+check("挂的是整场 50 分钟 session，不是凭空切一场",
+      [_en2["session"]["start"], _en2["session"]["duration"]], ["11:00", 50])
+check("layout 仍是 50+50",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [50, 50])
+
+print("== enlist 优先级：其它 formatter 先跑，enlist 最后、项目 plan 之前 ==")
+wd_pri = fresh([
+    {"id": "P1", "date": ISO, "start": "09:00", "end": "10:00",
+     "type": "工作", "name": "优先级", "calendar": "工作", "title": "优先级"},
+])
+_en_early = wd_pri.task_store.create({"title": "先登记的 enlist", "duration": 25})
+wd_pri.task_store.set_hook(_en_early["id"], "formatter", {
+    "name": "enlist", "kind": "formatter", "params": [], "args": {}})
+_end_late = wd_pri.task_store.create({"title": "后登记的 end", "duration": 25})
+wd_pri.task_store.set_hook(_end_late["id"], "formatter", {
+    "name": "end", "kind": "formatter", "params": [], "args": {}})
+check("formatter 队列按 end → enlist 排（不是按 id）",
+      [t["formatter"]["name"] for t in wd_pri.formatter_tasks_for_day(TODAY)
+       if t["id"] in (_en_early["id"], _end_late["id"])],
+      ["end", "enlist"])
+
+print("== 琐事屏：15:15 session，15:10 打开/refresh 仍然是琐事屏且 refresh 可用 ==")
+wd_chore = fresh([
+    {"id": "C1", "date": ISO, "start": "15:15", "end": "16:05",
+     "type": "工作", "name": "三点一刻", "calendar": "工作", "title": "三点一刻"},
+])
+sync_api(wd_chore)
+_chore_payload = pj.project_payload(
+    {"id": "p-chore-enlist", "name": "琐事库", "kind": "project_root",
+     "completed": False, "dropped": False},
+    [{"id": "p-chore-enlist", "name": "琐事库", "kind": "project_root",
+      "completed": False, "dropped": False},
+     {"id": "chore-1", "name": "倒垃圾", "kind": "action",
+      "project": "琐事库", "estimated_minutes": 25,
+      "completed": False, "dropped": False}],
+    now=datetime.datetime.now())
+wd_chore.projects.upsert(_chore_payload)
+check("绑定琐事项目", wd_chore.handle("set chore-project #1"), True)
+wd_chore.chore_now = datetime.datetime.combine(TODAY, datetime.time(15, 10))
+check("15:10 打开时当前时间不在 session 内", wd_chore._chore_active_session(), None)
+check("15:10 第一次 refresh 后自动进琐事屏",
+      (wd_chore.handle("refresh"), wd_chore.view.name)[1], "琐事")
+wd_chore.messages = []
+check("琐事屏里 refresh 仍可执行", wd_chore.handle("refresh"), True)
+check("refresh 后仍留在琐事屏", wd_chore.view.name, "琐事")
+check("没有「不认这个命令」的误报",
+      [m[2] for m in wd_chore.messages if "不认这个命令" in m[2]], [])
+
+print("== 查看明天：Day Plan 同时展示 formatter 任务和项目安排 ==")
+wd_plan = fresh([
+    {"id": "D1", "date": TOMORROW_ISO, "start": "11:00", "end": "12:00",
+     "type": "工作", "name": "明日", "calendar": "工作", "title": "明日"},
+])
+wd_plan.day_offset = 1
+wd_plan.reload_entries()
+_plan_payload = pj.project_payload(
+    {"id": "p-day", "name": "论文项目", "kind": "project_root",
+     "completed": False, "dropped": False},
+    [{"id": "p-day", "name": "论文项目", "kind": "project_root",
+      "completed": False, "dropped": False},
+     {"id": "day-task-1", "name": "写引言", "kind": "action",
+      "project": "论文项目", "estimated_minutes": 50,
+      "completed": False, "dropped": False}],
+    now=datetime.datetime.now())
+wd_plan.projects.upsert(_plan_payload)
+_plan_task = wd_plan.task_store.create({
+    "title": "写引言", "duration": 50, "count": 2,
+    "project": "论文项目", "project_id": 1, "project_task": "day-task-1"})
+wd_plan.task_store.assign(_plan_task["id"], {
+    "date": TOMORROW_ISO, "start": "11:00", "end": "12:00", "duration": 60})
+wd_plan.task_store.set_hook(_plan_task["id"], "formatter", {
+    "name": "enlist", "kind": "formatter", "params": [], "args": {},
+    "reservation": {"date": TOMORROW_ISO, "start": "11:00", "end": "12:00",
+                    "session_start": "11:00", "session_end": "12:00",
+                    "session_duration": 60, "duration": 50,
+                    "break_minutes": 5, "placement": "start",
+                    "task_id": _plan_task["id"]},
+    "result": {"name": "enlist", "session": {
+        "date": TOMORROW_ISO, "start": "11:00", "end": "12:00",
+        "duration": 60, "enlisted": True}},
+})
+wd_plan.projects.set_allocation(1, TOMORROW, 2)
+wd_plan.projects.record_items(1, TOMORROW, [{
+    "pk": "day-task-1", "task_id": _plan_task["id"], "count": 2,
+    "start": "11:00", "duration": 50}])
+_buf = io.StringIO()
+wd_plan.console = Console(file=_buf, width=180, force_terminal=False)
+_binder = wd_plan.render_day_binder()
+check_true("明天有编排表", _binder is not None)
+if _binder is not None:
+    wd_plan.console.print(_binder)
+_binder_out = _buf.getvalue()
+check_true("编排表显示 formatter 名称", "⏱enlist" in _binder_out)
+check_true("编排表显示任务所属项目", "论文项目" in _binder_out)
+check_true("编排表显示项目 plan 账", "项目安排" in _binder_out and "说好 2 count" in _binder_out)
 
 if fails:
     print("\n%d 项失败：" % len(fails))

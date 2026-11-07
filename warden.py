@@ -444,7 +444,8 @@ TASK_MARK_STATES = {
 }
 
 # trigger / formatter：两个后缀共用一套「具名 preset + 参数」的解析与提示。
-# trigger 默认是空的（框架先留出来，等真的需要再注册）；formatter 现在有 end。
+# trigger 默认是空的（框架先留出来，等真的需要再注册）；formatter 现在有
+# end / enlist（enlist 永远排在其它 formatter 之后）。
 TASK_HOOK_KINDS = ("trigger", "formatter")
 TASK_HOOK_FLAGS = {
     "trigger": ("--trigger", "-t"),
@@ -1567,6 +1568,11 @@ class ContractView(View):
         out = [self.w.render_table()]
         if self.w.rows_note:
             out.append(Text("  " + self.w.rows_note, style="dim"))
+        # 看未来日期时，额外给一张「这一天每个 session 挂什么任务、属于哪个项目」
+        # 的编排表；今天已经有契约表 + 任务面板，不重复占高度。
+        binder = self.w.render_day_binder()
+        if binder is not None:
+            out.append(binder)
         # 契约表格下面那块任务表格（Recent 由框架接在后面）
         index = self.w.render_task_index()
         if index is not None:
@@ -2467,9 +2473,17 @@ class ChoreView(View):
         return "琐事空闲屏只认 m / c / q。"
 
     def commands(self):
+        w = self.w
         # m / c / q 由 Warden.intercept 在命令派发之前先吃掉；q 不能落到
         # 通用 quit（那会退出整个 TUI，而这里只退出空闲屏）。
-        return []
+        # refresh 必须保留：app 从 Dock 唤起时会往 stdin 打一行 refresh，
+        # 如果琐事屏不认它，恰好在你空闲时唤起就会只得到一条「不认命令」。
+        return [
+            _cmd("refresh", w.cmd_refresh,
+                 "全量刷新看板（琐事屏里也能用；不会退出当前屏）", ("r", "reload"),
+                 usage="refresh [--check]", options=("--check", "-c",),
+                 hint=_hint_refresh),
+        ]
 
     def render(self):
         return self.w.render_chore_idle()
@@ -7050,7 +7064,7 @@ class Warden(object):
             task 3 -m complete          ← 只把本地 #3 标成完成（并归档）
             task -m discard 3           ← 只把本地 #3 标成放弃（外头都不动）
             task -t                    ← 列 trigger 预设（默认是空列表）
-            task -f                    ← 列 formatter 预设（现在有 end）
+            task -f                    ← 列 formatter 预设（现在有 end / enlist）
             task 3 -f end              ← 按 duration 排到当天最后一段并自动 assign
             task 3 -e true             ← 这条独占一整场（同一场不能再放第二条任务）
             task create title=写论文 duration=25 -e true -f end
@@ -7877,7 +7891,10 @@ class Warden(object):
                 pass
             if iso in own_days:
                 out.append(task)
-        out.sort(key=lambda t: (t.get("id") or 0))
+        # 用户要求 enlist 排在所有其它 formatter 的最后、项目之前。
+        # 同一优先级内按 id 稳定排序。
+        out.sort(key=lambda t: (th.formatter_priority(
+            (t.get("formatter") or {}).get("name")), t.get("id") or 0))
         return out
 
     def _formatter_apply_valid(self, task, day):
@@ -7892,10 +7909,13 @@ class Warden(object):
         day = day if hasattr(day, "isoformat") else self.sel_date
         iso = day.isoformat()
         fmt = (task or {}).get("formatter") or {}
-        if not fmt.get("name"):
+        name = str(fmt.get("name") or "").strip().lower()
+        if not name:
             return False
         res = fmt.get("reservation") or {}
         sess = (task or {}).get("session") or {}
+        if name == "enlist":
+            return self._enlist_apply_valid(task, day)
         if str(res.get("date") or "") != iso:
             return False
         if not str(res.get("session_start") or "").strip():
@@ -7959,6 +7979,82 @@ class Warden(object):
                        for s in sp.extras_for_date(sp.load_extras(), day))
         except Exception:                      # noqa: BLE001
             return False
+
+    def _enlist_apply_valid(self, task, day):
+        """``enlist`` 的幂等校验：目标 session 还在、空着，占位也没漂。
+
+        ``enlist`` 不切 layout，所以不能套 ``end`` 的「cut_prefix + 任务场」
+        校验。这里检查的是：任务绑定的整场 session、formatter 记下的任务块、
+        当前 layout 三者是否还对得上；以及这个块有没有被别的 formatter 抢走。
+        """
+        day = day if hasattr(day, "isoformat") else self.sel_date
+        iso = day.isoformat()
+        fmt = (task or {}).get("formatter") or {}
+        res = fmt.get("reservation") or {}
+        sess = (task or {}).get("session") or {}
+        if str(res.get("date") or "") != iso:
+            return False
+        try:
+            if int(res.get("duration") or 0) != int(ts.task_minutes(task) or 0):
+                return False
+            target_start = str(res.get("session_start") or "")
+            target_duration = int(res.get("session_duration") or 0)
+            if (str(sess.get("date")) != iso
+                    or str(sess.get("start")) != target_start
+                    or int(sess.get("duration") or 0) != target_duration):
+                return False
+        except (TypeError, ValueError):
+            return False
+        try:
+            sessions = self.sessions_for_day_plan(day)
+        except Exception:                          # noqa: BLE001
+            return False
+        target = None
+        for candidate in sessions:
+            try:
+                if (str(candidate.get("start")) == target_start
+                        and int(candidate.get("duration") or 0) == target_duration):
+                    target = candidate
+                    break
+            except (TypeError, ValueError):
+                continue
+        if target is None:
+            return False
+        target_range = th._range_of(target)
+        block = th._range_of(res)
+        if target_range is None or block is None:
+            return False
+        task_minutes = int(res.get("duration") or 0)
+        if block[0] < target_range[0]:
+            return False
+        if block[0] + task_minutes > target_range[1]:
+            return False
+        # 目标场次里除了自己不能再有别的 open 任务；enlist 的语义就是「挂进
+        # 一场空 session」，而且这样项目 plan 也不会看到假空场。
+        try:
+            others = [t for t in self.task_store.tasks_for_session(
+                iso, target_start) if t.get("id") != task.get("id")]
+        except Exception:                          # noqa: BLE001
+            others = []
+        if any(ts.TaskStore.is_open(t) for t in others):
+            return False
+        # 别的 formatter 后来占用了同一块 → 失效重排。
+        try:
+            reservations = [r for r in th.collect_reservations(
+                self.task_store.list(), iso) if r.get("task_id") != task.get("id")]
+        except Exception:                          # noqa: BLE001
+            reservations = []
+        if not th.is_free({"start_min": block[0], "end_min": block[1]},
+                          reservations):
+            return False
+        # 休息尾巴不能压住下一场 session。
+        for other in sessions:
+            if other is target:
+                continue
+            got = th._range_of(other)
+            if got is not None and th.overlaps(block, got):
+                return False
+        return True
 
     def _project_plan_invalid_reasons(self, project, day):
         """项目今天的 plan 为什么和当前资源对不上；空列表 = 对得上。"""
@@ -8271,6 +8367,9 @@ class Warden(object):
             "periods": self.periods_for_day(day),
             "reservations": th.collect_reservations(self.task_store.list(),
                                                     day.isoformat()),
+            # enlist 要判断哪些 session 已经有任务；把 open 任务一起交给算法，
+            # 但算法仍只读、不写盘。
+            "tasks": self.task_store.list(),
         }
         try:
             out = th.call_preset("formatter", spec, ctx)
@@ -8364,13 +8463,14 @@ class Warden(object):
                           "或 `cancel <表格行号>` 取消已订的那场"
                           % ("、".join(conflicts),
                              (reservation.get("period_id") or "T?")))
+            lock_txt = "；🔒 独占" if th.is_exclusive(task) else ""
             self.say("✅ 任务 %s「%s」已由 formatter %s 排到 %s %s–%s"
-                     "（session %s 分钟，任务 %s 分钟 + %s 分钟休息；占用 %s–%s；🔒 独占）%s"
+                     "（session %s 分钟，任务 %s 分钟 + %s 分钟休息；占用 %s–%s%s）%s"
                      % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                         spec.get("name"), reservation.get("date"), reservation.get("start"),
                         reservation.get("end"), reservation.get("session_duration"),
                         reservation.get("duration"), reservation.get("break_minutes"),
-                        reservation.get("start"), reservation.get("end"),
+                        reservation.get("start"), reservation.get("end"), lock_txt,
                         notes + (("；" + note) if note else "")), "ok")
             self.selected_task_id = task["id"]
         self.rebuild_rows()
@@ -11060,6 +11160,195 @@ class Warden(object):
     def project_rows(self, day=None):
         """项目预览表格的行（序号 = `task <序号> <count>` 里的那个数）。"""
         return self.projects.preview(day or self.sel_date, self.task_store)
+
+    def _task_project_label(self, task):
+        """任务 → 一句项目来源（项目名 / OmniFocus pk / count）。"""
+        fields = (task or {}).get("fields") or {}
+        source = (task or {}).get("source") or {}
+        pid = fields.get(pj.PROJECT_ID_FIELD)
+        title = str(fields.get(pj.PROJECT_FIELD) or "").strip()
+        if not title and pid is not None:
+            try:
+                project = self.projects.by_id(pid)
+                title = (project or {}).get("title") or ""
+            except Exception:                  # noqa: BLE001 - 显示失败别挡面板
+                title = ""
+        if not title and str(source.get("kind") or "") == "project":
+            title = str(source.get("title") or "").strip()
+        pk = str(fields.get(pj.PROJECT_TASK_FIELD) or "").strip()
+        count = fields.get("count")
+        if not title and not pk:
+            return ""
+        bits = []
+        if title:
+            bits.append("项目:%s" % title)
+        if pk:
+            bits.append(str(pk)[:12])
+        if count:
+            try:
+                bits.append("%d count" % int(count))
+            except (TypeError, ValueError):
+                pass
+        return " · ".join(bits)
+
+    def render_day_binder(self):
+        """未来某一天「session ← 任务 ← formatter / 项目」的编排总览。
+
+        用户看明天的 session 时，不只想看空白场次：还想知道哪一场已经被
+        ``end`` / ``enlist`` 占了、挂的是哪条任务、这条任务属于哪个项目。
+        这张表把这些信息放在**同一行**，方便决定剩下的空场怎么分给项目。
+
+        只读、只画；不改任何排期。今天不画（契约表本身已经是当天执行面）。
+        """
+        day = self.sel_date
+        if day <= datetime.date.today():
+            return None
+        iso = day.isoformat()
+        try:
+            sessions = self.sessions_for_day_plan(day)
+        except Exception:                          # noqa: BLE001
+            sessions = []
+        try:
+            tasks = self.task_store.list()
+        except Exception:                          # noqa: BLE001
+            tasks = []
+
+        entries = {}
+
+        def entry(start, end="", duration=None):
+            key = str(start or "")
+            rec = entries.get(key)
+            if rec is None:
+                rec = {"start": key, "end": str(end or ""), "duration": duration,
+                       "tasks": [], "plans": []}
+                entries[key] = rec
+            elif not rec.get("duration") and duration:
+                rec["duration"] = duration
+            return rec
+
+        for sess in sessions:
+            entry(sess.get("start"), sess.get("end"),
+                  int(sess.get("duration") or 0) or None)
+
+        # 本地任务：正常绑定在 session 上的，以及 formatter reservation 落在这一天的。
+        for task in tasks:
+            sess = task.get("session") or {}
+            fmt = task.get("formatter") or {}
+            res = fmt.get("reservation") or {}
+            if str(sess.get("date") or "") == iso and sess.get("start"):
+                start = str(sess.get("start"))
+            elif str(res.get("date") or "") == iso and res.get("start"):
+                start = str(res.get("session_start") or res.get("start"))
+            else:
+                continue
+            rec = entry(start, sess.get("end") or res.get("end"),
+                        int(sess.get("duration") or 0) or None)
+            if not any(t.get("id") == task.get("id") for t in rec["tasks"]):
+                rec["tasks"].append(task)
+
+        # 项目 plan items：即使本地 task 已丢失，也把「项目原本怎么排的」露出来。
+        try:
+            projects = self.projects.active()
+        except Exception:                          # noqa: BLE001
+            projects = []
+        for project in projects:
+            plan = pj.plan_of(project, day) or {}
+            for item in plan.get("items") or []:
+                rec = entry(item.get("start"), duration=item.get("duration"))
+                rec["plans"].append({"project": project, "item": item})
+
+        if not entries:
+            return None
+
+        t = Table(title="Day Plan · %s %s 编排（session ← 任务 / formatter / 项目）"
+                        % (iso, "明天" if day == datetime.date.today()
+                           + datetime.timedelta(days=1) else sch.cn_weekday_of_day(day)),
+                  box=box.SIMPLE_HEAVY, header_style="bold cyan",
+                  title_justify="left", expand=False)
+        t.add_column("时间", no_wrap=True)
+        t.add_column("时长", justify="right", no_wrap=True)
+        t.add_column("状态", no_wrap=True)
+        t.add_column("任务 / formatter", overflow="fold")
+        t.add_column("项目安排", overflow="fold")
+
+        # 当天 API 行：只看 start，订没订上以 id 为准。
+        rows_by_start = {}
+        for row in self.rows or ():
+            if row.get("date") != iso or not row.get("planned"):
+                continue
+            rows_by_start.setdefault(str(row.get("startLabel") or ""), row)
+
+        def sort_key(key):
+            got = th._clock_minutes(key)
+            return (got if got is not None else 24 * 60 + 1, key)
+
+        for start in sorted(entries, key=sort_key):
+            rec = entries[start]
+            row = rows_by_start.get(start) or {}
+            if row.get("id"):
+                status = Text("已订", style="bold green")
+            elif rows_by_start:
+                status = Text("未订", style="yellow")
+            else:
+                status = Text("仅本地", style="dim")
+            task_lines = []
+            for task in rec["tasks"]:
+                title = self.task_store.focusmate_title(task, max_len=48) or "（无标题）"
+                bits = [self.task_mark(task), title]
+                fmt = task.get("formatter") or {}
+                if fmt.get("name"):
+                    label = "⏱%s" % fmt.get("name")
+                    placement = (fmt.get("reservation") or {}).get("placement")
+                    if placement:
+                        label += "(%s)" % placement
+                    bits.append(label)
+                if th.is_exclusive(task):
+                    bits.append("🔒")
+                task_lines.append(" ".join(bits))
+            if not task_lines:
+                task_lines = [Text("空闲", style=STYLE_MUTED)]
+            project_lines = []
+            for task in rec["tasks"]:
+                label = self._task_project_label(task)
+                if label:
+                    project_lines.append(label)
+            for plan in rec["plans"]:
+                item = plan.get("item") or {}
+                project = plan.get("project") or {}
+                label = "plan:%s" % (project.get("title") or project.get("id") or "?")
+                if item.get("pk"):
+                    label += " · %s" % str(item.get("pk"))[:12]
+                if item.get("count"):
+                    label += " · %s count" % item.get("count")
+                project_lines.append(label)
+            # 任务/项目行可能重复（本地任务本身带项目来源），去重但保持顺序。
+            seen = set()
+            project_lines = [x for x in project_lines
+                             if not (x in seen or seen.add(x))]
+            dur = rec.get("duration")
+            t.add_row(Text("%s%s" % (start, ("–" + rec["end"]) if rec.get("end") else ""),
+                           style="bold"),
+                      Text(str(dur) if dur else "?"),
+                      status,
+                      Text("\n".join(str(x) if not isinstance(x, Text) else x.plain
+                                     for x in task_lines)),
+                      Text("\n".join(project_lines) if project_lines else "—",
+                           style=STYLE_MUTED))
+
+        # 项目当天的资源账：说好多少 / 已经落地多少。放 caption，避免再占一张表。
+        alloc_bits = []
+        for project in projects:
+            plan = pj.plan_of(project, day) or {}
+            if not plan:
+                continue
+            planned = sum(int(item.get("count") or 0)
+                          for item in plan.get("items") or [])
+            alloc_bits.append("「%s」说好 %s count · 已排 %s"
+                              % (project.get("title") or project.get("id"),
+                                 int(plan.get("count") or 0), planned))
+        if alloc_bits:
+            t.caption = Text("项目安排：" + "；".join(alloc_bits), style="dim")
+        return t
 
     def render_projects_table(self):
         """契约视图里**任务面板下面**那块项目表：剩余 count / 进度 / 今天 plan 了多少。"""
@@ -13916,7 +14205,8 @@ class Warden(object):
                                         "框架已就位，注册函数后才有名字"),
             ("task <id> -t <preset> [参数...]", "挂创建触发：只有在预设条件成立时才建任务；"
                                                   "当前只记本地，runner 还没实现"),
-            ("task -f  /  --formatter", "列出 formatter（排期算法）预设；现在有 end"),
+            ("task -f  /  --formatter",
+             "列出 formatter（排期算法）预设；现在有 end / enlist"),
             ("task <id> -f end", "按任务 duration 找当天最后一段可用时间，截出尾部并自动挂 session；"
                                   "例如 25min 任务占 11:30–12:00（25 + 5min 休息）。"
                                   "挂在重复任务**本体**上时，formatter 会转嫁给今天/明天的"

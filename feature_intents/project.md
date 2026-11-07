@@ -176,7 +176,8 @@ warden.py          接线                 task import 认项目、任务面板�
 - 计划里有、没静音、今天的还要「还没开始」；
 - 已经挂着任务的场次不算（那一格已经有活了）；
 - **被 formatter 占掉的时间块不算** —— formatter 是第一阶段的硬约束，项目 plan
-  只能使用它剩下的空场，不能覆盖或改写 formatter 的切分；
+  只能使用它剩下的空场，不能覆盖或改写 formatter 的切分。`end` 会切 layout，
+  `enlist` 只占用已有空场；两者都算项目队列的排除项；
 - **没订上 Focusmate 的不算** —— 拿一场可能不存在的 session 当资源，等于把任务排进
   空气里。面板会点名「哪几场还没订上，`refresh --check` 订上之后再 plan」。
 

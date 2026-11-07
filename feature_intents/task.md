@@ -253,8 +253,9 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task create ... --repeat 周几@HH:MM` | 一步建「每周重复任务」 |
 | `task -t` / `task --trigger` | 列出 trigger 预设（框架默认是**空列表**） |
 | `task <序号> -t <preset> [参数...]` | 给任务挂一个 trigger（只记账；runner 执行） |
-| `task -f` / `task --formatter` | 列出 formatter 预设（现在有 `end`） |
+| `task -f` / `task --formatter` | 列出 formatter 预设（现在有 `end` / `enlist`） |
 | `task <序号> -f end` | 按任务 `duration` 在当天最后一段的**尾巴上切一场**（11:30–11:55 那种）、写进排期并自动 assign；排出来的任务自动独占 |
+| `task <序号> -f enlist` | 不切排布，把任务挂进**已有** session：优先孤立且正好同长的块；大块只从开头/结尾塞入 |
 | `task <序号> -e true`（`--exclusive true`） | **独占**：这一场 session 只能有它一条任务（裸写 `-e` = true，`-e false` 取消） |
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
 | `task archive [N]` | 看归档：按完成日期分组、最近 N 条（默认 5） |
@@ -607,7 +608,7 @@ task -t / task -f                      # 只看预设列表，不动任务
 
 ### `task -f end`
 
-`end` 是唯一内置 formatter。它按任务 `fields.duration`（也认
+`end` 是内置 formatter 之一（另一个是 `enlist`）。它按任务 `fields.duration`（也认
 `duration_minutes` / `estimated_minutes` / `minutes` / `时长` / `预计时长`）排期：
 
 1. 取**当天最后一个还有空位的时段**（这就是 `end`：每天的结束时间不同，
@@ -656,7 +657,7 @@ task -t / task -f                      # 只看预设列表，不动任务
    不会跟新的 25 分钟并存；已经被正式 layout 覆盖的旧一次性 session 会删掉，
    不会同时留下 layout 场和 extra 场；
 5. **每次 `refresh` 都重查 formatter**：active formatter 任务会按当前可用场次
-   重新跑一遍 `end`。即使任务还“在”同一起点，只要所在时段的 layout 不是
+   按优先级重跑（`end` → 其它 → `enlist`，最后才是项目 plan）。即使任务还“在”同一起点，只要所在时段的 layout 不是
    `cut_prefix + 任务场`，也会重新剪断并重算 `data.csv`；已经正确时幂等，
    不取消、不新建、不重复挂 Focusmate task。
 
@@ -675,6 +676,29 @@ task -t / task -f                      # 只看预设列表，不动任务
 - 同起点但**时长不一样**（50 分钟的场里切 25 分钟）→ 照样剪断；
 - 剪断是**按天**的：写进 `temp/session-layouts.json` 的 `<那天> / <时段>`，
   别的日子不受影响。
+
+
+### `task -f enlist`
+
+`enlist` 是排在**所有其它 formatter 之后、项目 `plan` 之前**的 formatter。
+它和 `end` 的能力边界故意相反：**只使用已经排好的 session，不切 layout、
+不新造/取消 session**。
+
+挂载原则（用户原话：不打断大时间块，找孤立且正好时长适配的时间块；
+如果不得不用大块，就放在它的开始/结尾，保持连贯）：
+
+1. 两场 session 间隔 ≤ 15 分钟算同一个「大时间块」；单场成块就是 isolated；
+2. 第一优先：**孤立且时长正好等于任务 Focusmate 档位（25/50/75）** 的场次；
+3. 第二优先：孤立的大场次，把任务放在它的开头；
+4. 只剩大块时：只从**整块第一场的开头**或**最后一场的结尾**塞入，尽量不碰中间场；
+5. 前三类都没有才允许动中间场次，仍然只放在那一场的开头/结尾。
+
+任务占用 = 任务分钟 + `break_minutes`（默认 5）。已经有任务（手工 / 项目
+`plan` / 另一个 formatter）的场次不碰；别的 formatter 已占的区间是硬约束。
+`formatter.reservation` 里额外记 `session_start` / `session_duration`
+（整场身份）和 `placement`（`start` / `end`）、`exact_fit` / `isolated`。
+每次 `refresh` 都会核对目标场次是否还在、是否仍为空、占位有没有被抢；
+目标 layout 改坏后会自动重挂，已经正确时幂等。
 
 同一天**更早的场次**不受影响：任务从那一场的**起点**开始占「时长 + 休息」，
 绝不越过它去抢下一场的时间 —— 一场一个任务，不是两条挤一场。之后别的
