@@ -211,6 +211,7 @@ if os.path.isdir(PYLIBS) and PYLIBS not in sys.path:
 
 try:
     from rich import box
+    from rich.align import Align
     from rich.console import Console, Group
     from rich.panel import Panel
     from rich.table import Table
@@ -2519,7 +2520,9 @@ class WardenShell(repl_kit.ReplShell):
     """
 
     def __init__(self, *args, **kwargs):
+        pin_bottom = kwargs.pop("pin_bottom", True)
         super().__init__(*args, **kwargs)
+        self.pin_bottom = bool(pin_bottom) # 把输入行永远钉在屏幕最底部
         self.frame_rev = 0                 # 状态变化计数：变了就必须重排版
         self.frame_key_hook = None         # (() -> tuple)：业务侧补充的帧键
         self._frame_memo = None            # (key, ansi_text)
@@ -2550,7 +2553,7 @@ class WardenShell(repl_kit.ReplShell):
         except Exception:                             # noqa: BLE001
             width = 80
         key = [self.frame_rev, self.view_index, self._frame_clock(), width,
-               self._terminal_rows(), bool(self.show_warnings)]
+               self._terminal_rows(), bool(self.show_warnings), bool(self.pin_bottom)]
         try:
             key.append(self.warnings.signature())
         except Exception:                             # noqa: BLE001
@@ -2612,15 +2615,8 @@ class WardenShell(repl_kit.ReplShell):
             return list(to_formatted_text(ANSI(dashboard)))
         return [("", dashboard)]
 
-    def _build_frame_text(self):
-        """真正排版一次（贵：rich 要测量 / 换行 / 裁切整块看板）。"""
-        self._in_frame_text = True
-        try:
-            raw = super().frame_text()
-        finally:
-            self._in_frame_text = False
-        if not raw:
-            return raw
+    def dashboard_budget(self):
+        """看板画布的可用高度（终端总行数 - 底部视图栏/提示行/状态行/输入行）。"""
         reserved = 1                                  # 提示行
         # 老版本 repl_kit 没有这个属性时，PromptSession 仍会预留 8 行。
         reserved += max(0, getattr(self, "reserve_space_for_menu", 8))
@@ -2631,11 +2627,26 @@ class WardenShell(repl_kit.ReplShell):
         if has_status:
             reserved += 1                             # 状态行（专注视图）
         reserved += 1                                 # 提示符
-        budget = max(1, self._terminal_rows() - reserved)
+        return max(1, self._terminal_rows() - reserved)
+
+    def _build_frame_text(self):
+        """真正排版一次（贵：rich 要测量 / 换行 / 裁切整块看板）。"""
+        self._in_frame_text = True
+        try:
+            raw = super().frame_text()
+        finally:
+            self._in_frame_text = False
+        if not raw:
+            return raw
+        budget = self.dashboard_budget()
         lines = raw.splitlines()
         if len(lines) > budget:
             # 只保留最后 budget 行：顶部滚走，底部（含提示）留下。
             raw = "\n".join(lines[-budget:]) + "\n"
+        elif self.pin_bottom and len(lines) < budget:
+            # 内容不足一屏时在底部补齐空行，让视图栏/提示行/输入行永远钉在屏幕最底部。
+            pad = budget - len(lines)
+            raw = raw.rstrip("\n") + ("\n" * (pad + 1))
         return raw
 
     @staticmethod
@@ -2993,6 +3004,8 @@ class Warden(object):
         # `plan` 的分资源问答（project_plan.Allocator）：和收尾 / 到点没开始一样
         # 是「一次只问一件事」—— 它开着的时候那两个都不会弹。
         self.planning = None
+        # 帧内帮助面板（全屏单页模式下 `help` 挂在页面里展示，任意下一条输入收起）
+        self.help_overlay = None
         # 每日项目对账：每天第一次进 TUI / refresh 时后台读一次 OmniFocus。
         # 新增任务自动拉；删除/修改按项目整包问「本地 / OmniFocus / 先不处理」。
         self.project_sync = None
@@ -3083,8 +3096,14 @@ class Warden(object):
         # 下面留 8 行空白（留了就会把看板/提示挤出屏幕）。
         # 老版本 repl_kit 没有这个参数就退回默认值（WardenShell 会按 8 行算）。
         # 注意要问 repl_kit.ReplShell（WardenShell 自己只是 *args/**kwargs 透传）。
-        if "reserve_space_for_menu" in inspect.signature(repl_kit.ReplShell).parameters:
+        sig_params = inspect.signature(repl_kit.ReplShell).parameters
+        if "reserve_space_for_menu" in sig_params:
             shell_kwargs["reserve_space_for_menu"] = 0
+        if "erase_when_done" in sig_params:
+            shell_kwargs["erase_when_done"] = not bool(no_clear)
+        if "alt_screen" in sig_params:
+            shell_kwargs["alt_screen"] = not bool(no_clear)
+        shell_kwargs["pin_bottom"] = True
         self.shell = WardenShell(**shell_kwargs)
         # 画帧缓存要认识「业务状态变没变」：把签名挂上去（见 frame_signature）。
         self.shell.frame_key_hook = self.frame_signature
@@ -4319,6 +4338,7 @@ class Warden(object):
             isinstance(self.view, ChoreView), self.chore_index,
             self.chore_last_note,
             id(getattr(self, "stat", None)),
+            id(getattr(self, "help_overlay", None)),
             # 队列一动（进度条、日志、失败账）画面就得重排版
             self.jobs.signature(),
         )
@@ -5147,12 +5167,20 @@ class Warden(object):
         del self.messages[:-MESSAGE_KEEP]
         self.invalidate()
 
+    def _is_fullscreen_tty(self):
+        """当前是否处在交互式全屏单页模式（Alt-Screen，不留历史）。"""
+        return bool(not self.no_clear
+                    and getattr(self.shell, "alt_screen", False)
+                    and sys.stdin.isatty() and sys.stdout.isatty())
+
     def emit(self, renderable=None):
         """帧外打印：帮助面板 / 宣言闸门 / `>>>` 回显。
 
-        命令输出发生在两次提示符之间，所以直接 print 就行 —— 擦除和重画
-        归 prompt_toolkit 管，不用再手算「这一帧占几行」。
+        在 `--exec` / 测试 / `--no-clear` 下直接往 console.print 打字；
+        在全屏单页模式下不往 stdout 留滚动历史（面板改由帧内栏位承接）。
         """
+        if self._is_fullscreen_tty():
+            return
         if renderable is None:
             self.console.print()
         else:
@@ -6107,10 +6135,24 @@ class Warden(object):
         return {"project": project, "tasks": tasks, "task": tasks[index],
                 "index": index, "error": error}
 
+    def _chore_center(self, body):
+        """把琐事内容放在整个终端画布的正中央（水平 + 垂直居中）。"""
+        body.justify = "center"
+        try:
+            height = int(self.shell.dashboard_budget())
+        except Exception:                          # noqa: BLE001
+            height = 20
+        try:
+            width = int(self.frame_width())
+        except Exception:                          # noqa: BLE001
+            width = 80
+        return Align.center(body, vertical="middle",
+                            height=max(6, height), width=max(24, width))
+
     def render_chore_idle(self):
-        """琐事屏的全部内容：一条任务 + m/c/q 提示，不画正常看板。"""
+        """琐事屏的全部内容：一条任务 + m/c/q 提示，在屏幕正中央居中展示。"""
         snap = self.chore_snapshot()
-        body = Text()
+        body = Text(justify="center")
         if self.chore_last_note:
             body.append(self.chore_last_note + "\n\n", style="bold green")
         if not snap.get("task"):
@@ -6118,7 +6160,7 @@ class Warden(object):
             body.append((snap.get("error") or "现在没有可显示的琐事。") + "\n\n",
                         style="yellow")
             body.append("q 退出（回到正常界面）", style="cyan")
-            return body
+            return self._chore_center(body)
         task = snap["task"]
         project = snap.get("project") or {}
         body.append("琐事\n", style="dim")
@@ -6139,7 +6181,7 @@ class Warden(object):
             body.append("\n" + " · ".join(bits), style="dim")
         body.append("\n\n", style="")
         body.append("m 完成    c 换一个 task    q 退出（回到正常界面）", style="cyan")
-        return body
+        return self._chore_center(body)
 
     def _enter_chore_view(self):
         for index, view in enumerate(self.view_impls):
@@ -12395,6 +12437,10 @@ class Warden(object):
         表格一长就被挤出屏幕，而它恰恰是屏幕上最该看见的东西。现在它归框架的那个
         栏位管（压在整块看板下面、提示行上面），切视图、滚表格都不影响。
         """
+        if self.pending_sins():
+            return self.render_lockdown_panel()
+        if self.help_overlay is not None:
+            return self.help_overlay
         if self.pending_import is not None:
             return self.pending_import_panel()
         if self.project_sync is not None:
@@ -14237,7 +14283,11 @@ class Warden(object):
             ("quit  (q)", "退出（bridge 和浏览器一起收掉）"),
         ]:
             t.add_row(cmd, desc)
-        self.emit(Panel(t, title="[bold]命令[/]", border_style="cyan", box=box.ROUNDED))
+        panel_main = Panel(t, title="[bold]命令（回车或敲任意命令关闭）[/]",
+                           border_style="cyan", box=box.ROUNDED)
+        self.help_overlay = panel_main
+        self.invalidate()
+        self.emit(panel_main)
         self.emit(
             "[dim]ID 就是表格第一列，按时间排序、每次 refresh 重编号 —— 看着表敲，别凭记忆。\n"
             "区域标记（状态列第一格）：草=草稿区（随便改）· 锁=执行区（取消要敲宣言）"
@@ -14298,8 +14348,9 @@ class Warden(object):
         t.add_row("关联项目", "项目导入/刷新会把叶子任务镜像进任务库（fields.project），"
                               "任务视图可搜索、可 group project；plan 唤起时复用同一条。")
         t.add_row("任务库", self.task_store.path)
-        self.emit(Panel(t, title="[bold]Task · 任务视图详细说明[/]",
-                        border_style="cyan", box=box.ROUNDED))
+        p_detail = Panel(t, title="[bold]Task · 任务视图详细说明[/]",
+                         border_style="cyan", box=box.ROUNDED)
+        self.emit(p_detail)
 
         c = _Table.grid(padding=(0, 2))
         c.add_column(style="bold", no_wrap=True, justify="right")
@@ -14329,8 +14380,11 @@ class Warden(object):
             ("help --task", "本页"),
         ]:
             c.add_row(cmd, desc)
-        self.emit(Panel(c, title="[bold]Task · 命令[/]",
-                        border_style="cyan", box=box.ROUNDED))
+        p_cmd = Panel(c, title="[bold]Task · 命令（回车或敲任意命令关闭）[/]",
+                      border_style="cyan", box=box.ROUNDED)
+        self.help_overlay = Group(p_detail, p_cmd)
+        self.invalidate()
+        self.emit(p_cmd)
         self.emit("[dim]更多细节见 feature_intents/task.md；任务库字段不校验，"
                   "内部簿记见 store 文件。[/]")
         return False
@@ -14499,6 +14553,12 @@ class Warden(object):
         """
         self._last_line = line
         self._record_command_input(line)
+        # 如果上一帧开着 help 面板，敲回车或下一条命令时先收起它。
+        if self.help_overlay is not None:
+            self.help_overlay = None
+            if not (line or "").strip():
+                self.invalidate()
+                return True
         # 这条命令可能改画面（表格/任务/消息/警告）：先作废上一次的画帧缓存。
         self.invalidate()
         # 罪案区的全局锁：除了敲宣言，什么都不受理。

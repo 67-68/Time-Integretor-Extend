@@ -308,6 +308,19 @@ working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列
 任务所属项目（项目名 / OmniFocus pk / count），以及这一天各项目的 plan 账
 （「说好 N count · 已排 M」）。今天不重复画这张表；它只读，不改变排期。
 
+### 全屏单页模式（不留滚动历史 + 输入行钉在底部 + 琐事屏正中央居中）
+
+- 交互式 TUI 默认启用 `alt_screen=True`（终端 Alternate Screen Buffer）与
+  `erase_when_done=True`：切换视图或执行命令后，终端上方**不留任何历史残影**，
+  退出 TUI 后恢复原 shell 屏幕（`--no-clear` / `WARDEN_CLEAR=0` 可退回流式模式）；
+- `WardenShell._build_frame_text()` 在看板高于屏幕预算时从顶部裁剪，在低于预算时
+  自动补齐空行（`pin_bottom=True`），使**所有视图的输入行、状态行与提示行都永远
+  钉在屏幕最底部**；
+- `help` / `help --task` 与罪案锁死面板在全屏单页模式下挂入帧内 `interrogate`
+  栏位展示（敲回车或下一条命令自动收起），不再向帧外裸打滚动流；
+- 琐事屏（`ChoreView`）用 `Align.center(..., vertical="middle")` 将当前琐事任务与
+  `m/c/q` 提示置于终端画布的正中央。
+
 ### 琐事屏里的 `refresh`
 
 `ChoreView` 的日常输入仍然只有 `m` / `c` / `q`，但注册表保留 `refresh`

@@ -901,7 +901,13 @@ check("视图栏不在看板里（所以裁屏裁不掉它）", "视图 1 契约
 check("视图栏改由框架的 footer 画，永远在",
       "视图 1 契约" in plain(shell.footer_text()), True)
 shell._terminal_rows = lambda: 80
-check("终端够高时不裁", len(shell.frame_text().splitlines()), len(full.splitlines()))
+check("终端够高时不裁，且自动补齐空行把输入行钉在屏幕底部",
+      len(shell.frame_text().splitlines()), shell.dashboard_budget())
+_wd_fullscreen = w.Warden(Console(file=io.StringIO(), width=80, force_terminal=False),
+                          FakeBridge(), no_clear=False, offline=True)
+check("交互模式下开启 erase_when_done 与 alt_screen（切页/命令不留滚动历史）",
+      (_wd_fullscreen.shell.erase_when_done, _wd_fullscreen.shell.alt_screen),
+      (True, True))
 
 print("== 专注视图：stop = 消耗一次暂停（不是停 daemon）==")
 wd.bridge.calls = []

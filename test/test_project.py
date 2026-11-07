@@ -1239,6 +1239,17 @@ check_true("琐事屏带 m/c/q 提示",
            all(x in _chore_out for x in ("m 完成", "c 换一个", "q 退出")))
 check_true("琐事屏不画正常契约表 / 视图栏",
            ("契约（data.csv" not in _chore_out and "视图 " not in _chore_out))
+wd_chore.shell._terminal_rows = lambda: 30
+wd_chore.frame_width = lambda: 80
+wd_chore.invalidate()
+_chore_frame = re.sub(r"\x1b\[[0-9;]*m", "", wd_chore.shell.frame_text())
+_chore_lines = _chore_frame.splitlines()
+check("琐事屏占满整个画布高度（输入行钉在底部）",
+      len(_chore_lines), wd_chore.shell.dashboard_budget())
+_non_empty = [idx for idx, line in enumerate(_chore_lines) if line.strip()]
+check_true("琐事屏垂直居中（上下都有留白，不在左上角第 0 行）",
+           bool(_non_empty) and _non_empty[0] >= 5
+           and (_chore_lines[_non_empty[0]].startswith("     ")))
 check("q 回到正常界面（不是退出 TUI）", wd_chore.handle("q"), True)
 check("q 后回到契约视图", wd_chore.view.name, "契约")
 check_true("q 压制到下一场 session / 明天",

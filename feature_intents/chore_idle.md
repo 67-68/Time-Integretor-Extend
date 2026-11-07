@@ -33,6 +33,7 @@ set chore-project #1          # 也认 id:3 / OmniFocus 项目 pk / 唯一的项
 
 1. 当前琐事任务标题，以及项目名 / 时长 / count / 截止时间（有才显示）；
 2. 操作提示：`m 完成`、`c 换一个 task`、`q 退出（回到正常界面）`。
+3. 整块内容通过 `rich.align.Align.center(..., vertical="middle")` 放在**整个终端画布的正中央**（水平 + 垂直居中），底部输入行钉在屏幕最下方。
 
 正常看板、Recent、状态框、视图栏、警告板都不画。任务来自项目库里
 `remaining_tasks` 的未完成叶子任务；父壳若有子任务，会展开成一条条子任务来轮换。
