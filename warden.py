@@ -7705,6 +7705,72 @@ class Warden(object):
             self.reload_entries()
         return "切出来的 %s %dmin 这一场已经写进当天排期" % (start, duration)
 
+    @staticmethod
+    def _session_start_datetime(row):
+        """从一行 session（API / 本地绑定 / 快照）里取**实际开始时间**。
+
+        优先用 API 的 ``startMs`` —— 这是 Focusmate 真实约定的开始时刻；
+        计划里的 ``startLabel`` 可能和它差几分钟（用户说的「时间偏差」）。
+        只有没有 ``startMs`` 时才退回 ``date + startLabel/start``。
+        无法解析返回 None（调用方按「已开始」保守处理）。
+        """
+        if not isinstance(row, dict):
+            return None
+        raw_ms = row.get("startMs")
+        if raw_ms not in (None, ""):
+            try:
+                ms = float(raw_ms)
+                # 1 / 1234 这类占位值不是真实 epoch 毫秒（1970 年），退回
+                # date + startLabel；真实 Focusmate API 的 startMs 一定远大于此。
+                if ms >= 946684800000:            # 2000-01-01T00:00:00Z
+                    return datetime.datetime.fromtimestamp(ms / 1000.0)
+            except (TypeError, ValueError, OSError, OverflowError):
+                pass
+        raw_day = row.get("date") or row.get("period_date")
+        raw_hhmm = row.get("startLabel") or row.get("start")
+        if raw_day in (None, "") or raw_hhmm in (None, ""):
+            return None
+        try:
+            if hasattr(raw_day, "year"):
+                day = datetime.date(raw_day.year, raw_day.month, raw_day.day)
+            else:
+                day = datetime.date.fromisoformat(str(raw_day)[:10])
+            got = sch.parse_hhmm(str(raw_hhmm))
+            if not got:
+                return None
+            return datetime.datetime(day.year, day.month, day.day, got[0], got[1])
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _session_already_started(cls, row, now=None):
+        """这一场是否已经开始（含刚好到点）；解析不了也按已开始保护。"""
+        now = now or datetime.datetime.now()
+        start = cls._session_start_datetime(row)
+        return start is None or start <= now
+
+    def _split_started_sessions(self, rows):
+        """把待处理场次拆成 (未开始可取消, 已开始必须保护)。
+
+        **refresh / formatter / 改排布都不得取消已经开始或过去的 session。**
+        判定按 API 实际 ``startMs``，不是按表格的 zone / 计划 startLabel；
+        这样即使当前 session 因时间偏差被显示成 locked/draft，也不会误杀。
+        """
+        now = datetime.datetime.now()
+        protected, safe = [], []
+        for row in rows or []:
+            (protected if self._session_already_started(row, now) else safe).append(row)
+        if protected:
+            labels = "、".join(
+                str(row.get("startLabel") or row.get("start") or "?")
+                for row in protected[:5])
+            if len(protected) > 5:
+                labels += " 等"
+            self.say("⚠ %d 场 session 已经开始或已过去（%s）；refresh / 自动排布"
+                     "不会取消它们（按 API 实际 startMs 判定，不看计划时间偏差）。"
+                     % (len(protected), labels), "warn")
+        return safe, protected
+
     def _cancel_stale_sessions_for(self, day, period, new_sessions,
                                   reason="formatter-cut"):
         """计划里不再包含的**已订上**场次 → 真的去 Focusmate 取消。返回取消掉的行。
@@ -7740,6 +7806,7 @@ class Warden(object):
             if (str(start), dur) in keep:
                 continue
             stale.append(row)
+        stale, _protected = self._split_started_sessions(stale)
         if not stale:
             return []
         try:
@@ -13043,6 +13110,10 @@ class Warden(object):
             except (TypeError, ValueError):
                 dur = None
             if (str(start), dur) not in kept:
+                # 已经开始/过去的场次不进入挂号单：它们根本不会被自动取消，
+                # 不能给 daemon 留一张可能误掩护后续手动取消的 `expect_cancel`。
+                if self._session_already_started(row):
+                    continue
                 try:
                     keys.add(sch.key_of(datetime.date.fromisoformat(date), start))
                 except ValueError:
@@ -13064,6 +13135,8 @@ class Warden(object):
             except (TypeError, ValueError):
                 dur = None
             if (start, dur) not in kept:
+                if self._session_already_started({"date": date, "start": start}):
+                    continue
                 keys.add(str(key))
         return keys
 
@@ -13171,6 +13244,7 @@ class Warden(object):
                 continue
             if self._period_row_is_stale(row, new_by_start):
                 stale.append(row)
+        stale, _protected = self._split_started_sessions(stale)
         if not stale:
             return True
 

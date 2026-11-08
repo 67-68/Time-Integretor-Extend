@@ -163,8 +163,10 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 `refresh` 不只是「重拉 session 列表」——它是**刷新这界面**，所以一条命令把每块组件都
 拆开对一遍（`refresh_all()`）。对外**不订场、不挂 Focusmate task、不写回 OmniFocus**；
 对内会跑排期流水线（formatter 重查 + 项目 plan 校验），必要时重写本地 layout /
-data.csv 和后台取消已经不在计划里的旧场。不落「每周重复」（那会在 Focusmate 上真建
-task，走 `task sync`）：
+data.csv 和后台取消已经不在计划里的**未来**旧场。**已经开始 / 已经过去的 session
+绝不取消**：判定按 API 实际 `startMs`（没有才退回 date+startLabel），不看表格
+zone / 计划时间，所以即使当前 session 显示有明显时间偏差也不会被 refresh 误杀。
+不落「每周重复」（那会在 Focusmate 上真建 task，走 `task sync`）：
 
 | 组件 | 刷什么 |
 | --- | --- |
@@ -744,7 +746,9 @@ python3 warden.py install-deps
   任何一场超出时段终点 → 报错，layout 和 data.csv 都不动。
 - 改排布时若该时段已有 API session 且起点/时长不再匹配，先取消旧场
   （**改排布不要宣言**，用户明确要求：计划随你改，障碍只在 `cancel N`），
-  再写新 layout + data.csv，最后立刻 `check` 补订新场次。
+  再写新 layout + data.csv，最后立刻 `check` 补订新场次。但**实际开始时间已到
+  或已过的 session 一律跳过取消**；它们也不会写进 daemon 的 `expect_cancel`
+  挂号单。`refresh` / `refresh -c` 走同一条安全闸。
 - 取消旧场之前会把面板摊开：要取消哪几场、哪些任务绑定会被清掉，一目了然。
 - 任务绑定按「(起点, 时长) 有没有动」保留：没动的场次绑定留着，动过的清掉
   （详见 `session_plan.md` 的「任务绑定」一节）。

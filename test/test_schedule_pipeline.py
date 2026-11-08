@@ -478,6 +478,82 @@ check_true("编排表显示 formatter 名称", "⏱enlist" in _binder_out)
 check_true("编排表显示任务所属项目", "论文项目" in _binder_out)
 check_true("编排表显示项目 plan 账", "项目安排" in _binder_out and "说好 2 count" in _binder_out)
 
+print("== refresh 安全闸：绝不取消已经开始 / 已过去的 session（即使时间有偏差） ==")
+wd_guard = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
+                   "type": "工作", "name": "进行中", "calendar": "工作",
+                   "title": "进行中"}])
+check("guard：先排一场 50", wd_guard.handle("period T1 50"), True)
+wd_guard.reload_entries()
+sync_api(wd_guard)
+_now_ms = int(datetime.datetime.now().timestamp() * 1000)
+_guard_row = dict(wd_guard.rows[0])
+# 故意制造「计划 11:00，但 Focusmate 实际 5 分钟前已开始」的时间偏差。
+_guard_row.update({"startMs": _now_ms - 5 * 60 * 1000,
+                   "endMs": _now_ms + 45 * 60 * 1000,
+                   "phase": "进行中"})
+wd_guard.bridge.sessions = [dict(_guard_row)]
+wd_guard.api_rows = [dict(_guard_row)]
+wd_guard.rows_source = "bridge"
+wd_guard.rebuild_rows()
+try:
+    wd_guard._snapshot_cache.clear()
+except AttributeError:
+    pass
+_guard_period = wd_guard.periods_for_day(TODAY)[0]
+wd_guard.bridge.calls = []
+_guard_cancelled = wd_guard._cancel_stale_sessions_for(
+    TODAY, _guard_period, [{"start": "11:30", "duration": 25}],
+    reason="refresh-test")
+check("guard：formatter 取消路径跳过进行中的场次", _guard_cancelled, [])
+check("guard：formatter 取消路径没有发 cancel",
+      [c[0] for c in wd_guard.bridge.calls if c[0] == "cancel"], [])
+# 即使表格 zone 被错误标成 locked（时间偏差的典型表现），也只按实际 startMs 判定。
+_guard_row["zone"] = "locked"
+wd_guard.rows = [dict(_guard_row)]
+wd_guard.bridge.calls = []
+_guard_ok = wd_guard._cancel_stale_period_sessions(
+    _guard_period, [{"start": "11:30", "duration": 25}])
+check("guard：排布取消路径仍返回成功", _guard_ok, True)
+check("guard：zone 标错也不发 cancel",
+      [c[0] for c in wd_guard.bridge.calls if c[0] == "cancel"], [])
+
+print("== refresh 集成：当前进行中的 API session 不会被 formatter 流水线取消 ==")
+wd_live = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
+                  "type": "工作", "name": "进行中", "calendar": "工作",
+                  "title": "进行中"}])
+check("live：先排一场 50", wd_live.handle("period T1 50"), True)
+wd_live.reload_entries()
+sync_api(wd_live)
+_live_row = dict(wd_live.rows[0])
+_live_row.update({"startMs": _now_ms - 5 * 60 * 1000,
+                  "endMs": _now_ms + 45 * 60 * 1000,
+                  "phase": "进行中"})
+wd_live.bridge.sessions = [dict(_live_row)]
+wd_live.api_rows = [dict(_live_row)]
+wd_live.rows_source = "bridge"
+wd_live.rebuild_rows()
+try:
+    wd_live._snapshot_cache.clear()
+except AttributeError:
+    pass
+check("live：创建一个 end formatter 任务",
+      wd_live.handle("task create title=当前任务 duration=25 -f end"), True)
+# 把 layout 人为改坏，逼 refresh 重新跑 formatter / 切割逻辑。
+sp.set_layout(TODAY, "T1", [50])
+wd_live.reload_periods()
+wd_live.reload_entries()
+try:
+    wd_live._snapshot_cache.clear()
+except AttributeError:
+    pass
+wd_live.bridge.calls = []
+check("live：refresh 受理", wd_live.handle("refresh"), True)
+check("live：refresh 没有取消正在进行的那场",
+      [c[0] for c in wd_live.bridge.calls if c[0] == "cancel"], [])
+check("live：刷新后 API 里那场仍在",
+      any(r.get("id") == "sess-11:00" for r in wd_live.api_rows), True)
+
+
 if fails:
     print("\n%d 项失败：" % len(fails))
     for f in fails:
