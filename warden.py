@@ -2626,6 +2626,12 @@ class WardenShell(repl_kit.ReplShell):
             has_status = False
         if has_status:
             reserved += 1                             # 状态行（专注视图）
+        try:
+            has_footer = bool(self.footer_text())
+        except Exception:                             # 视图栏坏了也别撑破布局
+            has_footer = False
+        if has_footer:
+            reserved += 1                             # 底部视图栏
         reserved += 1                                 # 提示符
         return max(1, self._terminal_rows() - reserved)
 
@@ -7601,14 +7607,72 @@ class Warden(object):
         self.selected_task_id = task["id"]
         return task
 
-    def _formatter_sessions(self, day):
-        """formatter 的候选 session：先走日历下载层 + layout，再回退到 data.csv。"""
+    def _formatter_session_has_actual(self, day, session):
+        """这一天这一场在 API 里有没有真实 id（权威模式下才算数）。"""
+        if not self.authoritative:
+            return True
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        start = str((session or {}).get("start") or "").strip()
+        if not start:
+            return False
+        try:
+            for row in self._snapshot_rows(iso):
+                if (row.get("id")
+                        and str(row.get("startLabel") or "") == start):
+                    return True
+        except Exception:                     # noqa: BLE001 - 行坏了就按没有处理
+            return False
+        return False
+
+    def _formatter_bound_session_missing(self, task, day):
+        """formatter 任务绑的那场**已经开始或过去**，但 API 里根本没有它。
+
+        未来还没订上的场次允许先挂本地；但已经开始/结束的场次如果没有真实
+        session id，就说明它被取消了 —— 任务不能继续假装还挂在那里。
+        """
+        if not self.authoritative:
+            return False
+        sess = (task or {}).get("session") or {}
+        if not sess:
+            return False
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        if str(sess.get("date") or "") != iso:
+            return False
+        start = self._session_start_datetime(sess)
+        if start is None or start > datetime.datetime.now():
+            return False
+        sid = str(sess.get("focusmate_session_id") or "").strip()
+        if sid:
+            try:
+                if any(str(r.get("id") or "") == sid for r in self.rows):
+                    return False
+            except Exception:                 # noqa: BLE001
+                pass
+        return not self._formatter_session_has_actual(day, sess)
+
+    def _formatter_sessions(self, day, strict_actual=False):
+        """formatter 的候选 session：先走日历下载层 + layout，再回退到 data.csv。
+
+        ``strict_actual=True`` 是 refresh 流水线：权威模式下，**今天已经开始/
+        过去、但 API 里没有实际 id 的本地计划场**不再是候选。否则一场被取消的
+        21:00 session 永远躺在 data.csv 里，formatter 每轮都把它当目标重新挂
+        任务，任务就永远“还挂在取消的场上”。手动 `task -f` 仍允许排，
+        由调用方决定是否接受本地未订上的未来/过去窗。
+        """
         sessions = []
         try:
             sessions = [dict(s) for s in self.sessions_for_day_plan(day)]
         except Exception:                     # noqa: BLE001 - 下载层坏了不该挡住 csv
             sessions = []
         if sessions:
+            if strict_actual and self.authoritative and day <= datetime.date.today():
+                now = datetime.datetime.now()
+                sessions = [
+                    sess for sess in sessions
+                    if not (self._session_start_datetime(sess) is not None
+                            and self._session_start_datetime(sess) <= now
+                            and not self._formatter_session_has_actual(day, sess))
+                ]
             return sessions
         try:
             self.reload_entries()
@@ -7991,15 +8055,33 @@ class Warden(object):
             if ts.task_is_deferred(task, now=now):
                 # defer 还没到：不进这一轮排期队列，也不动它旧的位置。
                 continue
-            own_days = self._formatter_dates_of(task)
-            try:
-                own_days.add(th.resolve_target_day(
-                    self.sel_date, now, spec.get("args") or {},
-                    allow_today=True).isoformat())
-            except Exception:                  # noqa: BLE001 - 坏 args 不挡整条流水线
-                pass
-            if iso in own_days:
-                out.append(task)
+            # occurrence 子任务只属于它自己的 repeat_date，绝不能被 formatter
+            # 的旧 reservation / 全局「今天」拽到别的日子重排。否则前几天的
+            # 未收尾子任务会在每次 refresh 时全部涌到今天、互相抢 session。
+            if ts.TaskStore.is_repeat_occurrence(task):
+                own_days = set()
+                raw_repeat_day = str(task.get("repeat_date") or "").strip()
+                if raw_repeat_day:
+                    own_days.add(raw_repeat_day)
+            else:
+                own_days = self._formatter_dates_of(task)
+            # 只有「还没有任何落点日期」的新 formatter 任务，才允许按当前
+            # 选中的那天试排。已经有 reservation / session 的任务只看自己的
+            # 落点日期；不再无条件把 sel_date 塞进 own_days。
+            if own_days and iso not in own_days:
+                continue
+            if not own_days:
+                explicit_day = str((spec.get("args") or {}).get("date")
+                                   or (spec.get("args") or {}).get("day") or "").strip()
+                if explicit_day:
+                    try:
+                        if th.resolve_target_day(
+                                self.sel_date, now, spec.get("args") or {},
+                                allow_today=True).isoformat() != iso:
+                            continue
+                    except Exception:          # noqa: BLE001 - 坏 args 不挡流水线
+                        pass
+            out.append(task)
         # 用户要求 enlist 排在所有其它 formatter 的最后、项目之前。
         # 同一优先级内按 id 稳定排序。
         out.sort(key=lambda t: (th.formatter_priority(
@@ -8020,6 +8102,10 @@ class Warden(object):
         fmt = (task or {}).get("formatter") or {}
         name = str(fmt.get("name") or "").strip().lower()
         if not name:
+            return False
+        # 本地 layout 说“还在”不算数：已经开始/过去的目标场次必须在 API 里
+        # 真有 id；否则就是被取消的幽灵场，必须重跑 formatter 重新找位置。
+        if self._formatter_bound_session_missing(task, day):
             return False
         res = fmt.get("reservation") or {}
         sess = (task or {}).get("session") or {}
@@ -8054,6 +8140,16 @@ class Warden(object):
                        if str(p.get("id")) == period_id), None)
         if period is None:
             return False
+        # 非尾巴 placement（end 把任务塞进更早一场，或 enlist/兜底一次性场）：
+        # formatter 没有改写整段 layout，不能拿「prefix + 任务场」当整段预期，
+        # 否则同一时段里第二条 formatter 永远被判失效、每轮 refresh 都被搬走。
+        if not str(result_session.get("cut_period_id") or "").strip():
+            try:
+                return any(
+                    str(s.get("start")) == str(sess.get("start"))
+                    for s in self.sessions_for_day_plan(day))
+            except Exception:                  # noqa: BLE001 - 坏排布按失效处理
+                return False
         try:
             planned = sp.plan_period(period, prefix + [int(sess.get("duration") or 0)])
         except (TypeError, ValueError):
@@ -8290,6 +8386,13 @@ class Warden(object):
         if hasattr(day, "datetime"):
             day = day.date()
         result = {"formatters": 0, "invalidated": 0, "detached": 0, "errors": 0}
+        # 先清掉过期且从未处理的重复 occurrence：它们绝不能再进入今天/明天的
+        # formatter 队列（否则同名任务会越积越多，互相抢同一场 session）。
+        try:
+            result["expired"] = len(self.expire_stale_repeat_occurrences())
+        except Exception as e:                     # noqa: BLE001 - 清理失败不挡刷新
+            result["expired"] = 0
+            self.say("重复 occurrence 清理失败（继续刷新）：%s" % e, "warn")
         try:
             self.reload_periods()
             self.reload_entries()
@@ -8305,7 +8408,8 @@ class Warden(object):
                     result["formatters"] += 1
                     continue
                 self._apply_formatter_to_task(task, spec, action="hook",
-                                              day=day, quiet=True)
+                                              day=day, quiet=True,
+                                              strict_actual=True)
                 result["formatters"] += 1
             except Exception as e:                 # noqa: BLE001 - 一条坏任务不挡别的
                 result["errors"] += 1
@@ -8454,7 +8558,8 @@ class Warden(object):
                     self.task_label(child)), "warn")
         return parent
 
-    def _apply_formatter_to_task(self, task, spec, action="hook", day=None, quiet=False):
+    def _apply_formatter_to_task(self, task, spec, action="hook", day=None,
+                                 quiet=False, strict_actual=False):
         """在**一条具体任务**（通常是 occurrence 子任务）上执行 formatter。
 
         ``day`` 给了就排那一天（重复任务转嫁时按子任务的 repeat_date 排）；
@@ -8467,7 +8572,17 @@ class Warden(object):
         if day < today:
             raise ValueError("formatter 不能排到过去（%s）。先切到那一天或指定 date=。"
                              % day.isoformat())
-        sessions = self._formatter_sessions(day)
+        # 目标场次已经被取消：先把任务从旧 session 上摘下来，再拿真实候选重排。
+        # 这一步必须发生在 formatter 算法之前，否则它还会从 data.csv 里看见那场
+        # 幽灵 session，重新把任务挂回去。
+        if self._formatter_bound_session_missing(task, day):
+            old_sess = dict(task.get("session") or {})
+            self.say("⚠ formatter 任务 %s 原来挂的 %s %s 已经在 API 里不存在，"
+                     "先下架再重新找位置。"
+                     % (self.task_label(task), old_sess.get("date") or "?",
+                        old_sess.get("start") or "?"), "warn")
+            task = self._task_detach(task, reason="formatter-target-missing")
+        sessions = self._formatter_sessions(day, strict_actual=strict_actual)
         ctx = {
             "task": task,
             "task_id": task["id"],
@@ -8548,6 +8663,13 @@ class Warden(object):
         if moved or not previous:
             note = self.assign_task_to(task, session_info)
             task = self.task_store.get(task["id"])
+            assigned = task.get("session") or {}
+            if (not assigned
+                    or str(assigned.get("start") or "") != str(session_info.get("start") or "")):
+                raise th.HookError(
+                    "formatter 没能把任务挂到 %s %s：%s"
+                    % (day.isoformat(), session_info.get("start") or "?",
+                       note or "这场不可用（可能已被取消或被独占任务占用）"))
         else:
             note = "已经在这场，不重复建 Focusmate task"
 
@@ -10231,8 +10353,23 @@ class Warden(object):
         排布被拆开就消失。当天完全没有 session 时返回 ``(None, ...)``，
         occurrence 子任务仍然会生成，只是暂时不挂场。
         """
-        sessions = (sessions if sessions is not None
-                    else self.sessions_for_day_plan(day))
+        sessions = list(sessions if sessions is not None
+                        else self.sessions_for_day_plan(day))
+        # 今天已经开始的场次，只有 API 里真有 id 才能拿来自动挂重复任务。
+        # 否则一次日终/次日重开 TUI 会把今天的新 occurrence 硬塞回已经过去的
+        # 19:00 幽灵场（data.csv 有、Focusmate 早已没有），看起来就像任务又
+        # “留在取消的 session 上”。
+        if day <= datetime.date.today():
+            now = datetime.datetime.now()
+            usable = []
+            for sess in sessions:
+                start = self._session_start_datetime(sess)
+                if start is None or start > now:
+                    usable.append(sess)
+                    continue
+                if self.authoritative and self._formatter_session_has_actual(day, sess):
+                    usable.append(sess)
+            sessions = usable
         hit = self.task_store.repeat_occurrence(parent, day, sessions)
         if hit:
             return hit, "exact"
@@ -10338,6 +10475,73 @@ class Warden(object):
                     focusmate=fm or None, note=why)
         return changed
 
+    def expire_stale_repeat_occurrences(self, today=None):
+        """把**已经过期、从未处理过**的重复 occurrence 收掉，避免它们天天复活。
+
+        例如 FREQ=DAILY 的模板在 11-04 / 11-05 各生成过一条子任务，但用户那两天
+        没做也没收尾；它们会一直是 active。以前 refresh 会把这些旧子任务也当成
+        「今天要排的 formatter 任务」，于是一次 refresh 就出现好几条同名任务抢同一场
+        session。正确口径是：**一条 occurrence 只属于它的 repeat_date**；日期过了、
+        又没有处理痕迹，就记一笔 missed 并放弃（模板本身照常生成今天的新 occurrence）。
+
+        只处理有 active 重复模板的旧子任务；模板已经删除/结束的孤儿记录不动。
+        返回被收掉的 ``[(old_task, parent_id), ...]``。
+        """
+        today = today or datetime.date.today()
+        expired = []
+        for task in list(self.task_store.list()):
+            if not ts.TaskStore.is_repeat_occurrence(task):
+                continue
+            if not self.task_store.is_open(task):
+                continue
+            raw_day = str(task.get("repeat_date") or "").strip()
+            if not raw_day:
+                continue
+            try:
+                repeat_day = datetime.date.fromisoformat(raw_day)
+            except ValueError:
+                continue
+            if repeat_day >= today:
+                continue
+            parent_id = task.get("repeat_parent")
+            try:
+                parent = self.task_store.get(parent_id)
+            except (TypeError, ValueError):
+                continue
+            if not (ts.TaskStore.is_repeat_template(parent)
+                    and self.task_store.is_open(parent)):
+                continue
+            # 用户在那一天明确处理过（收尾里选了 skip / 延期等）就尊重历史，
+            # 不在这里二次改账；这里只收「完全没人碰过」的僵尸 occurrence。
+            if self.task_store.processed_on(task, raw_day):
+                continue
+            stamp = datetime.datetime.combine(
+                repeat_day, datetime.time(23, 59, 59)).isoformat(timespec="seconds")
+            try:
+                self.task_store.mark_processed(
+                    task["id"], repeat_day, action="missed", at=stamp)
+                # 旧 bug 可能已经把这场旧 occurrence 拖到今天并挂在某场幽灵
+                # session 上。收掉时一并断绑；否则它还会以 ✗ 的身份留在今天
+                # 的契约行里，看起来像“任务没被移走”。
+                try:
+                    task = self.task_store.unassign(
+                        task["id"], reason="repeat-missed")
+                except (ValueError, TypeError):
+                    pass
+                task = self.task_store.drop(
+                    task["id"], reason="repeat-missed", at=stamp)
+            except (ValueError, TypeError):
+                continue
+            expired.append((task, parent_id))
+        if expired:
+            names = "、".join(
+                "id:%s@%s" % (task.get("id"), task.get("repeat_date"))
+                for task, _parent in expired[:5])
+            self.say("🔁 收掉 %d 条过期未处理的重复 occurrence（%s）；"
+                     "模板会照常生成今天的新一条。" % (len(expired), names), "warn")
+            self.invalidate()
+        return expired
+
     def maybe_generate_repeat_occurrences(self):
         """TUI 每帧问一次；每天只自动扫一遍（外加 60 秒节流）。"""
         today = datetime.date.today()
@@ -10348,7 +10552,10 @@ class Warden(object):
         self._repeat_gen_day = today
         self._repeat_gen_at = now
         try:
+            expired = self.expire_stale_repeat_occurrences(today)
             created = self.ensure_repeat_occurrences(today)
+            if expired:
+                created = [t for t, _parent in expired] + list(created or [])
             # 挂了 formatter 的本体：顺手把明天那条也生成/排好，用户今天就能在
             # `day +1` 里看到「明天会被 format 成什么样」。没挂 formatter 的
             # 本体不提前生成（仍然等到那天）。

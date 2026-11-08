@@ -1480,9 +1480,9 @@ def fetch_sessions(now, until):
     return [r["start"] for r in fetch_session_details(now, until)]
 
 
-def match_planned(details, start, duration):
+def match_planned(details, start, duration, used=None):
     """计划的一场在 API 实际结果里对应什么（薄封装，见 ``schedule.match_slot``）。"""
-    return sch.match_slot(details or [], start, duration)
+    return sch.match_slot(details or [], start, duration, used=used)
 
 
 def has_session_at(sessions, start_dt):
@@ -1634,6 +1634,19 @@ def _run_once_locked(dry_run=False, force=False):
         }
         changed = True
 
+        # 一份 API session 只能对应一条计划。按计划顺序认领，已经被 19:00
+        # 用掉的 19:15 就不能再被 21:00 当成“覆盖”；否则实际场次明明被取消
+        # 了，daemon 也会因为复用旧场次而不再补订。
+        matched_actual = []
+
+        def match_planned_once(day, slot, start):
+            match = match_planned(details, start, slot["duration"],
+                                  used=matched_actual)
+            if match.get("kind") != "none":
+                for got in match.get("sessions") or []:
+                    matched_actual.append((got.get("start"), got.get("duration")))
+            return match
+
         # 计划外的场次（API 有、data.csv 没有）：不是错误，但要能看见 ——
         # 「这场我做完了、没人问我」就是从这里漏出去的。
         try:
@@ -1657,7 +1670,7 @@ def _run_once_locked(dry_run=False, force=False):
         rec = state["slots"].get(key) or {}
         if dry_run or sessions is None:
             continue
-        match = match_planned(details, start, slot["duration"])
+        match = match_planned_once(day, slot, start)
         if match["kind"] != "none":
             note = match.get("note") or None
             if (rec.get("status") != "booked" or rec.get("match") != match["kind"]
@@ -1724,7 +1737,7 @@ def _run_once_locked(dry_run=False, force=False):
             rec, status = {}, None
             changed = True
 
-        match = match_planned(details, start, slot["duration"])
+        match = match_planned_once(day, slot, start)
         present = match["kind"] != "none"
         if present and match["kind"] != "exact":
             # 计划与实际不一样，但**实际确实做了**（拆分 / 挪了半格）：

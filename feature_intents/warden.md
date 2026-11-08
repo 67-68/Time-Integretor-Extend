@@ -166,6 +166,11 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 data.csv 和后台取消已经不在计划里的**未来**旧场。**已经开始 / 已经过去的 session
 绝不取消**：判定按 API 实际 `startMs`（没有才退回 date+startLabel），不看表格
 zone / 计划时间，所以即使当前 session 显示有明显时间偏差也不会被 refresh 误杀。
+formatter 任务如果绑在**已经开始但 API 里没有 id** 的幽灵场上，refresh 会先把它
+下架再找位置，不会继续把任务留在已取消的 session 上；旧日期的重复 occurrence
+也会先收成 missed，绝不混进今天的 formatter 队列。daemon 侧认账也改成**一码
+一用**：同一场 API session 只能满足一条计划，不能再被 19:00 和 21:00 同时复用
+（那会让被取消的 21:00 永远以为还有“覆盖”，因而不补订）。
 不落「每周重复」（那会在 Focusmate 上真建 task，走 `task sync`）：
 
 | 组件 | 刷什么 |
@@ -177,6 +182,7 @@ zone / 计划时间，所以即使当前 session 显示有明显时间偏差也�
 | 收尾面板 | 正在问的那一轮从任务库重读（`Review.reload()`，不把人问回去） |
 | 警告 / 静音 / 日志 | mute 缓存、快照缓存、日志尾巴缓存一律作废 |
 | 排期流水线 | formatter 先按当前资源重查/重切（`end` → 其它 → `enlist`）；项目 plan 后校验，资源对不上就清空并提示重新 `plan` |
+| 重复 occurrence | 过期且从未处理的 occurrence 记 `missed` 并断绑，模板照常生成当天的新一条 |
 | 画帧缓存 | `invalidate()` → 下一帧按新状态重排版，不会停在旧画面上 |
 
 任何一块刷不动就记一句警告、其余照刷 —— refresh 是「再对一次账」，不是「全有或全无」。
@@ -312,9 +318,11 @@ working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列
 
 ### 全屏单页模式（不留滚动历史 + 输入行钉在底部 + 琐事屏正中央居中）
 
-- 交互式 TUI 默认启用 `alt_screen=True`（终端 Alternate Screen Buffer）与
-  `erase_when_done=True`：切换视图或执行命令后，终端上方**不留任何历史残影**，
-  退出 TUI 后恢复原 shell 屏幕（`--no-clear` / `WARDEN_CLEAR=0` 可退回流式模式）；
+- 交互式 TUI 默认启用 `alt_screen=True`，底层是 prompt_toolkit 的**常驻
+  `full_screen=True` Application**：整个 REPL 只 `run()` 一次，Enter 在应用内
+  dispatch 命令、清空输入并原地重画。切换视图或执行命令时**不会**“清屏一次、
+  再重新填满一次”，终端上方也没有滚动历史；退出 TUI 后才恢复原 shell 屏幕
+  （`--no-clear` / `WARDEN_CLEAR=0` 可退回旧的流式模式）。
 - `WardenShell._build_frame_text()` 在看板高于屏幕预算时从顶部裁剪，在低于预算时
   自动补齐空行（`pin_bottom=True`），使**所有视图的输入行、状态行与提示行都永远
   钉在屏幕最底部**；

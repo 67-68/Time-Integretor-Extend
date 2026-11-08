@@ -280,10 +280,10 @@ check("原计划任务被下架，等待重新安排",
       wd2.task_store.get(_task["id"]).get("session"), None)
 
 print("== end formatter：11:00–12:00 + 25 分钟任务 → 任务场次从 11:30 开始 ==")
-wd_hour = fresh([{"id": "H1", "date": ISO, "start": "11:00", "end": "12:00",
+wd_hour = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
                   "type": "工作", "name": "一小时", "calendar": "工作",
                   "title": "一小时"}])
-check("先排一场 50", wd_hour.handle("period H1 50"), True)
+check("先排一场 50", wd_hour.handle("period T1 50"), True)
 wd_hour.reload_entries()
 sync_api(wd_hour)
 check("11–12 的 25 分钟任务 -f end 受理",
@@ -294,7 +294,7 @@ _hour_res = (_hour_task.get("formatter") or {}).get("reservation") or {}
 check("任务占用 11:30–12:00",
       [_hour_res.get("start"), _hour_res.get("end")], ["11:30", "12:00"])
 check("排布精确切成 [25,25]（任务从 11:30 开始）",
-      sp.get_layout(sp.load_layouts(), TODAY, "H1"), [25, 25])
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [25, 25])
 check("任务那场是 11:30–11:55",
       [_hour_task["session"]["start"], _hour_task["session"]["end"]],
       ["11:30", "11:55"])
@@ -318,6 +318,10 @@ _mb = [t for t in wd_multi.task_store.list()
 _multi_layout = sp.get_layout(sp.load_layouts(), TODAY, "T1")
 _multi_a = (_ma["session"]["start"], _ma["session"]["duration"])
 _multi_b = (_mb["session"]["start"], _mb["session"]["duration"])
+# 让 API 快照里真的有当前排布对应的 id：这些时段在今天已经是“已开始”的
+# 时刻，refresh 的幽灵场保护只认可 API 里实际存在的场次。
+wd_multi.reload_entries()
+sync_api(wd_multi)
 wd_multi.messages = []
 check("多 formatter refresh 受理", wd_multi.handle("refresh"), True)
 _ma2 = wd_multi.task_store.get(_ma["id"])
@@ -552,6 +556,91 @@ check("live：refresh 没有取消正在进行的那场",
       [c[0] for c in wd_live.bridge.calls if c[0] == "cancel"], [])
 check("live：刷新后 API 里那场仍在",
       any(r.get("id") == "sess-11:00" for r in wd_live.api_rows), True)
+
+
+print("== 重复 occurrence：旧日期不会被 refresh 拖到今天，也不会堆成同名任务 ==")
+wd_rep = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "13:00",
+                 "type": "工作", "name": "重复", "calendar": "工作",
+                 "title": "重复"}])
+_parent = wd_rep.task_store.create({"title": "flashcard review & new learn",
+                                    "duration": 25, "count": 1})
+_parent = wd_rep.task_store.set_repeat(
+    _parent["id"], TODAY.weekday(), "10:00", 25,
+    rule="FREQ=DAILY", rule_anchor="%sT10:00:00" % ISO, source="omnifocus")
+_old_day = TODAY - datetime.timedelta(days=2)
+_old_child = wd_rep.task_store.create_repeat_occurrence(_parent["id"], _old_day)
+_old_child = wd_rep.task_store.set_hook(_old_child["id"], "formatter", {
+    "name": "end", "kind": "formatter", "params": [], "args": {},
+    # 模拟已经被旧 bug 拖到今天的状态
+    "reservation": {"date": ISO, "period_id": "T1", "start": "11:00",
+                    "end": "11:30", "session_start": "11:00",
+                    "session_duration": 25, "duration": 25},
+})
+check("旧 occurrence 即使 reservation 被改成今天，也不进今天的 formatter 队列",
+      [t["id"] for t in wd_rep.formatter_tasks_for_day(TODAY)
+       if t["id"] == _old_child["id"]], [])
+_expired = wd_rep.expire_stale_repeat_occurrences(TODAY)
+check("过期 occurrence 被收掉", [t["id"] for t, _p in _expired], [_old_child["id"]])
+_old_after = wd_rep.task_store.get(_old_child["id"])
+check("收掉后状态是 dropped", _old_after.get("status"), "dropped")
+check("原因记成 repeat-missed", _old_after.get("status_reason"), "repeat-missed")
+check("旧 occurrence 的幽灵 session 绑定也断掉", _old_after.get("session"), None)
+check("旧日期留下 missed 处理痕迹",
+      [h["action"] for h in wd_rep.task_store.processed_on(_old_after, _old_day)],
+      ["missed"])
+wd_rep.ensure_repeat_occurrences(TODAY, apply_formatters=False)
+_today_child = wd_rep.task_store.occurrence_for(_parent["id"], TODAY)
+check("今天的新 occurrence 仍能正常生成", bool(_today_child), True)
+check("自动生成时不会把新 occurrence 挂回已经开始的 11:00 幽灵场",
+      (_today_child or {}).get("session"), None)
+
+print("== refresh：被取消的已开始 session 上的任务会先下架，再重找位置 ==")
+wd_cancel = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
+                    "type": "工作", "name": "取消场", "calendar": "工作",
+                    "title": "取消场"}])
+check("取消场：先排一场 50", wd_cancel.handle("period T1 50"), True)
+wd_cancel.reload_entries()
+# 本地说挂着 11:00，但 API 里没有任何这场（等同于 21:00 被取消）
+_cancel_task = wd_cancel.task_store.create(
+    {"title": "flashcard review & new learn", "duration": 25, "count": 1})
+_now_ms = int(datetime.datetime.now().timestamp() * 1000)
+_cancel_task = wd_cancel.task_store.assign(_cancel_task["id"], {
+    "date": ISO, "start": "11:00", "end": "11:25", "duration": 25,
+    "startMs": _now_ms - 5 * 60 * 1000,
+    "focusmate_session_id": None})
+_cancel_task = wd_cancel.task_store.set_hook(_cancel_task["id"], "formatter", {
+    "name": "end", "kind": "formatter", "params": [], "args": {},
+    "reservation": {"date": ISO, "period_id": "T1", "start": "11:00",
+                    "end": "11:30", "session_start": "11:00",
+                    "session_duration": 25, "duration": 25},
+    "result": {"name": "end", "session": {
+        "date": ISO, "start": "11:00", "duration": 25,
+        "period_id": "T1", "cut_period_id": "T1", "cut_prefix": [25]}},
+})
+wd_cancel.api_rows = []
+wd_cancel.rows_source = "bridge"
+wd_cancel.rebuild_rows()
+check("目标已开始但 API 没 id → 判成幽灵场",
+      wd_cancel._formatter_bound_session_missing(_cancel_task, TODAY), True)
+check("幽灵场 formatter 校验必须失效",
+      wd_cancel._formatter_apply_valid(_cancel_task, TODAY), False)
+wd_cancel.messages = []
+wd_cancel.reconcile_schedule_pipeline(TODAY)
+_cancel_after = wd_cancel.task_store.get(_cancel_task["id"])
+check("refresh 后任务不再假装挂在取消场上", _cancel_after.get("session"), None)
+check_true("明确说了旧场在 API 里不存在",
+           any("已经在 API 里不存在" in m[2] for m in wd_cancel.messages))
+
+
+print("== 预约认账一码一用：同一场 API session 不能同时顶两条计划 ==")
+_d = datetime.datetime.combine(TODAY, datetime.time(20, 15))
+_actual = [{"start": _d, "duration": 50, "id": "sess-2015"}]
+_m_2000 = sch.match_slot(_actual, datetime.datetime.combine(TODAY, datetime.time(20, 0)), 50)
+check("20:15 先认领 20:00 计划", _m_2000["kind"], "shifted")
+_m_2100 = sch.match_slot(
+    _actual, datetime.datetime.combine(TODAY, datetime.time(21, 0)), 25,
+    used=[(s["start"], s["duration"]) for s in _m_2000["sessions"]])
+check("同一场 20:15 不能再去覆盖 21:00 的计划", _m_2100["kind"], "none")
 
 
 if fails:

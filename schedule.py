@@ -624,14 +624,30 @@ def _fmt_actual(pairs):
 
 def match_slot(actual, start, duration, tol_sec=MATCH_START_TOL,
                shift_min=ADOPT_SHIFT_MIN, gap_min=ADOPT_GAP_MIN,
-               short_min=ADOPT_SHORT_MIN):
+               short_min=ADOPT_SHORT_MIN, used=None):
     """计划的一场 (start, duration) 在 API 实际结果里对应什么 → dict。
 
     返回 ``{"kind", "sessions", "note", "planned", "actual_minutes"}``，
     ``kind`` ∈ ``exact`` / ``covered`` / ``shifted`` / ``none``。
     ``note`` 只在「实际和计划不一样」时非空（直接拿去打日志 / 显示）。
+
+    ``used`` 是**已经被别的计划 slot 认领**的 ``[(start, duration), ...]``。
+    同一场 API session 只能满足一条计划 —— 否则 20:15 那场会被同时算成
+    20:00 和 21:00 的预约，21:00 就永远不会真的去订。
     """
     pairs = _actual_pairs(actual)
+    if used:
+        counts = {}
+        for got, dur in used:
+            key = (got, dur)
+            counts[key] = counts.get(key, 0) + 1
+        remaining = []
+        for pair in pairs:
+            if counts.get(pair, 0) > 0:
+                counts[pair] -= 1
+                continue
+            remaining.append(pair)
+        pairs = remaining
     try:
         duration = int(duration)
     except (TypeError, ValueError):

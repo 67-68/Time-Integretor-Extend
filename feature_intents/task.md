@@ -572,6 +572,12 @@ CLI：`python3 task_store.py list|create|delete|modify|show|archive|reconcile`�
 - 切到 `day +1` 就能在契约表和任务面板看到明天那条已经排好的子任务；
 - 以后每天生成子任务时，`ensure_repeat_occurrences()` 会自动继承本体的
   formatter 模板并排当天；改过本体 formatter 后用 `-f` 会强制重排已知子任务。
+- occurrence 子任务**只属于它的 `repeat_date`**：refresh 的 formatter 队列不会
+  因为旧 reservation 被改到某天、或扫描当前日期，就把前几天的未处理子任务拖到
+  今天。过期且从未处理的旧 occurrence 会记一笔 `missed`、标成 dropped 并断绑；
+  模板仍照常生成今天的新子任务。
+- 如果 formatter 绑定的场次已经开始/过去、但 API 里没有真实 id（session 被取消），
+  refresh 会把任务从幽灵场下架再重新找位置；不会继续显示“任务还挂在取消的场上”。
 
 ### 本体不能完成，只能手动结束
 
