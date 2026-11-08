@@ -1,58 +1,84 @@
-# project
+# project —— `pro` / `op` / `task` 三个模型
 
 ## 模块职责
 
-把 **OmniFocus 项目**接进这套系统：项目是「活的母体」，它的任务清单先躺着不动，
-等到你给这一天分了资源，才把当天的任务「唤起」成本地任务、排进 session。
+把 **OmniFocus 项目**和**真正的项目 Project**接进这套系统。三个模型不要混：
+
+| 模型 | 是什么 | 关键字段 | 命令 |
+|---|---|---|---|
+| `task` | 具体任务，挂 session、执行、完成的最小单位 | `fields` / `session` / `count` | `task ...` |
+| `op` | **OmniFocus Project**，任务清单的母体；只能是 `SOP` 或 `incubator` 两种类型之一 | `op_type` / `omnifocus` / `project_tag` / `pro_id` / `plans` | `op ...`、`task import [sop\|incubator]` |
+| `pro` | **真正项目 Project**，有阶段 `running` / `bottleneck`，可关联一个打开文件 | `stage` / `file` / `sop_op_id` / `incubator_op_id` / `op_ids` | `pro ...`（`project` 同义） |
+
+- `task` 放 `data/tasks.json`：这一场（这一天）要干的活 + op 叶子任务的镜像。
+- `op` 和 `pro` 都放 `data/projects.json`：`projects` 是 op 库，`pros` 是真正项目库。
 
 ```
-project_store.py   data/projects.json   项目库：清单 + 每天的分配 + 谁被唤起过（纯数据层）
-project_plan.py    纯逻辑               容量 / 分资源问答 / 挑任务排 session
-warden.py          接线                 task import 认项目、任务面板下的项目表、plan 命令
+project_store.py   data/projects.json   op 清单 + pro 阶段/文件/关联 + 每天分配
+project_plan.py    纯逻辑               容量 / 两阶段分资源问答 / 挑任务排 session
+warden.py          接线                 import 类型、pro/op 命令、项目表、plan 命令
 ```
 
-和任务库的分工（两个文件、两件事，别混）：
-
-| 文件 | 放什么 | 谁写 |
-|---|---|---|
-| `data/tasks.json` | **这一场（这一天）要干的活** + 项目叶子任务的镜像（`fields.project` / `project_id` / `project_task`，没挂 session 的镜像只进任务视图，不进契约面板） | `task create` / 项目导入/刷新/对账镜像 / `plan` 唤起 / 重复任务生成 |
-| `data/projects.json` | **母体**：OmniFocus Project 的任务清单 + 每天分了多少 count + 唤起过哪几条本地任务 | `task import`（项目）/ `project refresh` / `plan` |
-
-用户原话就是这两句话，实现也照这个分：
+用户原话：
 *「在项目入库的时候就应该获取他所有的 task，但不展示直到他们被 project 唤起」*、
-（实现上：项目导入时把**叶子任务**镜像进任务库，供任务视图搜索 / `group project`；
-镜像没有 session 时不会进契约视图的任务面板，`plan` 唤起时复用同一条镜像并挂 session。）
-*「你可以把 project 想象成为一个 repeated task 的母体（会在对应的时间产生 task
-指向他）的变体」*。所以项目**永远不挂 session**（和重复任务本体一样），挂 session 的
-永远是它唤起的本地任务。
+*「你可以把 project 想象成为一个 repeated task 的母体」*。
+所以 op **永远不挂 session**；挂 session 的永远是它唤起的本地 task。
+
+### `op` 和 `pro` 为什么要分开
+
+- 一个真正项目可能先处于 `bottleneck`（瓶颈）阶段，这时只做对应的 **incubator op**；
+  突破瓶颈后进入 `running` 阶段，这时只做普通的 **SOP op**。
+- `op` 是 OmniFocus 里的工作清单；`pro` 是现实中的项目生命周期。
+- 一个 `pro` 可以先后关联多个 `op`：瓶颈期一个 incubator op，运行期一个 SOP op。
+- op 通过 OmniFocus 标签 `project/<pro名称>` 自动关联 pro；也可以用
+  `pro <序号> op <op序号>` / `op <序号> pro <pro序号>` 手动关联。
 
 ## 数据形状
 
 ```json
 {
-  "version": 1, "next_id": 2,
+  "version": 1,
+  "next_id": 2,
+  "next_pro_id": 2,
+
   "projects": [{
-    "id": 1,                                  // 项目序号 = 预览表上的 #（task 1 4 里的 1）
-    "title": "论文",
-    "omnifocus": {"id": "p-abc", "url": "omnifocus:///project/p-abc", "title": "论文"},
-    "status": "active",                       // active / dropped（撤掉是删记录，不是标记）
-    "imported_at": "…", "synced_at": "…",     // synced_at = 上次读 OmniFocus 的时间
-    "tasks": [{                               // **全部**任务（含已完成/已放弃），按 OmniFocus 顺序
-      "pk": "t-intro", "title": "写引言", "parent": "论文", "parent_id": "",
+    "id": 1,                                  // op 序号 = 预览表上的 #
+    "title": "论文写作 SOP",
+    "op_type": "SOP",                         // SOP / incubator / null(待补全)
+    "pro_id": 1,                              // 关联的真正项目 pro；null = 未关联
+    "project_tag": "学术论文",                // 从 OmniFocus 标签 project/... 提取
+    "tags": ["project/学术论文", "写作"],
+    "omnifocus": {"id": "p-abc", "url": "omnifocus:///project/p-abc", "title": "论文写作 SOP"},
+    "status": "active",
+    "imported_at": "…", "synced_at": "…",
+    "tasks": [{
+      "pk": "t-intro", "title": "写引言", "parent": "论文写作 SOP", "parent_id": "",
       "due": "2026-11-04T11:50:00",
-      "count": 3, "duration": 75,             // estimated minutes ÷ 25（往上取整）
-      "completed": false, "dropped": false,   // 任务自己的标记
-      "effective_completed": false,           // OmniFocus 的有效状态（含父任务继承）
-      "effective_dropped": false,
-      "blocked": false, "rank": 0
+      "count": 3, "duration": 75,
+      "completed": false, "dropped": false,
+      "effective_completed": false, "effective_dropped": false,
+      "blocked": false, "rank": 0,
+      "tags": ["project/学术论文"]
     }],
-    "plans": {                                // 按天记：这一天说好多少 count、真排了哪几条
+    "plans": {
       "2026-11-04": {
         "count": 4, "at": "…",
         "items": [{"pk": "t-intro", "task_id": 12, "count": 2,
                    "start": "11:00", "duration": 50}]
       }
     }
+  }],
+
+  "pros": [{
+    "id": 1,
+    "title": "学术论文",
+    "stage": "running",                       // running / bottleneck
+    "file": "/Users/me/paper/outline.md",     // open + Enter 顺便打开的文件
+    "sop_op_id": 1,                           // 当前运行期 SOP op
+    "incubator_op_id": null,                  // 瓶颈期 incubator op
+    "op_ids": [1],
+    "status": "active",
+    "created_at": "…", "updated_at": "…"
   }]
 }
 ```
@@ -66,7 +92,10 @@ warden.py          接线                 task import 认项目、任务面板�
 
 1. **只认 primary key**：这个 pk 必须在 OmniFocus 的 `list` 里是一条
    `kind == "project_root"` 的行。不拿标题猜身份（猜错了就是「导入了一条叫项目名的
-   任务」，项目里那些任务永远进不来）。
+   任务」，项目里那些任务永远进不来）。**同时必须说明这是 `SOP` 还是 `incubator`
+   类型的 op**：写成 `task import sop` / `task import incubator`（或
+   `op import sop|incubator`）；没写就先入 `pending_op_type` 队列，由打断面板
+   逐条问，用户输入 `SOP` / `incubator` 后继续。
 2. **先算本周会产出多少条任务**：除了项目当前 active 的任务，导入还会查：
    - **被推迟（defer 在未来）、但没有放弃**的任务；
    - **重复任务**的 OmniFocus `repetitionRule`，展开本周的 occurrence；
@@ -86,8 +115,36 @@ warden.py          接线                 task import 认项目、任务面板�
    理由很简单：没有时长就算不出几个 count，而项目一旦被唤起就是满地 0 count 的任务。
 4. 时长齐了 → 写进**项目库**（`upsert`，同一个 OmniFocus 项目只留一条）；
    第二次导入同一个项目 = **刷新它的任务清单**，不重复建。每个任务的 `defer` /
-   `planned` / `repeat` 规则也会一起保存，之后 `project` 仍能重算本周账。
+   `planned` / `repeat` 规则、以及 OmniFocus `tags` 都会保存。
+   - op 的 `tags` 里出现 `project/<名称>` 时，自动查找/创建同名 `pro` 并双向绑定；
+   - 也可以显式 `pro <序号> op <op序号>` 手动绑定；
 5. 清单里的任务**一条都不进任务库**（不占 session、不上任务面板）。
+
+### 类型（`SOP` / `incubator`）与阶段（`running` / `bottleneck`）
+
+- 每个 op 必须有一个类型：`SOP` 或 `incubator`；
+- 每个 pro 必须有一个阶段：`running` 或 `bottleneck`；
+- **门控规则**：
+  - pro 在 `running` → 只允许普通 `SOP` op 进行；
+  - pro 在 `bottleneck` → 只允许对应的 `incubator` op 进行；
+  - 未关联任何 pro 的 op → 按自身类型放行；
+- `refresh` / 每日对账会主动检查 active op：发现 `op_type` 为空的，就再次把
+  `SOP / incubator` 提示顶到打断栏位，直到用户补全或输入 `skip`。
+
+### 标签 `project/...`
+
+OmniFocus 里给项目（或项目内任务）打 `project/<名称>` 标签，就能把 op 自动挂到
+同名 `pro`：
+
+```
+OmniFocus 项目「论文写作 SOP」  tags: project/学术论文
+        ↓ 导入 / refresh
+pro「学术论文」  stage=running  sop_op_id=1
+op「论文写作 SOP」 op_type=SOP   pro_id=1
+```
+
+嵌套标签也认（`omnifocus_tasks.py` 输出完整 tag path）；没有标签时才需要手动绑定。
+
 
 归组只认 OmniFocus 的 **`project_id`（项目 primary key）**，不再按项目名分组，
 所以两个同名项目也不会串。旧版清单没有 `project_id` 时才退回按 `project` 名字
@@ -164,10 +221,21 @@ warden.py          接线                 task import 认项目、任务面板�
 - 还在进行 → 算 `count_invested`（干了一半就是一半）；
 - 放弃了 → 0（放掉的那部分活还在项目里等着）。
 
-## `plan`：分资源 → 唤起任务 → 排 session
+## `plan`：两阶段分资源 → 唤起任务 → 排 session
 
 用户原话：*首先列出元数据，比如说总共多少空闲时间，同时，展示时间 / 25 的 count；
-然后询问每个 project 如何分配时间*。所以分三步：
+然后询问每个 project 如何分配时间*。
+
+`plan` 现在是**两个连续阶段**，每个阶段内部都是「元数据 → 分资源 → 排任务」三步：
+
+1. **SOP 阶段**：只展示当前允许的 `SOP` op（即所属 pro 处于 `running`）。
+   敲 `complete` 后先应用这一阶段的分配与排期；
+2. **incubator 阶段**：如果还有 incubator op，自动扣掉已占用的 session，
+   进入第二阶段，只展示 `incubator` op（即所属 pro 处于 `bottleneck`）。
+   再敲 `complete` 才真正结束这次 plan。
+
+如果没有任何 eligible 的 SOP op，会直接进入 incubator 阶段；如果 SOP 阶段
+已经用完所有空场，则跳过 incubator 阶段并明确提示。
 
 ### 1) 元数据（容量）
 
@@ -292,15 +360,31 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 
 | 命令 | 作用 |
 |---|---|
-| `task import`（剪贴板里是项目） | 进项目库；时长缺一条就整批拒绝 |
-| `project` | 列出项目（剩余 count / 进度 / 今天的分工） |
-| `project <序号>` | 一个项目的清单 + 今天排了什么 |
-| `project <序号> refresh` | 重新读 OmniFocus（时长又缺了 → 拒绝，清单保持旧的） |
-| `project refresh` | 所有项目都刷一遍 |
-| `project check` | 立刻做一次每日对账：新增自动拉；删除/修改按项目问「本地 / OmniFocus / 先不处理」 |
-| `project <序号> remove` | 从项目库撤掉（**OmniFocus 不动**；已经排进 session 的任务照旧） |
-| `plan` / `plan +1` | 开始分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天，`+1` = 明天 |
-| `task <序号> <count>` / `task <序号> clear` / `complete` / `q` | plan 里的那几句 |
+| `task import sop` / `task import incubator` | 导入 OmniFocus 项目（op）并说明类型；时长缺一条就整批拒绝 |
+| `op import sop\|incubator [链接]` | 同上，专门的 op 命令 |
+| `op` / `op <序号>` | 列出 op / 看某个 op 的详情与清单 |
+| `op <序号> sop\|incubator` | 修改 op 类型（refresh 发现缺类型时也走这个） |
+| `op <序号> pro <pro序号\|none>` | 关联 / 解绑真正项目 pro |
+| `op <序号> refresh` / `op <序号> remove` | 刷新 / 移除 op |
+| `pro` / `project` | 列出真正项目 pro 和 op 库 |
+| `pro create <名称> [file=<路径>] [stage=running\|bottleneck]` | 新建 / 更新真正项目 pro |
+| `pro <序号> -a` / `--advance [op <N>\|task import]` | 切换阶段（running ↔ bottleneck）并关联新的 op |
+| `pro <序号> file <路径\|clear>` | 关联 / 清空“`open` + Enter 顺便打开”的文件 |
+| `pro <序号> open` / `open pro <序号>` | 直接打开关联文件 |
+| `pro <序号> stage <running\|bottleneck>` | 直接设置阶段 |
+| `pro <序号> op <op序号>` | 关联已有 op |
+| `pro <序号> refresh` / `remove` | 刷新关联 op / 删除 pro |
+| `project <序号> refresh` / `remove` | 兼容 op 的旧命令；序号按 op 表解析 |
+| `project refresh` / `project check` | 所有 op 刷一遍 / 每日对账 |
+| `plan` / `plan +1` | 开始两阶段分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天 |
+| `task <序号> <count>` / `op <序号> <count>` / `clear` / `complete` / `q` | plan 里的那几句（`op` 与 `task` 同义，只是强调操作对象是 op） |
+
+### `open` + Enter 顺便打开项目文件
+
+- 直接敲 `open` + 回车：切换 `working/detail` 口径，并顺便打开相关 `pro` 的 `file`；
+- 查找优先级：当前 session 任务所属 pro → 当前选中任务所属 pro → 最近选中的 pro →
+  所有配置了文件的 active pro；
+- 文件路径用 `pro <序号> file <路径>` 设置，支持 `~`；macOS 用系统 `open` 打开。
 
 ## 边界
 

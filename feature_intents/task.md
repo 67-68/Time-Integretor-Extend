@@ -223,15 +223,23 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
 - **标记说明**：`🔁=重复子任务 🔁*=模板 📁=项目任务 🔗=OmniFocus 🎯=Focusmate ⏳=挂载中 ⏱=formatter ⚡=trigger 🔒=独占`；
   状态记号 `·=进行中 ✓=完成 ✗=放弃 ⤼=转移走`；
   备注缩写 `dur=分钟 cnt=进度 excl=独占 tag=标签 rep=重复 fmt=formatter trig=trigger note=备注`。
-- **命令指引**：`refresh 同步 · review 收尾 · inspect-due 查过期 · plan 排期 · project 项目 ·
-  sort 排序 · group 分组 · search 搜索 · open 翻页/展开 · close 折叠 · task 任务操作 · help --task 详情`。
+- **命令指引**：`refresh 同步 · review 收尾 · inspect-due 查过期 · plan 两阶段排期 · pro 真正项目 ·
+  op OmniFocus 项目 · sort 排序 · group 分组 · search 搜索 · open 翻页/展开 · close 折叠 ·
+  task 任务操作 · help --task 详情`。
   每个命令的介绍不超过 7 个字，不展开参数；参数细节看 `help --task`。
+
+## 三个模型：`task` / `op` / `pro`
+
+- `task` = 具体任务（本文件的主角），挂 session、执行、完成；
+- `op` = OmniFocus Project（`SOP` 或 `incubator` 两种类型），任务清单母体，不挂 session；
+- `pro` = 真正项目 Project（`running` / `bottleneck` 阶段），可关联一个打开文件。
 
 ## 项目任务入库
 
 项目导入 / 刷新 / 每日对账时，项目库里的**叶子任务**会幂等镜像进任务库：
 
 - `fields.project` = 项目名，`fields.project_id` = 项目序号，`fields.project_task` = OmniFocus 任务 pk；
+- 这里说的“项目”是 **op（OmniFocus Project）**；`plan` 的两阶段门控按关联 **pro** 的阶段判定；
 - `source.kind == "project"`；没有 session 时 `TaskStore.is_project_backlog()` 为真；
 - 这些镜像**只进任务视图**（可搜索、可 `group project`、可排序），不会进契约视图的任务面板；
 - `plan` 挑中同一条任务时**复用镜像**并挂 session，不会建重复任务；
@@ -268,9 +276,12 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task -m complete` / `task -m discard` | 不写序号 = 标记当前选中的任务；`-m` 与 `--mark`、后缀位置都等价 |
 | `task <序号> link <链接\|PK>` | 把本地任务关联到 OmniFocus（认 Markdown / 尖括号 / 裸链接 / 裸 PK） |
 | `task import [粘贴文本]` | **读剪贴板**（不给参数就是它）导入任务并自动关联 OmniFocus；OmniFocus 里**多选 ⌘C** 就是一次导入多条，`-a` / `-f` 等后缀对**整批**生效；如果 OmniFocus 里是重复任务，会先问要不要复制重复设置 |
-| `task import`（剪贴板里是**项目**） | 走另一条路：写进**项目库**（`data/projects.json`），任务清单只存不展示；项目里每条未完成任务都必须有「持续时间」，缺一条就**整批拒绝导入**。见 [`project.md`](project.md) |
-| `project [序号] [refresh\|remove]` | 看项目库 / 看清单 / 重新读 OmniFocus / 撤掉（见 [`project.md`](project.md)） |
-| `plan` | 把这一天剩下的空场切成 count 分给项目，`complete` 之后自动挑任务排进 session（见 [`project.md`](project.md)） |
+| `task import sop\|incubator`（剪贴板里是**项目**） | 写进 op 库（`data/projects.json`），并说明它是 `SOP` 还是 `incubator`；任务清单只存不展示；项目里每条未完成任务都必须有「持续时间」，缺一条就**整批拒绝导入**。见 [`project.md`](project.md) |
+| `op [序号] [sop\|incubator\|pro N\|refresh\|remove]` | 管理 OmniFocus Project (op)：列表 / 类型 / 关联 pro / 刷新 / 撤掉 |
+| `pro` / `project [序号] ...` | 管理真正项目 Project (pro)：列表 / 详情 / create / -a / file / open / stage / op |
+| `pro <序号> file <路径>` | 关联文件；敲 `open` + Enter 时顺便打开 |
+| `pro <序号> -a` / `--advance` | 快捷切换阶段（running ↔ bottleneck）并关联新的 op |
+| `plan` | 两阶段：先把空场分给 SOP op，`complete` 后进入 incubator op 阶段，再完成分配并排任务（见 [`project.md`](project.md)） |
 | `task import -st`（`--single-task`） | 只导入这一条：不查重复设置、不问、不建本地 `repeat` |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
 | `task <序号> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |

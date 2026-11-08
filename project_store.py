@@ -90,6 +90,16 @@ STATUS_DROPPED = "dropped"
 #: 项目本身的 status（只有 active / dropped）；任务的有效状态还包含 completed。
 STATUSES = (STATUS_ACTIVE, STATUS_DROPPED)
 
+#: OmniFocus Project (op) 的两种类型：普通 SOP 与瓶颈孵化 incubator。
+OP_TYPE_SOP = "SOP"
+OP_TYPE_INCUBATOR = "incubator"
+OP_TYPES = (OP_TYPE_SOP, OP_TYPE_INCUBATOR)
+
+#: 真正项目 Project (pro) 的两个阶段：running 允许 SOP op，bottleneck 允许 incubator op。
+STAGE_RUNNING = "running"
+STAGE_BOTTLENECK = "bottleneck"
+PRO_STAGES = (STAGE_RUNNING, STAGE_BOTTLENECK)
+
 #: 唤起出来的本地任务用这几个 ``fields`` 键指回项目。字段名就是界面上显示的名字
 #: （任务视图会把 fields 的每个键摊成一列），所以要能一眼看懂。
 PROJECT_FIELD = "project"             # 项目名
@@ -167,7 +177,8 @@ def _backup_before_write(path):
 
 
 def blank():
-    return {"version": VERSION, "next_id": 1, "projects": []}
+    return {"version": VERSION, "next_id": 1, "projects": [],
+            "next_pro_id": 1, "pros": []}
 
 
 def load(path=None):
@@ -202,6 +213,58 @@ def _as_int(value):
 
 def _one_line(text, limit=120):
     return " ".join(str(text or "").split())[:limit]
+
+
+def normalize_op_type(raw):
+    """把用户输入或已存的 op 类型归一成 ``"SOP"`` / ``"incubator"`` / ``None``。"""
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    if text in ("sop", "normal", "standard", "普通", "常规"):
+        return OP_TYPE_SOP
+    if text in ("incubator", "inc", "孵化", "孵化器"):
+        return OP_TYPE_INCUBATOR
+    return None
+
+
+def normalize_pro_stage(raw):
+    """把项目阶段归一成 ``"running"`` / ``"bottleneck"`` / ``None``。"""
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    if text in ("bottleneck", "bottle", "bn", "瓶颈", "瓶颈期"):
+        return STAGE_BOTTLENECK
+    if text in ("running", "run", "normal", "active", "进行中", "运行", "运行中", "正常"):
+        return STAGE_RUNNING
+    return None
+
+
+def extract_project_tags(tags):
+    """从标签列表提取 ``project/xxx`` 关联的真正项目名（保留顺序、去重）。"""
+    out = []
+    seen = set()
+    for raw in tags or ():
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        parts = [p.strip() for p in text.split("/") if p.strip()]
+        target = ""
+        for idx, part in enumerate(parts):
+            if part.lower() == "project" and idx + 1 < len(parts):
+                target = "/".join(parts[idx + 1:]).strip()
+                break
+        if not target and text.lower().startswith("project:"):
+            target = text.split(":", 1)[1].strip()
+        if target and target.casefold() not in seen:
+            seen.add(target.casefold())
+            out.append(target)
+    return out
+
+
+def extract_project_tag(tags):
+    """提取第一个 ``project/xxx`` 标签对应的真正项目名；没有返回空串。"""
+    found = extract_project_tags(tags)
+    return found[0] if found else ""
 
 
 # ---------------------------------------------------------------- 一周任务预算
@@ -818,6 +881,9 @@ def _norm_task(raw, rank=0):
         "blocked": bool(raw.get("blocked")),
         "rank": _as_int(raw.get("rank")) if raw.get("rank") is not None else int(rank),
     }
+    if raw.get("tags"):
+        out["tags"] = [str(x).strip() for x in (raw.get("tags") or ())
+                       if str(x).strip()]
     repeat = _norm_repeat_info(raw.get("repeat"))
     if repeat:
         out["repeat"] = repeat
@@ -865,15 +931,69 @@ def _norm_project(raw):
             plans[str(day)] = rec
     omnifocus = _norm_omnifocus(raw.get("omnifocus"))
     status = raw.get("status") if raw.get("status") in STATUSES else STATUS_ACTIVE
-    return {
+    op_type = normalize_op_type(raw.get("op_type") or raw.get("type"))
+    tags = []
+    for tag in raw.get("tags") or ():
+        t = str(tag).strip()
+        if t and t not in tags:
+            tags.append(t)
+    project_tag = _one_line(raw.get("project_tag")) or extract_project_tag(tags)
+    if not project_tag:
+        task_tags = []
+        for task in tasks:
+            if not task.get("completed") and not task.get("dropped"):
+                task_tags.extend(task.get("tags") or ())
+        project_tag = extract_project_tag(task_tags)
+    pro_id = _as_int(raw.get("pro_id"))
+    out = {
         "id": ident,
         "title": _one_line(raw.get("title") or (omnifocus or {}).get("title")) or ("项目 %d" % ident),
+        "op_type": op_type,
+        "pro_id": pro_id,
+        "project_tag": project_tag or "",
+        "tags": tags,
         "omnifocus": omnifocus,
         "status": status,
         "imported_at": raw.get("imported_at") or None,
         "synced_at": raw.get("synced_at") or None,
         "tasks": tasks,
         "plans": plans,
+    }
+    return out
+
+
+def _norm_pro(raw):
+    """一条真正项目 Project（``pro``）记录。"""
+    if not isinstance(raw, dict):
+        return None
+    ident = _as_int(raw.get("id"))
+    if ident is None or ident <= 0:
+        return None
+    title = _one_line(raw.get("title") or raw.get("name")) or ("项目 %d" % ident)
+    stage = normalize_pro_stage(raw.get("stage")) or STAGE_RUNNING
+    file_path = str(raw.get("file") or "").strip() or None
+    sop_op_id = _as_int(raw.get("sop_op_id"))
+    incubator_op_id = _as_int(raw.get("incubator_op_id"))
+    op_ids = []
+    for oid in raw.get("op_ids") or ():
+        val = _as_int(oid)
+        if val is not None and val > 0 and val not in op_ids:
+            op_ids.append(val)
+    for oid in (sop_op_id, incubator_op_id):
+        if oid is not None and oid > 0 and oid not in op_ids:
+            op_ids.append(oid)
+    status = raw.get("status") if raw.get("status") in STATUSES else STATUS_ACTIVE
+    return {
+        "id": ident,
+        "title": title,
+        "stage": stage,
+        "file": file_path,
+        "sop_op_id": sop_op_id,
+        "incubator_op_id": incubator_op_id,
+        "op_ids": op_ids,
+        "status": status,
+        "created_at": raw.get("created_at") or None,
+        "updated_at": raw.get("updated_at") or None,
     }
 
 
@@ -890,7 +1010,23 @@ def normalize(store):
     next_id = _as_int(store.get("next_id")) or 1
     while next_id in used:
         next_id += 1
-    return {"version": VERSION, "next_id": max(1, next_id), "projects": projects}
+    pros = []
+    for raw in store.get("pros") or []:
+        rec = _norm_pro(raw)
+        if rec is not None:
+            pros.append(rec)
+    pros.sort(key=lambda p: p["id"])
+    used_pro = {p["id"] for p in pros}
+    next_pro_id = _as_int(store.get("next_pro_id")) or 1
+    while next_pro_id in used_pro:
+        next_pro_id += 1
+    return {
+        "version": VERSION,
+        "next_id": max(1, next_id),
+        "projects": projects,
+        "next_pro_id": max(1, next_pro_id),
+        "pros": pros,
+    }
 
 
 # ---------------------------------------------------------------- 从 OmniFocus 造 payload
@@ -954,6 +1090,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
             done += 1
         title = _one_line(r.get("name")) or raw_pk or "?"
         minutes = ts.parse_minutes(r.get("estimated_minutes"))
+        row_tags = [str(x).strip() for x in (r.get("tags") or ()) if str(x).strip()]
         item = {
             "pk": raw_pk,
             "title": title,
@@ -971,6 +1108,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
             "effective_dropped": dropped,
             "blocked": bool(r.get("blocked")),
             "rank": len(members),
+            "tags": row_tags,
         }
         rep = _norm_repeat_info(infos.get(item["pk"]))
         if rep:
@@ -1003,12 +1141,30 @@ def project_payload(row, rows, repeat_infos=None, now=None):
                         % (len(depth_errors),
                            "、".join("「%s」" % item.get("title")
                                     for item in depth_errors[:6])))
+    all_tags = []
+    for tag in row.get("tags") or ():
+        t = str(tag).strip()
+        if t and t not in all_tags:
+            all_tags.append(t)
+    for item in members:
+        if statuses.get(item["pk"], STATUS_ACTIVE) == STATUS_DROPPED:
+            continue
+        for tag in item.get("tags") or ():
+            t = str(tag).strip()
+            if t and t not in all_tags:
+                all_tags.append(t)
+    project_tag = (_one_line(row.get("project_tag"))
+                   or extract_project_tag(all_tags))
+    op_type = normalize_op_type(row.get("op_type") or row.get("type"))
     # 重复任务本身是父任务时，重复规则仍在父任务上；weekly_yield 会按整套算一条。
     payload = {
         "kind": "project",
         "id": pk,
         "title": name,
         "url": project_url(pk),
+        "op_type": op_type,
+        "tags": all_tags,
+        "project_tag": project_tag,
         "tasks": members,
         "missing": missing,
         "depth_errors": depth_errors,
@@ -1387,6 +1543,68 @@ class ProjectStore(object):
                          "`task import` 导入项目" % raw)
 
     # -- 写 -----------------------------------------------------------
+    @staticmethod
+    def _ensure_pro_in_store(store, title, default_stage=STAGE_RUNNING, file_path=None):
+        """在内存 store 里按名字查找或新建真正项目 Project（``pro``）。"""
+        clean = _one_line(title)
+        if not clean:
+            return None
+        pros = store.setdefault("pros", [])
+        for pro in pros:
+            if (pro.get("status", STATUS_ACTIVE) == STATUS_ACTIVE
+                    and str(pro.get("title") or "").strip().casefold() == clean.casefold()):
+                if file_path is not None:
+                    pro["file"] = str(file_path).strip() or None
+                return pro
+        nid = int(store.get("next_pro_id") or 1)
+        used = {p["id"] for p in pros}
+        while nid in used:
+            nid += 1
+        stamp = _now()
+        pro = {
+            "id": nid,
+            "title": clean,
+            "stage": normalize_pro_stage(default_stage) or STAGE_RUNNING,
+            "file": str(file_path).strip() if file_path else None,
+            "sop_op_id": None,
+            "incubator_op_id": None,
+            "op_ids": [],
+            "status": STATUS_ACTIVE,
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        pros.append(pro)
+        pros.sort(key=lambda p: p["id"])
+        store["next_pro_id"] = max(int(store.get("next_pro_id") or 1), nid + 1)
+        return pro
+
+    @staticmethod
+    def _bind_op_and_pro_in_store(store, op, pro):
+        """在内存 store 里把 ``op`` 与 ``pro`` 双向绑定（并清掉旧 pro 上的重复引用）。"""
+        if op is None or pro is None:
+            return
+        old_id = _as_int(op.get("pro_id"))
+        if old_id is not None and old_id != pro["id"]:
+            for old_pro in store.get("pros") or ():
+                if old_pro.get("id") != old_id:
+                    continue
+                old_pro["op_ids"] = [x for x in (old_pro.get("op_ids") or ())
+                                     if x != op["id"]]
+                if old_pro.get("sop_op_id") == op["id"]:
+                    old_pro["sop_op_id"] = None
+                if old_pro.get("incubator_op_id") == op["id"]:
+                    old_pro["incubator_op_id"] = None
+                old_pro["updated_at"] = _now()
+        op["pro_id"] = pro["id"]
+        op_ids = pro.setdefault("op_ids", [])
+        if op["id"] not in op_ids:
+            op_ids.append(op["id"])
+        if normalize_op_type(op.get("op_type")) == OP_TYPE_INCUBATOR:
+            pro["incubator_op_id"] = op["id"]
+        else:
+            pro["sop_op_id"] = op["id"]
+        pro["updated_at"] = _now()
+
     def upsert(self, payload):
         """把一个项目 payload 写进库（**同一个 OmniFocus 项目只留一条**）。
 
@@ -1400,36 +1618,450 @@ class ProjectStore(object):
         tasks = [rec for rec in (_norm_task(item, rank=rank)
                                  for rank, item in enumerate(payload.get("tasks") or []))
                  if rec is not None]
+        op_type = normalize_op_type(payload.get("op_type") or payload.get("type"))
+        tags = []
+        for tag in payload.get("tags") or ():
+            t = str(tag).strip()
+            if t and t not in tags:
+                tags.append(t)
+        project_tag = _one_line(payload.get("project_tag")) or extract_project_tag(tags)
+        if not project_tag:
+            task_tags = []
+            for item in tasks:
+                if not item.get("completed") and not item.get("dropped"):
+                    task_tags.extend(item.get("tags") or ())
+            project_tag = extract_project_tag(task_tags)
+        pro_id = _as_int(payload.get("pro_id"))
         stamp = _now()
+        target = None
+        created = True
         for project in store["projects"]:
             if ((project.get("omnifocus") or {}).get("id") or "") == pk:
                 project["tasks"] = tasks
                 project["title"] = _one_line(payload.get("title")) or project["title"]
+                if op_type is not None:
+                    project["op_type"] = op_type
+                if tags:
+                    project["tags"] = tags
+                if project_tag:
+                    project["project_tag"] = project_tag
+                if pro_id is not None:
+                    project["pro_id"] = pro_id
                 project["synced_at"] = stamp
                 project["status"] = STATUS_ACTIVE
-                self.save(store)
-                return project, False
-        nid = int(store.get("next_id") or 1)
-        used = {p["id"] for p in store["projects"]}
-        while nid in used:
-            nid += 1
-        project = {
-            "id": nid,
-            "title": _one_line(payload.get("title")) or ("项目 %s" % pk),
-            "omnifocus": {"id": pk,
-                          "url": payload.get("url") or project_url(pk),
-                          "title": _one_line(payload.get("title"))},
-            "status": STATUS_ACTIVE,
-            "imported_at": stamp,
-            "synced_at": stamp,
-            "tasks": tasks,
-            "plans": {},
-        }
-        store["projects"].append(project)
-        store["projects"].sort(key=lambda p: p["id"])
-        store["next_id"] = max(int(store.get("next_id") or 1), nid + 1)
+                target = project
+                created = False
+                break
+        if target is None:
+            nid = int(store.get("next_id") or 1)
+            used = {p["id"] for p in store["projects"]}
+            while nid in used:
+                nid += 1
+            target = {
+                "id": nid,
+                "title": _one_line(payload.get("title")) or ("项目 %s" % pk),
+                "op_type": op_type,
+                "pro_id": pro_id,
+                "project_tag": project_tag or "",
+                "tags": tags,
+                "omnifocus": {"id": pk,
+                              "url": payload.get("url") or project_url(pk),
+                              "title": _one_line(payload.get("title"))},
+                "status": STATUS_ACTIVE,
+                "imported_at": stamp,
+                "synced_at": stamp,
+                "tasks": tasks,
+                "plans": {},
+            }
+            store["projects"].append(target)
+            store["projects"].sort(key=lambda p: p["id"])
+            store["next_id"] = max(int(store.get("next_id") or 1), nid + 1)
+        # 如果带了显式 pro_id 或 OmniFocus 标签 project/...，自动关联真正项目 pro。
+        linked_pro = None
+        if target.get("pro_id") is not None:
+            for pro in store.get("pros") or ():
+                if pro["id"] == int(target["pro_id"]):
+                    linked_pro = pro
+                    break
+        if linked_pro is None and target.get("project_tag"):
+            def_stage = (STAGE_BOTTLENECK
+                         if normalize_op_type(target.get("op_type")) == OP_TYPE_INCUBATOR
+                         else STAGE_RUNNING)
+            linked_pro = self._ensure_pro_in_store(
+                store, target["project_tag"], default_stage=def_stage)
+        if linked_pro is not None:
+            self._bind_op_and_pro_in_store(store, target, linked_pro)
         self.save(store)
-        return project, True
+        return target, created
+
+    def set_op_type(self, project_id, op_type):
+        """设置 OmniFocus Project（``op``）的类型：``SOP`` 或 ``incubator``。"""
+        norm_type = normalize_op_type(op_type)
+        if norm_type not in OP_TYPES:
+            raise ValueError("op 类型只能是 SOP 或 incubator；你给的是 %r" % op_type)
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            project["op_type"] = norm_type
+            project["synced_at"] = _now()
+            linked_pro = None
+            if project.get("pro_id") is not None:
+                for pro in store.get("pros") or ():
+                    if pro["id"] == int(project["pro_id"]):
+                        linked_pro = pro
+                        break
+            if linked_pro is None and project.get("project_tag"):
+                def_stage = (STAGE_BOTTLENECK if norm_type == OP_TYPE_INCUBATOR
+                             else STAGE_RUNNING)
+                linked_pro = self._ensure_pro_in_store(
+                    store, project["project_tag"], default_stage=def_stage)
+            if linked_pro is not None:
+                self._bind_op_and_pro_in_store(store, project, linked_pro)
+            self.save(store)
+            return project
+        raise ValueError("没有 OmniFocus 项目（op）%s" % project_id)
+
+    def untyped_ops(self):
+        """返回还没填类型（SOP / incubator）的 active op 列表。"""
+        return [p for p in self.active()
+                if normalize_op_type(p.get("op_type")) is None]
+
+    def ensure_tagged_pros(self):
+        """把所有带 ``project/...`` 标签但还没建/没绑 ``pro`` 的 op 自动补齐关联。"""
+        store = self.load()
+        changed = False
+        for project in store.get("projects") or ():
+            if project.get("status") != STATUS_ACTIVE:
+                continue
+            ptag = (_one_line(project.get("project_tag"))
+                    or extract_project_tag(project.get("tags") or ()))
+            if not ptag:
+                continue
+            if project.get("project_tag") != ptag:
+                project["project_tag"] = ptag
+                changed = True
+            pro = None
+            if project.get("pro_id") is not None:
+                pro = next((p for p in (store.get("pros") or ())
+                            if p["id"] == int(project["pro_id"])
+                            and p.get("status") == STATUS_ACTIVE), None)
+            if pro is None:
+                def_stage = (STAGE_BOTTLENECK
+                             if normalize_op_type(project.get("op_type")) == OP_TYPE_INCUBATOR
+                             else STAGE_RUNNING)
+                pro = self._ensure_pro_in_store(store, ptag, default_stage=def_stage)
+                self._bind_op_and_pro_in_store(store, project, pro)
+                changed = True
+        if changed:
+            self.save(store)
+        return changed
+
+    # -- 真正项目 Project (pro) 的读写 --------------------------------
+    def pros(self, status=None):
+        pros = self.load().get("pros") or []
+        if status is None:
+            return pros
+        return [p for p in pros if p.get("status") == status]
+
+    def active_pros(self):
+        return self.pros(status=STATUS_ACTIVE)
+
+    def pro_by_id(self, pro_id, store=None):
+        ident = _as_int(pro_id)
+        if ident is None:
+            return None
+        data = store if isinstance(store, dict) else self.load()
+        for pro in data.get("pros") or ():
+            if pro["id"] == ident:
+                return pro
+        return None
+
+    def pro_number_of(self, pro_id):
+        ident = _as_int(pro_id)
+        if ident is None:
+            return None
+        for index, pro in enumerate(self.active_pros(), 1):
+            if pro["id"] == ident:
+                return index
+        return None
+
+    def resolve_pro(self, token):
+        """把 #序号 / id:N / 项目名 解析成一条 active ``pro`` 记录。"""
+        raw = str(token or "").strip()
+        if not raw:
+            raise ValueError("要给项目（pro）序号或名称")
+        if raw.startswith("#"):
+            raw = raw[1:].strip()
+        pros = self.active_pros()
+        if not pros:
+            raise ValueError("还没有真正项目（pro）：可用 `pro create <名称>` 创建，"
+                             "或给 OmniFocus 项目加 `project/<名称>` 标签后导入。")
+        low = raw.lower()
+        if low.startswith("id:"):
+            hit = self.pro_by_id(low[3:])
+            if hit is None:
+                raise ValueError("没有 id 为 %r 的项目（pro）" % raw[3:])
+            return hit
+        ident = _as_int(raw)
+        if ident is not None and 1 <= ident <= len(pros):
+            return pros[ident - 1]
+        if ident is not None:
+            hit = self.pro_by_id(ident)
+            if hit is not None:
+                return hit
+        exact = [p for p in pros
+                 if str(p.get("title") or "").strip().casefold() == raw.casefold()]
+        if len(exact) == 1:
+            return exact[0]
+        fuzzy = [p for p in pros
+                 if raw.casefold() in str(p.get("title") or "").casefold()]
+        if len(fuzzy) == 1:
+            return fuzzy[0]
+        raise ValueError("项目（pro）序号 %r 不在范围里：#1–#%d（`pro` 看全部）"
+                         % (raw, len(pros)))
+
+    def create_pro(self, title, stage=STAGE_RUNNING, file=None, op_id=None):
+        """创建或更新一个真正项目 Project（``pro``），返回 ``(pro, created)``。"""
+        clean = _one_line(title)
+        if not clean:
+            raise ValueError("项目（pro）名称不能为空")
+        norm_stage = normalize_pro_stage(stage) if stage else STAGE_RUNNING
+        if norm_stage is None:
+            raise ValueError("项目阶段只能是 running 或 bottleneck；你给的是 %r" % stage)
+        store = self.load()
+        pros = store.setdefault("pros", [])
+        target = None
+        created = False
+        for pro in pros:
+            if (pro.get("status") == STATUS_ACTIVE
+                    and str(pro.get("title") or "").strip().casefold() == clean.casefold()):
+                target = pro
+                break
+        if target is None:
+            target = self._ensure_pro_in_store(
+                store, clean, default_stage=norm_stage, file_path=file)
+            created = True
+        else:
+            if stage:
+                target["stage"] = norm_stage
+            if file is not None:
+                target["file"] = str(file).strip() or None
+            target["updated_at"] = _now()
+        if op_id is not None:
+            op = next((p for p in (store.get("projects") or ())
+                       if p["id"] == int(op_id)), None)
+            if op is None:
+                raise ValueError("没有 id 为 %s 的 OmniFocus 项目（op）" % op_id)
+            self._bind_op_and_pro_in_store(store, op, target)
+        # 顺手把同名 project_tag 的 op 也绑过来
+        for op in store.get("projects") or ():
+            if (op.get("status") == STATUS_ACTIVE
+                    and str(op.get("project_tag") or "").strip().casefold() == clean.casefold()):
+                self._bind_op_and_pro_in_store(store, op, target)
+        self.save(store)
+        return target, created
+
+    def set_pro_file(self, pro_id, file_path):
+        """设置或清空项目（``pro``）关联的打开文件。"""
+        store = self.load()
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        clean = str(file_path or "").strip()
+        if clean.lower() in ("", "none", "clear", "off", "清空", "无"):
+            pro["file"] = None
+        else:
+            pro["file"] = clean
+        pro["updated_at"] = _now()
+        self.save(store)
+        return pro
+
+    def set_pro_stage(self, pro_id, stage):
+        """直接修改项目（``pro``）阶段：``running`` 或 ``bottleneck``。"""
+        norm_stage = normalize_pro_stage(stage)
+        if norm_stage not in PRO_STAGES:
+            raise ValueError("项目阶段只能是 running 或 bottleneck；你给的是 %r" % stage)
+        store = self.load()
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        pro["stage"] = norm_stage
+        pro["updated_at"] = _now()
+        self.save(store)
+        return pro
+
+    def link_op_to_pro(self, op_id, pro_id, op_type=None):
+        """把 ``op`` 关联到 ``pro``（可选顺带指定 ``op_type``）。"""
+        store = self.load()
+        op = next((p for p in (store.get("projects") or ())
+                   if p["id"] == int(op_id)), None)
+        if op is None:
+            raise ValueError("没有 OmniFocus 项目（op）%s" % op_id)
+        if pro_id is None:
+            old_pro_id = op.get("pro_id")
+            op["pro_id"] = None
+            if old_pro_id is not None:
+                old_pro = self.pro_by_id(old_pro_id, store=store)
+                if old_pro is not None:
+                    old_pro["op_ids"] = [x for x in (old_pro.get("op_ids") or ())
+                                         if x != op["id"]]
+                    if old_pro.get("sop_op_id") == op["id"]:
+                        old_pro["sop_op_id"] = None
+                    if old_pro.get("incubator_op_id") == op["id"]:
+                        old_pro["incubator_op_id"] = None
+            self.save(store)
+            return op, None
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        if op_type is not None:
+            norm_type = normalize_op_type(op_type)
+            if norm_type not in OP_TYPES:
+                raise ValueError("op 类型只能是 SOP 或 incubator；你给的是 %r" % op_type)
+            op["op_type"] = norm_type
+        self._bind_op_and_pro_in_store(store, op, pro)
+        self.save(store)
+        return op, pro
+
+    def advance_pro(self, pro_id, op_id, target_stage=None):
+        """切换 ``pro`` 的阶段（``running`` ↔ ``bottleneck``），并关联新的 ``op``。
+
+        - ``running`` → ``bottleneck``：新的 ``op`` 会被标成 ``incubator`` 并作为该项目的
+          ``incubator_op_id``；
+        - ``bottleneck`` → ``running``：新的 ``op`` 会被标成 ``SOP`` 并作为该项目的
+          ``sop_op_id``。
+        返回 ``(pro, op)``。
+        """
+        store = self.load()
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        op = next((p for p in (store.get("projects") or ())
+                   if p["id"] == int(op_id)), None)
+        if op is None:
+            raise ValueError("没有 OmniFocus 项目（op）%s" % op_id)
+        cur = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+        nxt = (normalize_pro_stage(target_stage)
+               if target_stage else
+               (STAGE_BOTTLENECK if cur == STAGE_RUNNING else STAGE_RUNNING))
+        req_type = OP_TYPE_INCUBATOR if nxt == STAGE_BOTTLENECK else OP_TYPE_SOP
+        op["op_type"] = req_type
+        pro["stage"] = nxt
+        self._bind_op_and_pro_in_store(store, op, pro)
+        self.save(store)
+        return pro, op
+
+    def remove_pro(self, pro_id):
+        store = self.load()
+        before = len(store.get("pros") or [])
+        store["pros"] = [p for p in (store.get("pros") or [])
+                         if p["id"] != int(pro_id)]
+        if len(store["pros"]) == before:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        for op in store.get("projects") or ():
+            if op.get("pro_id") == int(pro_id):
+                op["pro_id"] = None
+        self.save(store)
+        return before - len(store["pros"])
+
+    def pro_for_op(self, op_or_id, store=None):
+        """查找一个 ``op`` 关联的真正项目 ``pro``；没有关联返回 ``None``。"""
+        data = store if isinstance(store, dict) else self.load()
+        if isinstance(op_or_id, dict):
+            op = op_or_id
+        else:
+            op = next((p for p in (data.get("projects") or ())
+                       if p["id"] == _as_int(op_or_id)), None)
+        if not op:
+            return None
+        pid = _as_int(op.get("pro_id"))
+        if pid is not None:
+            for pro in data.get("pros") or ():
+                if pro["id"] == pid and pro.get("status") == STATUS_ACTIVE:
+                    return pro
+        ptag = str(op.get("project_tag") or "").strip()
+        if not ptag:
+            ptag = extract_project_tag(op.get("tags") or ())
+        if ptag:
+            for pro in data.get("pros") or ():
+                if (pro.get("status") == STATUS_ACTIVE
+                        and str(pro.get("title") or "").strip().casefold() == ptag.casefold()):
+                    return pro
+        # 反向查 pro.op_ids / sop_op_id / incubator_op_id
+        oid = _as_int(op.get("id"))
+        if oid is not None:
+            for pro in data.get("pros") or ():
+                if pro.get("status") != STATUS_ACTIVE:
+                    continue
+                if (oid == pro.get("sop_op_id")
+                        or oid == pro.get("incubator_op_id")
+                        or oid in (pro.get("op_ids") or ())):
+                    return pro
+        return None
+
+    def ops_for_pro(self, pro_or_id, store=None):
+        """返回关联到某个 ``pro`` 的全部 active ``op``。"""
+        data = store if isinstance(store, dict) else self.load()
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.pro_by_id(pro_or_id, store=data))
+        if not pro:
+            return []
+        out = []
+        for op in data.get("projects") or ():
+            if op.get("status") != STATUS_ACTIVE:
+                continue
+            linked = self.pro_for_op(op, store=data)
+            if linked is not None and linked["id"] == pro["id"]:
+                out.append(op)
+        return out
+
+    def is_op_allowed_by_pro(self, op, store=None):
+        """根据关联 ``pro`` 的阶段判断这个 ``op`` 当前是否允许进行。
+
+        - ``pro`` 在 ``bottleneck`` 阶段：只允许对应的 ``incubator`` op 进行；
+        - ``pro`` 在 ``running`` 阶段：只允许普通的 ``SOP`` op 进行；
+        - 未关联任何 ``pro`` 的 ``op``：按自身类型（SOP / incubator）放行。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        pro = self.pro_for_op(op, store=data)
+        eff_type = normalize_op_type((op or {}).get("op_type")) or OP_TYPE_SOP
+        if pro is None:
+            return True
+        stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+        if stage == STAGE_BOTTLENECK:
+            if eff_type != OP_TYPE_INCUBATOR:
+                return False
+            inc_id = _as_int(pro.get("incubator_op_id"))
+            if inc_id is not None and inc_id != op.get("id"):
+                inc_op = next((p for p in (data.get("projects") or ())
+                               if p["id"] == inc_id and p.get("status") == STATUS_ACTIVE),
+                              None)
+                if inc_op is not None:
+                    return False
+            return True
+        # stage == STAGE_RUNNING
+        return eff_type == OP_TYPE_SOP
+
+    def eligible_ops(self, op_type=OP_TYPE_SOP):
+        """返回当前阶段允许参与 ``plan`` 的指定类型（``SOP`` 或 ``incubator``）的 active op。"""
+        want = normalize_op_type(op_type) or OP_TYPE_SOP
+        store = self.load()
+        out = []
+        for op in store.get("projects") or ():
+            if op.get("status") != STATUS_ACTIVE:
+                continue
+            raw_type = normalize_op_type(op.get("op_type"))
+            # 类型必须由用户说明；未说明的 op 不进入任何 plan 阶段，
+            # 等 refresh / 导入提示补全后再排。
+            if raw_type is None:
+                continue
+            if raw_type != want:
+                continue
+            if not self.is_op_allowed_by_pro(op, store=store):
+                continue
+            out.append(op)
+        return out
 
     def set_tasks(self, project_id, tasks):
         store = self.load()
@@ -1450,6 +2082,13 @@ class ProjectStore(object):
         store["projects"] = [p for p in store["projects"] if p["id"] != int(project_id)]
         if len(store["projects"]) == before:
             raise ValueError("没有项目 %s" % project_id)
+        for pro in store.get("pros") or ():
+            pro["op_ids"] = [x for x in (pro.get("op_ids") or ())
+                             if x != int(project_id)]
+            if pro.get("sop_op_id") == int(project_id):
+                pro["sop_op_id"] = None
+            if pro.get("incubator_op_id") == int(project_id):
+                pro["incubator_op_id"] = None
         self.save(store)
         return before - len(store["projects"])
 
@@ -1567,16 +2206,27 @@ class ProjectStore(object):
     def preview(self, day=None, task_store=None):
         """项目预览表格的每一行（``task <序号> <count>`` 里的序号 = 这里的 #）。"""
         rows = []
+        store = self.load()
         invested_all = invested_by_project(task_store) if task_store else {}
-        for index, project in enumerate(self.active(), 1):
+        active_ops = [p for p in (store.get("projects") or ())
+                      if p.get("status") == STATUS_ACTIVE]
+        for index, project in enumerate(active_ops, 1):
             mine = invested_all.get(project["id"]) or {}
             stat = stats(project, task_store, mine)
             plan = plan_of(project, day)
             week = weekly_yield(project.get("tasks") or [])
+            pro = self.pro_for_op(project, store=store)
+            allowed = self.is_op_allowed_by_pro(project, store=store)
             rows.append({
                 "number": index,
                 "id": project["id"],
                 "title": project["title"],
+                "op_type": normalize_op_type(project.get("op_type")),
+                "pro": pro,
+                "pro_id": pro["id"] if pro else None,
+                "pro_title": pro.get("title") if pro else "",
+                "pro_stage": pro.get("stage") if pro else "",
+                "allowed": allowed,
                 "pk": (project.get("omnifocus") or {}).get("id") or "",
                 "total": stat["total"],
                 "done": stat["done"],
@@ -1593,3 +2243,32 @@ class ProjectStore(object):
                 "plan": plan,
             })
         return rows
+
+    def pro_preview(self, day=None, task_store=None):
+        """真正项目 Project（``pro``）预览行。"""
+        store = self.load()
+        pros = [p for p in (store.get("pros") or ())
+                if p.get("status") == STATUS_ACTIVE]
+        ops_by_id = {p["id"]: p for p in (store.get("projects") or ())
+                     if p.get("status") == STATUS_ACTIVE}
+        out = []
+        for index, pro in enumerate(pros, 1):
+            linked_ops = self.ops_for_pro(pro, store=store)
+            sop_ops = [op for op in linked_ops
+                       if (normalize_op_type(op.get("op_type")) or OP_TYPE_SOP) == OP_TYPE_SOP]
+            inc_ops = [op for op in linked_ops
+                       if normalize_op_type(op.get("op_type")) == OP_TYPE_INCUBATOR]
+            sop_op = ops_by_id.get(pro.get("sop_op_id")) or (sop_ops[-1] if sop_ops else None)
+            inc_op = ops_by_id.get(pro.get("incubator_op_id")) or (inc_ops[-1] if inc_ops else None)
+            out.append({
+                "number": index,
+                "id": pro["id"],
+                "title": pro.get("title") or ("项目 %d" % pro["id"]),
+                "stage": normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING,
+                "file": pro.get("file"),
+                "sop_op": sop_op,
+                "incubator_op": inc_op,
+                "ops": linked_ops,
+                "pro": pro,
+            })
+        return out

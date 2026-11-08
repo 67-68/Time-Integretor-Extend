@@ -372,6 +372,15 @@ OMNIJS_SOURCE = r'''
     try { if (t.dropDate || t.effectiveDropDate) return true; } catch (e) {}
     return statusHas(t, "dropped");
   };
+  const tagPath = g => {
+    const names = [];
+    let x = g;
+    while (x) {
+      if (x.name) names.unshift(x.name);
+      x = x.parent;
+    }
+    return names.join("/");
+  };
   const rows = [];
   for (const t of all) {
     const inbox = inInboxTree(t);
@@ -386,7 +395,7 @@ OMNIJS_SOURCE = r'''
       parent: parent ? parent.name : "",
       parent_id: parent ? idOf(parent) : "",
       in_inbox: inbox,
-      tags: Array.from(t.tags).map(g => g.name),
+      tags: Array.from(t.tags).map(tagPath),
       tag_ids: Array.from(t.tags).map(g => idOf(g)),
       flagged: !!t.flagged,
       completed: !!t.completed,

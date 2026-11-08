@@ -114,6 +114,9 @@ class FakeBridge(object):
 def mkwarden(with_old=True):
     console = Console(file=io.StringIO(), width=200, force_terminal=False)
     wd = w.Warden(console, FakeBridge(), no_clear=True, offline=False)
+    # 固定“现在”在 21:00：这套用例的旧 session 是 22:15，必须仍然属于“未开始”，
+    # 否则用户明确要求的「已开始 session 不取消」保护会让用例在深夜假红。
+    wd.clock_now = datetime.datetime.combine(TODAY, datetime.time(21, 0))
     wd.rows_source = "bridge"
     wd.rows_at = time.time()
     h, m = 22, 15

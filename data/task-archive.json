@@ -2006,6 +2006,67 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-08T23:06:01",
+      "task_id": 155,
+      "fields": {
+        "title": "historyHw",
+        "due": "2026-11-08T23:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 10,
+        "date": "2026-11-08",
+        "start": "22:15",
+        "end": "23:05",
+        "duration": 50,
+        "focusmate_session_id": "0b405643-0308-416c-9acf-688749380993"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 50,
+      "status_at": "2026-11-08T23:06:01",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "e5059ddb-c495-4ad2-8471-8f80bae66849",
+        "title": "historyHw",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-08T23:10:48",
+      "task_id": 155,
+      "fields": {
+        "title": "historyHw",
+        "due": "2026-11-08T23:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 10,
+        "date": "2026-11-08",
+        "start": "22:15",
+        "end": "23:05",
+        "duration": 50,
+        "focusmate_session_id": "0b405643-0308-416c-9acf-688749380993"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "e5059ddb-c495-4ad2-8471-8f80bae66849",
+        "title": "historyHw",
+        "description": "",
+        "completed_at": "2026-11-08T15:05:20.986033+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "0b405643-0308-416c-9acf-688749380993"
+          }
+        ]
+      }
     }
   ]
 }

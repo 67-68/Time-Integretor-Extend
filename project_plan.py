@@ -46,7 +46,7 @@ COMPLETE_TOKENS = ("complete", "done", "ok", "go", "完成", "结束", "下一�
 CANCEL_TOKENS = ("q", "quit", "cancel", "exit", "取消", "放弃")
 HELP_TOKENS = ("?", "help", "h", "帮助")
 #: plan 进行中还认得的手敲命令（其余一律当「听不懂」）。
-DISPATCH_TOKENS = ("refresh", "project", "day", "task", "plan")
+DISPATCH_TOKENS = ("refresh", "project", "pro", "op", "day", "task", "plan")
 
 
 # ---------------------------------------------------------------- 容量
@@ -390,14 +390,21 @@ class Allocator(object):
     超预算（今天分不出这么多 count）**整条命令都不执行**：报错、状态不变。
     """
 
-    def __init__(self, day, projects, slots, task_store=None, hooks=None):
+    def __init__(self, day, projects, slots, task_store=None, hooks=None,
+                 stage=pj.OP_TYPE_SOP, incubator_projects=None, pro_map=None):
         self.day = day
+        self.stage = (pj.OP_TYPE_INCUBATOR
+                      if pj.normalize_op_type(stage) == pj.OP_TYPE_INCUBATOR
+                      else pj.OP_TYPE_SOP)
         self.projects = list(projects or [])
+        self.incubator_projects = list(incubator_projects or [])
+        self.pro_map = dict(pro_map or {})
         self.slots = [dict(s) for s in slots or []]
         self.task_store = task_store
         self.hooks = hooks or {}
         self.allocations = []          # [{"project_id","count"}]，顺序 = 排的顺序
         self.closed = False
+        self.had_sop_stage = False
         self.notes = []
         # 和 Review / NostartReview 对齐的字段名（画帧缓存通用）
         self.pending_task = None
@@ -438,26 +445,34 @@ class Allocator(object):
 
     # -- 给界面用的文字 -----------------------------------------------
     def headline(self):
-        return "%s 资源分配（%d 个空场 = %d count）" % (
+        stage_label = ("incubator 资源分配"
+                       if self.stage == pj.OP_TYPE_INCUBATOR
+                       else "SOP 资源分配")
+        return "%s %s（%d 个空场 = %d count）" % (
             self.day.isoformat() if hasattr(self.day, "isoformat") else self.day,
-            self.cap()["sessions"], self.cap()["counts"])
+            stage_label, self.cap()["sessions"], self.cap()["counts"])
 
     def options(self):
         return ["task <序号> <count>", "task <序号> clear", "complete", "q"]
 
     def stage_hint(self):
-        return ("task 1 4 = 项目 #1 分 4 count · task 1 clear = 清空 · "
-                "complete = 开始排任务 · q = 放弃（已分配 %d / %d count）"
-                % (self.allocated(), self.cap()["counts"]))
+        next_note = ("（complete 后进入 incubator 阶段）"
+                     if (self.stage == pj.OP_TYPE_SOP and self.incubator_projects)
+                     else "")
+        return ("task 1 4 = #%s #1 分 4 count · task 1 clear = 清空 · "
+                "complete = 开始排任务%s · q = 放弃（已分配 %d / %d count）"
+                % (self.stage, next_note, self.allocated(), self.cap()["counts"]))
 
     def lines(self):
         """面板正文：[(文本, 样式)]。"""
         cap = self.cap()
-        out = [("🗂 %s" % self.headline(), "bold cyan"),
+        icon = "🌱" if self.stage == pj.OP_TYPE_INCUBATOR else "🗂"
+        out = [("%s %s" % (icon, self.headline()), "bold cyan"),
+               ("  当前阶段：%s（只处理类型为 %s 的 op）" % (self.stage, self.stage), "dim"),
                ("  空闲 %s" % capacity_text(cap), "dim"),
                ("  空场 %s" % slots_text(self.slots), "dim")]
         if not self.projects:
-            out.append(("  （项目库是空的：先 `task import` 一个 OmniFocus 项目）",
+            out.append(("  （当前阶段没有可分配的 %s op）" % self.stage,
                         "yellow"))
         invested_all = {}
         if self.task_store is not None:
@@ -466,7 +481,12 @@ class Allocator(object):
             plan = pj.plan_of(project, self.day)
             stat = pj.stats(project, self.task_store, invested_all.get(project["id"]) or {})
             got = self.allocation_of(project["id"])
-            bits = ["剩余 %d count" % stat["remaining"],
+            op_kind = pj.normalize_op_type(project.get("op_type")) or pj.OP_TYPE_SOP
+            pro = self.pro_map.get(project["id"])
+            pro_txt = (" · pro:%s(%s)" % (pro.get("title"), pro.get("stage"))
+                       if pro else "")
+            bits = ["[%s%s]" % (op_kind, pro_txt),
+                    "剩余 %d count" % stat["remaining"],
                     "进度 %s" % stat["progress_text"]]
             if plan and plan.get("count"):
                 bits.append("今天说好 %d count、已排 %d"
@@ -490,18 +510,20 @@ class Allocator(object):
         parts = raw.split()
         head = parts[0].lower()
         if head in HELP_TOKENS:
-            self.say("task <序号> <count>：给这个项目分几个 count（1 count = 25 分钟）；"
-                     "再敲一次是覆盖。", "info")
+            self.say("task <序号> <count>（或 op <序号> <count>）：给这个 %s op 分几个 count"
+                     "（1 count = 25 分钟）；再敲一次是覆盖。" % self.stage, "info")
             self.say("task <序号> clear：清空这个项目的分配；"
                      "task <序号>：只看清单。", "info")
-            self.say("complete：分配完了，开始挑任务、排进 session；q：放弃这次 plan。",
-                     "info")
+            self.say("complete：分配完了，开始挑任务、排进 session%s；q：放弃这次 plan。"
+                     % ("（SOP 排完后进入 incubator 阶段）"
+                        if (self.stage == pj.OP_TYPE_SOP and self.incubator_projects)
+                        else ""), "info")
             return {"action": "handled"}
         if head in COMPLETE_TOKENS:
             return self._complete()
         if head in CANCEL_TOKENS:
             return self._cancel()
-        if head == "task":
+        if head in ("task", "op"):
             return self._task_command(parts[1:])
         if head == "clear":
             return self._task_command(["--all", "clear"])
@@ -628,6 +650,16 @@ class Allocator(object):
     # -- 收尾 ---------------------------------------------------------
     def _complete(self):
         if not self.allocations:
+            if self.stage == pj.OP_TYPE_SOP and self.incubator_projects:
+                summary = {"placements": 0, "counts": 0, "used_slot_indices": set()}
+                self.say("🗂 SOP 阶段分配 0 count，进入 incubator 时间安排阶段。", "info")
+                return self._enter_incubator_stage(summary, [])
+            if self.stage == pj.OP_TYPE_INCUBATOR and self.had_sop_stage:
+                self.say("🌱 incubator 阶段分配 0 count，本次 plan 完成。", "ok")
+                self.closed = True
+                return {"action": "close", "done": "complete",
+                        "summary": {"placements": 0, "counts": 0},
+                        "allocations": []}
             self.say("还没有任何分配 —— 先 `task 1 4`，或者 `q` 放弃这次 plan。", "warn")
             return {"action": "handled"}
         allocs = []
@@ -638,10 +670,41 @@ class Allocator(object):
                 continue
             allocs.append({"project_id": project["id"], "project": project,
                            "count": int(alloc.get("count") or 0)})
-        summary = self._hook("apply", self, allocs)
+        summary = self._hook("apply", self, allocs) or {}
+        if self.stage == pj.OP_TYPE_SOP and self.incubator_projects:
+            return self._enter_incubator_stage(summary, allocs)
         self.closed = True
         return {"action": "close", "done": "complete",
-                "summary": summary or {}, "allocations": allocs}
+                "summary": summary, "allocations": allocs}
+
+    def _enter_incubator_stage(self, sop_summary, sop_allocs):
+        """SOP 阶段排完后，无缝切入 incubator 时间安排阶段。"""
+        next_slots = self._hook("remaining_slots", self, sop_summary)
+        if next_slots is None:
+            used_idx = set((sop_summary or {}).get("used_slot_indices") or ())
+            next_slots = [dict(s) for s in self.slots
+                          if s.get("index") not in used_idx]
+        if not next_slots:
+            self.say("🌱 SOP 阶段已用完今天全部空场（剩余 0 场），跳过 incubator 时间安排阶段。",
+                     "info")
+            self.closed = True
+            return {"action": "close", "done": "complete",
+                    "summary": sop_summary or {}, "allocations": sop_allocs}
+        self.stage = pj.OP_TYPE_INCUBATOR
+        self.projects = list(self.incubator_projects)
+        self.incubator_projects = []
+        self.slots = [dict(s) for s in next_slots]
+        self.allocations = []
+        self.had_sop_stage = True
+        cap = self.cap()
+        self.say("🌱 进入 incubator 时间安排阶段：%d 个 incubator op、剩余 %d 场空 session "
+                 "= %d count 可以分（%d 分钟；1 count = %d 分钟）"
+                 % (len(self.projects), cap["sessions"], cap["counts"],
+                    cap["minutes"], MINUTES_PER_COUNT), "cmd")
+        self.say("   `task <序号> <count>` 分给 incubator op、`complete` 开始排任务、`q` 结束。",
+                 "info")
+        return {"action": "handled", "stage": pj.OP_TYPE_INCUBATOR,
+                "summary": sop_summary or {}, "allocations": sop_allocs}
 
     def _cancel(self):
         self.closed = True

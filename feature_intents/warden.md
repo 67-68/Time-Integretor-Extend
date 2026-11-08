@@ -131,9 +131,15 @@ open detail         计划 + 实际全部内容（原来的完整契约表）
 help / quit
 review [HH:MM|日期T时刻]   手动开始一场 session 的收尾（逐个问没做完的任务）
 inspect-due [分钟] [--all] 主动 inspect 过期没做完的任务（A~E，另有 G 延长排期）
-project [序号] [refresh|remove]  项目库：列表 / 清单 / 重读 OmniFocus / 撤掉
-plan [天数]         把这一天剩下的空场切成 count 分给项目，complete 之后自动排任务
-                    （不带参数 = 今天；plan +1 = 明天；今天没 plan 会在状态框里提醒）
+op [序号] [sop|incubator|pro N|refresh|remove]   OmniFocus Project (op)：列表 / 类型 / 关联 pro / 刷新 / 撤掉
+op import sop|incubator [链接]                   导入 op 时必须说明类型（SOP / incubator）
+pro / project       真正项目 Project (pro)：列表 / 详情 / create / -a / file / open / stage / op
+pro 1 -a            快捷切换阶段（running ↔ bottleneck），并关联新的 incubator op
+                    （可直接跟 task import / op N；不跟则进入问答）
+pro 1 file <路径>   关联“open + Enter 顺便打开”的文件
+open                切口径 + 顺便打开相关 pro 的文件
+plan [天数]         两阶段分配：先 SOP op，complete 后进入 incubator op；
+                    不带参数 = 今天；plan +1 = 明天；今天没 plan 会在状态框里提醒
 ```
 
 `sync` 不重写日历逻辑：薄封装 `download_calendar.py populate`（`--days` 等参数原样透传），
@@ -250,10 +256,10 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
-| 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `project` / `open working|detail` |
+| 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表（op 类型/pro 阶段）** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `pro` / `op` / `open` |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
-| 4 | 任务 | 任务表（默认常驻：`序号` / `标记` / `title` / `project` / `状态` / `session` / `截止` / `备注`；其余列默认折叠；表下灰色小字解释标记/缩写并给一行命令指引）+ 完成归档 | `task ...` + `open <页码|任务表头>` / `close <任务表头>` + `sort` / `group` / `search` + `help --task` + `review` + `inspect-due` + `plan` / `project` |
+| 4 | 任务 | 任务表（默认常驻：`序号` / `标记` / `title` / `project` / `状态` / `session` / `截止` / `备注`；其余列默认折叠；表下灰色小字解释标记/缩写并给一行命令指引）+ 完成归档 | `task ...` + `open <页码|任务表头>` / `close <任务表头>` + `sort` / `group` / `search` + `help --task` + `review` + `inspect-due` + `plan` / `pro` / `op` |
 | 5 | 设置 | 全部设置项（id / 当前值 / 默认值 / 解释） | `settings`（重画）/ `set <id> <value>`（任何视图都能敲） |
 | 6 | 琐事 | **没有 session 时自动接管**：只显示绑定的「琐事 Project」里一条未完成任务 + m/c/q 提示 | `m` 完成 / `c` 换一条 / `q` 回进入前的视图（并压制到下一场 session） |
 
@@ -520,15 +526,26 @@ inspect-due --all    不按截止时间筛（没做完的都看）
 A–E 的语义不变。结束时不写 postsession 状态文件（没有那一场可以翻篇）。
 过期任务同时会出现在状态框的警告里，提示你敲这条命令。
 
-## 项目（OmniFocus Project）：母体 → 当天的任务
+## 三个模型：`pro` / `op` / `task`
 
-`data/projects.json`（`project_store.py`）里存的是**活的母体**：一个 OmniFocus 项目
-的任务清单 + 每天分了多少 count。它**永远不挂 session**（和重复任务本体一个规矩），
-真正挂 session 的是 `plan` 唤起出来的本地任务。`plan` 的分资源问答和收尾 / 到点没
-开始共用同一个打断栏位 —— **一次只问一件事**（`planning` 开着时那两个都不会弹）。
+- **`task`**：具体任务，挂 session、执行、完成的最小单位。
+- **`op`**：OmniFocus Project，任务清单母体；类型只能是 `SOP` 或 `incubator`。
+  导入时必须说明（`task import sop|incubator` / `op import ...`）；refresh 发现缺失
+  会弹出补全提示。它**永远不挂 session**，由 `plan` 唤起本地 task。
+- **`pro`**：真正项目 Project，阶段 `running` / `bottleneck`，可关联一个文件：
+  - `running` 只允许 SOP op 进行；
+  - `bottleneck` 只允许对应的 incubator op 进行；
+  - `pro <序号> -a` 快捷切换阶段并关联新的 op；
+  - `pro <序号> file <路径>` 之后，敲 `open` + Enter 会顺便打开该文件。
+- op 用 OmniFocus 标签 `project/<pro名称>` 自动关联 pro；也可手动
+  `pro <序号> op <op序号>` / `op <序号> pro <pro序号>`。
 
-整条链路（导入 → 时长门槛 → 项目表 → `plan` → 挑任务 → 排 session → 「部分完成不勾
-OmniFocus」）见 [`project.md`](./project.md)。
+`plan` 是**两阶段**：先 SOP op，`complete` 后自动扣掉已占 session 并进入
+incubator op 阶段，再 `complete` 收尾。`plan` 的分资源问答和收尾 / 到点没开始共用
+同一个打断栏位 —— **一次只问一件事**。
+
+整条链路（导入类型 → 时长门槛 → tag 关联 → 项目表 → 两阶段 plan → 挑任务 → 排
+session → 「部分完成不勾 OmniFocus」）见 [`project.md`](./project.md)。
 
 ## OmniFocus 联动（只单向）
 

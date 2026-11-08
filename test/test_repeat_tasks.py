@@ -133,6 +133,9 @@ class FakeBridge(object):
 def mkwarden(offline=True):
     console = Console(file=io.StringIO(), width=140, force_terminal=False)
     wd = w.Warden(console, FakeBridge(), no_clear=True, offline=offline)
+    # 固定“现在”在 21:00：今天的 22:15 场必须仍是未来场，否则「已开始 session
+    # 不再自动挂重复任务」的保护会在 22:15 之后让这套用例假红。
+    wd.clock_now = datetime.datetime.combine(TODAY, datetime.time(21, 0))
     wd.reload_entries()
     return wd
 
