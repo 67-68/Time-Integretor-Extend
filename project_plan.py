@@ -95,15 +95,17 @@ def slots_text(slots, limit=8):
 
 
 def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=None):
-    """把「每个项目多少 count」摊成具体的任务（每条还带要几个 count）。
+    """把「每个项目多少 count」摊成具体的任务（每条还带要几个 count / 分钟）。
 
     ``allocations``：``[{"project_id": 1, "count": 4}, ...]``（**顺序就是排的顺序**）；
     ``invested_map``：``{项目序号: {项目任务 pk: 已投入 count}}``
     （就是 ``project_store.invested_by_project(task_store)`` 那份账）。
     返回 ``(items, notes)``：
-    ``items`` = ``[{"project_id", "project", "pk", "title", "count", "total"}]``。
-    项目里的任务不够填满分到的 count 时，少排一点并记一条 note（不报错 —— 那是
-    项目清单的事实，不是命令错了）。
+    ``items`` = ``[{"project_id", "project", "pk", "title", "count", ...}]``。
+
+    短任务（实际时长 < 25 分钟）按**实际分钟**吃预算：分 1 count（25 分钟）
+    可以塞下两条 10 分钟任务，而不是一条各占 1 count。项目里的任务不够填满
+    分到的 count 时，少排一点并记一条 note（不报错 —— 那是项目清单的事实）。
     """
     invested_map = invested_map or {}
     exclude_pks = exclude_pks or {}
@@ -114,38 +116,82 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
         need = int(alloc.get("count") or 0)
         if need <= 0:
             continue
+        budget = need * MINUTES_PER_COUNT
         took = 0
         excluded = (exclude_pks.get(pid) or exclude_pks.get(str(pid))
                     if isinstance(exclude_pks, dict) else exclude_pks)
         for item in pj.remaining_tasks(project, invested_map.get(pid) or {},
                                        now=now, exclude_pks=excluded):
-            if need <= 0:
+            if budget <= 0:
                 break
-            take = min(int(item.get("remaining") or 0), need)
-            if take <= 0:
-                continue
+            minutes = int(item.get("minutes") or 0)
+            if not minutes and int(item.get("remaining") or 0):
+                minutes = int(item.get("remaining") or 0) * MINUTES_PER_COUNT
             rec = {"project_id": pid,
                    "project": project,
                    "pk": item["pk"],
                    "title": item.get("title") or item["pk"],
-                   "count": take,
+                   "count": int(item.get("count") or 0),
                    "total": int(item.get("count") or 0),
                    "remaining": int(item.get("remaining") or 0)}
             if item.get("children"):
                 # 父任务壳：真正的 session 内容是不可拆的子任务。这里把整套
                 # 剩余子任务交给 schedule，由它按每场的实际分钟数选子集。
+                take = min(int(item.get("remaining") or 0), need)
+                if take <= 0:
+                    continue
                 rec.update({
+                    "count": take,
                     "shell": True,
                     "children": [dict(child) for child in item.get("children") or []],
                     "duration": int(item.get("duration") or 0),
-                    "budget_minutes": take * MINUTES_PER_COUNT,
+                    "budget_minutes": min(budget, take * MINUTES_PER_COUNT),
                 })
+                out.append(rec)
+                need -= take
+                budget -= take * MINUTES_PER_COUNT
+                took += take
+                continue
+            if 0 < minutes < MINUTES_PER_COUNT:
+                # 短任务：按实际分钟吃预算，任务不可拆。标题里的 count 仍保留
+                # ceil(duration/25)（如 10 分钟 = 1 count），但 schedule 会按
+                # 实际分钟把几条短任务叠进同一场。
+                if minutes > budget:
+                    continue
+                rec.update({
+                    "count": 1,
+                    "minutes": minutes,
+                    "small": True,
+                    "budget_minutes": minutes,
+                })
+                out.append(rec)
+                budget -= minutes
+                took += 1
+                continue
+            take = min(int(item.get("remaining") or 0), need,
+                       max(0, budget // MINUTES_PER_COUNT))
+            if take <= 0:
+                continue
+            rec.update({
+                "count": take,
+                "minutes": minutes if take == int(item.get("remaining") or 0) else take * MINUTES_PER_COUNT,
+            })
             out.append(rec)
             need -= take
+            budget -= take * MINUTES_PER_COUNT
             took += take
         if need > 0:
-            notes.append("「%s」的任务只剩 %d count，少排 %d（清单里没有更多可干的了）"
-                         % (project.get("title") or pid, took, need))
+            used_count = ts.minutes_to_count(need * MINUTES_PER_COUNT - budget) or 0
+            if budget < MINUTES_PER_COUNT:
+                notes.append("「%s」分到 %d count = %d 分钟；短任务按实际分钟只塞下 "
+                             "%d 分钟（%d count），还剩 %d 分钟对不齐 25 分钟的 count 格子。"
+                             % (project.get("title") or pid, need,
+                                need * MINUTES_PER_COUNT,
+                                need * MINUTES_PER_COUNT - budget, used_count, budget))
+            else:
+                notes.append("「%s」的任务只剩 %d count，少排 %d（清单里没有更多可干的了）"
+                             % (project.get("title") or pid, used_count,
+                                ts.minutes_to_count(budget) or 0))
     return out, notes
 
 
@@ -297,6 +343,69 @@ def _schedule_children(items, slots, placements, unscheduled, notes):
             if int(slot.get("used") or 0) < int(slot.get("counts") or 0)]
 
 
+def _schedule_small_items(items, slots, placements, unscheduled, notes):
+    """把短任务（实际时长 < 25 分钟）按分钟叠进空场次。
+
+    短任务的 count 是 ``ceil(duration/25)``（10 分钟也记 1 count），但它们的
+    真实占用是 10 分钟。这里不参加后面的「一场一个任务」匹配，而是像子任务
+    一样按实际分钟装箱：同一个 session 可以叠两条 10 分钟任务，剩下 5 分钟
+    空位；空位和这两条任务的分钟数会在 notes 里明说。
+    """
+    smalls = [item for item in items or []
+              if item.get("small") and 0 < int(item.get("minutes") or 0) < MINUTES_PER_COUNT]
+    for item in smalls:
+        minutes = int(item.get("minutes") or 0)
+        if minutes <= 0:
+            continue
+        candidates = []
+        for slot in slots:
+            free_minutes = int(slot.get("duration") or 0) - int(slot.get("used_minutes") or 0)
+            if free_minutes < minutes:
+                continue
+            # 优先装进「已经有短任务、且装完浪费最小」的场；其次用空场里容量
+            # 最小的（把大场留给后面 25 分钟整块的任务）。
+            used_minutes = int(slot.get("used_minutes") or 0)
+            candidates.append((0 if used_minutes > 0 else 1,
+                               free_minutes - minutes,
+                               int(slot.get("duration") or 0), slot))
+        if not candidates:
+            unscheduled.append(dict(item))
+            continue
+        candidates.sort(key=lambda row: row[:3])
+        _already, _waste, _size, slot = candidates[0]
+        stacked = int(slot.get("used_minutes") or 0) > 0
+        slot["used_minutes"] = int(slot.get("used_minutes") or 0) + minutes
+        # 短任务按分钟占位；把 count 格子也同步了，让后面的匹配/余量逻辑
+        # 不会再把这块时间派给 25 分钟整块的任务。
+        used_count = ts.minutes_to_count(int(slot.get("used_minutes") or 0)) or 0
+        slot["used"] = min(int(slot.get("counts") or 0), used_count)
+        placements.append({
+            "item": item,
+            "slot": slot,
+            "count": int(item.get("count") or 0),
+            "duration": minutes,
+            "split": False,
+            "stacked": stacked,
+            "by_minutes": True,
+        })
+    # 给用户说清楚：短任务在哪场叠了几条、分别几分钟、空了多久。
+    for slot in slots:
+        mine = [p for p in placements if p.get("by_minutes") and p["slot"] is slot]
+        if len(mine) < 2:
+            continue
+        free_minutes = int(slot.get("duration") or 0) - int(slot.get("used_minutes") or 0)
+        if free_minutes <= 0 or free_minutes >= MINUTES_PER_COUNT:
+            continue
+        durs = "、".join("%d" % int(p.get("duration") or 0) for p in mine)
+        notes.append("session %s（%d 分钟）塞了 %d 条短任务（%s 分钟），"
+                     "任务时长不是 25 的整块，剩 %d 分钟空位。"
+                     % (slot.get("start") or "?", int(slot.get("duration") or 0),
+                        len(mine), durs, free_minutes))
+    small_pks = {str(item.get("pk")) for item in smalls}
+    return ([item for item in items or ()
+             if str(item.get("pk")) not in small_pks], slots)
+
+
 def schedule(items, slots):
     """把任务排进空场次。
 
@@ -312,9 +421,11 @@ def schedule(items, slots):
     slots = [dict(s, used=0, used_minutes=0) for s in slots or []]
     items = [dict(i) for i in items or []]
     placements, unscheduled, notes = [], [], []
-    # 先排父任务壳（子任务不可拆、同一套尽量放同一场），再把剩余容量交给普通任务。
+    # 先排父任务壳（子任务不可拆、同一套尽量放同一场），再排短任务（按分钟叠），
+    # 最后把剩余容量交给普通任务。
     slots = _schedule_children(items, slots, placements, unscheduled, notes)
     items = [item for item in items if not item.get("children")]
+    items, slots = _schedule_small_items(items, slots, placements, unscheduled, notes)
     matched = _match(items, slots)
     for i in sorted(matched):
         item = items[i]
@@ -332,7 +443,8 @@ def schedule(items, slots):
         want = need
         chunks = []
         while need > 0:
-            # 空的先（容量大的优先 = 少碎），再有余量的（余量小的优先 = 少浪费）
+            # 空的先（容量大的优先 = 少碎），再有余量的（余量小的优先 = 少浪费）。
+            # 有短任务叠过的场按分钟算过 used，counts - used 就是还能放几块 25。
             free = [j for j, s in enumerate(slots) if s["used"] == 0 and s["counts"] > 0]
             free.sort(key=lambda j: (-slots[j]["counts"], j))
             relax = [j for j, s in enumerate(slots)

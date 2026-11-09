@@ -1579,6 +1579,129 @@ check_true("help 说明了 pro 代表真正项目 Project",
 check_true("help 说明了 task 代表任务",
            "task" in _help_plain and "任务" in _help_plain)
 
+print("== 7) 短任务按实际分钟算 count；1 count 塞两条 10 分钟任务 ==")
+_rows_small = [
+    {"id": "p-small", "name": "短任务项目", "kind": "project_root",
+     "project": "", "completed": False, "dropped": False},
+]
+for _i in range(7):
+    _rows_small.append({
+        "id": "small-%d" % _i, "name": "短任务 %d" % _i, "kind": "action",
+        "project": "短任务项目", "parent": "短任务项目",
+        "estimated_minutes": 10, "completed": False, "dropped": False,
+    })
+_proj_small = pj.project_payload(_rows_small[0], _rows_small)
+_stat_small = pj.stats(dict(_proj_small, id=1))
+check("7 条 10 分钟 = 3 count（不是 7）", _stat_small["total"], 3)
+check("剩余也是 3 count", _stat_small["remaining"], 3)
+_items_small, _notes_small = pp.distribute(
+    [{"project_id": 1, "project": dict(_proj_small, id=1), "count": 1}],
+    [dict(_proj_small, id=1)], {})
+check("1 count 实际挑出两条 10 分钟短任务",
+      [(i["title"], i.get("minutes")) for i in _items_small],
+      [("短任务 0", 10), ("短任务 1", 10)])
+_slots_small = [pp.slot_record(1, ISO, "11:00", 25, "s-small")]
+_places_small, _uns_small, _more_small = pp.schedule(_items_small, _slots_small)
+check("两条短任务进了同一场 25 分钟 session",
+      sorted((p["item"]["title"], p["duration"]) for p in _places_small),
+      [("短任务 0", 10), ("短任务 1", 10)])
+check("没有漏排", [u["title"] for u in _uns_small], [])
+check_true("提示了时间对不齐导致空位，并列出（10、10）",
+           any("剩 5 分钟空位" in n and "10、10" in n for n in _more_small))
+
+print("== 8) op relate --export/--import：模板 -> 本地项目库 ==")
+_relate_dir = os.path.join(TMP, "relate")
+os.makedirs(_relate_dir, exist_ok=True)
+_rows_rel_sop = [
+    {"id": "p-relate-sop", "name": "Relate SOP", "kind": "project_root",
+     "project": "", "completed": False, "dropped": False,
+     "tags": ["project/Relate Pro"]},
+    {"id": "sop-r1", "name": "SOP 已有任务", "kind": "action",
+     "project": "Relate SOP", "parent": "Relate SOP",
+     "estimated_minutes": 25, "completed": False, "dropped": False,
+     "tags": ["project/Relate Pro"]},
+]
+_rows_rel_inc = [
+    {"id": "p-relate-inc", "name": "Relate Inc", "kind": "project_root",
+     "project": "", "completed": False, "dropped": False,
+     "tags": ["project/Relate Pro"]},
+    {"id": "inc-r1", "name": "Inc 已有任务", "kind": "action",
+     "project": "Relate Inc", "parent": "Relate Inc",
+     "estimated_minutes": 25, "completed": False, "dropped": False,
+     "tags": ["project/Relate Pro"]},
+]
+wd_rel = fresh(_rows_rel_sop + _rows_rel_inc)
+wd_rel.settings.set("relate-dir", _relate_dir)
+check("relate import 之前 op 没有关联文件",
+      all(p.get("file") is None for p in wd_rel.projects.active()), True)
+check("SOP op import 受理",
+      wd_rel.handle("task import sop omnifocus:///project/p-relate-sop"), True)
+check("incubator op import 受理",
+      wd_rel.handle("task import incubator omnifocus:///project/p-relate-inc"), True)
+_inc_op = next(p for p in wd_rel.projects.active()
+               if pj.normalize_op_type(p.get("op_type")) == pj.OP_TYPE_INCUBATOR)
+_sop_op = next(p for p in wd_rel.projects.active()
+               if pj.normalize_op_type(p.get("op_type")) == pj.OP_TYPE_SOP)
+_inc_num = wd_rel.projects.number_of(_inc_op["id"])
+check("incubator op 序号", _inc_num, 2)
+# SOP op 不是 incubator：relate 不动作
+wd_rel.handle("op 1 relate --export")
+check("SOP op relate 不动作（仍无关联文件）",
+      wd_rel.projects.by_id(_sop_op["id"]).get("file"), None)
+check("incubator op export 受理",
+      wd_rel.handle("op %d relate --export" % _inc_num), True)
+_inc_after = wd_rel.projects.by_id(_inc_op["id"])
+_rel_path = _inc_after.get("file")
+check_true("export 生成了模板文件", bool(_rel_path) and os.path.exists(_rel_path))
+if _rel_path:
+    _template_text = open(_rel_path, encoding="utf-8").read()
+    check_true("模板填了「关联项目」",
+               "关联项目: Relate Pro" in _template_text)
+    check_true("模板里有「# 资源准备任务列表」和「# 具体的 SOP 流程」",
+               "# 资源准备任务列表" in _template_text
+               and "# 具体的 SOP 流程" in _template_text)
+    # 先用缺时长的模板试一次：应当拒绝且一条都不 append。
+    _before_titles = [t["title"] for t in wd_rel.projects.by_id(_inc_op["id"])["tasks"]]
+    open(_rel_path, "w", encoding="utf-8").write(
+        "---\n关联项目: Relate Pro\n---\n"
+        "# 资源准备任务列表\n- 缺时长的任务\n"
+        "# 具体的 SOP 流程\n- 也缺时长\n")
+    check("缺时长的 relate import 被拒（handle 不炸）",
+          wd_rel.handle("op %d relate --import" % _inc_num), True)
+    check("被拒后 incubator op 一条都没 append",
+          [t["title"] for t in wd_rel.projects.by_id(_inc_op["id"])["tasks"]],
+          _before_titles)
+    check_true("拒绝理由用了项目任务检查（没设持续时间）",
+               any("没设持续时间" in t or "没有「持续时间」" in t
+                   for t in texts(wd_rel)))
+    # 合法模板：资源准备 -> incubator op；SOP 流程 -> SOP op。
+    open(_rel_path, "w", encoding="utf-8").write(
+        "---\n关联项目: Relate Pro\n---\n"
+        "# 资源准备任务列表\n"
+        "- wash flashcards in English deck @estimate(10m)\n"
+        "- create flashcards about key themes @estimate(10m)\n"
+        "# 具体的 SOP 流程\n"
+        "- complete flashcards in English deck @estimate(25m)\n")
+    check("relate import 受理", wd_rel.handle("op %d relate --import" % _inc_num), True)
+    _inc_titles = [t["title"] for t in wd_rel.projects.by_id(_inc_op["id"])["tasks"]]
+    _sop_titles = [t["title"] for t in wd_rel.projects.by_id(_sop_op["id"])["tasks"]]
+    check("资源准备任务 append 到 incubator op",
+          all(t in _inc_titles for t in ["wash flashcards in English deck",
+                                         "create flashcards about key themes"]), True)
+    check("SOP 流程 append 到 SOP op",
+          "complete flashcards in English deck" in _sop_titles, True)
+    _rel_local = next((t for t in wd_rel.task_store.list()
+                       if (t.get("fields") or {}).get("title")
+                       == "wash flashcards in English deck"), None)
+    check_true("relate 任务已镜像进任务库", _rel_local is not None)
+    if _rel_local is not None:
+        check("relate 任务不挂 OmniFocus（本地 only）",
+              (dict(_rel_local).get("omnifocus") or {}).get("id"), None)
+        check("relate 任务 source 标记 local_only",
+              (dict(_rel_local).get("source") or {}).get("local_only"), True)
+    check("op 文件字段已记上模板路径",
+          wd_rel.projects.by_id(_inc_op["id"]).get("file"), _rel_path)
+
 print()
 if fails:
     print("FAILED %d" % len(fails))

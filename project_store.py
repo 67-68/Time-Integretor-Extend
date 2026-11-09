@@ -879,6 +879,7 @@ def _norm_task(raw, rank=0):
         "effective_dropped": bool(raw.get("effective_dropped",
                                           raw.get("dropped"))),
         "blocked": bool(raw.get("blocked")),
+        "local_only": bool(raw.get("local_only")),
         "rank": _as_int(raw.get("rank")) if raw.get("rank") is not None else int(rank),
     }
     if raw.get("tags"):
@@ -945,6 +946,7 @@ def _norm_project(raw):
                 task_tags.extend(task.get("tags") or ())
         project_tag = extract_project_tag(task_tags)
     pro_id = _as_int(raw.get("pro_id"))
+    file_path = str(raw.get("file") or "").strip() or None
     out = {
         "id": ident,
         "title": _one_line(raw.get("title") or (omnifocus or {}).get("title")) or ("项目 %d" % ident),
@@ -952,6 +954,7 @@ def _norm_project(raw):
         "pro_id": pro_id,
         "project_tag": project_tag or "",
         "tags": tags,
+        "file": file_path,
         "omnifocus": omnifocus,
         "status": status,
         "imported_at": raw.get("imported_at") or None,
@@ -1282,13 +1285,18 @@ def stats(project, task_store=None, invested_map=None):
     ``total/done/remaining`` 只逐条算叶子任务。父任务本身已完成的，它的子任务
     在 OmniFocus 里通常也已完成，仍按叶子算，不会把父壳再加一遍；继承后为
     dropped 的子树整棵不计账。
+
+    短任务按**实际分钟汇总**再向上取整成 count：7 条 10 分钟的任务总共 70
+    分钟 = 3 count，而不是 7 条各 1 count 累加成 7。相应地，剩余 count 也是
+    ``ceil(剩余分钟 / 25)``，保证 ``done + remaining == total``。
     """
     if invested_map is None:
         invested_map = invested(task_store, project)
     tasks = project.get("tasks") or []
     kids = child_map(tasks)
     statuses = effective_task_statuses(tasks)
-    total = done = remaining = 0
+    total_minutes = 0
+    remaining_minutes = 0
     for item in tasks:
         if kids.get(item.get("pk")):
             continue
@@ -1298,15 +1306,21 @@ def stats(project, task_store=None, invested_map=None):
             continue
         minutes = _item_minutes(item)
         cap = int(item.get("count") or 0)
-        if not cap and minutes:
-            cap = ts.minutes_to_count(minutes)
-        total += cap
-        if status == STATUS_COMPLETED:
-            done += cap
+        if not minutes and cap:
+            minutes = cap * ts.MINUTES_PER_COUNT
+        if not minutes:
             continue
-        got = min(cap, int(invested_map.get(item["pk"], 0) or 0))
-        done += got
-        remaining += cap - got
+        total_minutes += minutes
+        if status == STATUS_COMPLETED:
+            continue
+        # 已投入的 count 来自本地任务账；把 count 折回分钟封顶（短任务投 1 count
+        # 也只算它自己的 10 分钟，不会算成 25 分钟）。
+        got = min(cap or 0, int(invested_map.get(item["pk"], 0) or 0))
+        spent = min(minutes, got * ts.MINUTES_PER_COUNT)
+        remaining_minutes += max(0, minutes - spent)
+    total = ts.minutes_to_count(total_minutes) or 0
+    remaining = ts.minutes_to_count(remaining_minutes) or 0
+    done = max(0, total - remaining)
     return {
         "total": total,
         "done": done,
@@ -1379,7 +1393,13 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None):
         got = min(cap, int(invested_map.get(item.get("pk"), 0) or 0))
         if cap - got <= 0:
             continue
-        out.append(dict(item, remaining=cap - got, invested=got))
+        minutes = _item_minutes(item)
+        if not minutes and cap:
+            minutes = cap * ts.MINUTES_PER_COUNT
+        spent = min(minutes, got * ts.MINUTES_PER_COUNT)
+        out.append(dict(item, remaining=cap - got, invested=got,
+                        minutes=minutes,
+                        remaining_minutes=max(0, minutes - spent)))
     return out
 
 
@@ -1664,6 +1684,7 @@ class ProjectStore(object):
                 "pro_id": pro_id,
                 "project_tag": project_tag or "",
                 "tags": tags,
+                "file": str(payload.get("file") or "").strip() or None,
                 "omnifocus": {"id": pk,
                               "url": payload.get("url") or project_url(pk),
                               "title": _one_line(payload.get("title"))},
@@ -2071,6 +2092,43 @@ class ProjectStore(object):
             project["tasks"] = [rec for rec in
                                 (_norm_task(t, rank=i) for i, t in enumerate(tasks or []))
                                 if rec is not None]
+            project["synced_at"] = _now()
+            self.save(store)
+            return project
+        raise ValueError("没有项目 %s" % project_id)
+
+    def set_project_file(self, project_id, file_path):
+        """设置或清空 OmniFocus Project（``op``）关联的文件。"""
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            clean = str(file_path or "").strip()
+            if clean.lower() in ("", "none", "clear", "off", "清空", "无"):
+                project["file"] = None
+            else:
+                project["file"] = clean
+            project["synced_at"] = _now()
+            self.save(store)
+            return project
+        raise ValueError("没有项目 %s" % project_id)
+
+    def append_tasks(self, project_id, tasks):
+        """把新任务追加到某个项目清单末尾（relate --import 用）。
+
+        ``tasks`` 是已经按 ``project_payload`` 校验过的任务记录；这里只做
+        归一化 + 追加，不做校验。返回更新后的项目。
+        """
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            existing = project.setdefault("tasks", [])
+            start_rank = len(existing)
+            for offset, item in enumerate(tasks or []):
+                rec = _norm_task(item, rank=start_rank + offset)
+                if rec is not None:
+                    existing.append(rec)
             project["synced_at"] = _now()
             self.save(store)
             return project

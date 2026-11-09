@@ -282,6 +282,65 @@ import project_store as pj  # noqa: E402  项目库：OmniFocus Project 的存�
 import project_plan as pp  # noqa: E402  plan：空闲容量 → 分资源 → 排任务（纯逻辑）
 import runtime_log as rl  # noqa: E402  按天落盘的 JSONL 运行日志（Focusmate 拉取 / OmniFocus 写回）
 
+# -- relate：关联文件模板的 TaskPaper-ish 解析（op <N> relate --export/--import）-----
+_RELATE_HEADING_RE = re.compile(r"^#\s+(.*)$")
+_RELATE_BULLET_RE = re.compile(r"^\s*-\s+(.*)$")
+_RELATE_ESTIMATE_RE = re.compile(r"@estimate\(([^)]*)\)", re.I)
+
+
+def parse_relate_markdown(text):
+    """把 relate 模板拆成 ``{章节名: [bullet, ...]}``。
+
+    每个 bullet 形如 ``{"title": str, "notes": [str]}``；``@estimate(10m)``
+    留在 title 里，由 :func:`parse_relate_task` 再剥。
+    """
+    sections = {}
+    current = None
+    for line in (text or "").splitlines():
+        m = _RELATE_HEADING_RE.match(line.rstrip())
+        if m:
+            current = m.group(1).strip()
+            sections.setdefault(current, [])
+            continue
+        if current is None:
+            continue
+        if not line.strip():
+            continue
+        sections.setdefault(current, []).append(line)
+    out = {}
+    for name, lines in sections.items():
+        tasks = []
+        cur = None
+        for line in lines:
+            m = _RELATE_BULLET_RE.match(line.rstrip())
+            if m:
+                if cur is not None:
+                    tasks.append(cur)
+                cur = {"title": m.group(1).strip(), "notes": []}
+            else:
+                note = line.strip()
+                if note and cur is not None:
+                    cur["notes"].append(note)
+        if cur is not None:
+            tasks.append(cur)
+        out[name] = tasks
+    return out
+
+
+def parse_relate_task(task, fallback_pk):
+    """一条 markdown bullet → ``{"pk", "title", "note", "minutes"}``。"""
+    title = str((task or {}).get("title") or "")
+    minutes = None
+    m = _RELATE_ESTIMATE_RE.search(title)
+    if m:
+        minutes = ts.parse_minutes(m.group(1))
+        title = _RELATE_ESTIMATE_RE.sub("", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    note = "\n".join(str(x).strip() for x in ((task or {}).get("notes") or ())
+                     if str(x).strip()) or ""
+    return {"pk": fallback_pk, "title": title, "note": note, "minutes": minutes}
+
+
 BRIDGE_JS = os.path.join(HERE, "scripts", "bridge.mjs")
 #: bridge 的 stderr（`_lib` 的 die()/log 都落这儿）—— 报错信息里直接指过去。
 BRIDGE_LOG = os.path.join(TEMP, "warden-bridge.log")
@@ -1667,11 +1726,11 @@ class ContractView(View):
                  hint=_hint_actions("1", "1 -a", "1 file", "1 open", "create", "1 refresh", "1 remove",
                                     note="pro = 真正项目（stage: running/bottleneck）；-a 快捷切换阶段并关联新 op")),
             _cmd("op", w.cmd_op,
-                 "管理 OmniFocus Project (op)：op | op 1 | op 1 sop|incubator | op import [sop|incubator]",
+                 "管理 OmniFocus Project (op)：op | op 1 | op 1 sop|incubator | op 1 relate --export|--import | op import [sop|incubator]",
                  ("ofp", "omnifocus-project"),
-                 usage="op [<序号> [sop|incubator|pro <N>|refresh|remove] | import [sop|incubator]]",
-                 options=("sop", "incubator", "import", "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 sop", "1 incubator", "import sop", "import incubator", "refresh",
+                 usage="op [<序号> [sop|incubator|pro <N>|relate --export|--import [路径]|refresh|remove] | import [sop|incubator]]",
+                 options=("sop", "incubator", "import", "relate", "--export", "--import", "refresh", "remove", "check"),
+                 hint=_hint_actions("1", "1 sop", "1 incubator", "1 relate --export", "1 relate --import", "import sop", "import incubator", "refresh",
                                     note="op = OmniFocus Project（SOP 或 incubator 两种类型）")),
             _cmd("start", lambda a: w.cmd_start(), "启动 daemon",
                  usage="start", hint=_hint_actions("start", note="启动 daemon")),
@@ -2110,11 +2169,11 @@ class TaskView(View):
                  hint=_hint_actions("1", "1 -a", "1 file", "1 open", "create", "1 refresh", "1 remove",
                                     note="pro = 真正项目（stage: running/bottleneck）；-a 快捷切换阶段并关联新 op")),
             _cmd("op", w.cmd_op,
-                 "管理 OmniFocus Project (op)：op | op 1 | op 1 sop|incubator | op import [sop|incubator]",
+                 "管理 OmniFocus Project (op)：op | op 1 | op 1 sop|incubator | op 1 relate --export|--import | op import [sop|incubator]",
                  ("ofp", "omnifocus-project"),
-                 usage="op [<序号> [sop|incubator|pro <N>|refresh|remove] | import [sop|incubator]]",
-                 options=("sop", "incubator", "import", "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 sop", "1 incubator", "import sop", "import incubator", "refresh",
+                 usage="op [<序号> [sop|incubator|pro <N>|relate --export|--import [路径]|refresh|remove] | import [sop|incubator]]",
+                 options=("sop", "incubator", "import", "relate", "--export", "--import", "refresh", "remove", "check"),
+                 hint=_hint_actions("1", "1 sop", "1 incubator", "1 relate --export", "1 relate --import", "import sop", "import incubator", "refresh",
                                     note="op = OmniFocus Project（SOP 或 incubator 两种类型）")),
         ]
 
@@ -3204,6 +3263,8 @@ class Warden(object):
         self.pending_op_type = []
         # `pro <序号> -a/--advance` 等待用户提供新 op 的问答状态
         self.pending_advance = None
+        # `op <序号> relate --import` 没有关联文件时，等用户输入绝对路径
+        self.pending_relate_path = None
         # 最近一次选中的真正项目 pro id + open 顺便打开过的文件记录
         self.selected_pro_id = None
         self.opened_files = []
@@ -12549,6 +12610,9 @@ class Warden(object):
         rest = toks[1:]
         if not rest:
             return self._project_detail(op)
+        rel = repl_kit.relation.parse(toks, "op")
+        if rel is not None:
+            return self._op_relate(op, rel)
         r0 = rest[0].lower()
         if r0 in ("refresh", "sync", "reload", "更新"):
             return self._project_refresh(op)
@@ -12601,6 +12665,255 @@ class Warden(object):
         raise ValueError("op 子命令只认 sop / incubator / pro <N> / refresh / remove；你给的是 %r"
                          % rest[0])
 
+    # -- relate：关联文件（模板只给 incubator op 用）--------------------
+
+    def _relate_dir(self):
+        """``relate-dir`` 设置里指定的目录；相对路径按 warden 所在目录算。"""
+        raw = str(self.settings.get("relate-dir") or "").strip() or "data/relate"
+        if os.path.isabs(raw):
+            return raw
+        return os.path.join(HERE, raw)
+
+    def _op_relate(self, op, rel):
+        """``op <序号> relate ...`` 的分流。解析逻辑在 repl_kit.relation。"""
+        if rel.has_flag("--export", "-e", "export"):
+            return self._relate_export(op)
+        if rel.has_flag("--import", "-i", "import"):
+            return self._relate_import(op, rel)
+        raise ValueError("relate 只认 --export / -e（生成模板）或 --import / -i（解析并 append）；"
+                         "你给的是 %r" % (" ".join(rel.args) or "（空）"))
+
+    def _relate_export(self, op):
+        """在 ``relate-dir`` 生成 incubator SOP 模板，并把路径记到 op 关联文件。"""
+        num = self.projects.number_of(op["id"]) or op["id"]
+        if pj.normalize_op_type(op.get("op_type")) != pj.OP_TYPE_INCUBATOR:
+            self.say("⏭ op #%s「%s」不是 incubator 类型；relate 模板只给 incubator op 用，"
+                     "这条命令什么也没做。先用 `op %s incubator` 再试。"
+                     % (num, op.get("title"), num), "warn")
+            return None
+        pro = self.projects.pro_for_op(op)
+        if pro is None:
+            raise ValueError("op #%s「%s」没有关联真正项目 pro；先 `op %s pro <pro序号>` 再 relate。"
+                             % (num, op.get("title"), num))
+        pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        pro_title = pro.get("title") or ("pro #%s" % pnum)
+        body = ("---\n"
+                "created: %s\n"
+                "updated: %s\n"
+                "关联项目: %s\n"
+                "---\n"
+                "**用途**: 被incubator 使用，用来准备一个 SOP"
+                "（可以是无规律的，也就是说是 research + brainstorm 产生的 SOP）\n"
+                "# 资源准备任务列表\n"
+                "- example\n"
+                "\n"
+                "# 具体的 SOP 流程\n"
+                "**仔细思考，代入其中。作为一个实际上执行 SOP 的人，"
+                "你会需要提前准备什么还没有列出来的东西？**\n"
+                "- example\n") % (now, now, pro_title)
+        directory = self._relate_dir()
+        os.makedirs(directory, exist_ok=True)
+        slug = re.sub(r"[^\w\-]+", "-", str(op.get("title") or "op")).strip("-")[:40] or "op"
+        path = os.path.join(directory, "op-%d-%s.md" % (op["id"], slug))
+        if os.path.exists(path):
+            path = os.path.join(directory, "op-%d-%s-%d.md"
+                                % (op["id"], slug, int(time.time())))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        updated = self.projects.set_project_file(op["id"], path)
+        self.say("📄 已生成 relate 模板：%s" % path, "ok")
+        self.say("   关联项目：%s（pro #%s）· 已记到 op #%s「%s」的关联文件。"
+                 % (pro_title, pnum, num, updated.get("title")), "info")
+        self.rebuild_rows()
+        self.invalidate()
+        return updated
+
+    def _relate_import(self, op, rel):
+        """``op <序号> relate --import [绝对路径]``：解析模板并 append 到项目库。"""
+        num = self.projects.number_of(op["id"]) or op["id"]
+        if pj.normalize_op_type(op.get("op_type")) != pj.OP_TYPE_INCUBATOR:
+            self.say("⏭ op #%s「%s」不是 incubator 类型；relate 模板只给 incubator op 用，"
+                     "这条命令什么也没做。先用 `op %s incubator` 再试。"
+                     % (num, op.get("title"), num), "warn")
+            return None
+        pro = self.projects.pro_for_op(op)
+        if pro is None:
+            raise ValueError("op #%s「%s」没有关联真正项目 pro；先 `op %s pro <pro序号>` 再 relate。"
+                             % (num, op.get("title"), num))
+        sop_op = self._relate_sop_op(pro, exclude_op=op)
+        if sop_op is None:
+            pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
+            raise ValueError("项目 Pro #%s「%s」没有对应的 SOP op；"
+                             "relate 模板的「具体的 SOP 流程」没地方放，"
+                             "先 `pro %s op <SOP op序号>` 关联好再做任何导入。"
+                             % (pnum, pro.get("title"), pnum))
+        path = rel.flag_value("--import", "-i")
+        if not path:
+            for _arg in rel.args:
+                if _arg.lower().startswith("--import="):
+                    path = _arg.split("=", 1)[1]
+                    break
+                if _arg.lower().startswith("-i="):
+                    path = _arg.split("=", 1)[1]
+                    break
+        if not path:
+            path = op.get("file")
+        if path and not os.path.exists(path):
+            raise ValueError("关联文件不存在：%s（先 `op %s relate --export` 重新生成，"
+                             "或给一个存在的绝对路径）。" % (path, num))
+        if not path:
+            if getattr(self.shell, "_app_running", False):
+                self.pending_relate_path = {"op_id": op["id"]}
+                self.say("📄 op #%s「%s」还没有关联文件；请输入要 import 的绝对路径（q 取消）："
+                         % (num, op.get("title")), "cmd")
+                self.invalidate()
+                return None
+            raise ValueError("op #%s「%s」还没有关联文件；用法：op %s relate --import <绝对路径>。"
+                             % (num, op.get("title"), num))
+        return self._relate_import_from_path(op, pro, sop_op, path)
+
+    def _relate_sop_op(self, pro, exclude_op=None):
+        """找到 ``pro`` 对应的 SOP op；没有返回 None。"""
+        store = self.projects.load()
+        sop_ops = [op for op in store.get("projects") or ()
+                   if op.get("status") == pj.STATUS_ACTIVE
+                   and pj.normalize_op_type(op.get("op_type")) == pj.OP_TYPE_SOP]
+        by_id = {op["id"]: op for op in sop_ops}
+        if pro.get("sop_op_id"):
+            hit = by_id.get(pro["sop_op_id"])
+            if hit is not None and (exclude_op is None or hit["id"] != exclude_op["id"]):
+                return hit
+        pro_id = pro.get("id")
+        for op in sop_ops:
+            if exclude_op is not None and op["id"] == exclude_op["id"]:
+                continue
+            linked = self.projects.pro_for_op(op, store=store)
+            if linked is not None and linked["id"] == pro_id:
+                return op
+        return None
+
+    def _relate_import_from_path(self, op, pro, sop_op, path):
+        """读模板文件 → 解析两节 → 校验 → append 到两个 op 的清单。"""
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            raise ValueError("读不了 %s：%s" % (path, e))
+        sections = parse_relate_markdown(text)
+        resource_tasks = sections.get("资源准备任务列表") or []
+        sop_tasks = sections.get("具体的 SOP 流程") or []
+        if not resource_tasks and not sop_tasks:
+            raise ValueError("模板里没有找到「# 资源准备任务列表」或「# 具体的 SOP 流程」"
+                             "下面的无序列表。")
+        res_members = self._relate_validate_section(op, resource_tasks, "res")
+        sop_members = self._relate_validate_section(sop_op, sop_tasks, "sop")
+        # 两节都合法才动手，避免只 append 一半。
+        if res_members:
+            updated = self.projects.append_tasks(op["id"], res_members)
+            self.sync_project_tasks(self.projects.by_id(op["id"]), quiet=True)
+        else:
+            updated = self.projects.by_id(op["id"])
+        if sop_members:
+            self.projects.append_tasks(sop_op["id"], sop_members)
+            self.sync_project_tasks(self.projects.by_id(sop_op["id"]), quiet=True)
+        if updated is not None and str(updated.get("file") or "") != str(path):
+            updated = self.projects.set_project_file(op["id"], path)
+        self.rebuild_rows()
+        self.invalidate()
+        num = self.projects.number_of(op["id"]) or op["id"]
+        snum = self.projects.number_of(sop_op["id"]) or sop_op["id"]
+        self.say("📥 relate 导入完成：%s" % path, "ok")
+        self.say("   资源准备任务列表 → incubator op #%s「%s」append %d 条。"
+                 % (num, updated.get("title") if updated else op.get("title"),
+                    len(res_members)), "info")
+        self.say("   具体的 SOP 流程 → SOP op #%s「%s」append %d 条。"
+                 % (snum, sop_op.get("title"), len(sop_members)), "info")
+        self.say("   这两批任务都只落在本地项目库（OmniFocus 没动）；"
+                 "等 `plan` 分到 count 就会按项目任务正常唤起。", "info")
+        return updated
+
+    def _relate_validate_section(self, target_op, tasks, section):
+        """把一节里的 bullets 变成项目任务记录；没时长的整节报错（复用项目检查）。"""
+        stamp = int(time.time() * 1000)
+        root = {"id": "__relate_root__", "name": target_op.get("title") or "relate",
+                "kind": "project_root", "project": "",
+                "estimated_minutes": None}
+        rows = [root]
+        for index, task in enumerate(tasks or []):
+            pk = "relate-%d-%s-%d-%d" % (target_op["id"], section, index + 1, stamp)
+            rec = parse_relate_task(task, pk)
+            rows.append({
+                "id": rec["pk"],
+                "name": rec["title"] or ("relate 任务 %d" % (index + 1)),
+                "kind": "action",
+                "project": target_op.get("title") or "",
+                "estimated_minutes": rec["minutes"],
+                "note": rec["note"],
+                "completed": False,
+                "dropped": False,
+            })
+        try:
+            payload = pj.project_payload(root, rows)
+        except ValueError as e:
+            raise ValueError("「%s」这节解析不了：%s" % (section, e))
+        if payload.get("missing"):
+            raise ValueError(pj.format_missing(payload))
+        if payload.get("depth_errors"):
+            raise ValueError("「%s」这节有超过父-子两层的任务，先改成平铺的无序列表再 import。"
+                             % section)
+        members = list(payload.get("tasks") or [])
+        for member in members:
+            member["local_only"] = True
+        return members
+
+    def pending_relate_path_panel(self):
+        """``op <序号> relate --import`` 等用户输入绝对路径的面板。"""
+        pending = self.pending_relate_path or {}
+        op = self.projects.by_id(pending.get("op_id"))
+        num = self.projects.number_of(op["id"]) if op else None
+        title = (op or {}).get("title") or "?"
+        body = Text()
+        body.append("op #%s「%s」还没有关联文件，请直接输入要 import 的绝对路径：\n"
+                    % (num or pending.get("op_id"), title), style="bold")
+        body.append("（`op <序号> relate --export` 会先建好模板并自动关联；q 取消）\n",
+                    style="dim")
+        return Panel(body, title="[bold cyan]📄 relate --import[/]",
+                     border_style="cyan", box=box.HEAVY)
+
+    def _answer_pending_relate_path(self, line):
+        """处理 ``pending_relate_path`` 下的输入：路径或 q。"""
+        pending = self.pending_relate_path
+        if pending is None:
+            return None
+        raw = " ".join(str(line or "").strip().split())
+        if not raw:
+            return True
+        if raw.lower() in ("q", "quit", "cancel", "取消", "放弃"):
+            self.pending_relate_path = None
+            self.say("⏹ 已取消 relate --import。", "info")
+            self.invalidate()
+            return True
+        self.pending_relate_path = None
+        try:
+            op = self.projects.by_id(pending.get("op_id"))
+            if op is None:
+                raise ValueError("op %s 不见了" % pending.get("op_id"))
+            if not os.path.isabs(raw):
+                raise ValueError("要绝对路径：%r" % raw)
+            if not os.path.exists(raw):
+                raise ValueError("文件不存在：%s" % raw)
+            rel = repl_kit.relation.parse(
+                [str(pending.get("op_id")), "relate", "--import", raw], "op")
+            if rel is None:
+                raise ValueError("内部解析失败：%r" % raw)
+            self._relate_import(op, rel)
+        except Exception as e:                      # noqa: BLE001
+            self.had_error = True
+            self.say(str(e), "warn")
+        self.invalidate()
+        return True
+
     def _project_detail(self, project):
         """一个项目的清单 + 今天的分工（`project 1`）。"""
         invested = pj.invested_by_project(self.task_store).get(project["id"]) or {}
@@ -12611,6 +12924,8 @@ class Warden(object):
                     ((project.get("omnifocus") or {}).get("id") or "?"),
                     stat["remaining"], stat["progress_text"],
                     stat["done"], stat["total"]), "cmd")
+        if project.get("file"):
+            self.say("   📄 关联文件：%s" % project.get("file"), "info")
         week = pj.weekly_yield(project.get("tasks") or [])
         if week.get("count"):
             self.say("   " + pj.week_summary(week), "info")
@@ -13278,10 +13593,21 @@ class Warden(object):
                                   + parent_note).strip()
                 fields["duration"] = int(place.get("duration")
                                          or item.get("duration") or 0)
+            elif place.get("by_minutes") or item.get("small"):
+                # 短任务按实际分钟排；duration 写真实分钟（10 分钟就是 10 分钟），
+                # count 交给 task_store.create 的 link_count_fields 去 ceil。
+                fields["duration"] = int(place.get("duration")
+                                         or item.get("minutes") or 0)
             else:
                 fields["count"] = int(place["count"])
             source = {"kind": "project", "id": item["pk"], "url": url,
                       "title": item.get("title")}
+            if item.get("local_only"):
+                # relate --import 从模板文件 append 的任务在 OmniFocus 里没有
+                # 真 primary key：不能挂 omnifocus，否则完成时会拿假 pk 写回。
+                source["local_only"] = True
+                source["url"] = ""
+                url = ""
             if parent_pk:
                 source.update({"parent_id": parent_pk,
                                "parent_title": parent_title})
@@ -13296,8 +13622,9 @@ class Warden(object):
                 else:
                     task = self.task_store.create(
                         fields,
-                        omnifocus={"id": item["pk"], "url": url,
-                                   "title": item.get("title")},
+                        omnifocus=None if item.get("local_only") else {
+                            "id": item["pk"], "url": url,
+                            "title": item.get("title")},
                         source=source)
             except ValueError as e:
                 failed += 1
@@ -13692,6 +14019,8 @@ class Warden(object):
             return self.pending_advance_panel()
         if self.project_sync is not None:
             return self.project_sync_panel()
+        if self.pending_relate_path is not None:
+            return self.pending_relate_path_panel()
         if self.nostart is not None:
             return self.nostart_panel()
         if self.planning is not None:
@@ -16136,6 +16465,8 @@ class Warden(object):
             return self._answer_pending_advance(line)
         if self.project_sync is not None:
             return self._answer_project_sync(line)
+        if self.pending_relate_path is not None:
+            return self._answer_pending_relate_path(line)
 
         # 「到点没开始」那一问开着：p / x / s 先给它吃（和收尾互斥，见 _maybe_start_*）。
         prompt = getattr(self, "nostart", None)

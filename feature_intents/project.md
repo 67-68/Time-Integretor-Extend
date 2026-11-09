@@ -371,6 +371,8 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `op <序号> sop\|incubator` | 修改 op 类型（refresh 发现缺类型时也走这个） |
 | `op <序号> pro <pro序号\|none>` | 关联 / 解绑真正项目 pro |
 | `op <序号> refresh` / `op <序号> remove` | 刷新 / 移除 op |
+| `op <序号> relate --export` / `-e` | 在 `relate-dir` 生成 incubator SOP 模板（只对 incubator op 有效） |
+| `op <序号> relate --import [绝对路径]` | 解析模板：资源准备任务列表 → incubator op；具体的 SOP 流程 → 对应 SOP op |
 | `pro` / `project` | 列出真正项目 pro 和 op 库 |
 | `pro create <名称> [file=<路径>] [stage=running\|bottleneck]` | 新建 / 更新真正项目 pro |
 | `pro <序号> -a` / `--advance [op <N>\|task import]` | 切换阶段（running ↔ bottleneck）并关联新的 op |
@@ -398,4 +400,8 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 - 不联网（`omnifocus.py` 只在导入 / 刷新时被调用，且是**只读**）；
 - 项目没有「自动同步」：清单是快照，`project refresh` 或重新 `task import` 才更新。
   进度里「OmniFocus 已完成」的那部分同理，靠刷新跟上；
+- `relate --import` append 的任务是**本地 only**：OmniFocus 里没有对应 primary key，
+  所以唤起的本地任务不挂 OmniFocus 关联，完成时也不会写回 OmniFocus；
+- 短任务（实际时长 < 25 分钟）在项目统计里按**实际分钟汇总**再向上取整：7 条 10 分钟
+  = 3 count。`plan` 分 1 count 时可以塞两条 10 分钟任务进同一场，并提示空位和分钟数。
 - `temp/` 里的东西一概不碰；项目库是 `data/projects.json`（有 `.bak` 上一版）。

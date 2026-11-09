@@ -113,6 +113,15 @@ SETTINGS = [
         "desc": "填项目表序号 #1 / id:3 / OmniFocus 项目 pk / 唯一项目名。"
                 "空闲时按 m 完成、c 换一条、q 回正常界面。空 = 没绑定（状态栏会提醒）。",
     },
+    {
+        "id": "relate-dir",
+        "type": "text",
+        "default": "data/relate",
+        "values": (),
+        "summary": "relate 模板/关联文件的目录",
+        "desc": "op <序号> relate --export 会在这个目录生成关联文件模板；"
+                "--import 优先读这里/项目里记的关联文件。相对路径按 warden 所在目录算。",
+    },
 ]
 
 BY_ID = {item["id"]: item for item in SETTINGS}

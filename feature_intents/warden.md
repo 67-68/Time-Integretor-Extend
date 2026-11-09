@@ -132,8 +132,11 @@ open detail         计划 + 实际全部内容（原来的完整契约表）
 help / quit
 review [HH:MM|日期T时刻]   手动开始一场 session 的收尾（逐个问没做完的任务）
 inspect-due [分钟] [--all] 主动 inspect 过期没做完的任务（A~E，另有 G 延长排期）
-op [序号] [sop|incubator|pro N|refresh|remove]   OmniFocus Project (op)：列表 / 类型 / 关联 pro / 刷新 / 撤掉
+op [序号] [sop|incubator|pro N|relate --export|--import [路径]|refresh|remove]
+                                                 OmniFocus Project (op)：列表 / 类型 / 关联 pro / relate 模板 / 刷新 / 撤掉
 op import sop|incubator [链接]                   导入 op 时必须说明类型（SOP / incubator）
+op 3 relate --export|-e                          为 incubator op 在 `relate-dir` 生成关联文件模板
+op 3 relate --import [绝对路径]                   解析模板：资源准备任务 → incubator op；SOP 流程 → 对应 SOP op
 pro / project       真正项目 Project (pro)：列表 / 详情 / create / -a / file / open / stage / op
 pro 1 -a            快捷切换阶段（running ↔ bottleneck），并关联新的 incubator op
                     （可直接跟 task import / op N；不跟则进入问答）
@@ -558,6 +561,10 @@ A–E 的语义不变。结束时不写 postsession 状态文件（没有那一�
   - `bottleneck` 只允许对应的 incubator op 进行；
   - `pro <序号> -a` 快捷切换阶段并关联新的 op；
   - `pro <序号> file <路径>` 之后，敲 `open` + Enter 会顺便打开该文件。
+- **`task` / `op` / `pro` 都有「关联文件」**：`pro` 用 `pro <序号> file` 设；
+  `op` 用 `op <序号> relate --export/--import` 生成并记下；`task` 库内也保留
+  `file` 字段（命令后续按需开放）。relate 的解析逻辑在 repl_kit.relation，
+  其它数据模型以后接同一套 `<model> <n> relate` 语法。
 - op 用 OmniFocus 标签 `project/<pro名称>` 自动关联 pro；也可手动
   `pro <序号> op <op序号>` / `op <序号> pro <pro序号>`。
 

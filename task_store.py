@@ -45,7 +45,7 @@ DEFAULT_ARCHIVE_FILE = os.path.join(DATA_DIR, "task-archive.json")
 RESERVED = {"id", "fields", "created_at", "updated_at", "session", "focusmate", "repeat",
             "status", "status_at", "tags", "omnifocus", "duplicate_of", "actual_minutes",
             "history", "trigger", "formatter", "source", "repeat_parent", "repeat_date",
-            "count_credits"}
+            "count_credits", "file"}
 
 #: 「这条任务在哪一天的 session 里被处理过」的痕迹（见 :meth:`TaskStore.mark_processed`）。
 #: 任务是按天固化的：今天的任务面板 = 所有没做完的 + 今天处理过的；过去那天只剩
@@ -390,6 +390,8 @@ def _coerce_task(raw, fallback_id=None):
     task["repeat"] = _coerce_repeat(task.get("repeat"))
     task["omnifocus"] = _coerce_omnifocus(task.get("omnifocus"))
     task["tags"] = _coerce_tags(task.get("tags"))
+    _file = str(task.get("file") or "").strip()
+    task["file"] = _file or None
     source = _coerce_source(task.get("source"))
     if source is None and task["omnifocus"]:
         # 老任务只有 omnifocus、没有 source：补一个指针，界面和「本体来源」
@@ -998,6 +1000,7 @@ class TaskStore(object):
             "focusmate": {},
             "status": (status if status in STATUSES else STATUS_ACTIVE),
             "tags": _coerce_tags(tags),
+            "file": None,
             "omnifocus": _coerce_omnifocus(omnifocus),
         }
         src = _coerce_source(source)
@@ -1048,6 +1051,25 @@ class TaskStore(object):
         found["fields"][field] = value
         if field == COUNT_KEY or field in DURATION_KEYS:
             link_count_fields(found["fields"], changed=field)
+        found["updated_at"] = _now()
+        self.save(store)
+        return found
+
+    def set_file(self, task_id, file_path):
+        """设置或清空任务（``task``）关联的文件路径。"""
+        store = self.load()
+        found = None
+        for task in store["tasks"]:
+            if task["id"] == int(task_id):
+                found = task
+                break
+        if found is None:
+            raise ValueError("没有任务 %s" % task_id)
+        clean = str(file_path or "").strip()
+        if clean.lower() in ("", "none", "clear", "off", "清空", "无"):
+            found["file"] = None
+        else:
+            found["file"] = clean
         found["updated_at"] = _now()
         self.save(store)
         return found
@@ -1561,9 +1583,18 @@ class TaskStore(object):
             source.update({"parent_id": parent_pk,
                            "parent_title": str(item.get("parent") or "").strip()
                            or parent_pk})
+        omnifocus = None
+        if item.get("local_only"):
+            # relate --import 从模板文件 append 进来的任务只存在于本地项目库，
+            # OmniFocus 里并没有这条 primary key：不能挂 omnifocus，否则完成
+            # 时 warden 会拿假 pk 去写回 OmniFocus。
+            source["local_only"] = True
+            source["url"] = ""
+        else:
+            omnifocus = {"id": pk, "url": url, "title": title}
         task = self.create(
             fields,
-            omnifocus={"id": pk, "url": url, "title": title},
+            omnifocus=omnifocus,
             source=source,
         )
         return task, True

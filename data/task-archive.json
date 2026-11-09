@@ -2128,6 +2128,42 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-09T17:03:47",
+      "task_id": 156,
+      "fields": {
+        "title": "整理任务和 SOP",
+        "project": "English Rev W13",
+        "project_id": 4,
+        "project_task": "f7qELrGv5w9",
+        "duration": 60,
+        "notes": "父任务：English Rev W13",
+        "count": 3,
+        "due": "2026-11-09T17:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-11-09",
+        "start": "16:15",
+        "end": "17:05",
+        "duration": 50,
+        "focusmate_session_id": "d12d82dc-6887-4d56-862e-05a164a484d3"
+      },
+      "notes": "父任务：English Rev W13",
+      "focusmate": {
+        "task_id": "19fe8ba2-fc60-4232-ab1e-8814067f8d36",
+        "title": "整理任务和 SOP",
+        "description": "父任务：English Rev W13",
+        "completed_at": "2026-11-09T08:48:45.196691+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "d12d82dc-6887-4d56-862e-05a164a484d3"
+          }
+        ]
+      }
     }
   ]
 }
