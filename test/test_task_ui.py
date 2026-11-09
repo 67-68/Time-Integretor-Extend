@@ -2310,6 +2310,13 @@ t_a = wdt.task_store.create(
     tags=["未完成转移"],
     omnifocus={"id": "of-1", "url": "omnifocus:///task/of-1", "title": "表头测试"})
 wdt.handle("task create title=第二条 project=ProjB duration=50")
+# 回归：备注列末尾的 `fmt=enlist` 不能被 Rich 裁成 `fmt=enlis`；宽屏上
+# 备注列必须真的用掉右边空位，而不是先以「…」结束。
+t_long = wdt.task_store.create(
+    {"title": "复习leech cards", "duration": 25, "project": "habit", "count": 1})
+wdt.task_store.set_hook(t_long["id"], "formatter", {
+    "name": "enlist", "kind": "formatter", "params": [], "args": {}})
+wdt.task_store.set_repeat(t_long["id"], "sun", "00:00", 25)
 _tbl = wdt.view.render()[0]
 _headers = [str(c.header) for c in _tbl.columns]
 check("任务表默认可见列顺序",
@@ -2327,9 +2334,10 @@ _out = _buf.getvalue()
 check_true("标记列显示 🔗 和 🔒", "🔗🔒" in _out)
 check("task_remark_text 包含 dur=/cnt=/excl=/tag= 缩写",
       wdt.task_remark_text(t_a),
-      "dur=25m, cnt=1, excl=1, tag=未完成转移")
+      "dur=25m,cnt=1,excl=1,tag=未完成转移")
 check_true("表格备注列渲染 dur=/cnt=/excl=",
-           "dur=25m, cnt=1" in _out)
+           "dur=25m,cnt=1" in _out)
+check_true("备注列末尾的长项完整显示（不是 fmt=enlis）", "fmt=enlist" in _out)
 check_true("project 列超长自动裁剪", "SuperLo…" in _out or "SuperLongPr…" in _out)
 
 check("紧凑时间戳：同一天只显示 HH:MM",
@@ -2369,25 +2377,47 @@ wdt.messages = []
 wdt.shell._terminal_rows = lambda: 30
 wdt.invalidate()
 _tbl = wdt.view.render()[0]
-check("任务表按屏幕预算截行（30 行终端 → 8 条）", len(_tbl.rows), 8)
+_limit_30 = wdt.view._row_budget()
+check("任务表按屏幕预算截行（30 行终端 → 自适应页长）", len(_tbl.rows), _limit_30)
 check("截行后表头还在", [str(c.header) for c in _tbl.columns][:3], ["序号", "标记", "title"])
 _buf = io.StringIO()
 Console(file=_buf, width=200, force_terminal=False).print(_tbl)
+_total_tasks = len(wdt.task_store.list())
+_pages_30 = max(1, (_total_tasks + _limit_30 - 1) // _limit_30)
 check_true("表下说明显示页码与 open 1 / 2 / 3 提示",
-           "第 1/4 页，共 32 条（open 1 / 2 / 3" in _buf.getvalue())
+           ("第 1/%d 页，共 %d 条（open 1 / 2 / 3" % (_pages_30, _total_tasks))
+           in _buf.getvalue())
 check("open 2 直接翻到第 2 页", wdt.handle("open 2"), True)
 check("当前页码变为 2", wdt.task_view_page, 2)
 _tbl_p2 = wdt.view.render()[0]
-check_true("表下说明更新为第 2/4 页", "第 2/4 页，共 32 条" in str(_tbl_p2.caption or ""))
+check_true("表下说明更新为第 2/%d 页" % _pages_30,
+           ("第 2/%d 页，共 %d 条" % (_pages_30, _total_tasks))
+           in str(_tbl_p2.caption or ""))
 check("open 1 翻回第 1 页", wdt.handle("open 1"), True)
 
-for _rows in (24, 30, 40, 50):
-    wdt.shell._terminal_rows = lambda rows=_rows: rows
-    wdt.invalidate()
-    _lines = wdt.shell.frame_text().splitlines()
-    check_true("终端 %d 行时表头仍可见" % _rows,
-               any("序号" in line and "标记" in line and "title" in line and "状态" in line
-                   for line in _lines))
+# 高终端必须真正用掉多出来的高度，而不是永远卡在 20 条。
+wdt.shell._terminal_rows = lambda: 80
+wdt.invalidate()
+_tbl_tall = wdt.view.render()[0]
+check_true("80 行终端显示超过旧的 20 条硬上限", len(_tbl_tall.rows) > 20)
+wdt.shell._terminal_rows = lambda: 30
+wdt.invalidate()
+
+# 极小终端允许看板本身比视口高，但 PgUp 必须能在**帧内**把表头翻回来，
+# 而不是让 prompt_toolkit 把它写进终端 scrollback。
+wdt.shell._terminal_rows = lambda: 24
+wdt.invalidate()
+_bottom = wdt.shell.frame_text()
+check_true("24 行终端：看板仍严格钳在预算内", len(_bottom.splitlines()) <= wdt.shell.dashboard_budget())
+wdt.shell.scroll_by(999)
+_top = wdt.shell.frame_text()
+check_true("PgUp 翻到顶后表头可见",
+           any("序号" in line and "标记" in line and "title" in line and "状态" in line
+               for line in _top.splitlines()))
+check_true("上翻时显示帧内位置提示", "上翻" in _top)
+wdt.shell.scroll_to_bottom()
+wdt.shell._terminal_rows = lambda: 30
+wdt.invalidate()
 
 print("== 任务视图：sort 排序 + group(project) 分组 + search 搜索 ==")
 check("group project 受理", wdt.handle("group project"), True)

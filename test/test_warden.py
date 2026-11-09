@@ -909,6 +909,38 @@ check("交互模式下开启 erase_when_done 与 alt_screen（切页/命令不�
       (_wd_fullscreen.shell.erase_when_done, _wd_fullscreen.shell.alt_screen),
       (True, True))
 
+print("== 全屏帧：固定高度视口 + 帧内有限滚动（PgUp/PgDn） ==")
+wd_scroll = mkwarden()
+wd_scroll.shell._terminal_rows = lambda: 14
+_bottom = wd_scroll.shell.frame_text()
+_budget = wd_scroll.shell.dashboard_budget()
+check("视口严格钳在终端预算内", len(_bottom.splitlines()) <= _budget, True)
+check_true("长看板确实有可滚内容", wd_scroll.shell._max_scroll_offset > 0)
+wd_scroll.shell.scroll_by(999)
+_top = wd_scroll.shell.frame_text()
+check("往上翻后仍不超过一屏", len(_top.splitlines()) <= _budget, True)
+check_true("翻到顶能看到原看板最上面的状态框内容",
+           "状态" in plain(_top) and "契约：data.csv" in plain(_top))
+check_true("上翻提示在帧内", "上翻" in plain(_top))
+check_true("footer 提示 PgDn 回底部", "PgDn" in wd_scroll.shell.scroll_hint())
+wd_scroll.shell.scroll_to_bottom()
+check("回到底部 offset = 0", wd_scroll.shell.scroll_offset, 0)
+wd_scroll.shell.scroll_by(999)
+wd_scroll.shell.switch_view()
+check("切视图重置滚动位置", wd_scroll.shell.scroll_offset, 0)
+
+print("== 全屏 App 内 stdout 不落到终端历史：框架 print → Recent ==")
+wd_out = mkwarden()
+_buf_out = io.StringIO()
+wd_out.console = Console(file=_buf_out, width=120, force_terminal=False)
+wd_out.messages = []
+wd_out.shell._app_running = True
+wd_out.shell.print("[red]unknown command:[/red] 测试命令")
+wd_out.shell._app_running = False
+check("全屏时 console 一个字节都没写（不会留下 scrollback）", _buf_out.getvalue(), "")
+check_true("错误进入了 Recent 消息",
+           any("unknown command" in m[2] and "测试命令" in m[2] for m in wd_out.messages))
+
 print("== 专注视图：stop = 消耗一次暂停（不是停 daemon）==")
 wd.bridge.calls = []
 check("专注视图 stop 受理", wd.handle("stop"), True)

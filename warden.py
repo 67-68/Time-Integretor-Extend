@@ -1498,7 +1498,7 @@ class View(object):
                  hint=_hint_actions("on", "off", note="不写就是取反")),
             _task_command(w),
         # say 用 lambda 晚绑定：换 console（测试、--exec）时输出跟着走
-        ] + repl_kit.job_commands(w.jobs, say=lambda text: w.console.print(text))
+        ] + repl_kit.job_commands(w.jobs, say=lambda text: w.shell.print(text))
 
     def build_registry(self):
         w = self.w
@@ -2037,7 +2037,8 @@ class TaskView(View):
                      "task 3 -c +2", "open 1", "sort", "group project", "search",
                      "inspect-due", "review"),
             note="数字 = 面板上的序号 · open 1/2/3 翻页 · open/close <表头> 折叠列"
-                 " · sort <字段> 排序 · group <字段> 分组 · search <词> 搜索 · Tab 切视图",
+                 " · sort <字段> 排序 · group <字段> 分组 · search <词> 搜索 · "
+                 "PgUp/PgDn 翻看长看板 · Tab 切视图",
         )
 
     def status_line(self):
@@ -2115,12 +2116,38 @@ class TaskView(View):
         ]
 
     def _row_budget(self):
-        """任务表每页画几行 —— 留出头部/归档/Recent/提示行，别把表头挤出屏幕。"""
+        """任务表每页画几行 —— 用掉终端真正剩下的高度。
+
+        以前这里硬钳 ``min(20, terminal_rows - 22)``：120 行的终端也只显示
+        20 条，下面明明还有一大片空白，用户要找的任务被迫翻好几页。现在按
+        看板预算和当前宽度下固定的 chrome 高度算；表头/图例/归档/Recent
+        全部算进去，仍然不会把底部提示挤出屏幕。
+        """
         try:
-            terminal_rows = int(self.w.shell._terminal_rows())
+            budget = int(self.w.shell.dashboard_budget())
         except Exception:                             # noqa: BLE001 - 测试/离屏兜底
-            terminal_rows = 30
-        return max(2, min(20, terminal_rows - 22))
+            try:
+                budget = max(4, int(self.w.shell._terminal_rows()) - 3)
+            except Exception:                         # noqa: BLE001
+                budget = 27
+        try:
+            width = int(self.w.frame_width())
+        except Exception:                             # noqa: BLE001
+            width = 120
+        # 实测的固定开销：头部 8 行 + 表题/表头/分隔线 + 图例/命令 + 归档框；
+        # 窄屏时图例和 caption 会多折几行。这里取略保守值，宁可少画一条，
+        # 也不让页面高度超过一屏（超高时框架会从顶部裁，反而丢内容）。
+        if width < 90:
+            overhead = 27
+        elif width < 120:
+            overhead = 25
+        elif width < 170:
+            overhead = 24
+        else:
+            overhead = 23
+        # 至少留 4 条：极小终端也别把表变成只有表头；超出的一点点由
+        # WardenShell 的帧内滚动兜住（PgUp/PgDn）。
+        return max(4, min(200, budget - overhead))
 
     def _task_window(self, tasks):
         """返回 ``(当前页任务, 起始下标, 总数, 当前页码, 总页数)``。
@@ -2231,14 +2258,18 @@ class TaskView(View):
 
         width = w.frame_width()
         proj_max = 7 if width < 95 else TASK_PROJECT_MAX_LEN
+        # title + 备注分掉所有剩下的横向空间。以前 remark 硬钳 48，宽屏
+        # 明明右边还有十几列空白，备注却已经以「…」结束（例如重复任务的
+        # `fmt=enlist` 整段被吞掉）。硬钳只该防窄屏，不该在宽屏浪费。
         avail = max(18, width - (52 + proj_max))
-        title_max = max(8, min(32, avail * 2 // 5))
-        remark_max = max(10, min(48, avail - title_max))
+        title_max = max(8, min(48, avail * 2 // 5))
+        remark_max = max(10, avail - title_max)
         group_max = 10 if width < 95 else 16
 
         t = Table(title="Task · 任务表（open/close 折叠列 · open 1/2/3 翻页 · 序号 = 契约面板上的第几条）",
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
-                  title_justify="left", expand=False, show_header=True)
+                  title_justify="left", show_header=True,
+                  width=max(20, width - 1), expand=True)
         if group_col_header:
             t.add_column(group_col_header, style="bold cyan", no_wrap=True,
                          overflow="crop", max_width=group_max)
@@ -2252,7 +2283,18 @@ class TaskView(View):
             "Focusmate": 10, "OmniFocus": 12, "完成时间": 11, "标签": 14,
             "duration": 7, "count": 10, "exclusive": 7,
         }
-        min_widths = {"序号": 4, "标记": 4, "状态": 3}
+        # Rich 的 width/max_width/min_width 都算 padding。给关键列钉一个
+        # 恰好能装下内容的 min_width，表格又会按终端宽度展开，于是宽屏上
+        # 多出来的空间会真的分给备注，而不是在右边留白、同时把备注裁掉。
+        min_widths = {
+            "序号": 8, "标记": 10, "title": min(20, max(8, title_max)),
+            "project": min(14, max(8, proj_max + 2)),
+            "状态": 6, "session": 13, "截止": 13,
+            "备注": min(remark_max, 30 if width < 100 else 60),
+        }
+        if width < 100:
+            min_widths.update({"序号": 6, "标记": 8, "session": 10,
+                               "截止": 10, "备注": 12})
         for header in visible_headers:
             if header in specs:
                 kwargs = dict(specs[header])
@@ -2541,6 +2583,74 @@ class WardenShell(repl_kit.ReplShell):
         self.frame_key_hook = None         # (() -> tuple)：业务侧补充的帧键
         self._frame_memo = None            # (key, ansi_text)
         self._ansi_memo = None             # (ansi_text, chunks)
+        # 内部滚动：0 = 贴底（最新内容）。向上翻时离开底部，最多翻到整块
+        # 看板的第一行；不会把内容漏到终端 scrollback 里。因为深色终端的
+        # Alt-Screen 没有「往上滚」的原生操作，否则超高一截就只能丢顶部。
+        self.scroll_offset = 0
+        self._max_scroll_offset = 0
+        self._scroll_view_index = self.view_index
+
+    def switch_view(self, delta=1):
+        """切换视图时回到看板底部：新视图不该继承旧视图的滚动位置。"""
+        self.scroll_offset = 0
+        self._max_scroll_offset = 0
+        self._scroll_view_index = getattr(self, "view_index", 0)
+        return super().switch_view(delta)
+
+    def scroll_by(self, pages=1):
+        """页面内滚动看板。
+
+        ``pages > 0`` = 往上看旧内容，``< 0`` = 往下回到底部。上限由
+        :meth:`_build_frame_text` 按实际看板行数算出，不会滚出空白。
+        """
+        try:
+            step = max(1, int(self.dashboard_budget()) - 3)
+        except Exception:                             # noqa: BLE001
+            step = 10
+        old = self.scroll_offset
+        target = max(0, int(self.scroll_offset) + int(pages) * step)
+        # _max_scroll_offset 是上一帧实际算出的上限；有了它就不让一次
+        # PageUp 把 offset 留在一个下一帧必须回钳的荒谬值里。
+        if self._max_scroll_offset:
+            target = min(target, self._max_scroll_offset)
+        self.scroll_offset = target
+        self.invalidate_frame()
+        return self.scroll_offset != old
+
+    def scroll_to_bottom(self):
+        old = self.scroll_offset
+        self.scroll_offset = 0
+        if old:
+            self.invalidate_frame()
+        return bool(old)
+
+    def scroll_hint(self):
+        """给 footer 的一小段提示；没滚过就不占地方。"""
+        if not self.scroll_offset:
+            return ""
+        total = max(0, self._max_scroll_offset)
+        if not total:
+            return ""
+        return "↕ 已上翻 %d/%d 行 · PgDn 回底部" % (
+            min(self.scroll_offset, total), total)
+
+    def key_bindings(self):
+        """框架键 + PageUp/PageDown：长看板在**帧内**有限滚动。"""
+        bindings = super().key_bindings()
+
+        @bindings.add("pageup", eager=True)
+        def _(event):  # noqa: F811 - one binding per shell
+            self.scroll_by(1)
+            event.current_buffer.cancel_completion()
+            event.app.invalidate()
+
+        @bindings.add("pagedown", eager=True)
+        def _(event):  # noqa: F811
+            self.scroll_by(-1)
+            event.current_buffer.cancel_completion()
+            event.app.invalidate()
+
+        return bindings
 
     def invalidate_frame(self):
         """状态变了：下一次 chrome() 必须重新排版（不重排版就是旧画面）。"""
@@ -2567,7 +2677,8 @@ class WardenShell(repl_kit.ReplShell):
         except Exception:                             # noqa: BLE001
             width = 80
         key = [self.frame_rev, self.view_index, self._frame_clock(), width,
-               self._terminal_rows(), bool(self.show_warnings), bool(self.pin_bottom)]
+               self._terminal_rows(), bool(self.show_warnings), bool(self.pin_bottom),
+               int(self.scroll_offset)]
         try:
             key.append(self.warnings.signature())
         except Exception:                             # noqa: BLE001
@@ -2611,6 +2722,11 @@ class WardenShell(repl_kit.ReplShell):
             chunks = []
         # 底部状态栏（视图栏）：框架把它排在打断栏位下面、提示行上面 —— 这里照抄。
         footer = self.footer_text()
+        scroll_hint = self.scroll_hint()
+        if scroll_hint:
+            # 只在上翻后追加，平常不占额外宽度。footer 本来就是一行。
+            footer = ((footer.rstrip("\n") + "    " + scroll_hint + "\n")
+                      if footer else (scroll_hint + "\n"))
         if footer:
             chunks.extend(self._dashboard_chunks(footer))
         hint = self.hint_line(text)
@@ -2650,7 +2766,15 @@ class WardenShell(repl_kit.ReplShell):
         return max(1, self._terminal_rows() - reserved)
 
     def _build_frame_text(self):
-        """真正排版一次（贵：rich 要测量 / 换行 / 裁切整块看板）。"""
+        """真正排版一次，并把看板裁进「一屏固定高度」的视口。
+
+        不再让 prompt_toolkit 自己处理超高内容：那会从底部裁、还会把内容
+        推进终端 scrollback。这里从多行看板里取一个窗口：
+
+        * ``scroll_offset == 0``：永远显示最下面一屏（输入/消息/表格底部）；
+        * 按 PageUp：窗口整体上移，最多到第一行；PageDown 回到底部；
+        * 内容不足一屏：补空行把输入框钉在底部。
+        """
         self._in_frame_text = True
         try:
             raw = super().frame_text()
@@ -2658,16 +2782,57 @@ class WardenShell(repl_kit.ReplShell):
             self._in_frame_text = False
         if not raw:
             return raw
-        budget = self.dashboard_budget()
+        budget = max(1, self.dashboard_budget())
         lines = raw.splitlines()
+        # 视图切换可能发生在框架内部（set_view 走 switch_view，已重置）；
+        # 这里再兜一层，防止别的调用直接改 view_index。
+        if self.view_index != self._scroll_view_index:
+            self.scroll_offset = 0
+            self._scroll_view_index = self.view_index
+        max_offset = max(0, len(lines) - budget)
+        self._max_scroll_offset = max_offset
+        if self.scroll_offset > max_offset:
+            self.scroll_offset = max_offset
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
         if len(lines) > budget:
-            # 只保留最后 budget 行：顶部滚走，底部（含提示）留下。
-            raw = "\n".join(lines[-budget:]) + "\n"
+            end = max(0, len(lines) - self.scroll_offset)
+            start = max(0, end - budget)
+            visible = lines[start:end]
+            if self.scroll_offset > 0 and budget >= 3:
+                # 顶部用一行说明当前视口位置；其余仍显示原内容。这个提示
+                # 本身也算在预算内，所以总高度绝不会超过终端。
+                shown = min(self.scroll_offset, max_offset)
+                indicator = "↕ 上翻 %d/%d 行 · PgUp 更早 · PgDn 回底部" % (
+                    shown, max_offset)
+                keep = budget - 1
+                start = max(0, len(lines) - budget - self.scroll_offset)
+                visible = [indicator] + lines[start:start + keep]
+            raw = "\n".join(visible) + "\n"
         elif self.pin_bottom and len(lines) < budget:
             # 内容不足一屏时在底部补齐空行，让视图栏/提示行/输入行永远钉在屏幕最底部。
             pad = budget - len(lines)
             raw = raw.rstrip("\n") + ("\n" * (pad + 1))
         return raw
+
+    def print(self, *objects, **kwargs):
+        """全屏 App 内的标准输出改走帧内消息，不写终端历史。
+
+        ``ReplShell.dispatch`` 的 unknown / parse-error / exception 分支会直接
+        调 ``print``；在常驻 full-screen Application 里那会把文字写在渲染器
+        背后（就是用户看到的「拉一下终端就多出一截历史」）。Warden 把这些
+        输出接成 Recent 消息；--exec / 测试 / 普通模式仍按原样输出。
+        """
+        hook = getattr(self, "output_hook", None)
+        if getattr(self, "_app_running", False) and hook is not None:
+            try:
+                hook(*objects, **kwargs)
+            except Exception:                         # noqa: BLE001 - 别因为报错再报错
+                pass
+            # 全屏时**绝不能**回落到 print：那正是写穿渲染器、留下
+            # scrollback 的路径。接不住宁可丢一条消息。
+            return
+        return super().print(*objects, **kwargs)
 
     @staticmethod
     def _terminal_rows():
@@ -2749,6 +2914,10 @@ TASK_AUTO_HIDDEN_COLUMNS = (
     "id", "重复", "trigger", "formatter",
     "Focusmate", "OmniFocus", "完成时间", "标签",
     "duration", "count", "exclusive",
+    # 动态字段默认也收进「备注」：它们一列列自动铺开会把固定列挤到只剩
+    # 一个字，导致「后面还有空间，备注却先被裁掉」。需要单独看时
+    # `open defer` / `open <字段>` 展开即可。
+    "defer",
 )
 
 #: project 列默认裁剪长度（窄屏还会进一步按窗口宽度收紧）。
@@ -3140,6 +3309,9 @@ class Warden(object):
         self.shell = WardenShell(**shell_kwargs)
         # 画帧缓存要认识「业务状态变没变」：把签名挂上去（见 frame_signature）。
         self.shell.frame_key_hook = self.frame_signature
+        # 全屏 Application 运行期间，框架的 print（unknown command / exception /
+        # `jobs` 输出）必须接进 Recent，不能绕过渲染器写终端历史。
+        self.shell.output_hook = self._inline_shell_output
 
     # -- 画帧缓存 -------------------------------------------------------
 
@@ -4388,7 +4560,7 @@ class Warden(object):
             self.review_signature(), pending_sig,
             self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
             tuple(sorted(self.effective_hidden_columns())),
-            tuple(sorted(self.effective_task_hidden_columns())),
+            tuple(sorted(self.effective_task_hidden_columns(self.task_store.list()))),
             self.task_view_page, self.task_sort_key, self.task_sort_desc,
             self.task_group_by, self.task_search_query,
             isinstance(self.view, ChoreView), self.chore_index,
@@ -4496,6 +4668,12 @@ class Warden(object):
         """
         headers = set(task_table_headers(tasks)) if tasks is not None else None
         hidden = set(TASK_AUTO_HIDDEN_COLUMNS)
+        if tasks is not None:
+            # 自定义字段默认也收进「备注」：它们不是每张任务都有的固定列，
+            # 自动铺成列会挤掉 title/session/截止，宽屏上反而更早出现省略号。
+            # 需要单独看时仍可 `open <字段>`。
+            fixed = {header for header, _kw in TASK_TABLE_COLUMNS}
+            hidden |= {key for key in task_dynamic_keys(tasks) if key not in fixed}
         hidden |= self.permanent_hidden_columns.get(TASK_UI_MODE, set())
         hidden |= self.session_hidden_columns.get(TASK_UI_MODE, set())
         hidden -= self.permanent_visible_columns.get(TASK_UI_MODE, set())
@@ -4611,7 +4789,10 @@ class Warden(object):
             val = self.task_store._one_line(v)
             if val:
                 parts.append("%s=%s" % (k, val))
-        return ", ".join(parts)
+        # 用紧凑分隔符（不带空格）：备注列是固定宽度里信息密度最高的一格，
+        # 三个逗号省下的 3 列正好能让 `fmt=enlist` 这类尾项完整显示，而不是
+        # 在宽屏上仍被 Rich 裁掉最后一个字符。
+        return ",".join(parts)
 
     def task_group_label(self, task, group_by):
         """分组列显示的标签值。"""
@@ -5234,6 +5415,29 @@ class Warden(object):
         return bool(not self.no_clear
                     and getattr(self.shell, "alt_screen", False)
                     and sys.stdin.isatty() and sys.stdout.isatty())
+
+    def _inline_shell_output(self, *objects, **kwargs):
+        """把框架直接 print 的输出搬进 Recent（全屏模式下不能写 stdout）。"""
+        parts = []
+        for obj in objects:
+            if isinstance(obj, Text):
+                text = obj.plain
+            elif isinstance(obj, str):
+                try:
+                    text = Text.from_markup(obj).plain
+                except Exception:                     # noqa: BLE001 - 不是 markup 就原样
+                    text = obj
+            else:
+                try:
+                    text = Text.from_markup(str(obj)).plain
+                except Exception:                     # noqa: BLE001
+                    text = str(obj)
+            if text:
+                parts.append(text)
+        message = " ".join(parts).strip()
+        if message:
+            self.say(message, "warn")
+        self.invalidate()
 
     def emit(self, renderable=None):
         """帧外打印：帮助面板 / 宣言闸门 / `>>>` 回显。
@@ -12584,7 +12788,8 @@ class Warden(object):
         空气里；等它订上了再 plan 一次就好（notes 里会说清楚有哪几场。
         """
         slots, notes = [], []
-        now_ms = int(time.time() * 1000)
+        now = self._now_dt()
+        now_ms = int(now.timestamp() * 1000)
         is_today = (day == datetime.date.today())
         unbooked, busy, past, reserved = [], 0, 0, 0
         try:
@@ -12593,14 +12798,21 @@ class Warden(object):
         except Exception:                          # noqa: BLE001 - 坏任务不该挡 plan
             reservations = []
         for index, row in enumerate(self.rows, 1):
-            if not row.get("planned") or row.get("date") != day.isoformat():
+            if not row.get("planned"):
+                continue
+            # 场次的归属看**开始时间**：今天 23:15 开始、明天 00:05 结束
+            # 仍然是今天的一场。以前这里还要求 row["date"] 完全相等，
+            # 一旦行来自 API、日期字段被写成了终点日，跨午夜场次就整场漏算。
+            start_dt = self._row_start_datetime(row, fallback_day=day)
+            if start_dt is None or start_dt.date() != day:
                 continue
             if row.get("period_muted"):
                 continue
-            if is_today and (row.get("startMs") or 0) <= now_ms:
+            if is_today and start_dt <= now:
                 past += 1
                 continue
-            if self.task_store.tasks_for_session(row.get("date"), row.get("startLabel")):
+            if self.task_store.tasks_for_session(start_dt.date().isoformat(),
+                                                 row.get("startLabel")):
                 busy += 1
                 continue
             # formatter 已经占掉的时间是**硬约束**：项目 plan 只能看剩下的空场，
@@ -12618,7 +12830,8 @@ class Warden(object):
             if row.get("id") is None:
                 unbooked.append(row.get("startLabel") or "?")
                 continue
-            slots.append(pp.slot_record(index, row.get("date"), row.get("startLabel"),
+            slots.append(pp.slot_record(index, start_dt.date().isoformat(),
+                                        row.get("startLabel"),
                                         row.get("durationMin"), row.get("id"),
                                         row.get("endLabel")))
         if past:
@@ -12766,6 +12979,34 @@ class Warden(object):
             raise ValueError("最多 plan 到 +60 天（你给的是 %+d）" % offset)
         return today + datetime.timedelta(days=offset), offset
 
+    @staticmethod
+    def _row_start_datetime(row, fallback_day=None):
+        """一行 session 的本地开始时间。
+
+        ``startMs`` 是权威值；老快照/手工造的行没有它时，退回 ``date`` +
+        ``startLabel``。plan 的「哪一天」一律按这个**开始时间**判，不按终点：
+        23:15–00:05 这种跨午夜的场次属于 23:15 那天。
+        """
+        raw_ms = (row or {}).get("startMs")
+        try:
+            if raw_ms is not None and int(raw_ms) > 946684800000:
+                return datetime.datetime.fromtimestamp(int(raw_ms) / 1000.0)
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+        raw_day = (row or {}).get("date")
+        if fallback_day is not None and not raw_day:
+            raw_day = fallback_day
+        if hasattr(raw_day, "isoformat"):
+            raw_day = raw_day.isoformat()
+        label = str((row or {}).get("startLabel")
+                    or (row or {}).get("start") or "").strip()
+        try:
+            day = datetime.date.fromisoformat(str(raw_day))
+            hour, minute = (int(x) for x in label.split(":")[:2])
+            return datetime.datetime.combine(day, datetime.time(hour, minute))
+        except (TypeError, ValueError):
+            return None
+
     def free_plan_slots(self, day):
         """那一天「还没开始、没静音、没挂任务」的排好的场次（只看 data.csv + 本地绑定）。
 
@@ -12774,7 +13015,7 @@ class Warden(object):
         """
         day = day or datetime.date.today()
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
-        now = datetime.datetime.now()
+        now = self._now_dt()
         out = []
         try:
             sessions = self.sessions_for_day_plan(day)
@@ -12791,7 +13032,9 @@ class Warden(object):
                 start = datetime.datetime.combine(day, datetime.time(hour, minute))
             except (TypeError, ValueError):         # noqa: BLE001 - 坏行跳过
                 continue
-            if start <= now:
+            # 只按**开始日期**归属这一天；开始后即使终点跨到明天，也已经
+            # 不再是一场空 session。
+            if start.date() != day or start <= now:
                 continue
             if self.task_store.tasks_for_session(iso, label):
                 continue
@@ -15350,6 +15593,8 @@ class Warden(object):
         t.add_column()
         for cmd, desc in [
             ("Tab", "切换视图：契约 → 专注 → 统计 → 任务 → 设置 → 契约（循环）"),
+            ("PgUp / PgDn", "长看板在**当前界面内**往上/往下翻；只在一屏范围内滚动，"
+                            "不会把旧帧写进终端 scrollback（全屏模式）"),
             ("open working|detail", "切换 session 看板口径：working = 实际为主、"
                                      "过去只留最近一场；detail = 计划 + 实际全部"),
             ("open/close <表头>", "展开/折叠契约表的一列；加 --permanent 写进偏好，"
@@ -15497,14 +15742,16 @@ class Warden(object):
         t.add_column()
         t.add_row("默认列", "序号 · 标记 · title · project · 状态 · session · 截止 · 备注")
         t.add_row("默认折叠", "id · 重复 · trigger · formatter · Focusmate · OmniFocus · "
-                              "完成时间 · 标签 · duration · count · exclusive（用 open <表头> 展开）")
+                              "完成时间 · 标签 · duration · count · exclusive · defer"
+                              "（自定义字段默认也收进备注；用 open <表头> 展开）")
         t.add_row("标记", "🔁=重复子任务  🔁*=重复模板  📁=项目任务  🔗=OmniFocus  🎯=Focusmate  "
                           "⏳=挂载中  ⏱=formatter  ⚡=trigger  🔒=独占")
         t.add_row("状态", "·=进行中  ✓=完成  ✗=放弃  ⤼=转移走")
         t.add_row("备注缩写", "dur=分钟  cnt=已投/上限  excl=独占  tag=标签  "
                               "rep=重复  fmt=formatter  trig=trigger  note=备注")
         t.add_row("时间戳", "同天 HH:MM · 明天/昨天 +1/-1 HH:MM · 同年 MM/DD HH:MM")
-        t.add_row("分页", "open 1 / open 2 / open 3 直接翻页；表下会显示 第 X/Y 页")
+        t.add_row("分页", "open 1 / open 2 / open 3 直接翻页；表下会显示 第 X/Y 页。"
+                          "每页条数按终端高度自适应；长看板可用 PgUp/PgDn 帧内翻看")
         t.add_row("排序", "sort <字段> [asc|desc] · sort off；字段可用 id/title/project/"
                           "状态/session/截止/duration/count")
         t.add_row("分组", "group <字段> 或 group grouping(project) · group off；"

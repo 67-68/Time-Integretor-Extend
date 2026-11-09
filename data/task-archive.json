@@ -2067,6 +2067,67 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-08T23:41:21",
+      "task_id": 57,
+      "fields": {
+        "title": "测试这一套设置"
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-08T23:41:21",
+      "omnifocus": {
+        "id": "fR8RmNEkpXv",
+        "url": "omnifocus:///task/fR8RmNEkpXv",
+        "title": "测试这一套设置",
+        "linked_at": "2026-11-02T19:51:10"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "测试这一套设置",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-09T00:31:06",
+      "task_id": 152,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-09T00:05:00",
+        "due_source": "session",
+        "exclusive": true
+      },
+      "session": {
+        "index": 11,
+        "date": "2026-11-08",
+        "start": "23:15",
+        "end": "00:05",
+        "duration": 50,
+        "focusmate_session_id": "54f88314-85f3-4a34-a95f-ed86e91a3274",
+        "previous_due": "2026-11-08T21:25:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "c0b9dc13-ee52-4421-a993-fc614f1e89a3",
+        "title": "flashcard review & new learn",
+        "description": "",
+        "completed_at": "2026-11-08T16:05:53.551063+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "54f88314-85f3-4a34-a95f-ed86e91a3274"
+          }
+        ]
+      }
     }
   ]
 }

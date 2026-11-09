@@ -1499,6 +1499,39 @@ check_true("拒绝理由说清没有符合条件的 op",
            any("没有符合项目阶段的可排期 op" in t for t in texts(wd_gated)))
 check("被门控时不会打开 plan 问答", wd_gated.planning, None)
 
+print("== 5c) plan：跨午夜的场次按开始日归属（今天 23:15–明天 00:05 算今天） ==")
+wd_cross = fresh()
+_cross_day = TODAY
+_cross_start = datetime.datetime.combine(_cross_day, datetime.time(23, 15))
+_cross_end = _cross_start + datetime.timedelta(minutes=50)
+# 故意把 row["date"] 写成终点日：真正的权威归属应该看 startMs/开始时间，
+# 而不是终点落在哪天。旧实现按 row["date"] 过滤，会漏掉整场。
+_cross_row = {
+    "planned": True,
+    "date": (_cross_day + datetime.timedelta(days=1)).isoformat(),
+    "startMs": int(_cross_start.timestamp() * 1000),
+    "endMs": int(_cross_end.timestamp() * 1000),
+    "startLabel": "23:15", "endLabel": "00:05", "durationMin": 50,
+    "id": "sess-cross", "title": "", "quiet": False, "matched": False,
+    "phase": "未开始", "period_muted": False,
+}
+wd_cross.clock_now = datetime.datetime.combine(_cross_day, datetime.time(22, 0))
+wd_cross.rows = [dict(_cross_row)]
+wd_cross.task_store.tasks_for_session = lambda *a, **k: []
+_cross_slots, _cross_notes = wd_cross._plan_slots(_cross_day)
+check("跨午夜场次按开始日进入 plan 空场", len(_cross_slots), 1)
+if _cross_slots:
+    check("跨午夜场次保留 50 分钟容量",
+          (_cross_slots[0]["start"], _cross_slots[0]["end"],
+           _cross_slots[0]["duration"], _cross_slots[0]["counts"]),
+          ("23:15", "00:05", 50, 2))
+# 同样的口径也用在「今天还没 plan」提醒 / 空闲场查询上。
+wd_cross.sessions_for_day_plan = lambda day: [{
+    "start": "23:15", "end": "00:05", "duration": 50,
+}]
+_free_cross = wd_cross.free_plan_slots(_cross_day)
+check("free_plan_slots 也认跨午夜开始于今天的场次", len(_free_cross), 1)
+
 print("== 6) help 页面澄清 op / pro / task 三个数据模型的区别 ==")
 wd_help = fresh()
 wd_help.handle("help")
