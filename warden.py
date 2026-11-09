@@ -956,7 +956,10 @@ def _hint_title(parts):
 
 
 def _hint_cancel(parts):
-    return repl_kit.Hint("参数", ("<n>",), note="执行区要敲宣言")
+    if "--permanent" not in " ".join(parts):
+        return repl_kit.Hint("参数", ("<n>", "--permanent"),
+                             note="默认只弃这一场；--permanent 才从日历删掉")
+    return repl_kit.Hint("参数", ("<n>",), note="永久删掉日历里这个 session")
 
 
 class _TaskCompletionValues(dict):
@@ -1634,8 +1637,8 @@ class ContractView(View):
                  hint=_hint_mute_universal),
             _cmd("title", w.cmd_title, '把 #N 的标题改成文本：title N "文本"', ("t",),
                  usage='title <n> "文本"', hint=_hint_title),
-            _cmd("cancel", w.cmd_cancel, "取消 #N（执行区要敲宣言）",
-                 usage="cancel <n>", hint=_hint_cancel),
+            _cmd("cancel", w.cmd_cancel, "取消 #N（默认只弃这一场；--permanent 删日历）",
+                 usage="cancel <n> [--permanent]", hint=_hint_cancel),
             _cmd("review", w.cmd_review,
                  "手动开始一场 session 的收尾（逐个问没做完的任务）", ("收尾",),
                  usage="review [HH:MM | 日期T时刻]",
@@ -6900,19 +6903,38 @@ class Warden(object):
         return True
 
     def cmd_cancel(self, args):
-        """取消。摩擦层由**这一行**在哪个区决定：草稿区零阻力，执行区敲宣言。"""
-        if not args:
-            raise ValueError("用法：cancel N")
-        idx, row = self.pick(args[0])
+        """取消。默认只取消**这一个时间点的这一场**（判 abandoned，daemon 不再重订），
+        日历里的规则不动；加 ``--permanent`` 才把日历里这个 session 永久删掉。
+        摩擦层由**这一行**在哪个区决定：草稿区零阻力，执行区敲宣言。"""
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks:
+            raise ValueError("用法：cancel N [--permanent]")
+        permanent = False
+        kept = []
+        for tok in toks:
+            low = tok.lower()
+            if low in ("--permanent", "-p", "永久"):
+                permanent = True
+            else:
+                kept.append(tok)
+        if not kept:
+            raise ValueError("用法：cancel N [--permanent]")
+        idx, row = self.pick(kept[0])
         zone = row.get("zone")
 
         if zone == "past":
             raise ValueError("#%d 已经开始（%s）—— 过去的场次不取消也不补订。"
                              % (idx, row["startLabel"]))
 
-        if zone == "draft":
-            return self._drop_contract_row(idx, row)
+        key = sch.key_of(self.sel_date, row["startLabel"])
+        if permanent:
+            return self._cancel_permanent(idx, row, key)
+        return self._cancel_single(idx, row, key)
 
+    def _cancel_declaration_gate(self, idx, row):
+        """执行区取消前要敲宣言；草稿区不用。返回是否放行。"""
+        if row.get("zone") == "draft":
+            return True
         matched = row.get("matched")
         info = Table.grid(padding=(0, 2))
         info.add_column(style="bold", no_wrap=True)
@@ -6925,22 +6947,68 @@ class Warden(object):
         info.add_row("session", (row.get("id") or "—")[:8] + ("…" if row.get("id") else ""))
         self.emit(Panel(info, title="[bold red]⚠  执行区：取消要过宣言闸门[/]",
                                  border_style="bold red", box=box.HEAVY))
-
         if not self.require_declaration("取消 #%d（%s %s）"
                                         % (idx, self.sel_date.isoformat(), row["startLabel"])):
             self.say("没认罪，什么都没动。", "warn")
             return False
+        return True
 
-        key = sch.key_of(self.sel_date, row["startLabel"])
+    def _cancel_single(self, idx, row, key):
+        """默认 cancel：只弃这一个时间点的 session，日历规则保留。"""
+        if not self._cancel_declaration_gate(idx, row):
+            return False
         ks.mark_abandoned(key, why="walk-of-shame",
-                          note="TUI 里敲完宣言后放弃（#%d %s）" % (idx, row["startLabel"]))
-        self.say("已判 %s 为「已放弃」：daemon 不会再重订这一场。" % key, "ok")
-
+                          note="TUI 里放弃这一场（#%d %s）" % (idx, row["startLabel"]))
+        if row.get("planned"):
+            self.say("已判 %s 为「已放弃」：daemon 不会再重订这个时间点的这一场"
+                     "（日历规则还在；`cancel %d --permanent` 才从日历删掉）。"
+                     % (key, idx), "ok")
+        else:
+            self.say("已判 %s 为「已放弃」：这一场不是日历规则（计划外），"
+                     "daemon 本来也不会重订。" % key, "ok")
         if row.get("id") is None:
             self.say("它本来就没订上（契约缺的那一场），不用动 API。", "info")
             self.refresh(quiet=True)
             return True
+        return self._cancel_booked_session(idx, row)
 
+    def _cancel_permanent(self, idx, row, key):
+        """``cancel N --permanent``：日历里这个 session 永久不要 + 取消今天这场。"""
+        if not self._cancel_declaration_gate(idx, row):
+            return False
+        ks.mark_abandoned(key, why="permanent",
+                          note="TUI 里永久取消这一场（#%d %s）" % (idx, row["startLabel"]))
+        self.say("已判 %s 为「永久不要」：daemon 不会再重订这一场。" % key, "ok")
+        self._remove_contract_row_for_cancel(idx, row)
+        if row.get("id") is None:
+            self.say("它本来就没订上，不用动 API。", "info")
+            self.refresh(quiet=True)
+            return True
+        return self._cancel_booked_session(idx, row)
+
+    def _remove_contract_row_for_cancel(self, idx, row):
+        """把日历里这一行（data.csv）删掉；临时挪动的行会连挪动记录一起清。"""
+        relocation = row.get("relocation")
+        from_hhmm = (row.get("relocated_from")
+                     or (relocation or {}).get("from")
+                     or row.get("startLabel"))
+        if row.get("lineno"):
+            if sch.fingerprint() != self.csv_fp:
+                raise ValueError("data.csv 刚被别处改过（指纹不一致）。先 refresh 再动手，免得删错行。")
+            raw = sch.remove_row(None, row["lineno"], expect=row.get("raw"))
+            self.say("✅ 已从 data.csv 删掉第 %d 行：%s" % (row["lineno"], raw.strip()), "ok")
+            self.say("   日历里的这个 session 永久不要了（以后同星期几也不会再有）。", "warn")
+        elif not relocation:
+            self.say("· 这一场不是日历里的规则（计划外 session），只取消这一场本身。", "info")
+        if relocation:
+            try:
+                sch.remove_relocation(self.sel_date, from_hhmm)
+                self.say("✅ 已撤销 #%d 的临时挪动（原时间 %s）。" % (idx, from_hhmm), "ok")
+            except Exception as e:                     # noqa: BLE001 - 挪动记录坏了也别挡取消
+                self.say("⚠ 清理临时挪动记录失败：%s" % e, "warn")
+
+    def _cancel_booked_session(self, idx, row):
+        """取消一场已经订上的 session（乐观先拿掉，网络丢后台）。"""
         self.say("#%d 取消中…（%s；乐观：表格先拿掉，Focusmate 在后台）"
                  % (idx, row["startLabel"]), "cmd")
         before_row = dict(row)
@@ -10457,12 +10525,16 @@ class Warden(object):
             session_token = args[0]
         return self._assign_task(task, session_token, refresh=refresh)
 
-    def _assign_task(self, task, session_token, refresh=True):
+    def _assign_task(self, task, session_token, refresh=True, allow_unbooked=False):
         """把**已经拿到手**的任务挂到某一场（或下架）。内部路径全走这儿。
 
         ``cmd_task_assign`` 负责「用户敲的那个数 → 任务」，这里负责「任务 → 挂」。
         分开的原因很实际：内部调用方（swap / 批量转移 / refresh --check 重挂）
         手里是任务对象，绕回按序号解析会挂错人。
+
+        ``allow_unbooked`` 只给项目 plan 用：用户拍板把没订上的场次也算进
+        空场之后，任务可以**先本地挂上**，等 daemon 订上再由 ``refresh --check``
+        补挂 Focusmate；其它命令路径仍然不允许往空气里挂任务。
         """
         # 手上那份可能是「刚创建 / 刚改完备注之前」的快照，挂之前重读一遍：
         # Focusmate 那条 task 的标题和 description 要的是**现在**的字段。
@@ -10487,10 +10559,31 @@ class Warden(object):
             task = self._task_detach(task, reason="cmd-assign-none")
             self.rebuild_rows()
             return task
-        if row.get("id") is None:
-            raise ValueError("session #%d 还没有 Focusmate session id（没订上/快照），"
-                             "不能挂 task。先 refresh 成功一次。" % session_idx)
         date_iso = row.get("date") or self.sel_date.isoformat()
+        if row.get("id") is None:
+            if not allow_unbooked:
+                raise ValueError("session #%d 还没有 Focusmate session id（没订上/快照），"
+                                 "不能挂 task。先 refresh 成功一次。" % session_idx)
+            # 项目 plan 专用：这场还没订上，但用户已经把它算进空场了 —— 任务先
+            # 本地记到这场（Focusmate 上没有真实 session，不发起网络挂载），
+            # 等订上后 `refresh --check` 会补挂。
+            self._exclusive_guard(task, date_iso, row.get("startLabel"))
+            self.task_store.assign(task["id"], {
+                "index": session_idx,
+                "date": date_iso,
+                "start": row.get("startLabel"),
+                "end": row.get("endLabel"),
+                "duration": row.get("durationMin"),
+                "focusmate_session_id": None,
+            })
+            self.say("🗓 任务 %s「%s」先本地挂到 session #%d（%s %s；这一场还没订上，"
+                     "等 Focusmate 订上后 refresh --check 会自动补挂）。"
+                     % (self.task_label(task),
+                        (task.get("fields") or {}).get("title") or self.task_label(task),
+                        session_idx, date_iso, row.get("startLabel")), "cmd")
+            self.rebuild_rows()
+            self.invalidate()
+            return task
         if ts.TaskStore.is_repeat_template(task):
             # 本体不能进 session；-a/-ac 指到哪一天，就挂/生成那一天的子任务。
             probe = datetime.date.fromisoformat(date_iso)
@@ -12606,6 +12699,45 @@ class Warden(object):
         self.invalidate()
         return updated
 
+    def _project_tasks_refreshable(self):
+        """``refresh`` 能不能顺带刷新 OmniFocus 项目任务清单。"""
+        if self.offline or not self.net_async:
+            return False
+        try:
+            if not self.omnifocus_enabled():
+                return False
+        except Exception:                           # noqa: BLE001 - 检查失败不挡刷新
+            return False
+        try:
+            return bool(self.projects.active())
+        except Exception:                           # noqa: BLE001
+            return False
+
+    def _refresh_project_tasks(self):
+        """``refresh`` 时把 OmniFocus 项目任务清单也对一遍（60→50 这种改动要能更新）。"""
+        projects = self.projects.active()
+        if not projects:
+            return False
+        today = datetime.date.today()
+        self._project_sync_day = today
+        try:
+            pj.mark_sync_day(today)
+        except Exception:                           # noqa: BLE001 - 标记失败不挡对账
+            pass
+        action = self.net_action(
+            "omnifocus.project_sync",
+            "刷新 %d 个 OmniFocus 项目任务" % len(projects),
+            {"projects": projects}, source=SRC_OMNIFOCUS)
+        self.jobs.submit(
+            action,
+            on_ok=lambda payload: self._apply_project_sync_result(payload),
+            on_fail=lambda error: self.say(
+                "OmniFocus 项目任务刷新失败（可用 `project check` 再试）：%s" % error,
+                "warn"))
+        if not self.jobs.sync:
+            self.say("正在后台刷新 OmniFocus 项目任务…", "cmd")
+        return True
+
     # -- 每日项目对账：新增自动拉，删除/修改整包问 -------------------------
 
     def _prompt_busy(self):
@@ -12781,11 +12913,9 @@ class Warden(object):
     def _plan_slots(self, day):
         """这一天的**可用空场** → ``(slots, notes)``。
 
-        只算四种条件全中的：计划里有、还没开始（今天就按「现在」筛）、没静音、
-        **API 里确实订上了**、而且这一场还没挂任务。
-
-        为什么「没订上」的不算：拿一场可能不存在的 session 当资源，等于把任务排进
-        空气里；等它订上了再 plan 一次就好（notes 里会说清楚有哪几场。
+        只排除三类：已经过去的（今天就按「现在」筛）、已经挂任务的、
+        被 formatter 占掉的。**没订上 Focusmate 的场次照常计入**（notes 里点名），
+        任务先本地挂到那场，等 daemon 订上之后 ``refresh --check`` 再补挂。
         """
         slots, notes = [], []
         now = self._now_dt()
@@ -12827,13 +12957,12 @@ class Warden(object):
                               reservations):
                 reserved += 1
                 continue
-            if row.get("id") is None:
-                unbooked.append(row.get("startLabel") or "?")
-                continue
             slots.append(pp.slot_record(index, start_dt.date().isoformat(),
                                         row.get("startLabel"),
                                         row.get("durationMin"), row.get("id"),
                                         row.get("endLabel")))
+            if row.get("id") is None:
+                unbooked.append(row.get("startLabel") or "?")
         if past:
             notes.append("今天已经过去的 %d 场不算空闲。" % past)
         if busy:
@@ -12841,8 +12970,8 @@ class Warden(object):
         if reserved:
             notes.append("%d 场已经被 formatter 占掉，项目 plan 不会碰。" % reserved)
         if unbooked:
-            notes.append("%s 还没订上 Focusmate（`refresh --check` 订上之后再 plan），"
-                         "先不算空闲。" % "、".join(unbooked))
+            notes.append("%s 还没订上 Focusmate，但仍计入空场（plan 排进去后，"
+                         "等订上会自动挂任务）。" % "、".join(unbooked))
         return slots, notes
 
     def cmd_plan(self, args=None):
@@ -12915,8 +13044,8 @@ class Warden(object):
         for note in notes:
             self.say("· %s" % note, "info")
         if not slots:
-            raise ValueError("%s 一场空着的、订上的 session 都没有 —— 先 `refresh --check` "
-                             "把 session 订上，或者 `day` 换个日子。" % day.isoformat())
+            raise ValueError("%s 一场空着的 session 都没有 —— 换个日子，或者先 "
+                             "`session <HH:MM> <25|50|75>` 把排布加上。" % day.isoformat())
         cap = pp.capacity(slots)
         pro_map = {op["id"]: self.projects.pro_for_op(op) for op in projects}
         if sop_ops:
@@ -13181,7 +13310,8 @@ class Warden(object):
                                 or int(place["count"]) * pp.MINUTES_PER_COUNT),
                 "parent_pk": parent_pk or ""})
             try:
-                self._assign_task(task, str(slot["index"]), refresh=False)
+                self._assign_task(task, str(slot["index"]), refresh=False,
+                                  allow_unbooked=True)
             except ValueError as e:
                 failed += 1
                 self.say("⚠ 「%s」建好了但没挂到 session #%s：%s"
@@ -15159,13 +15289,17 @@ class Warden(object):
         失败不拦路：任何一块刷不动就记一句警告，其余照刷 —— refresh 是「再对一次账」，
         不是「全有或全无」。
         """
-        self.jobs.begin(2, title="刷新（refresh）")
+        project_sync = self._project_tasks_refreshable()
+        self.jobs.begin(2 + (1 if project_sync else 0), title="刷新（refresh）")
         self.forget_caches()
         pulled = self.refresh()
         # 「再对一次账」必须拿着刚拉回来的账：后台模式下这里等它落地
         self.wait_net()
         self.refresh_task_state()
         self.wait_net()
+        if project_sync:
+            self._refresh_project_tasks()
+            self.wait_net()
         # refresh 的排期流水线：formatter 先占时间，项目 plan 后校验。
         # 必须在刚拉回的 session 账上跑，否则会把已取消的场次当成资源。
         try:

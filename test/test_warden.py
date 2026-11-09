@@ -354,7 +354,7 @@ check("缺的那场被算进 missing", [r["startLabel"] for r in wd.plan_summary
 
 print("== cancel 的三种命运 ==")
 
-# 1) 草稿区：零阻力，直接删契约行，不敲宣言
+# 1) 草稿区默认 cancel：只弃这一场，不删日历规则，不敲宣言
 write_csv(ROWS)
 clear_state()
 wd = mkwarden()
@@ -364,11 +364,29 @@ wd.bridge.calls = []
 builtins.input = lambda prompt="": "绝不敲宣言"
 check("草稿区取消 → 成功", wd.cmd_cancel(["1"]), True)
 check("草稿区取消 → 没碰 API", [c for c in wd.bridge.calls if c[0] == "cancel"], [])
-check("草稿区取消 → 契约行没了",
-      [ln for ln in sch.read_text().splitlines() if "21:00" in ln], [])
+check("草稿区取消 → 契约行还在（默认只弃这一场）",
+      [ln for ln in sch.read_text().splitlines() if "21:00" in ln],
+      ["%s,21:00,25" % TODAY_WD])
 check("草稿区取消 → 没记罪", ks.load_sins()["sins"], [])
-check("草稿区取消 → 没有判决", ks.load_verdicts()["abandoned"], {})
-check("草稿区取消 → 动了 data.csv 会留下备份", os.path.exists(sch.BACKUP_CSV), True)
+ab = ks.load_verdicts()["abandoned"]
+check("草稿区取消 → 判决落盘（daemon 不再重订这一场）", list(ab), ["%sT21:00" % TODAY])
+check("草稿区取消 → 没动 data.csv 不留备份", os.path.exists(sch.BACKUP_CSV), False)
+
+# 1b) 草稿区 cancel --permanent：删日历规则 + 判决
+write_csv(ROWS)
+clear_state()
+wd = mkwarden()
+wd.reload_entries()
+wd.rows = [fd(zone="draft", hhmm="21:00", id_=None, lineno=2, raw="%s,21:00,25" % TODAY_WD)]
+wd.bridge.calls = []
+builtins.input = lambda prompt="": "绝不敲宣言"
+check("草稿区 --permanent → 成功", wd.cmd_cancel(["1", "--permanent"]), True)
+check("草稿区 --permanent → 没碰 API", [c for c in wd.bridge.calls if c[0] == "cancel"], [])
+check("草稿区 --permanent → 契约行没了",
+      [ln for ln in sch.read_text().splitlines() if "21:00" in ln], [])
+check("草稿区 --permanent → 判决落盘", list(ks.load_verdicts()["abandoned"]),
+      ["%sT21:00" % TODAY])
+check("草稿区 --permanent → 动了 data.csv 会留下备份", os.path.exists(sch.BACKUP_CSV), True)
 
 # 2) 执行区：敲错就锁死，敲对才动；判决落盘
 write_csv(ROWS)
@@ -386,6 +404,22 @@ ab = ks.load_verdicts()["abandoned"]
 check("判决落盘：这场被标 abandoned", list(ab), ["%sT21:00" % TODAY])
 check("判决记了理由", ab["%sT21:00" % TODAY]["why"], "walk-of-shame")
 check("敲错的那两次被记进消息", any("不通过" in m[2] for m in wd.messages), True)
+
+# 2b) 执行区 --permanent：宣言后删日历 + 取消 API
+write_csv(ROWS)
+clear_state()
+wd = mkwarden()
+wd.reload_entries()
+wd.rows = [fd(zone="locked", hhmm="21:00", id_="sess-9", lineno=2, raw="%s,21:00,25" % TODAY_WD)]
+wd.bridge.calls = []
+answer([w.DECLARATION])
+check("执行区 --permanent → 执行", wd.cmd_cancel(["1", "--permanent"]), True)
+check("执行区 --permanent → 真调了 cancel",
+      [c[0] for c in wd.bridge.calls if c[0] == "cancel"], ["cancel"])
+check("执行区 --permanent → 契约行没了",
+      [ln for ln in sch.read_text().splitlines() if "21:00" in ln], [])
+check("执行区 --permanent → 判决落盘",
+      list(ks.load_verdicts()["abandoned"]), ["%sT21:00" % TODAY])
 
 # 3) 执行区 + Ctrl+C：什么都没发生
 write_csv(ROWS)
@@ -417,7 +451,7 @@ try:
 except ValueError as e:
     check_true("不存在的 ID 被拒", "没有 ID 7" in str(e))
 
-# 6) 草稿区 + 文件被别处改过 → 拒绝（不能删错行）
+# 6) 草稿区 --permanent + 文件被别处改过 → 拒绝（不能删错行）
 write_csv(ROWS)
 clear_state()
 wd = mkwarden()
@@ -425,10 +459,22 @@ wd.reload_entries()
 wd.rows = [fd(zone="draft", hhmm="21:00", id_=None, lineno=2, raw="%s,21:00,25" % TODAY_WD)]
 write_csv(["# test schedule", "%s,20:00,50" % TODAY_WD])   # 别处改过了
 try:
-    wd.cmd_cancel(["1"])
+    wd.cmd_cancel(["1", "--permanent"])
     check("指纹不一致应该被拒", False, True)
 except ValueError as e:
     check_true("指纹不一致被拒（免得删错行）", "指纹不一致" in str(e))
+
+# 6b) 草稿区默认 cancel + 文件被别处改过 → 仍然能判弃（不碰 data.csv）
+write_csv(ROWS)
+clear_state()
+wd = mkwarden()
+wd.reload_entries()
+wd.rows = [fd(zone="draft", hhmm="21:00", id_=None, lineno=2, raw="%s,21:00,25" % TODAY_WD)]
+write_csv(["# test schedule", "%s,20:00,50" % TODAY_WD])   # 别处改过了
+builtins.input = lambda prompt="": "绝不敲宣言"
+check("草稿区默认 cancel 文件变了也不挡", wd.cmd_cancel(["1"]), True)
+check("草稿区默认 cancel 文件变了 → 判决落盘",
+      list(ks.load_verdicts()["abandoned"]), ["%sT21:00" % TODAY])
 
 # ---------------------------------------------------------------- session 命令
 

@@ -289,7 +289,25 @@ try:
 finally:
     __import__("builtins").input = builtins_input
 check("草稿区取消：直接成功、不用宣言", ok, True)
-check("data.csv 那行没了", hhmm not in sch.read_text(), True)
+check("data.csv 那行还在（默认只弃这一场）", hhmm in sch.read_text(), True)
+check_true("判决落盘：daemon 不再重订这一场",
+            "%sT%s" % (tomorrow.isoformat(), hhmm) in ks.load_verdicts()["abandoned"])
+
+# --permanent 才删日历行
+write_csv(["# test", "%s,%s,25" % (tomorrow.isoformat(), hhmm)])
+wd = mkwarden()
+wd.reload_entries()
+wd.api_rows = []
+wd.rows_source = "bridge"
+wd.day_offset = 1
+wd.rebuild_rows()
+__import__("builtins").input = lambda prompt="": "绝不敲宣言"
+try:
+    ok = wd.cmd_cancel(["1", "--permanent"])
+finally:
+    __import__("builtins").input = builtins_input
+check("草稿区 --permanent：直接成功、不用宣言", ok, True)
+check("草稿区 --permanent：data.csv 那行没了", hhmm not in sch.read_text(), True)
 
 shutil.rmtree(TMP, ignore_errors=True)
 

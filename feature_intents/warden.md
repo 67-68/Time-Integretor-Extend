@@ -20,7 +20,7 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
      │    → daemon Running/Stopped、未认罪的罪、已放弃的场次
      │
      │ 2) 读写 data.csv（控制面）──> schedule.py（解析/序列化/增删的唯一实现）
-     │    → day 切换看哪天、session 加一场、草稿区 cancel 删一场
+     │    → day 切换看哪天、session 加一场、草稿区 cancel 弃这一场（--permanent 才删日历）
      │    → 时间可写 `HH:MM,duration`，也可写 `HH:MM-HH:MM` 区间（时长由区间推出）
      │
      │ 3) 子进程：python3 keep_session.py check | daemon start | stop
@@ -58,7 +58,7 @@ daemon 负责「保证订上」，warden 负责「随时看得见、随时能改
 
 | 层 | 判据 | 代价 |
 |---|---|---|
-| 草稿区 | `start > now+24h` | 零阻力：`session` 加、`cancel` 删，直接改 data.csv |
+| 草稿区 | `start > now+24h` | 零阻力：`session` 加、`cancel` 只弃这一场（判 abandoned），`cancel --permanent` 才删 data.csv 规则 |
 | 执行区 | `now < start ≤ now+24h` | `cancel` 必须**一字不差敲完 152 字宣言**（改排布 `period`/`session T1 …` 不用） |
 | 罪案区 | state 说 booked、API 里查不到 | **全局锁死**：除宣言外任何命令都不受理（含 `session` / `day` / `stop`）；罪落盘，关掉重开照样锁 |
 | 过去 | `start ≤ now` | 只能看：不取消也不补订 |
@@ -99,7 +99,8 @@ day / day -1 / day 0 / day 1 / day 2026-10-11   切换看哪一天（草稿区�
 session HH:MM LEN   创建一场：先写 data.csv，再立刻触发一轮 check（LEN ∈ 25/50/75）
 session HH:MM-HH:MM 同上，但用起点–终点：11:15-12:05 → 写入 11:15 + 50min
                     （11:15 12:05 / 11:15 - 12:05 / "11:15 - 12:05" 都认）
-cancel N            取消：草稿区直接删契约行；执行区敲宣言；过去直接拒
+cancel N            取消：默认只弃这一个时间点的这一场（daemon 不再重订），日历规则不动；执行区敲宣言；过去直接拒
+cancel N --permanent  取消并永久删掉日历里这个 session（data.csv 那一行）
 relocate N -15      临时把 #N 提前 15 分钟（只改选中这一天的计划，不写 data.csv）
 relocate N +15      临时把 #N 推后 15 分钟；同一天只能推一次，且不能跨天
 relocate T1 +15     把时段 T1 里**每一场**一起推后 15 分钟（相对位置不变、任务跟着走）
@@ -183,6 +184,7 @@ formatter 任务如果绑在**已经开始但 API 里没有 id** 的幽灵场上
 | --- | --- |
 | 契约表格 | 重读 `data.csv` / 日历下载层 / 时段 layout → 重拉 session |
 | 任务面板 | 任务的**完成状态**：`GET /v1/tasks` 只读同步（不用再手敲 `task sync`） |
+| OmniFocus 项目任务 | 项目清单也重新对一遍（60→50 这种改动会更新；新增自动拉，删除/修改按项目问一次「本地 / OmniFocus / 先不处理」） |
 | 重复任务 | **不碰** —— 落地会真的在 Focusmate 建 task，那是 `task sync` 的事 |
 | 统计视图 | 已经加载过、且超过 TTL 的那份数字重算一次（没看过就不替用户拉） |
 | 收尾面板 | 正在问的那一轮从任务库重读（`Review.reload()`，不把人问回去） |
@@ -342,6 +344,11 @@ working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列
   栏位展示（敲回车或下一条命令自动收起），不再向帧外裸打滚动流；
 - 琐事屏（`ChoreView`）用 `Align.center(..., vertical="middle")` 将当前琐事任务与
   `m/c/q` 提示置于终端画布的正中央。
+- 进入/退出全屏时都会向终端写 `CSI 3 J`（清除 scrollback 已保存行；不支持的
+  终端会忽略）。但 iTerm2 等终端如果开着「把 alternate screen 的内容存进
+  scrollback」，运行中仍会自己累积历史 —— 那属于终端设置，不是应用能关掉的：
+  去终端的 Profile → Terminal 里关掉 “Save lines to scrollback when an app
+  status bar is present” / “Save lines to scrollback in alternate screen”。
 
 ### 任务表分页与高度
 

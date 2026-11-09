@@ -753,6 +753,33 @@ check("OmniFocus 覆盖后采用远端标题",
       [t["title"] for t in _after_remote["tasks"] if t["pk"] == "old-a"],
       ["旧甲改"])
 
+print("== refresh 会检查 OmniFocus 项目任务变化（60→50 能更新） ==")
+_ref_rows_60 = [
+    {"id": "p-refresh", "name": "刷新项目", "kind": "project_root",
+     "completed": False, "dropped": False},
+    {"id": "r-1", "name": "任务一", "kind": "action",
+     "project": "刷新项目", "estimated_minutes": 60, "completed": False},
+]
+_ref_rows_50 = [
+    {"id": "p-refresh", "name": "刷新项目", "kind": "project_root",
+     "completed": False, "dropped": False},
+    {"id": "r-1", "name": "任务一", "kind": "action",
+     "project": "刷新项目", "estimated_minutes": 50, "completed": False},
+]
+_wd_ref = fresh(_ref_rows_60)
+_wd_ref.projects.upsert(pj.project_payload(_ref_rows_60[0], _ref_rows_60,
+                                           now=_fixed_now))
+check("项目库先存的是 60 分钟",
+      [t["duration"] for t in _wd_ref.projects.active()[0]["tasks"]
+       if t["pk"] == "r-1"], [60])
+_wd_ref.omnifocus.rows = [dict(r) for r in _ref_rows_50]
+_wd_ref._refresh_project_tasks()
+check("refresh 项目任务对账：发现修改并开问答", _wd_ref.project_sync is not None, True)
+_wd_ref._answer_project_sync("o")
+check("refresh 后 OmniFocus 的 50 分钟更新进项目库",
+      [t["duration"] for t in _wd_ref.projects.active()[0]["tasks"]
+       if t["pk"] == "r-1"], [50])
+
 print("== task import：重复 / 被推迟的本周任务没时长 → 整批拒绝 ==")
 _week_mon = TODAY - datetime.timedelta(days=TODAY.weekday())
 _thu = _week_mon + datetime.timedelta(days=3)
@@ -1068,11 +1095,11 @@ wd6.api_rows = []                   # data.csv 有排布、但一场都没订上
 wd6.rows_source = "bridge"
 wd6.rebuild_rows()
 wd6.handle("plan +1")
-check_true("没订上的场次不算空场",
-           any("还没订上 Focusmate" in t for t in texts(wd6)))
-check_true("并说「一场空着的都没有」",
-           any("空着" in t and "session" in t for t in texts(wd6)))
-check("这时也没开问答", wd6.planning, None)
+check_true("没订上的场次仍计入空场（只排除 formatter/过去/已有任务）",
+           any("还没订上 Focusmate，但仍计入空场" in t for t in texts(wd6)))
+check("这时开了问答（不再因为没订上而拒绝）", wd6.planning is not None, True)
+wd6.handle("q")                       # 关掉问答，下一段继续用
+check("问答关掉了", wd6.planning, None)
 
 print("== plan 进行中：别的问答不会抢输入 ==")
 plan_day(wd6)
@@ -1087,15 +1114,22 @@ check("放弃时没分资源", by_num(wd6)["plans"], {})
 print("== plan 的日期参数：默认今天，+1 是明天 ==")
 wd7 = fresh(rows_ok)
 wd7.omnifocus.rows = [dict(r) for r in rows_ok]
+with open(sch.DATA_CSV, "w", encoding="utf-8") as _f:   # 清掉上一段遗留的明天排布
+    _f.write("# empty\n")
+wd7.reload_entries()
 wd7.handle("task import sop omnifocus:///project/p-lunwen")
 wd7.handle("day 1")                       # 看板在看明天
 check("看板是明天", wd7.sel_date.isoformat(), TOMORROW)
 wd7.messages.clear()
-wd7.handle("plan 明天")                    # 明天还没订上 → 空场为 0
+try:
+    wd7.handle("plan 明天")                # 明天连排布都没有 → 空场为 0
+    check("这时没开问答", wd7.planning, None)
+except ValueError as e:
+    check("这时没开问答（无空场被拒）", wd7.planning, None)
+    check_true("说清是一场空着的 session 都没有",
+               "一场空着的 session 都没有" in str(e))
 check_true("说清 plan 的是哪一天",
            any("plan 的是 %s" % TOMORROW in t for t in texts(wd7)))
-check_true("没订上就不算空场", any("还没订上 Focusmate" in t for t in texts(wd7)))
-check("这时没开问答", wd7.planning, None)
 
 check("plan 的日期参数：+1", wd7._plan_target(["+1"])[1], 1)
 check("plan 的日期参数：明天", wd7._plan_target(["明天"])[1], 1)
