@@ -795,9 +795,18 @@ python3 warden.py install-deps
 - 契约表增加 `时段 ID | 时段 | 类型 | 名称` 四列；同一时段只有第一行显示，
   后续行留空（避免把同属 T1 的 session 误看成 T2）。
 - 来源是 `temp/calendar-download.json`；没有下载层时这四列留空，旧流程照常。
-- 第四个视图 `任务 / 归档`：`task create/delete/modify/assign/select/sync`。
-  任务挂 session 时自动在 Focusmate 建 task；完成时间用 `GET /v1/tasks` 的
-  `completedAt`，归档到 `data/task-archive.json`。
+- 第四个视图已改名为 `数据 / task · project · op`。默认打开 task 模型：
+  `task create/delete/modify/assign/select/sync`。任务挂 session 时自动在
+  Focusmate 建 task；完成时间用 `GET /v1/tasks` 的 `completedAt`，归档到
+  `data/task-archive.json`。
+- 数据视图内用 `open task` / `open project` / `open op` 切换三类本地数据：
+  - `open task`：本地任务库 `data/tasks.json`（含分页、排序、分组、搜索、归档）；
+  - `open project`：真正项目 Project（`pro`），显示阶段、当前 SOP/incubator op、
+    文件、状态和关联 op 数；
+  - `open op`：OmniFocus Project（`op`），显示类型、关联 pro、是否进入 plan、
+    count 进度和 OmniFocus primary key；未关联 pro 的孤立 op 也会显示。
+- 为避免和任务表 `project` 列冲突，`open project` 固定表示切换数据模型；
+  在 task 模型下要展开该列请敲 `open 项目`。
 - `session T1 50 50` / `period T1 50 50` / 裸 `T1 50 50` 改时段排布；
   任何一场超出时段终点 → 报错，layout 和 data.csv 都不动。
 - 改排布时若该时段已有 API session 且起点/时长不再匹配，先取消旧场

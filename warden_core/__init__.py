@@ -45,6 +45,7 @@ from .hints import (  # noqa: F401
 from .views import (  # noqa: F401
     ChoreView,
     ContractView,
+    DataView,
     FocusView,
     SettingsView,
     StatsView,

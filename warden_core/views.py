@@ -1,4 +1,4 @@
-"""warden_core.views —— 六个 Tab 视图（契约 / 专注 / 统计 / 任务 / 设置 / 琐事）。"""
+"""warden_core.views —— 六个 Tab 视图（契约 / 专注 / 统计 / 数据 / 设置 / 琐事）。"""
 import dataclasses
 import datetime
 
@@ -93,21 +93,27 @@ class View(object):
             _cmd("quit", lambda a: w.exit_tui(),
                  "退出（bridge 和浏览器一起收掉）", ("exit", "q"), "通用",
                  usage="quit", hint=_hint_actions("quit", note="bridge 和浏览器一起收掉")),
-            _cmd("help", w.cmd_help, "命令列表（help --task = 任务视图详细说明）", ("?", "h"), "通用",
-                 usage="help [--task]", hint=_hint_actions("help", "--task", note="当前视图的全部命令")),
+            _cmd("help", w.cmd_help, "命令列表（help --task / --data = 数据视图详细说明）",
+                 ("?", "h"), "通用", usage="help [--task|--data]",
+                 hint=_hint_actions("help", "--task", "--data",
+                                    note="当前视图的全部命令")),
             _cmd("view", lambda a: w.cycle_view(),
                  "下一个视图", ("tab", "switch"), "通用",
                  usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
             _cmd("open", w.cmd_open,
-                 "open working|detail 切口径；open <表头> [--permanent] 打开当前表的一列",
-                 ("看板",), "通用", usage="open working|detail | open <列名> [--permanent]",
+                 "open task|project|op 切换数据模型；open working|detail 切口径；"
+                 "open <表头> [--permanent] 打开当前表的一列",
+                 ("看板",), "通用",
+                 usage="open task|project|op | open working|detail | open <列名> [--permanent]",
                  options=tuple(dict.fromkeys(
-                     ("working", "detail")
+                     ("task", "project", "op", "working", "detail")
                      + tuple(h for h, _kw in SESSION_TABLE_COLUMNS)
                      + tuple(h for h, _kw in TASK_TABLE_COLUMNS)
                      + (TASK_CONTENT_COLUMN,))),
-                 hint=_hint_actions("working", "detail", "时段类型", "id", "状态",
-                                    note="open 表头名 = 展开列；任务视图操作任务表")),
+                 hint=_hint_actions("task", "project", "op", "working", "detail",
+                                    "时段类型", "id", "状态",
+                                    note="open task/project/op = 看三个数据模型；"
+                                         "open 表头名 = 展开列")),
             _cmd("close", w.cmd_close,
                  "close <表头> [--permanent]：折叠当前表的一列（--permanent = 永久折叠）",
                  ("关闭",), "通用", usage="close <列名> [--permanent]",
@@ -116,7 +122,7 @@ class View(object):
                      + tuple(h for h, _kw in TASK_TABLE_COLUMNS)
                      + (TASK_CONTENT_COLUMN, "--permanent"))),
                  hint=_hint_actions("时段类型", "id", "状态",
-                                    note="close 表头名 = 折叠列；任务视图操作任务表")),
+                                    note="close 表头名 = 折叠列；数据视图操作任务表")),
             _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
                  ("stats",), "通用", usage="stat [refresh [full]]",
                  options=("refresh", "full"), hint=_hint_stat),
@@ -627,8 +633,17 @@ class StatsView(View):
 
 
 @register_view
-class TaskView(View):
-    """任务视图：本地 JSON 任务库 + 挂到 session + Focusmate 完成归档。
+class DataView(View):
+    """数据视图：同一个界面查看 task / project / op 三种本地数据模型。
+
+    ``open task`` / ``open project`` / ``open op`` 切换当前展示的数据模型：
+
+    * task：本地任务库（data/tasks.json）+ 挂 session + Focusmate 归档；
+    * project：真正项目 Project（``pro``，data/projects.json 的 ``pros``）；
+    * op：OmniFocus Project（``op``，data/projects.json 的 ``projects``）。
+
+    task 相关的 create/assign/modify 等命令仍然是这个视图的主操作；project / op
+    的管理命令也保留，切到对应数据只是把“看什么”切换过去。
 
     命令统一以 ``task`` 开头（需求里的语法）：::
 
@@ -667,28 +682,35 @@ class TaskView(View):
     """
 
     key = "4"
-    name = "任务"
-    label = "任务 / 归档"
+    name = "数据"
+    label = "数据 / task · project · op"
+
+    #: 当前数据模型：task / project / op。真正的状态放在 Warden 上，
+    #: 这样从任何视图敲 `open project` 都能切过来并保持选择。
+    @property
+    def model(self):
+        return getattr(self.w, "data_view_model", "task")
 
     def idle_hint(self):
         return repl_kit.Hint(
-            "命令", ("task create", "task 3 -a 1", "task 3 -an", "task 3 -ac",
-                     "task 3 -c +2", "open 1", "sort", "group project", "search",
+            "命令", ("open task", "open project", "open op", "task create",
+                     "task 3 -a 1", "sort", "group project", "search",
                      "inspect-due", "review"),
-            note="数字 = 面板上的序号 · open 1/2/3 翻页 · open/close <表头> 折叠列"
-                 " · sort <字段> 排序 · group <字段> 分组 · search <词> 搜索 · "
-                 "PgUp/PgDn 翻看长看板 · Tab 切视图",
+            note="open task/project/op = 切换数据模型（task / 真正项目 pro / "
+                 "OmniFocus op）· task 模式 open 1/2/3 翻页 · open/close <表头> 折叠列"
+                 " · sort/group/search 操作任务数据 · Tab 切视图",
         )
 
     def status_line(self):
         return None
 
     def unknown_hint(self):
-        return ("「任务」视图认 task create/delete/modify/assign/select/duplicate/"
-                "drop/done/link/import/sync/swap、sort、group、search、open <页码|表头>、"
-                "close <表头>、review、inspect-due"
-                "（也可以直接写序号，如 task 3 -a 1 / task 3 -an / task 3 -c +2；"
-                "序号 = 面板上的第几条，面板外的任务用 id:N）；Shift+Tab 切回去再干别的。")
+        return ("「数据」视图认 open task/project/op 切换数据模型，以及 task "
+                "create/delete/modify/assign/select/duplicate/drop/done/link/import/sync/swap、"
+                "project、op、sort、group、search、open <页码|表头>、close <表头>、"
+                "review、inspect-due（也可以直接写序号，如 task 3 -a 1 / task 3 -an / "
+                "task 3 -c +2；序号 = 面板上的第几条，面板外的任务用 id:N）；"
+                "Shift+Tab 切回去再干别的。")
 
     def commands(self):
         w = self.w
@@ -862,10 +884,12 @@ class TaskView(View):
     def _command_guide_text(self):
         """表下一行灰色命令指引：每条 ≤7 字，参数细节交给 help --task。"""
         entries = (
-            ("refresh", "同步"), ("review", "收尾"), ("inspect-due", "查过期"),
-            ("plan", "排期"), ("project", "项目"), ("sort", "排序"),
-            ("group", "分组"), ("search", "搜索"), ("open", "翻页/展开"),
-            ("close", "折叠"), ("task", "任务操作"), ("help --task", "详情"),
+            ("open task", "任务数据"), ("open project", "项目数据"),
+            ("open op", "op 数据"), ("refresh", "同步"), ("review", "收尾"),
+            ("inspect-due", "查过期"), ("plan", "排期"), ("project", "项目"),
+            ("sort", "排序"), ("group", "分组"), ("search", "搜索"),
+            ("open", "翻页/展开"), ("close", "折叠"), ("task", "任务操作"),
+            ("help --task", "详情"),
         )
         mode = self._guidance_mode()
         text = Text(style="dim")
@@ -878,6 +902,127 @@ class TaskView(View):
         return text
 
     def render(self):
+        """按当前数据模型分派：task / project / op。"""
+        model = self.model
+        if model == "project":
+            return self._render_project_data()
+        if model == "op":
+            return self._render_op_data()
+        return self._render_task_data()
+
+    def _dispatch_hint(self):
+        return Text("open task · open project · open op    ← 切换数据模型（当前：%s）"
+                    % self.model, style="dim")
+
+    def _render_project_data(self):
+        """project 模型：真正项目 Project（``pro``）的本地数据。"""
+        w = self.w
+        rows = w.projects.pro_preview(w.sel_date, w.task_store)
+        t = Table(title="Project · 真正项目 pro 数据（open task / open project / open op 切换）",
+                  box=box.SIMPLE_HEAVY, header_style="bold blue",
+                  title_justify="left", expand=True)
+        t.add_column("#", justify="right", style="bold", no_wrap=True)
+        t.add_column("id", justify="right", style=STYLE_MUTED, no_wrap=True)
+        t.add_column("title", no_wrap=True, overflow="crop")
+        t.add_column("阶段", no_wrap=True)
+        t.add_column("当前 op", overflow="crop")
+        t.add_column("SOP op", overflow="crop", style="cyan")
+        t.add_column("incubator op", overflow="crop", style="magenta")
+        t.add_column("文件", overflow="crop", style=STYLE_MUTED)
+        t.add_column("状态", no_wrap=True)
+        t.add_column("关联 op", justify="right", no_wrap=True)
+        for row in rows:
+            current = row.get("active_op") or {}
+            sop = row.get("sop_op") or {}
+            inc = row.get("incubator_op") or {}
+            raw_pro = row.get("pro") or {}
+
+            def op_label(op):
+                if not op:
+                    return "—"
+                num = w.projects.number_of(op.get("id")) or op.get("id")
+                return "#%s %s" % (num, op.get("title") or "?")
+
+            t.add_row(
+                str(row.get("number") or "—"),
+                str(row.get("id") or "—"),
+                Text(row.get("title") or "—", style="bold"),
+                Text(row.get("stage") or "—",
+                     style="magenta" if row.get("stage") == "bottleneck" else "cyan"),
+                Text(op_label(current), style="green"),
+                Text(op_label(sop)),
+                Text(op_label(inc)),
+                Text(str(row.get("file") or "—")),
+                Text(str(raw_pro.get("status") or "—")),
+                Text(str(len(row.get("ops") or ()))),
+            )
+        if not rows:
+            row = [Text("") for _ in range(10)]
+            row[0] = Text("（还没有真正项目 pro；用 `project create <名称>` 创建，"
+                          "或给 op 加 project/… 标签关联）", style="dim")
+            t.add_row(*row)
+        t.caption = ("%d 条真正项目 Project（pro）· 存储：%s · 每个 pro 的当前 op 由 "
+                     "stage 决定（running=SOP / bottleneck=incubator）"
+                     % (len(rows), w.projects.path))
+        return [t, self._dispatch_hint()]
+
+    def _render_op_data(self):
+        """op 模型：OmniFocus Project（``op``）的本地数据，含未关联 pro 的孤立项。"""
+        w = self.w
+        rows = w.project_rows()
+        try:
+            plan_ids = {op.get("id") for op in w.projects.plan_ops()}
+        except Exception:                          # noqa: BLE001 - 展示失败别挡表
+            plan_ids = set()
+        t = Table(title="Op · OmniFocus Project 数据（SOP / incubator；含未关联 pro 的 op）",
+                  box=box.SIMPLE_HEAVY, header_style="bold magenta",
+                  title_justify="left", expand=True)
+        t.add_column("#", justify="right", style="bold", no_wrap=True)
+        t.add_column("id", justify="right", style=STYLE_MUTED, no_wrap=True)
+        t.add_column("title", no_wrap=True, overflow="crop")
+        t.add_column("类型", no_wrap=True)
+        t.add_column("关联 pro", overflow="crop")
+        t.add_column("阶段", no_wrap=True)
+        t.add_column("plan", no_wrap=True)
+        t.add_column("剩余", justify="right", no_wrap=True)
+        t.add_column("进度", justify="right", no_wrap=True)
+        t.add_column("未完成", justify="right", no_wrap=True)
+        t.add_column("本周", justify="right", no_wrap=True)
+        t.add_column("OmniFocus", no_wrap=True, style=STYLE_MUTED)
+        for row in rows:
+            kind = row.get("op_type") or "未设类型"
+            kind_style = ("magenta" if kind == "incubator"
+                          else "cyan" if kind == "SOP" else "yellow")
+            pro_txt = row.get("pro_title") or "—"
+            if row.get("pro_title") and row.get("pro_stage"):
+                pro_txt += " (%s)" % row.get("pro_stage")
+            plan_txt = Text("✓", style="bold green") if row.get("id") in plan_ids else Text("—", style=STYLE_MUTED)
+            if not row.get("allowed", True):
+                plan_txt = Text("⏸", style=STYLE_MUTED)
+            t.add_row(
+                str(row.get("number") or "—"),
+                str(row.get("id") or "—"),
+                Text(row.get("title") or "—", style="bold"),
+                Text(kind, style=kind_style),
+                Text(pro_txt, style="cyan" if row.get("pro_title") else STYLE_MUTED),
+                Text(row.get("pro_stage") or "—", style=STYLE_MUTED),
+                plan_txt,
+                Text(str(row.get("remaining") or 0), style="bold cyan"),
+                Text(row.get("progress_text") or "—", style=STYLE_MUTED),
+                Text(str(row.get("tasks_open") or 0), style=STYLE_MUTED),
+                Text(str(row.get("week_count") or 0), style=STYLE_MUTED),
+                Text(str(row.get("pk") or "")[:12] or "—"),
+            )
+        if not rows:
+            row = [Text("") for _ in range(12)]
+            row[0] = Text("（还没有 OmniFocus Project op；用 `op import sop|incubator` 导入）",
+                          style="dim")
+            t.add_row(*row)
+        t.caption = ("%d 条 OmniFocus Project（op）· plan 只收有 pro 关联且阶段匹配的 op；"
+                     "孤立 op 仍在这里显示" % len(rows))
+        return [t, self._dispatch_hint()]
+
+    def _render_task_data(self):
         w = self.w
         raw_tasks = w.task_store.list()
         filtered_tasks = w.filter_and_sort_tasks(raw_tasks)
@@ -908,7 +1053,8 @@ class TaskView(View):
         remark_max = max(10, avail - title_max)
         group_max = 10 if width < 95 else 16
 
-        t = Table(title="Task · 任务表（open/close 折叠列 · open 1/2/3 翻页 · 序号 = 契约面板上的第几条）",
+        t = Table(title="Data · Task · 任务表（open task/project/op 切换模型 · "
+                        "open/close 折叠列 · open 1/2/3 翻页 · 序号 = 契约面板上的第几条）",
                   box=box.SIMPLE_HEAVY, header_style="bold magenta",
                   title_justify="left", show_header=True,
                   width=max(20, width - 1), expand=True)
@@ -1099,7 +1245,13 @@ class TaskView(View):
                 note_renderable(note))
         out.append(Panel(at, title="[bold]Task Archive · 完成归档[/]",
                          border_style="dim", box=box.ROUNDED))
+        out.append(Text("open task · open project · open op    ← 切换数据模型（当前：task）",
+                        style="dim"))
         return out
+
+
+# 兼容旧代码/测试：类对象仍是原来那个，只是界面名字改成了「数据」。
+TaskView = DataView
 
 
 @register_view

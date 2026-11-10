@@ -97,7 +97,7 @@ class TaskSyncMixin(object):
                 line += "\n     备注：%s" % note
             self.say(line, "ok")
         if len(fresh) > limit:
-            self.say("…还有 %d 条完成归档（「任务」视图 / task archive 看全部）"
+            self.say("…还有 %d 条完成归档（「数据」视图 / task archive 看全部）"
                      % (len(fresh) - limit), "info")
         return fresh
 

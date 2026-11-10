@@ -1093,8 +1093,8 @@ check_true("提醒里直接给出命令",
            any("inspect-due" in str(getattr(item, "hint", "")) for item in wd.collect_warnings()))
 # 两个视图都注册了这条命令
 view_names = [v.name for v in wd.view_impls]
-check("任务 / 契约视图都在", ("任务" in view_names and "契约" in view_names), True)
-for name in ("任务", "契约"):
+check("数据 / 契约视图都在", ("数据" in view_names and "契约" in view_names), True)
+for name in ("数据", "契约"):
     impl = [v for v in wd.view_impls if v.name == name][0]
     registry = impl.to_view().registry
     check("%s视图认 inspect-due" % name, registry.get("inspect-due") is not None, True)
@@ -1279,8 +1279,8 @@ check_true("在收尾", wd.review is not None)
 contract_parts = [v for v in wd.view_impls if v.name == "契约"][0].render()
 check("契约视图的 render 里没有收尾面板了",
       [p for p in contract_parts if "收尾" in str(getattr(p, "title", ""))], [])
-task_parts = [v for v in wd.view_impls if v.name == "任务"][0].render()
-check("任务视图的 render 里也没有",
+task_parts = [v for v in wd.view_impls if v.name == "数据"][0].render()
+check("数据视图的 render 里也没有",
       [p for p in task_parts if "收尾" in str(getattr(p, "title", ""))], [])
 
 # 2) 栏位里（repl_kit.interrogate）有这块东西
@@ -1305,7 +1305,7 @@ check("栏位在看板之后、提示行之前", _tbl < _blk < _hint, True)
 
 # 4) 切视图不掉
 wd.go_to_view(w.TaskView)
-check_true("切到任务视图，栏位里还有", wd.shell.interrogate() is not None)
+check_true("切到数据视图，栏位里还有", wd.shell.interrogate() is not None)
 wd.go_to_view(w.StatsView)
 check_true("切到统计视图，栏位里还有", wd.shell.interrogate() is not None)
 wd.go_to_view(w.ContractView)

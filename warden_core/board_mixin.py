@@ -122,6 +122,7 @@ class BoardMixin(object):
             self.csv_fp, len(self.entries),
             self.review_signature(), pending_sig,
             self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
+            getattr(self, "data_view_model", "task"),
             tuple(sorted(self.effective_hidden_columns())),
             tuple(sorted(self.effective_task_hidden_columns(self.task_store.list()))),
             self.task_view_page, self.task_sort_key, self.task_sort_desc,
@@ -2111,13 +2112,39 @@ class BoardMixin(object):
                 opened.append(got)
         return opened
 
+    #: `open <模型>` 的别名。只收英文 token，避免和任务表/契约表的表头名
+    #: （例如「项目」列）抢同一个词。
+    DATA_MODEL_ALIASES = {
+        "task": "task", "tasks": "task",
+        "project": "project", "projects": "project",
+        "op": "op", "ops": "op",
+    }
+
+    def _switch_data_model(self, model):
+        """切到第四视图「数据」并选择展示 task / project / op 模型。"""
+        if model not in ("task", "project", "op"):
+            raise ValueError("数据模型只能是 task / project / op；你给的是 %r" % model)
+        self.data_view_model = model
+        if model == "task":
+            # 任务模型重新从第一页开始；project / op 没有分页状态。
+            self.task_view_page = None
+        if not isinstance(self.view, TaskView):
+            self.go_to_view(TaskView)
+        label = {"task": "Task 任务", "project": "Project 真正项目 pro",
+                 "op": "Op OmniFocus Project"}[model]
+        self.say("🗂 数据视图 → %s（open task / open project / open op 切换）" % label,
+                 "cmd")
+        self.invalidate()
+        return model
+
     def cmd_open(self, args=None):
-        """``open working|detail`` 切口径；``open <表头> [--permanent]`` 展开列；
-        直接敲 ``open`` + 回车时顺便打开项目（``pro``）关联的文件。
+        """``open task|project|op`` 切数据模型；``open working|detail`` 切口径；
+        ``open <表头> [--permanent]`` 展开列；直接敲 ``open`` + 回车时顺便
+        打开项目（``pro``）关联的文件。
 
         working 默认自动折叠「时段类型 / 时段名称 / 契约」；手动 open 只是
         本次运行的覆盖，加 ``--permanent`` 才会写进偏好、以后也不再自动折叠。
-        在任务视图里，``open/close`` 作用于任务表的表头。
+        在数据视图里，``open/close`` 作用于任务表的表头。
         """
         text, permanent, toks = self._column_command_args(args)
         if not text:
@@ -2127,6 +2154,13 @@ class BoardMixin(object):
                 "detail" if self.session_ui_mode == "working" else "working")
             self._open_associated_project_files()
             return mode
+        # 三个数据模型优先于同名的任务表表头：open project = 看 pro 数据，
+        # 想看任务表的 project 列请用 `open 项目`。
+        model = self.DATA_MODEL_ALIASES.get(text.strip().lower())
+        if model is not None:
+            if permanent:
+                raise ValueError("open task/project/op 是切换数据模型，不带 --permanent")
+            return self._switch_data_model(model)
         if toks and toks[0].lower() in ("pro", "project", "项目") and len(toks) >= 2:
             pro = self._ensure_pro_for_token(" ".join(toks[1:]))
             self.selected_pro_id = pro["id"]
@@ -2141,7 +2175,8 @@ class BoardMixin(object):
             if permanent:
                 raise ValueError("open --permanent 只用于表头列；切口径不带 --permanent")
             return self._switch_session_mode(mode)
-        task_mode = isinstance(self.view, TaskView)
+        task_mode = isinstance(self.view, TaskView) and getattr(
+            self, "data_view_model", "task") == "task"
         if task_mode and re.match(r"^(?:page\s*|p)?(\d+)$", text.lower()):
             if permanent:
                 raise ValueError("open <页码> 翻页不带 --permanent")
@@ -2216,18 +2251,21 @@ class BoardMixin(object):
         return col
     def cmd_help(self, args=None):
         toks = [str(a).strip().lower() for a in (args or [])]
-        if any(tok in ("--task", "-t", "task", "任务") for tok in toks):
+        if any(tok in ("--task", "--data", "-t", "task", "data", "任务", "数据")
+               for tok in toks):
             return self.cmd_help_task()
         t = Table.grid(padding=(0, 2))
         t.add_column(style="bold", no_wrap=True, justify="right")
         t.add_column()
         for cmd, desc in [
-            ("Tab", "切换视图：契约 → 专注 → 统计 → 任务 → 设置 → 契约（循环）"),
+            ("Tab", "切换视图：契约 → 专注 → 统计 → 数据 → 设置 → 契约（循环）"),
             ("PgUp / PgDn", "长看板在**当前界面内**往上/往下翻；只在一屏范围内滚动，"
                             "不会把旧帧写进终端 scrollback（全屏模式）"),
             ("open working|detail", "切换 session 看板口径：working = 实际为主、"
                                      "过去只留最近一场；detail = 计划 + 实际全部"),
-            ("open/close <表头>", "展开/折叠契约表的一列；加 --permanent 写进偏好，"
+            ("open task|project|op", "切到第四视图「数据」，分别查看 task 任务库 / "
+                                      "project 真正项目 pro / op OmniFocus Project 三种数据模型"),
+            ("open/close <表头>", "展开/折叠契约表或任务表的一列；加 --permanent 写进偏好，"
                                   "working 默认折叠 时段类型 / 时段名称 / 契约"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
             ("stat refresh full", "统计：丢掉缓存、全量重拉（默认只增量拉缺口 + 最近几天）"),
@@ -2240,7 +2278,8 @@ class BoardMixin(object):
             ("period T1 25 25 25 25", "同 session T1 ...；只给 T1 = 撤销自定义，恢复默认"),
             ("set <id> <value>（设置视图）", "改设置；不写 value = 恢复默认。settings 重新列出全部"),
             ("warn on|off", "状态框里的警告显示开关（不写 = 取反）"),
-            ("task create ...", "在「任务」视图建任务：task create [id] [field=value ...]"),
+            ("task create ...", "在「数据」视图的 task 模型建任务："
+                                 "task create [id] [field=value ...]"),
             ("task delete/modify ...", "task delete <id> / task modify <id> <field> <值>"),
             ("task assign <session ID>", "把选中的任务挂到表格 #N 的 session，并自动写 Focusmate task"),
             ("task <任务ID> -a <session ID>", "选中并挂上：task 8 -a 1（裸 ID 就等于 task select 8）"),
@@ -2360,7 +2399,8 @@ class BoardMixin(object):
             "OmniFocus 那条自己要是重复任务，写完会在那边翻到下一次（新 primary key），"
             "本地还开着的记录（本体 + 后面的子任务）自动改挂过去 —— 不然下一次的活"
             "永远勾不掉；放弃本体时带 --all-occurrences，连那一套一起放弃。\n"
-            "任务视图：task 命令在任何视图都能敲；任务字段不校验，JSON 存在 data/tasks.json。\n"
+            "数据视图：open task/project/op 切换 task / project / op 三种数据模型；"
+            "task 命令在任何视图都能敲；任务字段不校验，JSON 存在 data/tasks.json。\n"
             "设置视图：列出所有设置项和解释；set <id> <value> 改，"
             "edit-tomorrow / tomorrow-plan 见那里的说明。\n"
             "状态框（契约视图最上面）：契约执行情况 + 警告；warn off 可以藏掉警告。\n"
@@ -2370,11 +2410,13 @@ class BoardMixin(object):
         return False
 
     def cmd_help_task(self):
-        """``help --task``：任务视图的详细说明（列、标记、缩写、全部命令）。"""
+        """``help --task`` / ``help --data``：数据视图的详细说明（三模型、列、命令）。"""
         from rich.table import Table as _Table
         t = _Table.grid(padding=(0, 2))
         t.add_column(style="bold cyan", no_wrap=True, justify="right")
         t.add_column()
+        t.add_row("三个模型", "open task = 任务 Task · open project = 真正项目 Project（pro） · "
+                              "open op = OmniFocus Project（op）；本界面顶部随选择切换")
         t.add_row("默认列", "序号 · 标记 · title · project · 状态 · session · 截止 · 备注")
         t.add_row("默认折叠", "id · 重复 · trigger · formatter · Focusmate · OmniFocus · "
                               "完成时间 · 标签 · duration · count · exclusive · defer"
@@ -2396,9 +2438,10 @@ class BoardMixin(object):
         t.add_row("三模型区别", "pro = 真正项目 Project（running/bottleneck + 关联文件） · "
                                 "op = OmniFocus Project（SOP 或 incubator） · task = 单条任务")
         t.add_row("关联项目", "op（SOP）用标签 project/… 关联 pro；导入/刷新把叶子任务镜像进任务库"
-                              "（fields.project），任务视图可搜索/group project；plan 按项目当前阶段唤起对应 op。")
+                              "（fields.project），数据视图的 task 模型可搜索/group project；"
+                              "plan 按项目当前阶段唤起对应 op。")
         t.add_row("任务库", self.task_store.path)
-        p_detail = Panel(t, title="[bold]Task · 任务视图详细说明[/]",
+        p_detail = Panel(t, title="[bold]Data · 数据视图 / Task · 任务视图详细说明[/]",
                          border_style="cyan", box=box.ROUNDED)
         self.emit(p_detail)
 

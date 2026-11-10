@@ -286,6 +286,7 @@ from warden_core import (  # noqa: E402,F401
     TASK_UI_MODE,
     TEMP,
     Table,
+    DataView,
     TaskCmdMixin,
     TaskPipelineMixin,
     TaskSyncMixin,
@@ -429,6 +430,10 @@ class Warden(
         self.selected_task_id = None
         self.task_sync_at = 0.0
         self.task_view_page = None
+        # 第四视图「数据」当前展示的数据模型：task / project / op。
+        # 用 open task / open project / open op 切换；放在 Warden 上，
+        # 从任何视图切过来都能保持上一次选择。
+        self.data_view_model = "task"
         self.task_sort_key = None
         self.task_sort_desc = False
         self.task_group_by = None

@@ -827,8 +827,8 @@ check("快照模式标出「快照」而不是「缺」", "快照" in out and " 
 # ---------------------------------------------------------------- 视图（Tab 切换）
 
 print("== 视图：注册 + Tab 切换 ==")
-check("注册了契约/专注/统计/任务/设置/琐事六个视图", [v.name for v in w.VIEWS],
-      ["契约", "专注", "统计", "任务", "设置", "琐事"])
+check("注册了契约/专注/统计/数据/设置/琐事六个视图", [v.name for v in w.VIEWS],
+      ["契约", "专注", "统计", "数据", "设置", "琐事"])
 wd = mkwarden()
 check("默认契约视图", (wd.view.name, wd.view_index), ("契约", 0))
 wd.handle("tab")
@@ -836,7 +836,7 @@ check("tab 切到专注", (wd.view.name, wd.view_index), ("专注", 1))
 wd.handle("\t")
 check("再一个 Tab 切到统计（Tab 是循环）", (wd.view.name, wd.view_index), ("统计", 2))
 wd.handle("\t")
-check("第三个 Tab 切到任务", (wd.view.name, wd.view_index), ("任务", 3))
+check("第三个 Tab 切到数据", (wd.view.name, wd.view_index), ("数据", 3))
 wd.handle("\t")
 check("第四个 Tab 切到设置", (wd.view.name, wd.view_index), ("设置", 4))
 wd.handle("\t")
