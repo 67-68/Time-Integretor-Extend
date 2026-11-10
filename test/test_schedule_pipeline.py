@@ -451,6 +451,11 @@ _plan_payload = pj.project_payload(
       "completed": False, "dropped": False}],
     now=datetime.datetime.now())
 wd_plan.projects.upsert(_plan_payload)
+# Day Plan 现在只展示每个 pro 当前阶段的 op；把这条 op 关联到真正项目。
+# 直接走 store，避免当前恰好是琐事屏时命令被它吃掉。
+_plan_pro, _ = wd_plan.projects.create_pro("论文项目")
+wd_plan.projects.link_op_to_pro(1, _plan_pro["id"])
+wd_plan.projects.set_op_type(1, "SOP")
 _plan_task = wd_plan.task_store.create({
     "title": "写引言", "duration": 50, "count": 2,
     "project": "论文项目", "project_id": 1, "project_task": "day-task-1"})

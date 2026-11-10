@@ -34,8 +34,37 @@ class ProjectMixin(object):
     # 所有的 task，但不展示直到他们被 project 唤起*）。
 
     def project_rows(self, day=None):
-        """项目预览表格的行（序号 = `task <序号> <count>` 里的那个数）。"""
+        """OmniFocus Project（op）预览行；``op`` 命令仍需要看到全部 op。"""
         return self.projects.preview(day or self.sel_date, self.task_store)
+
+    def current_project_rows(self, day=None):
+        """契约视图用的项目行：每个 Pro 只显示**当前阶段对应的那一个 op**。
+
+        ``running`` 只显示 SOP op，``bottleneck`` 只显示 incubator op；未关联
+        真正项目 ``pro`` 的孤立 op 不在这里出现（仍可在 ``op`` 命令里管理）。
+        行上的 ``number`` 用 Pro 序号，``op_number`` 另存 op 原序号。
+        """
+        day = day or self.sel_date
+        op_rows = {row["id"]: row for row in self.project_rows(day)}
+        out = []
+        for pr in self.projects.pro_preview(day, self.task_store):
+            op = pr.get("active_op")
+            if op is None:
+                continue
+            row = dict(op_rows.get(op["id"]) or {})
+            row.update({
+                "number": pr["number"],
+                "pro_id": pr["id"],
+                "pro_number": pr["number"],
+                "op_number": row.get("number"),
+                "pro": pr["pro"],
+                "pro_title": pr["title"],
+                "pro_stage": pr["stage"],
+                "active_op": op,
+                "active_op_type": pr.get("active_op_type"),
+            })
+            out.append(row)
+        return out
 
     def _task_project_label(self, task):
         """任务 → 一句项目来源（项目名 / OmniFocus pk / count）。"""
@@ -123,8 +152,9 @@ class ProjectMixin(object):
                 rec["tasks"].append(task)
 
         # 项目 plan items：即使本地 task 已丢失，也把「项目原本怎么排的」露出来。
+        # 只取每个 pro 当前阶段的 op；旧阶段的 plan 记录不再占屏。
         try:
-            projects = self.projects.active()
+            projects = self.projects.plan_ops()
         except Exception:                          # noqa: BLE001
             projects = []
         for project in projects:
@@ -227,18 +257,21 @@ class ProjectMixin(object):
         return t
 
     def render_projects_table(self):
-        """契约视图里**任务面板下面**那块项目表：剩余 count / 进度 / 今天 plan 了多少。"""
-        rows = self.project_rows()
-        pro_rows = self.projects.pro_preview(self.sel_date, self.task_store)
-        if not rows and not pro_rows:
+        """契约视图里**任务面板下面**那块项目表。
+
+        每个真正项目 ``pro`` 一行，只展示当前阶段的 op：running → SOP，
+        bottleneck → incubator。这样表里不会同时出现同一个项目的 SOP 和
+        incubator 两套资源，plan 的序号也和这张表一致。
+        """
+        rows = self.current_project_rows()
+        if not rows:
             return None
-        t = Table(title="Project · 项目（op = OmniFocus Project [SOP/incubator] · "
-                        "pro = 真正项目 [running/bottleneck]）",
+        t = Table(title="Project · 项目（每个 Pro 只显示当前阶段活跃的 op）",
                   box=box.SIMPLE_HEAVY, header_style="bold blue",
                   title_justify="left", expand=False)
         t.add_column("#", justify="right", style="bold", no_wrap=True)
-        t.add_column("项目", no_wrap=True, overflow="crop")
-        t.add_column("类型/阶段", no_wrap=True)
+        t.add_column("项目 / 当前 op", no_wrap=True, overflow="crop")
+        t.add_column("阶段 / 类型", no_wrap=True)
         t.add_column("剩余 count", justify="right", no_wrap=True)
         t.add_column("进度", justify="right", no_wrap=True)
         t.add_column("今天 plan", no_wrap=True)
@@ -247,48 +280,37 @@ class ProjectMixin(object):
         t.add_column("OmniFocus", no_wrap=True, style=STYLE_MUTED)
         for row in rows:
             plan_txt = "—"
-            if row["allocated"]:
+            if row.get("allocated"):
                 plan_txt = "说好 %d count" % row["allocated"]
-                if row["scheduled"]:
+                if row.get("scheduled"):
                     plan_txt += " · 已排 %d" % row["scheduled"]
-            elif row["scheduled"]:
+            elif row.get("scheduled"):
                 plan_txt = "已排 %d count" % row["scheduled"]
-            op_kind = row.get("op_type") or "未设"
-            if row.get("pro_title"):
-                type_txt = "%s · pro:%s(%s)" % (
-                    op_kind, row["pro_title"], row.get("pro_stage") or "running")
-            else:
-                type_txt = op_kind
-            type_style = ("bold yellow" if not row.get("op_type")
-                          else ("magenta" if op_kind == pj.OP_TYPE_INCUBATOR else "cyan"))
+            op_kind = row.get("active_op_type") or row.get("op_type") or "?"
+            stage = row.get("pro_stage") or "running"
+            type_txt = "%s · %s" % (stage, op_kind)
+            type_style = ("magenta" if op_kind == pj.OP_TYPE_INCUBATOR
+                          else "cyan")
             if not row.get("allowed", True):
                 type_txt += " ⏸"
                 type_style = STYLE_MUTED
+            op_title = (row.get("active_op") or {}).get("title") or "?"
             t.add_row(str(row["number"]),
-                      row["title"],
+                      Text("%s → %s" % (row.get("pro_title") or "?", op_title),
+                           overflow="crop"),
                       Text(type_txt, style=type_style),
-                      Text(str(row["remaining"]), style="bold cyan"),
-                      Text(row["progress_text"], style=STYLE_MUTED),
-                      Text(plan_txt, style="green" if row["allocated"] else STYLE_MUTED),
-                      Text(str(row["tasks_open"]), style=STYLE_MUTED),
-                      Text(str(row["week_count"]),
+                      Text(str(row.get("remaining") or 0), style="bold cyan"),
+                      Text(row.get("progress_text") or "—", style=STYLE_MUTED),
+                      Text(plan_txt, style="green" if row.get("allocated") else STYLE_MUTED),
+                      Text(str(row.get("tasks_open") or 0), style=STYLE_MUTED),
+                      Text(str(row.get("week_count") or 0),
                            style="bold yellow" if row.get("week_missing")
                            else STYLE_MUTED),
-                      Text(str(row["pk"])[:10] or "—"))
-        total_remaining = sum(r["remaining"] for r in rows)
-        pro_summary = ""
-        if pro_rows:
-            bits = []
-            for pr in pro_rows:
-                f_bit = (" · 文件:%s" % os.path.basename(pr["file"])) if pr.get("file") else ""
-                bits.append("Pro#%d「%s」[%s%s]" % (
-                    pr["number"], pr["title"], pr["stage"], f_bit))
-            pro_summary = "真正项目：" + "、".join(bits) + " · "
-        t.caption = ("%s%d 个项目 · 剩余 %d count（%d 分钟）· 本周 = 周一起这一周会产生的"
-                     "任务（含被推迟到本周开放的、重复任务的每个 occurrence）· 剩余 "
-                     "count = 未完成任务还差几块 25 分钟；进度 = 已完成 / 总共（按 count "
-                     "算）· `plan` 分配今天的资源"
-                     % (pro_summary, len(rows), total_remaining,
+                      Text(str(row.get("pk") or "")[:10] or "—"))
+        total_remaining = sum(int(r.get("remaining") or 0) for r in rows)
+        t.caption = ("%d 个活跃项目 · 剩余 %d count（%d 分钟）· 只显示当前阶段对应的 "
+                     "op（running=SOP / bottleneck=incubator）· `plan` 也按同一份清单分配"
+                     % (len(rows), total_remaining,
                         total_remaining * pp.MINUTES_PER_COUNT))
         return t
 
@@ -499,43 +521,51 @@ class ProjectMixin(object):
             pro <序号> open                     打开该项目关联的文件
             pro <序号> stage <running|bottleneck>  直接设置阶段
             pro <序号> op <op序号>              关联已有 op
-            project 1                           看 #1 的详情与任务清单
-            project 1 refresh                   刷新 OmniFocus 清单
-            project 1 remove                    撤掉项目
+            pro <序号> interrupt [--hard]       硬中断当前进行中的 session：
+                                                下架全部任务 → 输入 title → 建整场任务挂回去
+            project 1                           看 #1 当前阶段 op 的详情与任务清单
+            project 1 refresh                   刷新该 pro 关联的 OmniFocus 清单
+            project 1 remove                    撤掉 pro（op 仍在，用 op remove）
             project refresh / check             全量刷新 / 每日对账
         """
         self.projects.ensure_tagged_pros()
         toks = [str(a).strip() for a in (args or []) if str(a).strip()]
         if not toks:
             pro_rows = self.projects.pro_preview(self.sel_date, self.task_store)
-            rows = self.project_rows()
-            if not pro_rows and not rows:
-                self.say("📁 项目库是空的：在 OmniFocus 里 ⌘C 一个项目，再敲 `task import`，"
+            current_rows = self.current_project_rows()
+            by_pro = {row["pro_id"]: row for row in current_rows}
+            if not pro_rows:
+                self.say("📁 项目库是空的：在 OmniFocus 里 ⌘C 一个**项目**，再敲 `task import`，"
                          "或 `pro create <名称>`。", "warn")
                 return []
             for pr in pro_rows:
-                sop_txt = ("#%s「%s」" % (self.projects.number_of(pr["sop_op"]["id"]) or pr["sop_op"]["id"],
-                                          pr["sop_op"].get("title"))
-                           if pr.get("sop_op") else "—")
-                inc_txt = ("#%s「%s」" % (self.projects.number_of(pr["incubator_op"]["id"]) or pr["incubator_op"]["id"],
-                                          pr["incubator_op"].get("title"))
-                           if pr.get("incubator_op") else "—")
                 file_txt = (" · 文件：%s" % pr["file"]) if pr.get("file") else ""
-                self.say("📂 Pro #%d %s [阶段:%s] · SOP:%s · incubator:%s%s"
+                row = by_pro.get(pr["id"])
+                if row is None:
+                    need = ("incubator" if pr.get("stage") == pj.STAGE_BOTTLENECK
+                            else pj.OP_TYPE_SOP)
+                    self.say("📂 Pro #%d %s [阶段:%s] · 当前缺少 %s op（先 `op import %s` "
+                             "或 `pro %d -a`）%s"
+                             % (pr["number"], pr["title"], pr["stage"], need, need,
+                                pr["number"], file_txt), "warn")
+                    continue
+                op = row.get("active_op") or {}
+                self.say("📂 Pro #%d %s [阶段:%s → %s op #%s「%s」]：剩余 %d count · "
+                         "进度 %s · %d 条未完成 · 本周 %d 条%s%s"
                          % (pr["number"], pr["title"], pr["stage"],
-                            sop_txt, inc_txt, file_txt), "info")
-            for row in rows:
-                op_kind = row.get("op_type") or "未设类型"
-                pro_bit = (" · pro:%s(%s)" % (row["pro_title"], row.get("pro_stage") or "running")
-                           if row.get("pro_title") else "")
-                self.say("📁 #%d %s [%s%s]：剩余 %d count · 进度 %s · %d 条未完成 · 本周 %d 条%s"
-                         % (row["number"], row["title"], op_kind, pro_bit,
-                            row["remaining"], row["progress_text"], row["tasks_open"],
-                            int(row.get("week_count") or 0),
-                            ("· 今天说好 %d count（已排 %d）"
-                             % (row["allocated"], row["scheduled"]))
-                            if row["allocated"] else ""), "info")
-            return rows or pro_rows
+                            row.get("active_op_type") or "?",
+                            row.get("op_number") or "?", op.get("title") or "?",
+                            row.get("remaining") or 0, row.get("progress_text") or "—",
+                            row.get("tasks_open") or 0, int(row.get("week_count") or 0),
+                            (" · 今天说好 %d count（已排 %d）"
+                             % (row.get("allocated"), row.get("scheduled")))
+                            if row.get("allocated") else "", file_txt), "info")
+            orphans = [row for row in self.project_rows()
+                       if not row.get("pro_title")]
+            if orphans:
+                self.say("· 另有 %d 个未关联真正项目的 op；用 `op` 查看/关联。"
+                         % len(orphans), "dim")
+            return pro_rows
         action = toks[0].lower()
         if action in ("create", "new", "add", "新建", "创建"):
             return self._cmd_pro_create(toks[1:])
@@ -594,6 +624,12 @@ class ProjectMixin(object):
             self._open_pro_file(pro)
             return pro
 
+        # 硬中断：下掉当前 session 的所有任务，等用户输入 title 后新建一条
+        # 与整场等长的任务并挂回去。默认 --hard，显式写 --hard 也一样。
+        if rest and rest_low[0] in ("interrupt", "中断", "打断", "硬中断"):
+            pro = self._ensure_pro_for_token(toks[0])
+            return self._start_project_interrupt(pro, rest[1:])
+
         # 检查是否是 stage <running|bottleneck>
         if rest and (rest_low[0] in ("stage", "--stage", "阶段")
                      or rest_low[0].startswith("stage=")
@@ -631,18 +667,25 @@ class ProjectMixin(object):
             self.invalidate()
             return pro
 
-        # refresh / remove / 详情：兼容 op 与 pro
+        # refresh / remove / 详情：project 命令优先按真正项目 pro 解析
         if rest and rest_low[0] in ("refresh", "sync", "reload", "更新"):
             try:
-                project = self.projects.resolve(toks[0])
-                return self._project_refresh(project)
-            except ValueError:
                 pro = self.projects.resolve_pro(toks[0])
                 ops = self.projects.ops_for_pro(pro)
                 made = [self._project_refresh(op) for op in ops]
                 return [p for p in made if p]
+            except ValueError:
+                project = self.projects.resolve(toks[0])
+                return self._project_refresh(project)
         if rest and rest_low[0] in ("remove", "rm", "delete", "撤掉", "删除"):
             try:
+                pro = self.projects.resolve_pro(toks[0])
+                pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
+                self.projects.remove_pro(pro["id"])
+                self.invalidate()
+                self.say("🗑 项目（pro）#%s「%s」已删除。" % (pnum, pro.get("title")), "ok")
+                return pro
+            except ValueError:
                 project = self.projects.resolve(toks[0])
                 num = self.projects.number_of(project["id"]) or project["id"]
                 removed = self.task_store.remove_project_backlog(project["id"])
@@ -654,15 +697,23 @@ class ProjectMixin(object):
                          % (num, project.get("title"),
                             "；清掉 %d 条未唤起的镜像任务" % removed if removed else ""), "ok")
                 return project
-            except ValueError:
-                pro = self.projects.resolve_pro(toks[0])
-                pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
-                self.projects.remove_pro(pro["id"])
-                self.invalidate()
-                self.say("🗑 项目（pro）#%s「%s」已删除。" % (pnum, pro.get("title")), "ok")
-                return pro
-        # 详情：如果既有 pro 也有 op，优先看 op 详情并附带 pro 信息；若只有 pro 则看 pro 详情
+        # 详情：project 序号首先指真正项目 pro；该 pro 当前阶段有 op 时把
+        # op 的清单一起铺开。旧用法（只有 op）仍退回 op 详情。
         try:
+            pro = self.projects.resolve_pro(toks[0])
+            self.selected_pro_id = pro["id"]
+            pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
+            active_op = self.projects.current_op_for_pro(pro)
+            self.say("📂 Pro #%s「%s」· 阶段：%s · 当前 %s op：%s%s"
+                     % (pnum, pro.get("title"), pro.get("stage"),
+                        pj.normalize_op_type((active_op or {}).get("op_type")) or "—",
+                        (active_op or {}).get("title") or "（缺失）",
+                        (" · 文件：%s" % pro["file"]) if pro.get("file") else ""),
+                     "info")
+            if active_op is not None:
+                return self._project_detail(active_op)
+            return self._pro_detail(pro)
+        except ValueError:
             project = self.projects.resolve(toks[0])
             pro = self.projects.pro_for_op(project)
             if pro is not None:
@@ -673,9 +724,179 @@ class ProjectMixin(object):
                             (" · 文件：%s" % pro["file"]) if pro.get("file") else ""),
                          "info")
             return self._project_detail(project)
-        except ValueError:
-            pro = self.projects.resolve_pro(toks[0])
-            return self._pro_detail(pro)
+
+    # -- 硬中断 --------------------------------------------------------
+    def _start_project_interrupt(self, pro, tail_tokens=None):
+        """``project <序号> interrupt [--hard]``：清空当前场，等 title 后建新任务。
+
+        默认就是 ``--hard``：当前进行中的 session 上所有未完成任务先全部下架
+        （Focusmate task 走同一套 ``_task_detach``），然后让用户输入一个 title，
+        新建「duration = 整场长度」的任务并挂回这一场。``--soft`` 目前不实现，
+        避免用户以为有一个实际不会清场的选项。
+        """
+        tail = [str(t).strip().lower() for t in (tail_tokens or ()) if str(t).strip()]
+        mode = "hard"
+        for token in tail:
+            if token in ("--hard", "hard", "硬"):
+                mode = "hard"
+            elif token in ("--soft", "soft", "软"):
+                raise ValueError("目前只实现了硬中断（--hard）：会下掉当前 session "
+                                 "的全部任务。软中断还没定义，先别用。")
+            else:
+                raise ValueError("用法：project <序号> interrupt [--hard]（默认就是 hard）")
+        live = self.live_session()
+        if live:
+            index, row = live
+        else:
+            # 和 `task -ac` 的「当前这一场」保持同一口径：没有进行中的场次时，
+            # 最近一场已经订上的 upcoming 也可以作为当前场处理。
+            try:
+                index, row = self.current_session()
+            except ValueError:
+                raise ValueError("现在没有正在进行的 session，也没有已订上的下一场，"
+                                 "没法 interrupt。先开始/订上一场再试。") from None
+        date_iso = str(row.get("date") or self.sel_date.isoformat())
+        start = str(row.get("startLabel") or row.get("start") or "").strip()
+        duration = int(row.get("durationMin") or row.get("duration") or 0)
+        if not start or duration <= 0:
+            raise ValueError("当前 session 的起点/时长认不出来，不能硬中断。")
+        # 同一场 Focusmate meeting 可能因为 relocate 在本地有不同的 startLabel；
+        # 有 session id 时以 id 认场，没有才退回「同一天 + 同一起点」。
+        meeting_id = str(row.get("id") or row.get("focusmate_session_id") or "")
+        tasks = []
+        for task in self.task_store.list():
+            if not self.task_store.is_open(task):
+                continue
+            sess = task.get("session") or {}
+            same_start = (str(sess.get("date") or "") == date_iso
+                          and str(sess.get("start") or "") == start)
+            same_meeting = (bool(meeting_id)
+                            and str(sess.get("focusmate_session_id") or "") == meeting_id)
+            if same_start or same_meeting:
+                tasks.append(task)
+        detached = []
+        for task in tasks:
+            title = self.task_store.focusmate_title(task, 30) or ("#%s" % task.get("id"))
+            try:
+                self._task_detach(task, reason="project-interrupt-hard")
+                detached.append(title)
+            except Exception as exc:                   # noqa: BLE001 - 一条失败也继续清
+                self.had_error = True
+                self.say("❌ 硬中断：任务「%s」下架失败：%s" % (title, exc), "error")
+        self.pending_interrupt = {
+            "mode": mode,
+            "pro_id": pro["id"],
+            "pro_title": pro.get("title") or "?",
+            "pro_number": self.projects.pro_number_of(pro["id"]) or pro["id"],
+            "date": date_iso,
+            "start": start,
+            "end": str(row.get("endLabel") or ""),
+            "duration": duration,
+            "index": index,
+            "focusmate_session_id": row.get("id"),
+            "startMs": row.get("startMs"),
+            "detached": detached,
+        }
+        self.selected_pro_id = pro["id"]
+        self.say("⛔ 硬中断：%s %s 当前场的 %d 条任务已下架%s。"
+                 % (date_iso, start, len(detached),
+                    ("：" + "、".join(detached)) if detached else "（本来就没有任务）"),
+                 "warn")
+        self.say("请输入新任务的 title（直接回车不发；`q` 取消）。新建任务会占满这一场 %d 分钟。"
+                 % duration, "cmd")
+        self.invalidate()
+        return self.pending_interrupt
+
+    def pending_interrupt_panel(self):
+        """硬中断等待 title 时挂在打断栏位的面板。"""
+        pending = self.pending_interrupt
+        if pending is None:
+            return None
+        body = Text()
+        body.append("项目「%s」(#%s) 硬中断\n"
+                    % (pending.get("pro_title") or "?",
+                       pending.get("pro_number") or "?"), style="bold")
+        body.append("  目标场：%s %s–%s（%d 分钟）\n"
+                    % (pending.get("date") or "?", pending.get("start") or "?",
+                       pending.get("end") or "?", int(pending.get("duration") or 0)),
+                    style="cyan")
+        body.append("  已下架：%s\n"
+                    % ("、".join(pending.get("detached") or ()) or "（原本就没有任务）"),
+                    style="yellow")
+        body.append("\n请输入新任务 title（会新建一条整场长度的任务并挂回这一场）；"
+                    "`q` 取消。", style="bold")
+        return Panel(body, title="[bold red]⛔ project interrupt · 输入新任务 title[/]",
+                     border_style="red", box=box.HEAVY)
+
+    def _answer_pending_interrupt(self, line):
+        """硬中断 title 输入：建立整场长度的任务并挂回原 session。"""
+        pending = self.pending_interrupt
+        if pending is None:
+            return None
+        raw = str(line or "").strip()
+        if not raw:
+            self.say("请输入新任务 title（不能为空）；`q` 取消。", "warn")
+            return True
+        if raw.lower() in ("q", "quit", "cancel", "取消", "放弃"):
+            self.pending_interrupt = None
+            self.say("⏹ 已取消硬中断；当前场剩余任务已经下架，不会再自动挂回去。",
+                     "info")
+            self.invalidate()
+            return True
+        task = None
+        try:
+            pro = self.projects.pro_by_id(pending.get("pro_id")) or {}
+            if not pro:
+                raise ValueError("项目已经不在了")
+            duration = int(pending.get("duration") or 0)
+            active_op = self.projects.current_op_for_pro(pro)
+            fields = {"title": raw, "duration": duration,
+                      "project": pro.get("title") or pending.get("pro_title") or "",
+                      "pro_id": pro.get("id"),
+                      "interrupt": "hard"}
+            # 沿用项目任务的口径：project_id 指向 OmniFocus op（如果当前阶段有）。
+            if active_op is not None:
+                fields["project_id"] = active_op["id"]
+            task = self.task_store.create(
+                fields,
+                source={"kind": "project", "title": pro.get("title") or "",
+                        "interrupt": "hard", "local_only": True},
+            )
+            if not th.is_exclusive(task):
+                task = self.task_store.modify(task["id"], "exclusive", True)
+            session = {
+                "index": pending.get("index"),
+                "date": pending.get("date"),
+                "start": pending.get("start"),
+                "end": pending.get("end"),
+                "duration": duration,
+                "focusmate_session_id": pending.get("focusmate_session_id"),
+                "startMs": pending.get("startMs"),
+            }
+            note = self.assign_task_to(task, session)
+            task = self.task_store.get(task["id"])
+            assigned = task.get("session") or {}
+            if str(assigned.get("start") or "") != str(pending.get("start") or ""):
+                raise ValueError(note or "任务没有挂到目标 session")
+            self.selected_task_id = task["id"]
+            self.pending_interrupt = None
+            self.say("✅ 硬中断完成：新任务「%s」%d 分钟，已挂到 %s %s。"
+                     % (raw, duration, pending.get("date"), pending.get("start")), "ok")
+            self.rebuild_rows()
+            self.invalidate()
+            return True
+        except Exception as exc:                       # noqa: BLE001 - 失败时别重复建任务
+            self.had_error = True
+            self.pending_interrupt = None
+            if task is not None:
+                self.say("❌ 硬中断：新任务 #%s「%s」已经建好，但挂到当前场失败：%s。"
+                         "用 `task %s -ac` 再挂一次。"
+                         % (task.get("id"), raw, exc, self.task_label(task)), "error")
+            else:
+                self.say("❌ 硬中断失败：%s。当前场的任务已经下架，可以重敲 "
+                         "`project <序号> interrupt` 再试。" % exc, "error")
+            self.invalidate()
+            return True
 
     def cmd_op(self, args=None):
         """``op`` —— 管理 OmniFocus Project（类型：``SOP`` 或 ``incubator``）。
@@ -1170,6 +1391,7 @@ class ProjectMixin(object):
         return bool(self.pending_import is not None or self.nostart is not None
                     or self.planning is not None or self.review_active()
                     or self.pending_advance is not None
+                    or self.pending_interrupt is not None
                     or self.project_sync is not None)
 
     def _maybe_daily_project_sync(self):
@@ -1425,26 +1647,30 @@ class ProjectMixin(object):
         if self.planning is not None:
             raise ValueError("已经有一次 plan 在等你的分配（看下面那块面板）："
                              "`task <序号> <count>` 分资源、`complete` 开始排、`q` 放弃。")
-        if self.pending_import is not None or self.nostart is not None or self.review_active():
-            raise ValueError("先把手头那一问答完（收尾 / 到点没开始 / 导入确认）再来 plan。")
+        if (self.pending_import is not None or self.nostart is not None
+                or self.pending_interrupt is not None or self.review_active()):
+            raise ValueError("先把手头那一问答完（收尾 / 到点没开始 / 导入确认 / 硬中断 title）"
+                             "再来 plan。")
         day, offset = self._plan_target(toks)
         self.projects.ensure_tagged_pros()
-        projects = self.projects.active()
-        if not projects:
-            raise ValueError("项目库是空的：在 OmniFocus 里 ⌘C 一个**项目**，再敲 "
-                             "`task import sop` 或 `task import incubator`（项目里每条未完成任务都要有「持续时间」）。")
-        untyped = self.projects.untyped_ops()
+        untyped = self.projects.untyped_linked_ops()
         if untyped:
             self.check_untyped_ops(announce_import=False)
-            raise ValueError("还有 %d 个 OmniFocus 项目（op）没说明类型（SOP / incubator）；"
-                             "请先按提示补全类型，再 `plan`。"
+            raise ValueError("还有 %d 个已关联真正项目的 OmniFocus 项目（op）没说明类型"
+                             "（SOP / incubator）；请先按提示补全类型，再 `plan`。"
                              % len(untyped))
-        sop_ops = self.projects.eligible_ops(pj.OP_TYPE_SOP)
-        inc_ops = self.projects.eligible_ops(pj.OP_TYPE_INCUBATOR)
-        if not sop_ops and not inc_ops:
-            raise ValueError("当前没有符合项目阶段的可排期 op（running 阶段允许 SOP op，"
-                             "bottleneck 阶段允许 incubator op；可用 `pro <序号> -a` 切换阶段"
-                             "或用 `op <序号> sop|incubator` 检查类型）。")
+        # 唯一候选清单：每个 active pro 当前阶段对应的那一个 op。running 取
+        # SOP、bottleneck 取 incubator，所以不再有全局 SOP / incubator 两阶段。
+        plan_ops = self.projects.plan_ops()
+        if not plan_ops:
+            if not self.projects.active_pros():
+                raise ValueError("项目库是空的：在 OmniFocus 里 ⌘C 一个**项目**，"
+                                 "再敲 `task import sop` 或 `task import incubator`"
+                                 "（或者先 `pro create <名称>` 再把 op 关联给它）。")
+            raise ValueError("当前没有可排期的 OmniFocus 项目（op）：只有关联了真正项目 pro、"
+                             "且类型与项目阶段匹配的 op 才会进 plan（running 需要 SOP，"
+                             "bottleneck 需要 incubator）。先用 `op <序号> pro <N>` 关联项目、"
+                             "`pro <序号> -a` 切阶段，或用 `op <序号> sop|incubator` 设类型。")
         if offset != self.day_offset:
             # 空场、`-a <编号>` 都按**看板那一天**的表格算，所以先把看板搬过去。
             # 搬过去之后必须**等到**那天的真数据：空场判据要看「订没订上」，
@@ -1473,28 +1699,21 @@ class ProjectMixin(object):
             raise ValueError("%s 一场空着的 session 都没有 —— 换个日子，或者先 "
                              "`session <HH:MM> <25|50|75>` 把排布加上。" % day.isoformat())
         cap = pp.capacity(slots)
-        pro_map = {op["id"]: self.projects.pro_for_op(op) for op in projects}
-        if sop_ops:
-            self.planning = pp.Allocator(
-                day, sop_ops, slots, task_store=self.task_store,
-                hooks=self.plan_hooks(), stage=pj.OP_TYPE_SOP,
-                incubator_projects=inc_ops, pro_map=pro_map)
-            self.say("🗂 %s 的 SOP 资源分配：%d 个 SOP op、%d 场空 session = %d count 可以分"
-                     "（%d 分钟；1 count = %d 分钟）%s"
-                     % (day.isoformat(), len(sop_ops), cap["sessions"], cap["counts"],
-                        cap["minutes"], pp.MINUTES_PER_COUNT,
-                        ("；完成后将进入 %d 个 incubator op 的时间安排阶段" % len(inc_ops))
-                        if inc_ops else ""), "cmd")
-        else:
-            self.planning = pp.Allocator(
-                day, inc_ops, slots, task_store=self.task_store,
-                hooks=self.plan_hooks(), stage=pj.OP_TYPE_INCUBATOR,
-                incubator_projects=[], pro_map=pro_map)
-            self.say("🌱 %s 的 incubator 资源分配（当前无 running 阶段的 SOP op）："
-                     "%d 个 incubator op、%d 场空 session = %d count 可以分"
-                     "（%d 分钟；1 count = %d 分钟）"
-                     % (day.isoformat(), len(inc_ops), cap["sessions"], cap["counts"],
-                        cap["minutes"], pp.MINUTES_PER_COUNT), "cmd")
+        pro_map = {op["id"]: self.projects.pro_for_op(op) for op in plan_ops}
+        self.planning = pp.Allocator(
+            day, plan_ops, slots, task_store=self.task_store,
+            hooks=self.plan_hooks(), pro_map=pro_map)
+        by_type = {}
+        for op in plan_ops:
+            kind = pj.normalize_op_type(op.get("op_type")) or "?"
+            by_type[kind] = by_type.get(kind, 0) + 1
+        kind_txt = "、".join("%s %d" % (kind, count)
+                            for kind, count in sorted(by_type.items()))
+        self.say("🗂 %s 的项目资源分配：%d 个当前 op（%s）、%d 场空 session = %d count 可以分"
+                 "（%d 分钟；1 count = %d 分钟）"
+                 % (day.isoformat(), len(plan_ops), kind_txt,
+                    cap["sessions"], cap["counts"], cap["minutes"],
+                    pp.MINUTES_PER_COUNT), "cmd")
         self.say("   `task <序号> <count>` 分给项目（序号 = 面板上的 #）、"
                  "`task <序号> clear` 清空、`complete` 开始排任务、`q` 放弃。", "info")
         self.invalidate()
@@ -1619,7 +1838,7 @@ class ProjectMixin(object):
         """
         day = day or datetime.date.today()
         try:
-            projects = self.projects.active()
+            projects = self.projects.plan_ops()
         except Exception:                          # noqa: BLE001 - 项目库坏了别挡住警告板
             return None
         if not projects:
@@ -1642,21 +1861,7 @@ class ProjectMixin(object):
         return {
             "say": lambda text, kind="info": self.say(text, kind),
             "apply": lambda allocator, allocs: self._plan_apply(allocator, allocs),
-            "remaining_slots": lambda allocator, summary: self._plan_remaining_slots(
-                allocator, summary),
         }
-
-    def _plan_remaining_slots(self, allocator, summary):
-        """SOP 阶段排完之后，给 incubator 阶段留下的空场列表。"""
-        used_idx = set((summary or {}).get("used_slot_indices") or ())
-        out = []
-        for slot in allocator.slots or ():
-            if slot.get("index") in used_idx:
-                continue
-            if self.task_store.tasks_for_session(slot.get("date"), slot.get("start")):
-                continue
-            out.append(dict(slot))
-        return out
 
     def _plan_apply(self, allocator, allocs):
         """分配完了：先记资源，再挑任务、排进 session。

@@ -133,7 +133,7 @@ class FakeBridge(object):
 
 ONROWS = [
     {"id": "p-lunwen", "name": "论文", "kind": "project_root", "project": "",
-     "completed": False, "dropped": False},
+     "tags": ["project/论文"], "completed": False, "dropped": False},
     {"id": "t-intro", "name": "写引言", "kind": "action", "project": "论文",
      "parent": "论文", "estimated_minutes": 75, "completed": False,
      "due": "%sT11:50:00" % ISO},
@@ -144,7 +144,7 @@ ONROWS = [
     {"id": "t-done", "name": "写完的", "kind": "action", "project": "论文",
      "parent": "论文", "estimated_minutes": 25, "completed": True},
     {"id": "p-dushu", "name": "读书", "kind": "project_root", "project": "",
-     "completed": False, "dropped": False},
+     "tags": ["project/读书"], "completed": False, "dropped": False},
     {"id": "t-book", "name": "读一章", "kind": "action", "project": "读书",
      "parent": "读书", "estimated_minutes": 50, "completed": False},
     {"id": "t-more", "name": "读书笔记", "kind": "action", "project": "读书",
@@ -369,7 +369,7 @@ wd_off.settings.set("omnifocus", "on")
 print("== 子任务：最多父-子两层、父任务空壳、周账按父任务算一条 ==")
 _sub_rows = [
     {"id": "p-sub", "name": "子任务项目", "kind": "project_root",
-     "completed": False, "dropped": False},
+     "tags": ["project/子任务项目"], "completed": False, "dropped": False},
     {"id": "parent", "name": "父任务", "kind": "action", "project": "子任务项目",
      "parent_id": "", "estimated_minutes": None, "completed": False},
     {"id": "c10", "name": "子 10", "kind": "action", "project": "子任务项目",
@@ -1066,7 +1066,10 @@ wd4.omnifocus.rows = [dict(r) for r in rows_ok if r["id"] != "t-done"]
 check("project 1 refresh 受理", wd4.handle("project 1 refresh"), True)
 check("清单刷新成 3 条", len(wd4.projects.active()[0]["tasks"]), 3)
 check_true("说了「刷新了」", any("刷新了" in t for t in texts(wd4)))
-check("project 1 remove 受理", wd4.handle("project 1 remove"), True)
+check("project 1 remove 受理（优先删真正项目 pro）",
+      wd4.handle("project 1 remove"), True)
+check("Pro 已删除", wd4.projects.active_pros(), [])
+check("op 还在，用 op 命令单独撤", wd4.handle("op 1 remove"), True)
 check("项目库空了", wd4.projects.active(), [])
 
 print("== 刷新时项目里冒出一条没时长的 → 拒绝写库 ==")
@@ -1389,6 +1392,10 @@ check("refresh 检查出缺少 op_type 的项目",
       wd_untyped.handle("refresh"), True)
 check("refresh 后 pending_op_type 有待补项",
       len(wd_untyped.pending_op_type), 1)
+# 现在 plan 只收「关联了真正项目 pro」的 op；先把它绑到 pro，验证未设类型
+# 的 linked op 仍然会挡住 plan，而不是被静默跳过。
+wd_untyped.handle("pro create 未类型项目")
+wd_untyped.handle("op 1 pro 1")
 check("未说明类型时 eligible_ops 不把它当成 SOP",
       wd_untyped.projects.eligible_ops("SOP"), [])
 check("未说明类型时 plan 直接拒绝", wd_untyped.handle("plan"), True)
@@ -1445,7 +1452,7 @@ check("running 阶段允许 SOP op 进行",
 check("running 阶段不再允许该项目的 incubator op 进行",
       wd_tag.projects.eligible_ops("incubator"), [])
 
-print("== 5) plan 两阶段：先安排 SOP op，complete 后自动进入 incubator 时间安排阶段 ==")
+print("== 5) plan 只有一次：每个项目按阶段取当前的 SOP / incubator op ==")
 _two_stage_rows = [
     {"id": "p-run-sop", "name": "常规开发 SOP", "kind": "project_root",
      "tags": ["project/核心系统"], "completed": False, "dropped": False},
@@ -1472,31 +1479,24 @@ check("Pro #1 处于 running、Pro #2 处于 bottleneck",
 
 plan_day(wd_plan2)  # 明天 3 场：T1 75(3) + 25(1)、T2 50(2) = 6 count
 check("启动 plan +1", wd_plan2.handle("plan +1"), True)
-check_true("第一阶段是 SOP 阶段",
-           wd_plan2.planning is not None and wd_plan2.planning.stage == "SOP")
-check("第一阶段只展示 running 项目的 SOP op（被 bottleneck 阻塞的 SOP 和 incubator 都不展示）",
-      [p["title"] for p in wd_plan2.planning.projects], ["常规开发 SOP"])
-wd_plan2.handle("task 1 2")  # 给「常规开发 SOP」分 2 count（50 分钟）
-check("第一阶段 complete 后自动进入 incubator 阶段（不关闭 planning）",
-      wd_plan2.handle("complete"), True)
-check_true("planning 仍在打开状态且切换为 incubator 阶段",
-           wd_plan2.planning is not None and wd_plan2.planning.stage == "incubator")
-check("第二阶段只展示 bottleneck 项目的 incubator op",
-      [p["title"] for p in wd_plan2.planning.projects], ["算法破局孵化"])
-check("第二阶段容量已扣除第一阶段占用的 50 分钟场（剩 75+25 = 4 count）",
-      wd_plan2.planning.cap()["counts"], 4)
-wd_plan2.handle("op 1 1")    # 给「算法破局孵化」分 1 count（25 分钟）
-check("第二阶段 complete 后收尾关闭 planning",
-      wd_plan2.handle("complete"), True)
+check_true("plan 开着", wd_plan2.planning is not None)
+check("一次 plan 同时列出 running 的 SOP 与 bottleneck 的 incubator",
+      [(p["title"], p.get("op_type")) for p in wd_plan2.planning.projects],
+      [("常规开发 SOP", "SOP"), ("算法破局孵化", "incubator")])
+check("不再有全局 SOP/incubator 阶段切换", wd_plan2.planning.stage, "mixed")
+check("容量是全部空场 6 count", wd_plan2.planning.cap()["counts"], 6)
+wd_plan2.handle("task 1 2")  # 常规开发 SOP：2 count
+wd_plan2.handle("task 2 1")  # 算法破局孵化：1 count
+check("complete 一次就收尾", wd_plan2.handle("complete"), True)
 check("planning 已关闭", wd_plan2.planning, None)
 _assigned_titles = sorted(
     t["fields"]["title"] for t in wd_plan2.task_store.list()
     if (t.get("session") or {}).get("start")
 )
-check("SOP 与 incubator 两个阶段的任务都被自动唤起并挂入 session",
+check("SOP 与 incubator 的当前 op 在**同一次 plan** 里排好",
       _assigned_titles, ["实现接口", "验证新启发式"])
 
-print("== 5b) 只有 incubator op 时 plan 直接从 incubator 阶段开始；阶段门控挡住时明确拒绝 ==")
+print("== 5b) 只有 incubator op 时 plan 也一次完成；阶段门控挡住时明确拒绝 ==")
 _inc_only_rows = [
     {"id": "p-only-inc", "name": "唯一孵化 op", "kind": "project_root",
      "tags": ["project/唯一项目"], "completed": False, "dropped": False},
@@ -1511,11 +1511,11 @@ check("incubator op 自动关联的 pro 默认处于 bottleneck",
       _inc_pro["stage"], "bottleneck")
 plan_day(wd_inc_only)
 check("只有 incubator op 时 plan 仍可启动", wd_inc_only.handle("plan +1"), True)
-check("没有 SOP 时直接从 incubator 阶段开始",
-      wd_inc_only.planning is not None
-      and wd_inc_only.planning.stage == "incubator", True)
-check("incubator 阶段只展示 incubator op",
-      [p["title"] for p in wd_inc_only.planning.projects], ["唯一孵化 op"])
+check("一次 plan 就只含 incubator op",
+      [(p["title"], p.get("op_type")) for p in wd_inc_only.planning.projects],
+      [("唯一孵化 op", "incubator")])
+check("只有一种类型时 stage 也明确",
+      wd_inc_only.planning.stage, "incubator")
 wd_inc_only.handle("q")
 
 _gated_rows = [
@@ -1528,9 +1528,9 @@ wd_gated = fresh(_gated_rows)
 wd_gated.handle("op import sop omnifocus:///project/p-gated")
 check("把项目阶段改为 bottleneck", wd_gated.handle("pro 1 stage bottleneck"), True)
 plan_day(wd_gated)
-check("bottleneck 下 SOP op 被门控，plan 拒绝", wd_gated.handle("plan +1"), True)
-check_true("拒绝理由说清没有符合条件的 op",
-           any("没有符合项目阶段的可排期 op" in t for t in texts(wd_gated)))
+check("bottleneck 下没有 incubator op，plan 拒绝", wd_gated.handle("plan +1"), True)
+check_true("拒绝理由说清没有当前阶段可排期的 op",
+           any("当前没有可排期的 OmniFocus 项目" in t for t in texts(wd_gated)))
 check("被门控时不会打开 plan 问答", wd_gated.planning, None)
 
 print("== 5c) plan：跨午夜的场次按开始日归属（今天 23:15–明天 00:05 算今天） ==")

@@ -140,9 +140,11 @@ op 3 relate --import [绝对路径]                   解析模板：资源准�
 pro / project       真正项目 Project (pro)：列表 / 详情 / create / -a / file / open / stage / op
 pro 1 -a            快捷切换阶段（running ↔ bottleneck），并关联新的 incubator op
                     （可直接跟 task import / op N；不跟则进入问答）
+pro 1 interrupt    硬中断当前进行中的 session：下架全部任务 → 输入 title →
+                    新建与整场等长的任务并挂回去（--hard 是默认值）
 pro 1 file <路径>   关联“open + Enter 顺便打开”的文件
 open                切口径 + 顺便打开相关 pro 的文件
-plan [天数]         两阶段分配：先 SOP op，complete 后进入 incubator op；
+plan [天数]         一次分配：每个 pro 只取当前阶段的 SOP/incubator op；
                     不带参数 = 今天；plan +1 = 明天；今天没 plan 会在状态框里提醒
 ```
 
@@ -261,7 +263,7 @@ TUI 现在是**多视图**的：按 **Tab** 在最下面那行「视图」上切
 
 | # | 视图 | 主体 | 命令 |
 |---|---|---|---|
-| 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表（op 类型/pro 阶段）** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `pro` / `op` / `open` |
+| 1 | 契约（默认） | **状态框（平滑边框）+ session 看板 + 任务面板 + 项目表（pro 阶段 + 当前活跃 SOP/incubator op）** | 原来那一整套（`session` / `period` / `cancel` / `mute` / `title` / `day` / `sync` / `start` / `stop`…）+ `plan` / `pro` / `op` / `open` |
 | 2 | 专注 | 目标 + 当前 session + 专注模式 + 可暂停次数 + 一行实时状态 | **`stop`**（消耗一次暂停）+ **`Shift+Tab`**（循环普通 / 做题 / 写作模式）；预约那套命令在这个视图里**一律没用** |
 | 3 | 统计 | 生涯累计 + 每天分布 + 按月 + 最近 14 天 + 底部逐行列「永不重订」 | `stat`（走缓存）/ `stat refresh`（增量刷新）/ `stat refresh full`（全量重拉）/ `r` |
 | 4 | 任务 | 任务表（默认常驻：`序号` / `标记` / `title` / `project` / `状态` / `session` / `截止` / `备注`；其余列默认折叠；表下灰色小字解释标记/缩写并给一行命令指引）+ 完成归档 | `task ...` + `open <页码|任务表头>` / `close <任务表头>` + `sort` / `group` / `search` + `help --task` + `review` + `inspect-due` + `plan` / `pro` / `op` |
@@ -568,11 +570,12 @@ A–E 的语义不变。结束时不写 postsession 状态文件（没有那一�
 - op 用 OmniFocus 标签 `project/<pro名称>` 自动关联 pro；也可手动
   `pro <序号> op <op序号>` / `op <序号> pro <pro序号>`。
 
-`plan` 是**两阶段**：先 SOP op，`complete` 后自动扣掉已占 session 并进入
-incubator op 阶段，再 `complete` 收尾。`plan` 的分资源问答和收尾 / 到点没开始共用
-同一个打断栏位 —— **一次只问一件事**。
+`plan` 只有**一次**：每个 pro 按当前阶段取一个 op（running → SOP /
+bottleneck → incubator），汇总所有空场后一次分配、`complete` 一次应用并结束。
+只关联了 pro 的 op 才进 plan；同一项目不会同时出现 SOP 和 incubator。
+`plan` 的分资源问答和收尾 / 到点没开始共用同一个打断栏位 —— **一次只问一件事**。
 
-整条链路（导入类型 → 时长门槛 → tag 关联 → 项目表 → 两阶段 plan → 挑任务 → 排
+整条链路（导入类型 → 时长门槛 → tag 关联 → 项目表 → 单次 plan → 挑任务 → 排
 session → 「部分完成不勾 OmniFocus」）见 [`project.md`](./project.md)。
 
 ## OmniFocus 联动（只单向）

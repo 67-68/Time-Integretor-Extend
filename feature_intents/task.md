@@ -226,7 +226,7 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
 - **标记说明**：`🔁=重复子任务 🔁*=模板 📁=项目任务 🔗=OmniFocus 🎯=Focusmate ⏳=挂载中 ⏱=formatter ⚡=trigger 🔒=独占`；
   状态记号 `·=进行中 ✓=完成 ✗=放弃 ⤼=转移走`；
   备注缩写 `dur=分钟 cnt=进度 excl=独占 tag=标签 rep=重复 fmt=formatter trig=trigger note=备注`。
-- **命令指引**：`refresh 同步 · review 收尾 · inspect-due 查过期 · plan 两阶段排期 · pro 真正项目 ·
+- **命令指引**：`refresh 同步 · review 收尾 · inspect-due 查过期 · plan 按项目阶段排期 · pro 真正项目 ·
   op OmniFocus 项目 · sort 排序 · group 分组 · search 搜索 · open 翻页/展开 · close 折叠 ·
   task 任务操作 · help --task 详情`。
   每个命令的介绍不超过 7 个字，不展开参数；参数细节看 `help --task`。
@@ -242,7 +242,7 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
 项目导入 / 刷新 / 每日对账时，项目库里的**叶子任务**会幂等镜像进任务库：
 
 - `fields.project` = 项目名，`fields.project_id` = 项目序号，`fields.project_task` = OmniFocus 任务 pk；
-- 这里说的“项目”是 **op（OmniFocus Project）**；`plan` 的两阶段门控按关联 **pro** 的阶段判定；
+- 这里说的“项目”是 **op（OmniFocus Project）**；`plan` 按关联 **pro** 的当前阶段选择 SOP / incubator op；
 - `source.kind == "project"`；没有 session 时 `TaskStore.is_project_backlog()` 为真；
 - 这些镜像**只进任务视图**（可搜索、可 `group project`、可排序），不会进契约视图的任务面板；
 - `plan` 挑中同一条任务时**复用镜像**并挂 session，不会建重复任务；
@@ -284,7 +284,8 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `pro` / `project [序号] ...` | 管理真正项目 Project (pro)：列表 / 详情 / create / -a / file / open / stage / op |
 | `pro <序号> file <路径>` | 关联文件；敲 `open` + Enter 时顺便打开 |
 | `pro <序号> -a` / `--advance` | 快捷切换阶段（running ↔ bottleneck）并关联新的 op |
-| `plan` | 两阶段：先把空场分给 SOP op，`complete` 后进入 incubator op 阶段，再完成分配并排任务（见 [`project.md`](project.md)） |
+| `pro <序号> interrupt [--hard]` | 硬中断当前进行中的 session：下架这一场所有任务，输入 title 后新建整场任务挂回去 |
+| `plan` | 一次分配：每个 pro 按阶段取当前 SOP/incubator op，`complete` 一次应用并排任务（见 [`project.md`](project.md)） |
 | `task import -st`（`--single-task`） | 只导入这一条：不查重复设置、不问、不建本地 `repeat` |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |
 | `task <序号> -a none`（`-an`） | **下架**：删掉 Focusmate 那条 task + 本地断绑定 |

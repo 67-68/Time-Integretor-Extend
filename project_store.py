@@ -2084,6 +2084,71 @@ class ProjectStore(object):
             out.append(op)
         return out
 
+    def current_op_for_pro(self, pro_or_id, store=None):
+        """一个 ``pro`` **当前阶段**对应的那一个 op（没有返回 None）。
+
+        - ``running`` 阶段 → 只取绑定的 SOP op；
+        - ``bottleneck`` 阶段 → 只取绑定的 incubator op；
+        - 优先 ``sop_op_id`` / ``incubator_op_id``，旧数据没写绑定字段时退回
+          该阶段类型里最后导入的 active op。
+
+        这里刻意**不**允许一个 pro 同时暴露两个 op：项目展示、plan 的资源清单
+        和契约表都只该看到当前阶段那一个。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.pro_by_id(pro_or_id, store=data))
+        if not pro or pro.get("status") != STATUS_ACTIVE:
+            return None
+        stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+        want = OP_TYPE_INCUBATOR if stage == STAGE_BOTTLENECK else OP_TYPE_SOP
+        field = ("incubator_op_id" if want == OP_TYPE_INCUBATOR else "sop_op_id")
+        oid = _as_int(pro.get(field))
+        if oid is not None:
+            op = next((p for p in (data.get("projects") or ())
+                       if p.get("id") == oid and p.get("status") == STATUS_ACTIVE),
+                      None)
+            if op is not None and normalize_op_type(op.get("op_type")) == want:
+                return op
+        linked = [op for op in self.ops_for_pro(pro, store=data)
+                  if normalize_op_type(op.get("op_type")) == want]
+        if not linked:
+            return None
+        # 同一阶段如果历史上有多个 op，绑定字段才是权威；旧数据没有字段时取
+        # 最后导入的 active op，保证展示/plan 都只有一个当前 op。
+        linked.sort(key=lambda op: (_as_int(op.get("id")) or 0))
+        return linked[-1]
+
+    def untyped_linked_ops(self, store=None):
+        """关联了真正项目、但还没说明 SOP / incubator 类型的 active op。"""
+        data = store if isinstance(store, dict) else self.load()
+        out = []
+        for op in data.get("projects") or ():
+            if op.get("status") != STATUS_ACTIVE:
+                continue
+            if normalize_op_type(op.get("op_type")) is not None:
+                continue
+            if self.pro_for_op(op, store=data) is not None:
+                out.append(op)
+        return out
+
+    def plan_ops(self, store=None):
+        """``plan`` 的唯一候选清单：每个 active pro 当前阶段对应的那一个 op。
+
+        没有关联真正项目 ``pro`` 的 op 不进 plan —— 否则一个孤立的
+        OmniFocus 项目会和真正的项目阶段脱节，出现在资源分配里却没有任何
+        阶段门控。返回顺序 = 真正项目序号顺序。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        out = []
+        for pro in (data.get("pros") or ()):
+            if pro.get("status") != STATUS_ACTIVE:
+                continue
+            op = self.current_op_for_pro(pro, store=data)
+            if op is not None:
+                out.append(op)
+        return out
+
     def set_tasks(self, project_id, tasks):
         store = self.load()
         for project in store["projects"]:
@@ -2318,14 +2383,20 @@ class ProjectStore(object):
                        if normalize_op_type(op.get("op_type")) == OP_TYPE_INCUBATOR]
             sop_op = ops_by_id.get(pro.get("sop_op_id")) or (sop_ops[-1] if sop_ops else None)
             inc_op = ops_by_id.get(pro.get("incubator_op_id")) or (inc_ops[-1] if inc_ops else None)
+            stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+            active_op = self.current_op_for_pro(pro, store=store)
             out.append({
                 "number": index,
                 "id": pro["id"],
                 "title": pro.get("title") or ("项目 %d" % pro["id"]),
-                "stage": normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING,
+                "stage": stage,
                 "file": pro.get("file"),
                 "sop_op": sop_op,
                 "incubator_op": inc_op,
+                "active_op": active_op,
+                "active_op_type": (normalize_op_type((active_op or {}).get("op_type"))
+                                   or (OP_TYPE_INCUBATOR if stage == STAGE_BOTTLENECK
+                                       else OP_TYPE_SOP)),
                 "ops": linked_ops,
                 "pro": pro,
             })

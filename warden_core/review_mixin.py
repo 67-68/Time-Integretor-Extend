@@ -708,6 +708,8 @@ class ReviewMixin(object):
             return self.project_sync_panel()
         if self.pending_relate_path is not None:
             return self.pending_relate_path_panel()
+        if self.pending_interrupt is not None:
+            return self.pending_interrupt_panel()
         if self.nostart is not None:
             return self.nostart_panel()
         if self.planning is not None:
@@ -759,9 +761,9 @@ class ReviewMixin(object):
         body.append("OmniFocus 项目（op）#%s「%s」（%s）尚未指定类型（共 %d 个待补全）：\n"
                     % (num, cur.get("title") or "?", pk, len(valid_ids)),
                     style="bold")
-        body.append("  [SOP]       普通标准项目流程（项目处于 running 阶段时进行，plan 第一阶段安排）\n",
+        body.append("  [SOP]       普通标准项目流程（项目处于 running 阶段时进行，plan 只取这一类 op）\n",
                     style="cyan")
-        body.append("  [incubator] 瓶颈孵化器流程（项目处于 bottleneck 阶段时进行，plan 第二阶段安排）\n",
+        body.append("  [incubator] 瓶颈孵化器流程（项目处于 bottleneck 阶段时进行，plan 只取这一类 op）\n",
                     style="magenta")
         body.append("\n请直接输入 SOP 或 incubator（输入 skip 暂不处理）", style="bold")
         return Panel(body, title="[bold yellow]📁 补全 op 类型（SOP / incubator）[/]",

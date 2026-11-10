@@ -2275,6 +2275,8 @@ class BoardMixin(object):
             ("pro <序号> -a / --advance", "快捷切换 pro 状态（running ↔ bottleneck），"
                                            "需提供新的 op 作为关联（可直接跟 `task import` 或 `op <序号>`，"
                                            "也可回车后按提示输入）"),
+            ("pro <序号> interrupt [--hard]", "硬中断当前进行中的 session：把这一场所有任务下架，"
+                                               "再让你输入 title，新建一条与整场等长的任务挂回去"),
             ("pro <序号> file <路径>", "为项目 pro 关联一个文件，作为敲 `open` + Enter 之后顺便打开的文件"
                                        "（也可 `pro create <名> file=<路径>` 或 `pro <序号> open`）"),
             ("op [序号] [sop|incubator]", "管理 OmniFocus Project (op)：每个 op 必须是 SOP 或 incubator "
@@ -2282,12 +2284,12 @@ class BoardMixin(object):
             ("task import [sop|incubator]（项目）",
              "剪贴板里是 **OmniFocus 项目**（omnifocus:///project/PK）→ 进 op 库（也可 `op import sop|incubator`）："
              "需说明 SOP 或 incubator 类型；带 `project/…` 标签自动关联 pro；时长不齐整批拒绝"),
-            ("project [序号] [refresh|remove|check]", "看 pro 与 op 库 / 看 #1 详情与清单 / 重新去 "
+            ("project [序号] [interrupt|refresh|remove|check]", "看 pro 与当前 op / 看 #1 详情与清单 / 硬中断当前场 / 重新去 "
                                                        "OmniFocus 读一遍 / 撤掉 / check = 每日对账"),
-            ("plan [天数]", "两阶段排期：第一阶段处理类型为 SOP 的 op（仅限 running 阶段的 pro），"
-                            "敲 complete 完成 SOP 时间安排后，自动进入第二阶段 incubator 时间安排"
-                            "（仅展示并分配类型为 incubator 且处于 bottleneck 阶段的 op）。"
-                            "每个阶段都是分配 count + 自动挑任务挂 session。**默认今天**，plan +1 = 明天"),
+            ("plan [天数]", "一次排期：每个真正项目只取当前阶段对应的那一个 op"
+                            "（running → SOP / bottleneck → incubator），"
+                            "分配 count + 自动挑任务挂 session。没有关联 pro 的孤立 op 不进 plan。"
+                            "**默认今天**，plan +1 = 明天"),
             ("task -t  /  --trigger", "列出 trigger（创建触发）预设；现在是空列表 —— "
                                         "框架已就位，注册函数后才有名字"),
             ("task <id> -t <preset> [参数...]", "挂创建触发：只有在预设条件成立时才建任务；"
@@ -2394,7 +2396,7 @@ class BoardMixin(object):
         t.add_row("三模型区别", "pro = 真正项目 Project（running/bottleneck + 关联文件） · "
                                 "op = OmniFocus Project（SOP 或 incubator） · task = 单条任务")
         t.add_row("关联项目", "op（SOP）用标签 project/… 关联 pro；导入/刷新把叶子任务镜像进任务库"
-                              "（fields.project），任务视图可搜索/group project；plan 分 SOP → incubator 两阶段唤起。")
+                              "（fields.project），任务视图可搜索/group project；plan 按项目当前阶段唤起对应 op。")
         t.add_row("任务库", self.task_store.path)
         p_detail = Panel(t, title="[bold]Task · 任务视图详细说明[/]",
                          border_style="cyan", box=box.ROUNDED)

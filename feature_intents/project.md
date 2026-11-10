@@ -15,7 +15,7 @@
 
 ```
 project_store.py   data/projects.json   op 清单 + pro 阶段/文件/关联 + 每天分配
-project_plan.py    纯逻辑               容量 / 两阶段分资源问答 / 挑任务排 session
+project_plan.py    纯逻辑               容量 / 单次分资源问答（按 pro 阶段取 op）/ 挑任务排 session
 warden.py          接线                 import 类型、pro/op 命令、项目表、plan 命令
 ```
 
@@ -198,12 +198,15 @@ op「论文写作 SOP」 op_type=SOP   pro_id=1
 
 ## 项目表：挂在任务面板下面
 
-契约视图里，`Task · 任务` 面板**下面**那张表（`render_projects_table()`）：
+契约视图里，`Task · 任务` 面板**下面**那张表（`render_projects_table()`）。
+它把真正项目 `pro` 和当前活跃的 op 合成一行；**每个 pro 只显示当前阶段对应的
+那一个 op**（running → SOP，bottleneck → incubator），不会同时铺开 SOP 与
+incubator 两套账。没有关联 pro 的孤立 op 不出现在这张表里，仍用 `op` 命令管理。
 
 ```
- #  项目   剩余 count  进度   今天 plan         未完成  OmniFocus
- 1  论文    9          1/10   说好 4 count·已排 4   3     p-abc
- 2  读书    5          0/5    —                  2     p-dushu
+ #  项目 / 当前 op          阶段 / 类型      剩余 count  进度   今天 plan          未完成  OmniFocus
+ 1  论文 → 论文写作 SOP      running · SOP   9          1/10   说好 4 count·已排 4   3     p-abc
+ 2  算法攻关 → 破局孵化      bottleneck · inc 5         0/5    —                  2     p-inc
 ```
 
 | 列 | 怎么算 |
@@ -221,21 +224,19 @@ op「论文写作 SOP」 op_type=SOP   pro_id=1
 - 还在进行 → 算 `count_invested`（干了一半就是一半）；
 - 放弃了 → 0（放掉的那部分活还在项目里等着）。
 
-## `plan`：两阶段分资源 → 唤起任务 → 排 session
+## `plan`：单次分资源 → 唤起任务 → 排 session
 
 用户原话：*首先列出元数据，比如说总共多少空闲时间，同时，展示时间 / 25 的 count；
 然后询问每个 project 如何分配时间*。
 
-`plan` 现在是**两个连续阶段**，每个阶段内部都是「元数据 → 分资源 → 排任务」三步：
+`plan` 只有**一次**分配，不再先排 SOP 再切 incubator：
 
-1. **SOP 阶段**：只展示当前允许的 `SOP` op（即所属 pro 处于 `running`）。
-   敲 `complete` 后先应用这一阶段的分配与排期；
-2. **incubator 阶段**：如果还有 incubator op，自动扣掉已占用的 session，
-   进入第二阶段，只展示 `incubator` op（即所属 pro 处于 `bottleneck`）。
-   再敲 `complete` 才真正结束这次 plan。
-
-如果没有任何 eligible 的 SOP op，会直接进入 incubator 阶段；如果 SOP 阶段
-已经用完所有空场，则跳过 incubator 阶段并明确提示。
+- 候选 op 必须**关联了真正项目 `pro`**；孤立 op 不进 plan；
+- 每个 pro 只取当前阶段的**那一个** op：`running → SOP`，
+  `bottleneck → incubator`；
+- 如果不同项目阶段不同，同一次 plan 里会同时出现这些项目的当前 op；
+- 先收集所有空场，问每个项目分多少 count，`complete` 一次应用并结束；
+- 不再有「SOP 阶段 complete 后自动进入 incubator 阶段」。
 
 ### 1) 元数据（容量）
 
@@ -381,10 +382,27 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `pro <序号> stage <running\|bottleneck>` | 直接设置阶段 |
 | `pro <序号> op <op序号>` | 关联已有 op |
 | `pro <序号> refresh` / `remove` | 刷新关联 op / 删除 pro |
-| `project <序号> refresh` / `remove` | 兼容 op 的旧命令；序号按 op 表解析 |
+| `project <序号> interrupt [--hard]` | 硬中断当前进行中的 session：下架这一场所有任务，等 title 后新建整场任务挂回去 |
+| `project <序号> refresh` / `remove` | 刷新该 pro 关联的 op / 删除 pro（op 仍用 `op ... remove`） |
 | `project refresh` / `project check` | 所有 op 刷一遍 / 每日对账 |
-| `plan` / `plan +1` | 开始两阶段分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天 |
+| `plan` / `plan +1` | 开始一次分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天 |
 | `task <序号> <count>` / `op <序号> <count>` / `clear` / `complete` / `q` | plan 里的那几句（`op` 与 `task` 同义，只是强调操作对象是 op） |
+
+### `project <序号> interrupt --hard`
+
+硬中断用于「正在这一场做着，但必须立刻换掉全部任务」：
+
+1. 只认**当前进行中**的 session（`live_session()`；不是下一场、也不是本地幽灵场）；
+2. 把这一场上所有未完成任务全部下架（`_task_detach`，Focusmate task 也删）；
+3. 进入打断栏位，要求输入新任务 title；
+4. 新建一条 `duration = 当前 session 长度` 的本地任务，自动设为独占，
+   并调用正常的 `assign_task_to` 挂回这场；
+5. `--hard` 是默认值；`interrupt` 不写参数也是 hard。软中断尚未定义。
+
+```text
+project 1 interrupt            # 默认 hard
+project 1 interrupt --hard     # 显式写法
+```
 
 ### `open` + Enter 顺便打开项目文件
 
