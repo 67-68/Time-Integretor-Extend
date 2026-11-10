@@ -2199,6 +2199,75 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-10T20:37:48",
+      "task_id": 189,
+      "fields": {
+        "title": "initProjects",
+        "due": "2026-11-10T20:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-11-10",
+        "start": "20:00",
+        "end": "20:50",
+        "duration": 50,
+        "focusmate_session_id": "67057a5e-c317-432a-b67b-ba61669c5009"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "aa6b5ef1-ae6f-4d40-90c7-6e816381c843",
+        "title": "initProjects",
+        "description": "",
+        "completed_at": "2026-11-10T12:37:12.872592+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "67057a5e-c317-432a-b67b-ba61669c5009"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-10T20:51:27",
+      "task_id": 188,
+      "fields": {
+        "title": "词汇题多 50 个",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "pp1eVCxZvUP",
+        "duration": 25,
+        "notes": "父任务：sat review",
+        "count": 1,
+        "defer": "2026-11-08T00:00:00",
+        "due": "2026-11-10T20:50:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-11-10",
+        "start": "20:00",
+        "end": "20:50",
+        "duration": 50,
+        "focusmate_session_id": "67057a5e-c317-432a-b67b-ba61669c5009",
+        "previous_due": "2026-11-10T21:25:00"
+      },
+      "notes": "父任务：sat review",
+      "focusmate": {
+        "task_id": "4b104234-9e08-4230-90fc-c25833c8b610",
+        "title": "词汇题多 50 个",
+        "description": "父任务：sat review",
+        "completed_at": "2026-11-10T12:49:02.265382+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "67057a5e-c317-432a-b67b-ba61669c5009"
+          }
+        ]
+      }
     }
   ]
 }

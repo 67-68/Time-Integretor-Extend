@@ -603,13 +603,13 @@ _sub_items, _sub_notes = pp.distribute(
     [{"project_id": 1, "project": dict(_sub_payload, id=1), "count": 2}],
     [dict(_sub_payload, id=1)], {1: {}})
 check("distribute 给出一套父任务单元", len(_sub_items), 1)
-check("单元里带三个不可拆子任务",
+check("单元里带三个原始子任务（能整条放就不拆）",
       [c["pk"] for c in _sub_items[0]["children"]], ["c10", "c13", "c27"])
 _slot25 = pp.slot_record(1, ISO, "11:00", 25, "s25")
 _places, _uns, _more = pp.schedule(_sub_items, [_slot25])
 check("25 分钟场选中 10+13",
       sorted(p["duration"] for p in _places), [10, 13])
-check("27 分钟子任务没被拆 / 没硬塞",
+check("27 分钟子任务在容量不足时整条留着",
       [p["item"]["pk"] for p in _places], ["c10", "c13"])
 check("没排下的仍是剩余子任务",
       [c["pk"] for c in _uns[0]["children"]], ["c27"])
@@ -622,6 +622,37 @@ _places75, _uns75, _more75 = pp.schedule(_sub_items, [_slot75])
 check("75 分钟场放得下就三个子任务一起排",
       sorted(p["duration"] for p in _places75), [10, 13, 27])
 check("全部排下就没有 unscheduled", _uns75, [])
+
+print("== 排期：75 分钟 action 在 50+25 两场里放两次（count 2 + 1） ==")
+_long_rows = [
+    {"id": "p-long", "name": "Physic Review", "kind": "project_root",
+     "tags": ["project/Physic Review"], "completed": False, "dropped": False},
+    {"id": "long-parent", "name": "physic review", "kind": "action",
+     "project": "Physic Review", "parent_id": "", "completed": False},
+    {"id": "long-a", "name": "action A", "kind": "action",
+     "project": "Physic Review", "parent_id": "long-parent",
+     "estimated_minutes": 75, "completed": False},
+    {"id": "long-b", "name": "action B", "kind": "action",
+     "project": "Physic Review", "parent_id": "long-parent",
+     "estimated_minutes": 75, "completed": False},
+]
+_long_payload = pj.project_payload(_long_rows[0], _long_rows, now=_fixed_now)
+_long_items, _long_notes = pp.distribute(
+    [{"project_id": 1, "project": dict(_long_payload, id=1), "count": 3}],
+    [dict(_long_payload, id=1)], {1: {}})
+_long_slots = [pp.slot_record(1, ISO, "11:00", 50, "s50"),
+               pp.slot_record(2, ISO, "12:00", 25, "s25")]
+_long_places, _long_uns, _long_more = pp.schedule(_long_items, _long_slots)
+check("同一个 action 排两次，count 分别 2 和 1",
+      sorted((p["item"]["pk"], p["count"])
+             for p in _long_places if p["item"]["pk"] == "long-a"),
+      [("long-a", 1), ("long-a", 2)])
+check("两段实际时长分别是 50 / 25 分钟",
+      sorted(p["duration"] for p in _long_places), [25, 50])
+check("两段都标成 split", [p["split"] for p in _long_places], [True, True])
+check("第二条 75 分钟 action 没被误报成排不下", _long_uns, [])
+check_true("提示 75 分钟拆成 2 段",
+           any("拆成 2 段" in n and "50 + 25" in n for n in _long_more))
 
 print("== plan 落地子任务：session 里只出现子任务，note 标注父任务 ==")
 wd_sub = fresh(_sub_rows)

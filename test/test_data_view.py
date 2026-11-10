@@ -172,6 +172,40 @@ check_true("任务表回来了", "Task · 任务表" in str(wd.view.render()[0].
 check("open 项目 仍能展开任务表 project 列", wd.handle("open 项目"), True)
 check("project 列出现", "project" in [str(c.header) for c in wd.view.render()[0].columns], True)
 
+print("== stage 与唯一关联 op 类型不一致时不能吞掉项目 ==")
+wd2 = fresh()
+ti_pro, _ = wd2.projects.create_pro("TimeIntegrator", stage="running")
+ti_op, _ = wd2.projects.upsert({
+    "id": "of-ti-extend", "title": "TI Extend", "op_type": "incubator",
+    "tasks": [],
+})
+wd2.projects.link_op_to_pro(ti_op["id"], ti_pro["id"])
+ti_after = wd2.projects.pro_by_id(ti_pro["id"])
+check("running + 唯一 incubator 自动校正为 bottleneck",
+      ti_after["stage"], "bottleneck")
+check("current_op_for_pro 取到 incubator",
+      wd2.projects.current_op_for_pro(ti_after)["id"], ti_op["id"])
+check("plan_ops 不丢这个项目",
+      ti_op["id"] in [op["id"] for op in wd2.projects.plan_ops()], True)
+rows = wd2.current_project_rows()
+ti_rows = [(row["pro_title"], row["active_op_type"]) for row in rows
+           if row["pro_title"] == "TimeIntegrator"]
+check("契约项目表显示 TimeIntegrator", ti_rows,
+      [("TimeIntegrator", "incubator")])
+# 防御旧数据：即使 stage 字段没来得及校正，current_op_for_pro 也按唯一
+# active op 兜底，不会让整行消失。
+store = wd2.projects.load()
+for pro in store.get("pros") or []:
+    if pro["id"] == ti_pro["id"]:
+        pro["stage"] = "running"
+wd2.projects.save(store)
+fallback = wd2.projects.display_op_for_pro(ti_pro["id"])
+check("旧 stage 数据仍能按唯一 incubator 展示兜底", fallback["id"], ti_op["id"])
+check("严格 plan 入口仍尊重 stage",
+      wd2.projects.current_op_for_pro(ti_pro["id"]), None)
+check("effective_stage 推导为 bottleneck",
+      wd2.projects.effective_stage_for_pro(ti_pro["id"]), "bottleneck")
+
 print("== 从别的视图也能直接 open project ==")
 wd.go_to_view(w.ContractView)
 check("从契约视图 open project", wd.handle("open project"), True)

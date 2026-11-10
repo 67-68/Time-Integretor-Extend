@@ -1046,8 +1046,11 @@ class DataView(View):
                 str(row.get("number") or "—"),
                 str(row.get("id") or "—"),
                 Text(row.get("title") or "—", style="bold"),
-                Text(row.get("stage") or "—",
-                     style="magenta" if row.get("stage") == "bottleneck" else "cyan"),
+                Text((row.get("effective_stage") or row.get("stage") or "—")
+                     + (" ⚠阶段按实际 op 推导" if row.get("stage_mismatch") else ""),
+                     style="magenta"
+                     if (row.get("effective_stage") or row.get("stage")) == "bottleneck"
+                     else "cyan"),
                 Text(op_label(current), style="green"),
                 Text(op_label(sop)),
                 Text(op_label(inc)),

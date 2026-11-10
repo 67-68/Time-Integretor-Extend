@@ -1018,6 +1018,7 @@ def _norm_pro(raw):
         "status": status,
         "status_at": raw.get("status_at") or None,
         "status_reason": raw.get("status_reason") or None,
+        "stage_locked": bool(raw.get("stage_locked", False)),
         "created_at": raw.get("created_at") or None,
         "updated_at": raw.get("updated_at") or None,
     }
@@ -1653,6 +1654,7 @@ class ProjectStore(object):
             "incubator_op_id": None,
             "op_ids": [],
             "status": STATUS_ACTIVE,
+            "stage_locked": False,
             "created_at": stamp,
             "updated_at": stamp,
         }
@@ -1778,6 +1780,7 @@ class ProjectStore(object):
                 store, target["project_tag"], default_stage=def_stage)
         if linked_pro is not None:
             self._bind_op_and_pro_in_store(store, target, linked_pro)
+            self.reconcile_pro_stage(linked_pro, store=store, save=False)
         self.save(store)
         return target, created
 
@@ -1805,6 +1808,7 @@ class ProjectStore(object):
                     store, project["project_tag"], default_stage=def_stage)
             if linked_pro is not None:
                 self._bind_op_and_pro_in_store(store, project, linked_pro)
+                self.reconcile_pro_stage(linked_pro, store=store, save=False)
             self.save(store)
             return project
         raise ValueError("没有 OmniFocus 项目（op）%s" % project_id)
@@ -1891,6 +1895,15 @@ class ProjectStore(object):
                              else STAGE_RUNNING)
                 pro = self._ensure_pro_in_store(store, ptag, default_stage=def_stage)
                 self._bind_op_and_pro_in_store(store, project, pro)
+                changed = True
+        # 兼容旧数据：如果 pro 只有唯一一种 active op，而 stage 还是另一种，
+        # 把 stage 校正到实际 op 类型（例如 running + 唯一 incubator → bottleneck）。
+        for pro in store.get("pros") or ():
+            if pro.get("status") != STATUS_ACTIVE:
+                continue
+            _pro, old_stage, new_stage = self.reconcile_pro_stage(
+                pro, store=store, save=False)
+            if new_stage != old_stage:
                 changed = True
         if changed:
             self.save(store)
@@ -2038,6 +2051,7 @@ class ProjectStore(object):
             if (op.get("status") == STATUS_ACTIVE
                     and str(op.get("project_tag") or "").strip().casefold() == clean.casefold()):
                 self._bind_op_and_pro_in_store(store, op, target)
+        self.reconcile_pro_stage(target, store=store, save=False)
         self.save(store)
         return target, created
 
@@ -2066,6 +2080,9 @@ class ProjectStore(object):
         if pro is None:
             raise ValueError("没有项目（pro）%s" % pro_id)
         pro["stage"] = norm_stage
+        # 用户显式设置的阶段优先于「按唯一 op 类型推导」；否则阶段门控会被
+        # 下一次 ensure_tagged_pros 悄悄推翻，plan 的拒绝逻辑就失效了。
+        pro["stage_locked"] = True
         pro["updated_at"] = _now()
         self.save(store)
         return pro
@@ -2100,6 +2117,7 @@ class ProjectStore(object):
                 raise ValueError("op 类型只能是 SOP 或 incubator；你给的是 %r" % op_type)
             op["op_type"] = norm_type
         self._bind_op_and_pro_in_store(store, op, pro)
+        self.reconcile_pro_stage(pro, store=store, save=False)
         self.save(store)
         return op, pro
 
@@ -2127,6 +2145,7 @@ class ProjectStore(object):
         req_type = OP_TYPE_INCUBATOR if nxt == STAGE_BOTTLENECK else OP_TYPE_SOP
         op["op_type"] = req_type
         pro["stage"] = nxt
+        pro["stage_locked"] = True
         self._bind_op_and_pro_in_store(store, op, pro)
         self.save(store)
         return pro, op
@@ -2242,6 +2261,54 @@ class ProjectStore(object):
             out.append(op)
         return out
 
+    def effective_stage_for_pro(self, pro_or_id, store=None):
+        """返回 pro 的实际可用阶段：阶段字段和唯一关联 op 类型不一致时按 op 推导。
+
+        规则非常保守：只有当**当前阶段对应的 op 类型没有 active 关联 op**，
+        而另一种类型恰好只有一种 active 关联 op 时，才把阶段推导为那一种。
+        两种类型同时存在时仍以 pro 自己的 stage 为准（stage 决定当前做哪套）。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.pro_by_id(pro_or_id, store=data))
+        if not pro:
+            return STAGE_RUNNING
+        stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+        linked = self.ops_for_pro(pro, store=data) if pro.get("status") == STATUS_ACTIVE else []
+        kinds = {normalize_op_type(op.get("op_type")) for op in linked}
+        kinds.discard(None)
+        want = OP_TYPE_INCUBATOR if stage == STAGE_BOTTLENECK else OP_TYPE_SOP
+        if want in kinds:
+            return stage
+        other = OP_TYPE_SOP if want == OP_TYPE_INCUBATOR else OP_TYPE_INCUBATOR
+        if kinds == {other}:
+            return STAGE_BOTTLENECK if other == OP_TYPE_INCUBATOR else STAGE_RUNNING
+        return stage
+
+    def reconcile_pro_stage(self, pro_or_id, store=None, save=True):
+        """持久化修正「阶段字段 / 唯一关联 op 类型」不一致。
+
+        例：running 的 pro 只关联了一个 active incubator op，且没有任何 SOP op，
+        说明实际已进入 bottleneck；把 stage 改成 bottleneck，项目表和 plan
+        才能继续使用它。返回 ``(pro, old_stage, new_stage)``。
+        """
+        own_store = not isinstance(store, dict)
+        data = store if isinstance(store, dict) else self.load()
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.pro_by_id(pro_or_id, store=data))
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_or_id)
+        old_stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+        if pro.get("stage_locked"):
+            return pro, old_stage, old_stage
+        new_stage = self.effective_stage_for_pro(pro, store=data)
+        if new_stage != old_stage and pro.get("status") == STATUS_ACTIVE:
+            pro["stage"] = new_stage
+            pro["updated_at"] = _now()
+            if save:
+                self.save(data)
+        return pro, old_stage, new_stage
+
     def current_op_for_pro(self, pro_or_id, store=None):
         """一个 ``pro`` **当前阶段**对应的那一个 op（没有返回 None）。
 
@@ -2276,6 +2343,27 @@ class ProjectStore(object):
         # 最后导入的 active op，保证展示/plan 都只有一个当前 op。
         linked.sort(key=lambda op: (_as_int(op.get("id")) or 0))
         return linked[-1]
+
+    def display_op_for_pro(self, pro_or_id, store=None):
+        """项目表展示用的当前 op：阶段匹配优先；没有则唯一 active op 兜底。
+
+        这和 :meth:`current_op_for_pro` 必须分开：plan 要严格遵守 stage 门控，
+        而展示层不能因为 stage 字段陈旧就把一个明明有关联 op 的项目整行吞掉。
+        展示兜底出来的 op 会由 ``pro_preview`` 标成 stage_mismatch。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.pro_by_id(pro_or_id, store=data))
+        if not pro or pro.get("status") != STATUS_ACTIVE:
+            return None
+        op = self.current_op_for_pro(pro, store=data)
+        if op is not None:
+            return op
+        typed = [op for op in self.ops_for_pro(pro, store=data)
+                 if normalize_op_type(op.get("op_type")) in OP_TYPES]
+        if len(typed) == 1:
+            return typed[0]
+        return None
 
     def untyped_linked_ops(self, store=None):
         """关联了真正项目、但还没说明 SOP / incubator 类型的 active op。"""
@@ -2554,12 +2642,20 @@ class ProjectStore(object):
             sop_op = ops_by_id.get(pro.get("sop_op_id")) or (sop_ops[-1] if sop_ops else None)
             inc_op = ops_by_id.get(pro.get("incubator_op_id")) or (inc_ops[-1] if inc_ops else None)
             stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
-            active_op = self.current_op_for_pro(pro, store=store)
+            active_op = self.display_op_for_pro(pro, store=store)
+            op_kind = normalize_op_type((active_op or {}).get("op_type"))
+            effective_stage = stage
+            if op_kind in OP_TYPES:
+                effective_stage = (STAGE_BOTTLENECK if op_kind == OP_TYPE_INCUBATOR
+                                   else STAGE_RUNNING)
             out.append({
                 "number": index,
                 "id": pro["id"],
                 "title": pro.get("title") or ("项目 %d" % pro["id"]),
                 "stage": stage,
+                "effective_stage": effective_stage,
+                "stage_mismatch": bool(active_op and op_kind in OP_TYPES
+                                       and effective_stage != stage),
                 "status": pro.get("status") or STATUS_ACTIVE,
                 "status_at": pro.get("status_at"),
                 "status_reason": pro.get("status_reason"),

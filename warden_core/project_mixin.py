@@ -60,6 +60,8 @@ class ProjectMixin(object):
                 "pro": pr["pro"],
                 "pro_title": pr["title"],
                 "pro_stage": pr["stage"],
+                "effective_stage": pr.get("effective_stage") or pr["stage"],
+                "stage_mismatch": bool(pr.get("stage_mismatch")),
                 "active_op": op,
                 "active_op_type": pr.get("active_op_type"),
             })
@@ -287,10 +289,13 @@ class ProjectMixin(object):
             elif row.get("scheduled"):
                 plan_txt = "已排 %d count" % row["scheduled"]
             op_kind = row.get("active_op_type") or row.get("op_type") or "?"
-            stage = row.get("pro_stage") or "running"
+            stage = (row.get("effective_stage") or row.get("pro_stage")
+                     or "running")
             type_txt = "%s · %s" % (stage, op_kind)
             type_style = ("magenta" if op_kind == pj.OP_TYPE_INCUBATOR
                           else "cyan")
+            if row.get("stage_mismatch"):
+                type_txt += " ⚠阶段按实际 op 推导"
             if not row.get("allowed", True):
                 type_txt += " ⏸"
                 type_style = STYLE_MUTED
