@@ -299,22 +299,36 @@ class ContractView(View):
                                     note="不带参数 = 今天；plan +1 = 明天；"
                                          "每个项目只出现当前阶段对应的 op；超预算整条命令不执行")),
             _cmd("project", w.cmd_project,
-                 "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -a | pro 1 interrupt | pro create",
+                 "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -m complete|discard | "
+                 "pro 1 -a | pro 1 interrupt | pro create",
                  ("pro", "pr", "项目"),
-                 usage="pro [<序号> [-a|--advance [op <N>|task import] | interrupt [--hard] | "
-                       "file <路径> | open | refresh | remove] | create <名称>]",
-                 options=("--advance", "-a", "interrupt", "--hard", "create", "file", "open",
+                 usage="pro [<序号> [-a|--advance [op <N>|task import] | "
+                       "-m complete|discard | interrupt [--hard] | file <路径> | open | "
+                       "refresh | remove] | create <名称>]",
+                 options=("--advance", "-a", "-m", "--mark", "complete", "discard",
+                          "active", "interrupt", "--hard", "create", "file", "open",
                           "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 -a", "1 interrupt --hard", "1 file", "1 open",
-                                    "create", "1 refresh", "1 remove",
-                                    note="pro = 真正项目（running/bottleneck）；interrupt 硬中断当前场并新建整场任务")),
+                 hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
+                                    "1 -a", "1 interrupt --hard", "create",
+                                    note="pro = 真正项目（running/bottleneck）；"
+                                         "-m complete|discard 只动本地状态，"
+                                         "默认 disposable filter 会隐藏")),
             _cmd("op", w.cmd_op,
-                 "管理 OmniFocus Project (op)：op | op 1 | op 1 sop|incubator | op 1 relate --export|--import | op import [sop|incubator]",
+                 "管理 OmniFocus Project (op)：op | op 1 -m complete|discard | "
+                 "op 1 sop|incubator | op 1 relate --export|--import | "
+                 "op import [sop|incubator]",
                  ("ofp", "omnifocus-project"),
-                 usage="op [<序号> [sop|incubator|pro <N>|relate --export|--import [路径]|refresh|remove] | import [sop|incubator]]",
-                 options=("sop", "incubator", "import", "relate", "--export", "--import", "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 sop", "1 incubator", "1 relate --export", "1 relate --import", "import sop", "import incubator", "refresh",
-                                    note="op = OmniFocus Project（SOP 或 incubator 两种类型）")),
+                 usage="op [<序号> [-m complete|discard | sop|incubator | pro <N> | "
+                       "relate --export|--import [路径] | refresh|remove] | "
+                       "import [sop|incubator]]",
+                 options=("-m", "--mark", "complete", "discard", "active", "sop",
+                          "incubator", "import", "relate", "--export", "--import",
+                          "refresh", "remove", "check"),
+                 hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
+                                    "1 sop", "1 incubator", "1 relate --export",
+                                    "import sop", "refresh",
+                                    note="op = OmniFocus Project（SOP / incubator）；"
+                                         "-m complete|discard 只动本地状态")),
             _cmd("start", lambda a: w.cmd_start(), "启动 daemon",
                  usage="start", hint=_hint_actions("start", note="启动 daemon")),
             _cmd("stop", lambda a: w.cmd_stop(), "停用 daemon（要敲宣言）",
@@ -691,12 +705,67 @@ class DataView(View):
     def model(self):
         return getattr(self.w, "data_view_model", "task")
 
+    #: 数据视图的过滤器。disposable 是默认值：只留 active 记录，
+    #: 被 mark complete / discard 的 task、pro、op 都从这里消失。
+    FILTER_ALIASES = {
+        "disposable": "disposable", "active": "disposable", "only": "disposable",
+        "可支配": "disposable", "活跃": "disposable",
+        "all": "all", "off": "all", "全部": "all", "所有": "all",
+        "completed": "completed", "complete": "completed", "done": "completed",
+        "完成": "completed",
+        "dropped": "dropped", "discard": "dropped", "discarded": "dropped",
+        "drop": "dropped", "放弃": "dropped",
+    }
+
+    @property
+    def data_filter(self):
+        raw = str(getattr(self.w, "data_filter", "disposable") or "disposable").lower()
+        return self.FILTER_ALIASES.get(raw, "disposable")
+
+    def _status_in_filter(self, status):
+        """当前 filter 是否接受一个 active / completed / dropped 状态。"""
+        mode = self.data_filter
+        status = str(status or ts.STATUS_ACTIVE).lower()
+        if mode == "disposable":
+            return status == ts.STATUS_ACTIVE
+        if mode in ("completed", "dropped"):
+            return status == mode
+        return True
+
+    def _filter_caption(self):
+        mode = self.data_filter
+        if mode == "disposable":
+            return "filter: disposable（只看 active；隐藏 completed / dropped）"
+        return "filter: %s" % mode
+
+    def cmd_data_filter(self, args=None):
+        """切换数据视图默认过滤器；disposable 隐藏 completed / dropped。"""
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks:
+            self.w.say("当前数据过滤器：%s。可用：disposable / all / completed / "
+                       "dropped（filter off = all）" % self.data_filter, "cmd")
+            self.w.invalidate()
+            return self.data_filter
+        raw = toks[0].lower()
+        if raw not in self.FILTER_ALIASES:
+            raise ValueError("filter 只认 disposable / active / all / completed / "
+                             "dropped / off；你给的是 %r" % toks[0])
+        mode = self.FILTER_ALIASES[raw]
+        self.w.data_filter = mode
+        self.w.task_view_page = None
+        self.w.say("🗂 数据视图 filter → %s%s"
+                   % (mode, "（隐藏 completed / dropped）" if mode == "disposable"
+                      else "（显示全部状态）" if mode == "all" else ""), "cmd")
+        self.w.invalidate()
+        return mode
+
     def idle_hint(self):
         return repl_kit.Hint(
-            "命令", ("open task", "open project", "open op", "task create",
-                     "task 3 -a 1", "sort", "group project", "search",
-                     "inspect-due", "review"),
-            note="open task/project/op = 切换数据模型（task / 真正项目 pro / "
+            "命令", ("open task", "open project", "open op", "filter",
+                     "task create", "task 3 -a 1", "sort", "group project",
+                     "search", "inspect-due", "review"),
+            note="默认 filter=disposable 只看 active · "
+                 "open task/project/op = 切换数据模型（task / 真正项目 pro / "
                  "OmniFocus op）· task 模式 open 1/2/3 翻页 · open/close <表头> 折叠列"
                  " · sort/group/search 操作任务数据 · Tab 切视图",
         )
@@ -719,6 +788,14 @@ class DataView(View):
                  "拉 GET /v1/tasks，把已完成任务的 completedAt 归档",
                  ("r", "reload"), usage="refresh",
                  hint=_hint_actions("refresh", note="同步 Focusmate task 完成时间")),
+            _cmd("filter", self.cmd_data_filter,
+                 "数据视图过滤器（默认 disposable=只看 active）："
+                 "filter disposable|all|completed|dropped",
+                 ("筛选",), usage="filter [disposable|active|all|completed|dropped|off]",
+                 options=("disposable", "active", "all", "completed", "dropped", "off"),
+                 hint=_hint_actions("disposable", "all", "completed", "dropped",
+                                    note="disposable 隐藏 completed / dropped；"
+                                         "all 显示全部")),
             _cmd("sort", w.cmd_task_sort,
                  "任务表排序：sort <字段> [asc|desc] | sort off",
                  ("排序",), usage="sort <字段> [asc|desc] | sort off",
@@ -734,7 +811,7 @@ class DataView(View):
                                     note="前置分组列，同组首行显示组名，后续行留空")),
             _cmd("search", w.cmd_task_search,
                  "搜索任务（支持按字段分组显示）：search <关键词> [--group <字段>] | search off",
-                 ("find", "filter", "搜索"),
+                 ("find", "搜索"),
                  usage="search [<关键词>] [-g|--group <字段>] | search off",
                  options=("--group", "-g", "project", "off"),
                  hint=_hint_actions("project", "--group project", "off",
@@ -761,22 +838,36 @@ class DataView(View):
                                     note="不带参数 = 今天；plan +1 = 明天；"
                                          "每个项目只出现当前阶段对应的 op；超预算整条命令不执行")),
             _cmd("project", w.cmd_project,
-                 "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -a | pro 1 interrupt | pro create",
+                 "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -m complete|discard | "
+                 "pro 1 -a | pro 1 interrupt | pro create",
                  ("pro", "pr", "项目"),
-                 usage="pro [<序号> [-a|--advance [op <N>|task import] | interrupt [--hard] | "
-                       "file <路径> | open | refresh | remove] | create <名称>]",
-                 options=("--advance", "-a", "interrupt", "--hard", "create", "file", "open",
+                 usage="pro [<序号> [-a|--advance [op <N>|task import] | "
+                       "-m complete|discard | interrupt [--hard] | file <路径> | open | "
+                       "refresh | remove] | create <名称>]",
+                 options=("--advance", "-a", "-m", "--mark", "complete", "discard",
+                          "active", "interrupt", "--hard", "create", "file", "open",
                           "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 -a", "1 interrupt --hard", "1 file", "1 open",
-                                    "create", "1 refresh", "1 remove",
-                                    note="pro = 真正项目（running/bottleneck）；interrupt 硬中断当前场并新建整场任务")),
+                 hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
+                                    "1 -a", "1 interrupt --hard", "create",
+                                    note="pro = 真正项目（running/bottleneck）；"
+                                         "-m complete|discard 只动本地状态，"
+                                         "默认 disposable filter 会隐藏")),
             _cmd("op", w.cmd_op,
-                 "管理 OmniFocus Project (op)：op | op 1 | op 1 sop|incubator | op 1 relate --export|--import | op import [sop|incubator]",
+                 "管理 OmniFocus Project (op)：op | op 1 -m complete|discard | "
+                 "op 1 sop|incubator | op 1 relate --export|--import | "
+                 "op import [sop|incubator]",
                  ("ofp", "omnifocus-project"),
-                 usage="op [<序号> [sop|incubator|pro <N>|relate --export|--import [路径]|refresh|remove] | import [sop|incubator]]",
-                 options=("sop", "incubator", "import", "relate", "--export", "--import", "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 sop", "1 incubator", "1 relate --export", "1 relate --import", "import sop", "import incubator", "refresh",
-                                    note="op = OmniFocus Project（SOP 或 incubator 两种类型）")),
+                 usage="op [<序号> [-m complete|discard | sop|incubator | pro <N> | "
+                       "relate --export|--import [路径] | refresh|remove] | "
+                       "import [sop|incubator]]",
+                 options=("-m", "--mark", "complete", "discard", "active", "sop",
+                          "incubator", "import", "relate", "--export", "--import",
+                          "refresh", "remove", "check"),
+                 hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
+                                    "1 sop", "1 incubator", "1 relate --export",
+                                    "import sop", "refresh",
+                                    note="op = OmniFocus Project（SOP / incubator）；"
+                                         "-m complete|discard 只动本地状态")),
         ]
 
     def _row_budget(self):
@@ -885,8 +976,9 @@ class DataView(View):
         """表下一行灰色命令指引：每条 ≤7 字，参数细节交给 help --task。"""
         entries = (
             ("open task", "任务数据"), ("open project", "项目数据"),
-            ("open op", "op 数据"), ("refresh", "同步"), ("review", "收尾"),
-            ("inspect-due", "查过期"), ("plan", "排期"), ("project", "项目"),
+            ("open op", "op 数据"), ("filter", "过滤器"), ("refresh", "同步"),
+            ("review", "收尾"), ("inspect-due", "查过期"), ("plan", "排期"),
+            ("project", "项目"),
             ("sort", "排序"), ("group", "分组"), ("search", "搜索"),
             ("open", "翻页/展开"), ("close", "折叠"), ("task", "任务操作"),
             ("help --task", "详情"),
@@ -912,12 +1004,19 @@ class DataView(View):
 
     def _dispatch_hint(self):
         return Text("open task · open project · open op    ← 切换数据模型（当前：%s）"
-                    % self.model, style="dim")
+                    "    |    %s" % (self.model, self._filter_caption()), style="dim")
 
     def _render_project_data(self):
         """project 模型：真正项目 Project（``pro``）的本地数据。"""
         w = self.w
-        rows = w.projects.pro_preview(w.sel_date, w.task_store)
+        mode = self.data_filter
+        # disposable 为保持管理序号连续，默认只看 active；其他筛选需要把
+        # completed / dropped 的 pro 也一起读出来再过滤。
+        rows = w.projects.pro_preview(
+            w.sel_date, w.task_store,
+            include_inactive=(mode != "disposable"))
+        rows = [row for row in rows
+                if self._status_in_filter(row.get("status"))]
         t = Table(title="Project · 真正项目 pro 数据（open task / open project / open op 切换）",
                   box=box.SIMPLE_HEAVY, header_style="bold blue",
                   title_justify="left", expand=True)
@@ -953,23 +1052,32 @@ class DataView(View):
                 Text(op_label(sop)),
                 Text(op_label(inc)),
                 Text(str(row.get("file") or "—")),
-                Text(str(raw_pro.get("status") or "—")),
+                Text(str(row.get("status") or raw_pro.get("status") or "—"),
+                     style=STYLE_DONE if row.get("status") == ts.STATUS_COMPLETED
+                     else STYLE_DROPPED if row.get("status") == ts.STATUS_DROPPED
+                     else "green"),
                 Text(str(len(row.get("ops") or ()))),
             )
         if not rows:
             row = [Text("") for _ in range(10)]
-            row[0] = Text("（还没有真正项目 pro；用 `project create <名称>` 创建，"
-                          "或给 op 加 project/… 标签关联）", style="dim")
+            row[0] = Text("（当前 filter=%s 下没有真正项目 pro；`filter all` 显示全部，"
+                          "或 `project create <名称>` 新建）"
+                          % self.data_filter, style="dim")
             t.add_row(*row)
-        t.caption = ("%d 条真正项目 Project（pro）· 存储：%s · 每个 pro 的当前 op 由 "
-                     "stage 决定（running=SOP / bottleneck=incubator）"
-                     % (len(rows), w.projects.path))
+        t.caption = ("%s · %d 条真正项目 Project（pro）· 存储：%s · 每个 pro 的当前 "
+                     "op 由 stage 决定（running=SOP / bottleneck=incubator）"
+                     % (self._filter_caption(), len(rows), w.projects.path))
         return [t, self._dispatch_hint()]
 
     def _render_op_data(self):
         """op 模型：OmniFocus Project（``op``）的本地数据，含未关联 pro 的孤立项。"""
         w = self.w
-        rows = w.project_rows()
+        mode = self.data_filter
+        rows = w.projects.preview(
+            w.sel_date, w.task_store,
+            include_inactive=(mode != "disposable"))
+        rows = [row for row in rows
+                if self._status_in_filter(row.get("status"))]
         try:
             plan_ids = {op.get("id") for op in w.projects.plan_ops()}
         except Exception:                          # noqa: BLE001 - 展示失败别挡表
@@ -981,6 +1089,7 @@ class DataView(View):
         t.add_column("id", justify="right", style=STYLE_MUTED, no_wrap=True)
         t.add_column("title", no_wrap=True, overflow="crop")
         t.add_column("类型", no_wrap=True)
+        t.add_column("状态", no_wrap=True)
         t.add_column("关联 pro", overflow="crop")
         t.add_column("阶段", no_wrap=True)
         t.add_column("plan", no_wrap=True)
@@ -1004,6 +1113,10 @@ class DataView(View):
                 str(row.get("id") or "—"),
                 Text(row.get("title") or "—", style="bold"),
                 Text(kind, style=kind_style),
+                Text(str(row.get("status") or ts.STATUS_ACTIVE),
+                     style=STYLE_DONE if row.get("status") == ts.STATUS_COMPLETED
+                     else STYLE_DROPPED if row.get("status") == ts.STATUS_DROPPED
+                     else "green"),
                 Text(pro_txt, style="cyan" if row.get("pro_title") else STYLE_MUTED),
                 Text(row.get("pro_stage") or "—", style=STYLE_MUTED),
                 plan_txt,
@@ -1014,18 +1127,22 @@ class DataView(View):
                 Text(str(row.get("pk") or "")[:12] or "—"),
             )
         if not rows:
-            row = [Text("") for _ in range(12)]
-            row[0] = Text("（还没有 OmniFocus Project op；用 `op import sop|incubator` 导入）",
-                          style="dim")
+            row = [Text("") for _ in range(13)]
+            row[0] = Text("（当前 filter=%s 下没有 OmniFocus Project op；"
+                          "`filter all` 显示全部，或 `op import sop|incubator` 导入）"
+                          % self.data_filter, style="dim")
             t.add_row(*row)
-        t.caption = ("%d 条 OmniFocus Project（op）· plan 只收有 pro 关联且阶段匹配的 op；"
-                     "孤立 op 仍在这里显示" % len(rows))
+        t.caption = ("%s · %d 条 OmniFocus Project（op）· plan 只收有 pro 关联且"
+                     "阶段匹配的 active op；孤立 op 仍在这里显示"
+                     % (self._filter_caption(), len(rows)))
         return [t, self._dispatch_hint()]
 
     def _render_task_data(self):
         w = self.w
         raw_tasks = w.task_store.list()
-        filtered_tasks = w.filter_and_sort_tasks(raw_tasks)
+        visible_tasks = [task for task in raw_tasks
+                         if self._status_in_filter(w.task_store.status_of(task))]
+        filtered_tasks = w.filter_and_sort_tasks(visible_tasks)
         tasks, start, total, page, total_pages = self._task_window(filtered_tasks)
         selected = w.selected_task_id
         keys = task_dynamic_keys(raw_tasks)
@@ -1099,9 +1216,11 @@ class DataView(View):
         total_cols = (1 if group_col_header else 0) + len(visible_headers)
         if not tasks:
             row = [Text("") for _ in range(total_cols)]
-            msg = ("（没有匹配「%s」的任务；`search off` 清除过滤）" % w.task_search_query
+            msg = ("（没有匹配「%s」的任务；`search off` 清除搜索）"
+                   % w.task_search_query
                    if getattr(w, "task_search_query", "")
-                   else "（还没有任务；task create title=写论文 开始）")
+                   else "（当前 filter=%s 下没有任务；`filter all` 显示全部，"
+                        "task create title=写论文 开始）" % self.data_filter)
             row[0] = Text(msg, style="dim")
             t.add_row(*row)
         prev_group_val = object()
@@ -1206,6 +1325,7 @@ class DataView(View):
         caption_bits.append(
             "第 %d/%d 页，共 %d 条（open %s 直接翻页）"
             % (page, total_pages, total, page_examples or "1"))
+        caption_bits.append(self._filter_caption())
         active_filters = w.task_filter_summary()
         if active_filters:
             caption_bits.append(active_filters)
@@ -1245,8 +1365,8 @@ class DataView(View):
                 note_renderable(note))
         out.append(Panel(at, title="[bold]Task Archive · 完成归档[/]",
                          border_style="dim", box=box.ROUNDED))
-        out.append(Text("open task · open project · open op    ← 切换数据模型（当前：task）",
-                        style="dim"))
+        out.append(Text("open task · open project · open op    ← 切换数据模型（当前：task）"
+                        "    |    " + self._filter_caption(), style="dim"))
         return out
 
 

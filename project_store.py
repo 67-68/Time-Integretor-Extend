@@ -25,7 +25,7 @@ data/projects.json   项目母体：任务清单 + 每天分配了多少 count +
   "id": 1,                                   // 项目序号（面板第几条；数据库内部主键）
   "title": "论文",
   "omnifocus": {"id": "p-abc", "url": "omnifocus:///project/p-abc", "title": "论文"},
-  "status": "active",                        // active / dropped
+  "status": "active",                        // active / completed / dropped
   "imported_at": "…", "synced_at": "…",
   "tasks": [                                 // **全部**任务（含已完成/已放弃），按 OmniFocus 顺序
     {"pk": "t-1", "title": "写引言", "parent": "", "due": "…",
@@ -87,8 +87,9 @@ VERSION = 1
 STATUS_ACTIVE = "active"
 STATUS_COMPLETED = "completed"
 STATUS_DROPPED = "dropped"
-#: 项目本身的 status（只有 active / dropped）；任务的有效状态还包含 completed。
-STATUSES = (STATUS_ACTIVE, STATUS_DROPPED)
+#: 项目 / op 本身的 status：active / completed / dropped。
+#: 任务的有效状态也使用同一组名字。
+STATUSES = (STATUS_ACTIVE, STATUS_COMPLETED, STATUS_DROPPED)
 
 #: OmniFocus Project (op) 的两种类型：普通 SOP 与瓶颈孵化 incubator。
 OP_TYPE_SOP = "SOP"
@@ -236,6 +237,24 @@ def normalize_pro_stage(raw):
         return STAGE_BOTTLENECK
     if text in ("running", "run", "normal", "active", "进行中", "运行", "运行中", "正常"):
         return STAGE_RUNNING
+    return None
+
+
+def normalize_status(raw):
+    """把用户输入 / 已存记录的状态归一成 active / completed / dropped。
+
+    ``-m complete`` 和 ``-m discard`` 与任务使用同一套词；也接受常见别名。
+    空值返回 ``None``（调用方决定默认值）。
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    if text in ("active", "open", "todo", "进行中", "活跃", "正常"):
+        return STATUS_ACTIVE
+    if text in ("complete", "completed", "done", "完成", "已完成"):
+        return STATUS_COMPLETED
+    if text in ("discard", "discarded", "drop", "dropped", "放弃", "已放弃"):
+        return STATUS_DROPPED
     return None
 
 
@@ -931,7 +950,7 @@ def _norm_project(raw):
         if rec is not None:
             plans[str(day)] = rec
     omnifocus = _norm_omnifocus(raw.get("omnifocus"))
-    status = raw.get("status") if raw.get("status") in STATUSES else STATUS_ACTIVE
+    status = normalize_status(raw.get("status")) or STATUS_ACTIVE
     op_type = normalize_op_type(raw.get("op_type") or raw.get("type"))
     tags = []
     for tag in raw.get("tags") or ():
@@ -957,6 +976,8 @@ def _norm_project(raw):
         "file": file_path,
         "omnifocus": omnifocus,
         "status": status,
+        "status_at": raw.get("status_at") or None,
+        "status_reason": raw.get("status_reason") or None,
         "imported_at": raw.get("imported_at") or None,
         "synced_at": raw.get("synced_at") or None,
         "tasks": tasks,
@@ -985,7 +1006,7 @@ def _norm_pro(raw):
     for oid in (sop_op_id, incubator_op_id):
         if oid is not None and oid > 0 and oid not in op_ids:
             op_ids.append(oid)
-    status = raw.get("status") if raw.get("status") in STATUSES else STATUS_ACTIVE
+    status = normalize_status(raw.get("status")) or STATUS_ACTIVE
     return {
         "id": ident,
         "title": title,
@@ -995,6 +1016,8 @@ def _norm_pro(raw):
         "incubator_op_id": incubator_op_id,
         "op_ids": op_ids,
         "status": status,
+        "status_at": raw.get("status_at") or None,
+        "status_reason": raw.get("status_reason") or None,
         "created_at": raw.get("created_at") or None,
         "updated_at": raw.get("updated_at") or None,
     }
@@ -1506,15 +1529,17 @@ class ProjectStore(object):
         raw = str(token or "").strip()
         if not raw:
             raise ValueError("要给项目序号（预览表格上的第几条）")
-        projects = self.active()
-        if not projects:
-            raise ValueError("项目库是空的：先 `task import` 一个 OmniFocus 项目。")
         low = raw.lower()
+        # id: 是内部主键，必须能在 active 列表为空时也解析到已完成的记录，
+        # 否则 mark complete 后就无法用 id: 恢复。
         if low.startswith("id:"):
             hit = self.by_id(low[3:])
             if hit is None:
                 raise ValueError("没有 id 为 %r 的项目" % raw[3:])
             return hit
+        projects = self.active()
+        if not projects:
+            raise ValueError("项目库是空的：先 `task import` 一个 OmniFocus 项目。")
         ident = _as_int(raw)
         if ident is not None and 1 <= ident <= len(projects):
             return projects[ident - 1]
@@ -1524,6 +1549,44 @@ class ProjectStore(object):
                 return hit
         raise ValueError("项目序号 %r 不在范围里：#1–#%d（`project` 看全部）"
                          % (raw, len(projects)))
+
+    def resolve_any(self, token):
+        """像 :meth:`resolve` 一样解析，但连 completed / dropped 的 op 也认。
+
+        用于状态恢复（``op -m active id:1``）和审计；普通管理命令仍只用 active。
+        """
+        try:
+            return self.resolve(token)
+        except ValueError:
+            pass
+        raw = str(token or "").strip()
+        if raw.startswith("#"):
+            raw = raw[1:].strip()
+        if not raw:
+            raise ValueError("要给项目序号")
+        low = raw.lower()
+        if low.startswith("id:"):
+            hit = self.by_id(low[3:])
+            if hit is None:
+                raise ValueError("没有 id 为 %r 的项目" % raw[3:])
+            return hit
+        projects = sorted(self.list(), key=lambda p: p["id"])
+        ident = _as_int(raw)
+        if ident is not None:
+            hit = self.by_id(ident)
+            if hit is not None:
+                return hit
+            if 1 <= ident <= len(projects):
+                return projects[ident - 1]
+        exact = [p for p in projects
+                 if str(p.get("title") or "").strip().casefold() == raw.casefold()]
+        if len(exact) == 1:
+            return exact[0]
+        fuzzy = [p for p in projects
+                 if raw.casefold() in str(p.get("title") or "").casefold()]
+        if len(fuzzy) == 1:
+            return fuzzy[0]
+        raise ValueError("项目库里找不到「%s」（含 completed / dropped）" % raw)
 
     def find(self, token):
         """把设置里的值解析成一个 active 项目；认 #序号 / id:N / OF pk / 项目名。
@@ -1668,7 +1731,10 @@ class ProjectStore(object):
                 if pro_id is not None:
                     project["pro_id"] = pro_id
                 project["synced_at"] = stamp
-                project["status"] = STATUS_ACTIVE
+                # refresh/upsert 只刷新 OmniFocus 内容；本地 mark 的 completed /
+                # dropped 状态不能被一次刷新悄悄复活。
+                if normalize_status(project.get("status")) is None:
+                    project["status"] = STATUS_ACTIVE
                 target = project
                 created = False
                 break
@@ -1748,6 +1814,56 @@ class ProjectStore(object):
         return [p for p in self.active()
                 if normalize_op_type(p.get("op_type")) is None]
 
+    def set_op_status(self, project_id, status, reason=None):
+        """修改 OmniFocus Project（``op``）的本地状态。
+
+        status = active / completed / dropped。只动本地账，不碰 OmniFocus。
+        completed / dropped 的 op 不再出现在 active 列表、plan 和当前阶段 op 中。
+        """
+        norm_status = normalize_status(status)
+        if norm_status is None:
+            raise ValueError("op 状态只能是 active / completed / dropped；你给的是 %r"
+                             % status)
+        store = self.load()
+        for project in store.get("projects") or ():
+            if project["id"] != int(project_id):
+                continue
+            project["status"] = norm_status
+            if norm_status == STATUS_ACTIVE:
+                project["status_at"] = None
+                project["status_reason"] = None
+            else:
+                project["status_at"] = _now()
+                project["status_reason"] = str(reason or "cmd-mark-%s" % norm_status)
+            self.save(store)
+            return project
+        raise ValueError("没有 OmniFocus 项目（op）%s" % project_id)
+
+    def set_pro_status(self, pro_id, status, reason=None):
+        """修改真正项目 Project（``pro``）的本地状态。
+
+        status = active / completed / dropped。只动本地账；completed / dropped
+        的 pro 不再出现在 active 列表、项目预览和 plan 中。
+        """
+        norm_status = normalize_status(status)
+        if norm_status is None:
+            raise ValueError("项目（pro）状态只能是 active / completed / dropped；"
+                             "你给的是 %r" % status)
+        store = self.load()
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        pro["status"] = norm_status
+        if norm_status == STATUS_ACTIVE:
+            pro["status_at"] = None
+            pro["status_reason"] = None
+        else:
+            pro["status_at"] = _now()
+            pro["status_reason"] = str(reason or "cmd-mark-%s" % norm_status)
+        pro["updated_at"] = _now()
+        self.save(store)
+        return pro
+
     def ensure_tagged_pros(self):
         """把所有带 ``project/...`` 标签但还没建/没绑 ``pro`` 的 op 自动补齐关联。"""
         store = self.load()
@@ -1764,9 +1880,11 @@ class ProjectStore(object):
                 changed = True
             pro = None
             if project.get("pro_id") is not None:
+                # 已有关联优先，哪怕 pro 已经被 mark 成 completed / dropped。
+                # 否则一次自动补关联会凭空重建一个同名 active pro，等于把
+                # 用户刚标记完的状态又复活了。
                 pro = next((p for p in (store.get("pros") or ())
-                            if p["id"] == int(project["pro_id"])
-                            and p.get("status") == STATUS_ACTIVE), None)
+                            if p["id"] == int(project["pro_id"])), None)
             if pro is None:
                 def_stage = (STAGE_BOTTLENECK
                              if normalize_op_type(project.get("op_type")) == OP_TYPE_INCUBATOR
@@ -1814,16 +1932,18 @@ class ProjectStore(object):
             raise ValueError("要给项目（pro）序号或名称")
         if raw.startswith("#"):
             raw = raw[1:].strip()
-        pros = self.active_pros()
-        if not pros:
-            raise ValueError("还没有真正项目（pro）：可用 `pro create <名称>` 创建，"
-                             "或给 OmniFocus 项目加 `project/<名称>` 标签后导入。")
         low = raw.lower()
+        # 同上：completed / dropped 的 pro 不在 active_pros 里，
+        # 但 id: 必须仍然能定位它，供 -m active 恢复和审计。
         if low.startswith("id:"):
             hit = self.pro_by_id(low[3:])
             if hit is None:
                 raise ValueError("没有 id 为 %r 的项目（pro）" % raw[3:])
             return hit
+        pros = self.active_pros()
+        if not pros:
+            raise ValueError("还没有真正项目（pro）：可用 `pro create <名称>` 创建，"
+                             "或给 OmniFocus 项目加 `project/<名称>` 标签后导入。")
         ident = _as_int(raw)
         if ident is not None and 1 <= ident <= len(pros):
             return pros[ident - 1]
@@ -1841,6 +1961,44 @@ class ProjectStore(object):
             return fuzzy[0]
         raise ValueError("项目（pro）序号 %r 不在范围里：#1–#%d（`pro` 看全部）"
                          % (raw, len(pros)))
+
+    def resolve_pro_any(self, token):
+        """像 :meth:`resolve_pro` 一样解析，但连 completed / dropped 的 pro 也认。
+
+        主要用于状态恢复；普通 pro 管理仍只用 active。
+        """
+        try:
+            return self.resolve_pro(token)
+        except ValueError:
+            pass
+        raw = str(token or "").strip()
+        if raw.startswith("#"):
+            raw = raw[1:].strip()
+        if not raw:
+            raise ValueError("要给项目（pro）序号或名称")
+        low = raw.lower()
+        if low.startswith("id:"):
+            hit = self.pro_by_id(low[3:])
+            if hit is None:
+                raise ValueError("没有 id 为 %r 的项目（pro）" % raw[3:])
+            return hit
+        pros = sorted(self.pros(), key=lambda p: p["id"])
+        ident = _as_int(raw)
+        if ident is not None:
+            hit = self.pro_by_id(ident)
+            if hit is not None:
+                return hit
+            if 1 <= ident <= len(pros):
+                return pros[ident - 1]
+        exact = [p for p in pros
+                 if str(p.get("title") or "").strip().casefold() == raw.casefold()]
+        if len(exact) == 1:
+            return exact[0]
+        fuzzy = [p for p in pros
+                 if raw.casefold() in str(p.get("title") or "").casefold()]
+        if len(fuzzy) == 1:
+            return fuzzy[0]
+        raise ValueError("还没有找到项目（pro）「%s」（含 completed / dropped）" % raw)
 
     def create_pro(self, title, stage=STAGE_RUNNING, file=None, op_id=None):
         """创建或更新一个真正项目 Project（``pro``），返回 ``(pro, created)``。"""
@@ -2326,13 +2484,17 @@ class ProjectStore(object):
         raise ValueError("没有项目 %s" % project_id)
 
     # -- 给界面用的行 -------------------------------------------------
-    def preview(self, day=None, task_store=None):
-        """项目预览表格的每一行（``task <序号> <count>`` 里的序号 = 这里的 #）。"""
+    def preview(self, day=None, task_store=None, include_inactive=False):
+        """项目预览表格的每一行（``task <序号> <count>`` 里的序号 = 这里的 #）。
+
+        ``include_inactive=True`` 时连 completed / dropped 的 op 一起返回，
+        供数据视图筛选；plan / 管理命令仍只使用 active。
+        """
         rows = []
         store = self.load()
         invested_all = invested_by_project(task_store) if task_store else {}
         active_ops = [p for p in (store.get("projects") or ())
-                      if p.get("status") == STATUS_ACTIVE]
+                      if include_inactive or p.get("status") == STATUS_ACTIVE]
         for index, project in enumerate(active_ops, 1):
             mine = invested_all.get(project["id"]) or {}
             stat = stats(project, task_store, mine)
@@ -2349,6 +2511,9 @@ class ProjectStore(object):
                 "pro_id": pro["id"] if pro else None,
                 "pro_title": pro.get("title") if pro else "",
                 "pro_stage": pro.get("stage") if pro else "",
+                "status": project.get("status") or STATUS_ACTIVE,
+                "status_at": project.get("status_at"),
+                "status_reason": project.get("status_reason"),
                 "allowed": allowed,
                 "pk": (project.get("omnifocus") or {}).get("id") or "",
                 "total": stat["total"],
@@ -2367,11 +2532,16 @@ class ProjectStore(object):
             })
         return rows
 
-    def pro_preview(self, day=None, task_store=None):
-        """真正项目 Project（``pro``）预览行。"""
+    def pro_preview(self, day=None, task_store=None, include_inactive=False):
+        """真正项目 Project（``pro``）预览行。
+
+        ``include_inactive=True`` 时连 completed / dropped 的 pro 一起返回，
+        供数据视图的 filter=all / completed / dropped 使用；管理命令默认仍只看
+        active。
+        """
         store = self.load()
         pros = [p for p in (store.get("pros") or ())
-                if p.get("status") == STATUS_ACTIVE]
+                if include_inactive or p.get("status") == STATUS_ACTIVE]
         ops_by_id = {p["id"]: p for p in (store.get("projects") or ())
                      if p.get("status") == STATUS_ACTIVE}
         out = []
@@ -2390,6 +2560,9 @@ class ProjectStore(object):
                 "id": pro["id"],
                 "title": pro.get("title") or ("项目 %d" % pro["id"]),
                 "stage": stage,
+                "status": pro.get("status") or STATUS_ACTIVE,
+                "status_at": pro.get("status_at"),
+                "status_reason": pro.get("status_reason"),
                 "file": pro.get("file"),
                 "sop_op": sop_op,
                 "incubator_op": inc_op,

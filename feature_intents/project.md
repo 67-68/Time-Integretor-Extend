@@ -24,6 +24,26 @@ warden.py          接线                 import 类型、pro/op 命令、项目
 *「你可以把 project 想象成为一个 repeated task 的母体」*。
 所以 op **永远不挂 session**；挂 session 的永远是它唤起的本地 task。
 
+### `op` / `pro` 的本地状态
+
+- `op` 和 `pro` 和 `task` 一样有 `active / completed / dropped` 三个本地状态。
+- 命令：
+
+```text
+op 1 -m complete        # 或 op 1 complete
+op 1 -m discard         # 或 op 1 discard
+pro 1 -m complete       # project 同义
+pro 1 -m discard
+pro -m active id:1      # 恢复（completed / dropped 后序号可能漂移，用 id: 最稳）
+op -m active id:1
+```
+
+- 只改本地账，不写 OmniFocus。
+- completed / dropped 的 op / pro 不再进入 active 列表、`plan`、当前阶段 op 选择。
+- 数据视图默认 `filter=disposable`，只显示 active；被 mark 掉的记录会隐藏。
+  `filter all` 显示全部，`filter completed` / `filter dropped` 单独查看，
+  `filter active` 或 `filter disposable` 恢复默认。
+
 ### `op` 和 `pro` 为什么要分开
 
 - 一个真正项目可能先处于 `bottleneck`（瓶颈）阶段，这时只做对应的 **incubator op**；
@@ -49,7 +69,8 @@ warden.py          接线                 import 类型、pro/op 命令、项目
     "project_tag": "学术论文",                // 从 OmniFocus 标签 project/... 提取
     "tags": ["project/学术论文", "写作"],
     "omnifocus": {"id": "p-abc", "url": "omnifocus:///project/p-abc", "title": "论文写作 SOP"},
-    "status": "active",
+    "status": "active",                       // active / completed / dropped
+    "status_at": null, "status_reason": null,
     "imported_at": "…", "synced_at": "…",
     "tasks": [{
       "pk": "t-intro", "title": "写引言", "parent": "论文写作 SOP", "parent_id": "",
@@ -77,7 +98,8 @@ warden.py          接线                 import 类型、pro/op 命令、项目
     "sop_op_id": 1,                           // 当前运行期 SOP op
     "incubator_op_id": null,                  // 瓶颈期 incubator op
     "op_ids": [1],
-    "status": "active",
+    "status": "active",                       // active / completed / dropped
+    "status_at": null, "status_reason": null,
     "created_at": "…", "updated_at": "…"
   }]
 }

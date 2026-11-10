@@ -315,6 +315,81 @@ class ProjectMixin(object):
         return t
 
     @staticmethod
+    def _mark_word(token):
+        """返回 mark 状态；``complete`` / ``discard`` 等走和任务同一套词。"""
+        return pj.normalize_status(str(token or "").lstrip("="))
+
+    def _extract_mark_action(self, toks):
+        """从 pro / op 参数里摘出 ``-m complete`` / ``--mark discard``。
+
+        返回 ``(status, remaining_tokens)``。支持三种位置：
+
+            project 1 -m complete
+            project -m complete 1
+            project 1 complete        # 省略 -m 的简写
+
+        只有 ``complete / discard / dropped / completed`` 等状态词能作为裸第二
+        参数；``project create complete`` 这种创建命令不会被误判。
+        """
+        raw = [str(t).strip() for t in (toks or []) if str(t).strip()]
+        status = None
+        kept = []
+        i = 0
+        while i < len(raw):
+            tok = raw[i]
+            low = tok.lower()
+            if low in ("-m", "--mark", "mark", "状态"):
+                if i + 1 >= len(raw):
+                    raise ValueError("-m/--mark 后面要跟 complete 或 discard"
+                                     "（例如 project 1 -m complete）")
+                status = self._mark_word(raw[i + 1])
+                if status is None:
+                    raise ValueError("--mark 只认 active / complete / discard；"
+                                     "你给的是 %r" % raw[i + 1])
+                i += 2
+                continue
+            if low.startswith("--mark=") or low.startswith("-m="):
+                val = tok.split("=", 1)[1]
+                status = self._mark_word(val)
+                if status is None:
+                    raise ValueError("--mark 只认 active / complete / discard；"
+                                     "你给的是 %r" % val)
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        if status is None and len(kept) >= 2:
+            first_low = kept[0].lower()
+            action_words = ("create", "new", "add", "check", "refresh", "sync",
+                            "reload", "import", "新建", "创建", "对账", "更新", "导入")
+            direct = self._mark_word(kept[1])
+            if (first_low not in action_words and direct is not None
+                    and direct != pj.STATUS_ACTIVE):
+                status = direct
+                kept = [kept[0]] + kept[2:]
+        return status, kept
+
+    def _finish_mark_status(self, kind, record, status):
+        """pro / op mark 完成后的统一回执。"""
+        status = pj.normalize_status(status) or status
+        number = (self.projects.pro_number_of(record["id"])
+                  if kind == "pro" else self.projects.number_of(record["id"]))
+        number = number or record["id"]
+        name = record.get("title") or "?"
+        zh = {"active": "active（恢复）", "completed": "completed（已完成）",
+              "dropped": "dropped（已放弃）"}.get(status, status)
+        self.say("✅ %s #%s「%s」状态已标为 %s；只动本地账，不碰 OmniFocus。"
+                 % ("项目 pro" if kind == "pro" else "OmniFocus op",
+                    number, name, zh), "ok")
+        if status != pj.STATUS_ACTIVE:
+            self.say("   数据视图默认 filter=disposable 会隐藏它；"
+                     "敲 `filter all`（或 filter completed / dropped）可查看。", "info")
+        else:
+            self.say("   数据视图默认 filter=disposable 会重新显示它。", "info")
+        self.invalidate()
+        return record
+
+    @staticmethod
     def _is_advance_flag(token):
         low = str(token or "").strip().lower()
         return low in ("-a", "--advance", "—advance", "advance", "切换", "推进")
@@ -336,6 +411,12 @@ class ProjectMixin(object):
         existing = self.projects.pro_for_op(op)
         if existing is not None:
             return existing
+        # op 指向的 pro 可能已经被 mark completed/dropped；此时 pro_for_op()
+        # 只认 active 会返回 None，但绝不能因此新建同名 pro 把状态复活。
+        if op.get("pro_id") is not None:
+            linked = self.projects.pro_by_id(op["pro_id"])
+            if linked is not None:
+                return linked
         title = op.get("project_tag") or op.get("title") or ("项目 %s" % op["id"])
         stage = (pj.STAGE_BOTTLENECK
                  if pj.normalize_op_type(op.get("op_type")) == pj.OP_TYPE_INCUBATOR
@@ -516,6 +597,8 @@ class ProjectMixin(object):
 
             pro / project                       列出真正项目 pro 与 OmniFocus 项目 op
             pro create <名称> [file=<路径>]     创建真正项目 pro
+            pro <序号> -m complete|discard      本地状态（默认数据视图 disposable 会隐藏）
+            pro <序号> -m active                恢复 active（非 active 时建议 id:<内部id>）
             pro <序号> -a / --advance [...]     快捷切换阶段（running ↔ bottleneck）并关联新 op
             pro <序号> file <路径|clear>        关联/清空项目的打开文件（open + enter 顺便打开）
             pro <序号> open                     打开该项目关联的文件
@@ -530,6 +613,19 @@ class ProjectMixin(object):
         """
         self.projects.ensure_tagged_pros()
         toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        mark_status, mark_toks = self._extract_mark_action(toks)
+        if mark_status is not None:
+            if len(mark_toks) != 1:
+                raise ValueError("用法：project <序号> -m complete|discard"
+                                 "（也可 project <序号> complete|discard）")
+            try:
+                pro = self.projects.resolve_pro(mark_toks[0])
+            except ValueError:
+                pro = self.projects.resolve_pro_any(mark_toks[0])
+            updated = self.projects.set_pro_status(
+                pro["id"], mark_status, reason="cmd-project-mark-%s" % mark_status)
+            self.selected_pro_id = updated["id"]
+            return self._finish_mark_status("pro", updated, mark_status)
         if not toks:
             pro_rows = self.projects.pro_preview(self.sel_date, self.task_store)
             current_rows = self.current_project_rows()
@@ -904,6 +1000,8 @@ class ProjectMixin(object):
             op                              列出全部 OmniFocus Project（op）
             op import [sop|incubator] [...] 从剪贴板/链接导入 op 并指定类型
             op <序号>                       查看 op 详情与任务清单
+            op <序号> -m complete|discard   本地状态（默认数据视图 disposable 会隐藏）
+            op <序号> -m active             恢复 active（非 active 时建议 id:<内部id>）
             op <序号> sop | incubator       设置 op 类型为 SOP 或 incubator
             op <序号> pro <pro序号|名称|none> 关联/解绑真正项目 pro
             op <序号> refresh | remove      刷新或移除该 op
@@ -911,6 +1009,18 @@ class ProjectMixin(object):
         """
         self.projects.ensure_tagged_pros()
         toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        mark_status, mark_toks = self._extract_mark_action(toks)
+        if mark_status is not None:
+            if len(mark_toks) != 1:
+                raise ValueError("用法：op <序号> -m complete|discard"
+                                 "（也可 op <序号> complete|discard）")
+            try:
+                op = self.projects.find(mark_toks[0])
+            except ValueError:
+                op = self.projects.resolve_any(mark_toks[0])
+            updated = self.projects.set_op_status(
+                op["id"], mark_status, reason="cmd-op-mark-%s" % mark_status)
+            return self._finish_mark_status("op", updated, mark_status)
         if not toks:
             rows = self.project_rows()
             if not rows:

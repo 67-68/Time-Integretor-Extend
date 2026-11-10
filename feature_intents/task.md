@@ -202,7 +202,8 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
 - `open op`：OmniFocus Project（`op`，含未关联 pro 的孤立项）。
 
 `open 项目` 仍保留为任务表 `project` 列的展开别名。以下表头、分页与排序/
-分组/搜索规则都属于 task 模型。
+分组/搜索规则都属于 task 模型。数据视图默认 `filter=disposable`，因此 task
+模型默认隐藏 completed / dropped 的任务；`filter all` 显示全部。
 
 ## 任务模型的表头、紧凑表示、分页与排序/分组/搜索
 

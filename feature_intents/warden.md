@@ -807,6 +807,12 @@ python3 warden.py install-deps
     count 进度和 OmniFocus primary key；未关联 pro 的孤立 op 也会显示。
 - 为避免和任务表 `project` 列冲突，`open project` 固定表示切换数据模型；
   在 task 模型下要展开该列请敲 `open 项目`。
+- 数据视图默认 `filter=disposable`：只显示 status=active 的记录。task / pro / op
+  被 `-m complete` 或 `-m discard` 后从默认视图隐藏；`filter all` 可看全部，
+  `filter completed` / `filter dropped` 可单独查看。
+- `pro` / `op` 的状态命令：`project 1 -m complete|discard`、
+  `op 1 -m complete|discard`；恢复用 `project -m active id:1` /
+  `op -m active id:1`。这些只改本地状态，不碰 OmniFocus。
 - `session T1 50 50` / `period T1 50 50` / 裸 `T1 50 50` 改时段排布；
   任何一场超出时段终点 → 报错，layout 和 data.csv 都不动。
 - 改排布时若该时段已有 API session 且起点/时长不再匹配，先取消旧场

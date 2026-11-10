@@ -123,6 +123,7 @@ class BoardMixin(object):
             self.review_signature(), pending_sig,
             self.sel_date.isoformat(), self.day_offset, self.session_ui_mode,
             getattr(self, "data_view_model", "task"),
+            getattr(self, "data_filter", "disposable"),
             tuple(sorted(self.effective_hidden_columns())),
             tuple(sorted(self.effective_task_hidden_columns(self.task_store.list()))),
             self.task_view_page, self.task_sort_key, self.task_sort_desc,
@@ -2265,6 +2266,9 @@ class BoardMixin(object):
                                      "过去只留最近一场；detail = 计划 + 实际全部"),
             ("open task|project|op", "切到第四视图「数据」，分别查看 task 任务库 / "
                                       "project 真正项目 pro / op OmniFocus Project 三种数据模型"),
+            ("filter disposable|all", "数据视图过滤器：默认 disposable 只显示 active，"
+                                      "隐藏被 mark complete / discard 的 task / pro / op；"
+                                      "all 显示全部"),
             ("open/close <表头>", "展开/折叠契约表或任务表的一列；加 --permanent 写进偏好，"
                                   "working 默认折叠 时段类型 / 时段名称 / 契约"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
@@ -2314,6 +2318,10 @@ class BoardMixin(object):
             ("pro <序号> -a / --advance", "快捷切换 pro 状态（running ↔ bottleneck），"
                                            "需提供新的 op 作为关联（可直接跟 `task import` 或 `op <序号>`，"
                                            "也可回车后按提示输入）"),
+            ("pro <序号> -m complete|discard", "只改真正项目 pro 的本地状态；completed / dropped "
+                                               "不再进入 active 列表、plan 和默认数据视图"),
+            ("op <序号> -m complete|discard", "只改 OmniFocus op 的本地状态；completed / dropped "
+                                              "不再进入 active 列表、plan 和默认数据视图"),
             ("pro <序号> interrupt [--hard]", "硬中断当前进行中的 session：把这一场所有任务下架，"
                                                "再让你输入 title，新建一条与整场等长的任务挂回去"),
             ("pro <序号> file <路径>", "为项目 pro 关联一个文件，作为敲 `open` + Enter 之后顺便打开的文件"
@@ -2417,6 +2425,9 @@ class BoardMixin(object):
         t.add_column()
         t.add_row("三个模型", "open task = 任务 Task · open project = 真正项目 Project（pro） · "
                               "open op = OmniFocus Project（op）；本界面顶部随选择切换")
+        t.add_row("状态 / filter", "默认 filter=disposable 只显示 active；task / pro / op 被 "
+                                  "`-m complete` 或 `-m discard` 后隐藏。filter all 显示全部，"
+                                  "filter completed / dropped 可单独查看，filter active 恢复默认")
         t.add_row("默认列", "序号 · 标记 · title · project · 状态 · session · 截止 · 备注")
         t.add_row("默认折叠", "id · 重复 · trigger · formatter · Focusmate · OmniFocus · "
                               "完成时间 · 标签 · duration · count · exclusive · defer"
@@ -2460,6 +2471,9 @@ class BoardMixin(object):
             ("task <序号> -c 5|+2|-1", "设 count / 加进度 / 减进度"),
             ("task <序号> -e true|false", "独占 / 取消独占"),
             ("task <序号> -m complete|discard", "只改本地状态（不碰外部系统）"),
+            ("project <序号> -m complete|discard", "修改 pro 本地状态；默认 disposable filter 隐藏"),
+            ("op <序号> -m complete|discard", "修改 op 本地状态；默认 disposable filter 隐藏"),
+            ("filter disposable|all|completed|dropped", "数据视图过滤器；默认 disposable"),
             ("task <序号> done [分钟]", "完成（勾 Focusmate + 写回 OmniFocus）"),
             ("task <序号> drop [--local]", "放弃（默认也放弃 OmniFocus）"),
             ("task <序号> duplicate [-a N]", "复制一条任务"),

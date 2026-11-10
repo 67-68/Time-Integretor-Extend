@@ -434,6 +434,9 @@ class Warden(
         # 用 open task / open project / open op 切换；放在 Warden 上，
         # 从任何视图切过来都能保持上一次选择。
         self.data_view_model = "task"
+        # 数据视图的默认过滤器：disposable = 只看未完成/未放弃的记录。
+        # 可切到 all / completed / dropped 查看被 mark 掉的 pro/op/task。
+        self.data_filter = "disposable"
         self.task_sort_key = None
         self.task_sort_desc = False
         self.task_group_by = None
