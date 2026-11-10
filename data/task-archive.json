@@ -2164,6 +2164,41 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-10T08:27:27",
+      "task_id": 147,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-09T23:40:00",
+        "due_source": "session",
+        "exclusive": true,
+        "count_invested": 1
+      },
+      "session": {
+        "index": 9,
+        "date": "2026-11-09",
+        "start": "23:15",
+        "end": "23:40",
+        "duration": 25,
+        "focusmate_session_id": "85b47baa-122a-4266-89c2-29ac5180c44e",
+        "previous_due": "2026-11-09T16:05:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "38d1e0bb-c385-4011-b989-3ed1a25df9dd",
+        "title": "flashcard review & new learn",
+        "description": "",
+        "completed_at": "2026-11-09T15:40:11.473846+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "85b47baa-122a-4266-89c2-29ac5180c44e"
+          }
+        ]
+      }
     }
   ]
 }

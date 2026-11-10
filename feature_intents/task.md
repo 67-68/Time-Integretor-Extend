@@ -264,7 +264,7 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task create ... --repeat 周几@HH:MM` | 一步建「每周重复任务」 |
 | `task -t` / `task --trigger` | 列出 trigger 预设（框架默认是**空列表**） |
 | `task <序号> -t <preset> [参数...]` | 给任务挂一个 trigger（只记账；runner 执行） |
-| `task -f` / `task --formatter` | 列出 formatter 预设（现在有 `end` / `enlist`） |
+| `task -f` / `task --formatter` | 列出 formatter 预设（现在有 `end` / `enlist` / `repeat`） |
 | `task <序号> -f end` | 按任务 `duration` 在当天最后一段的**尾巴上切一场**（11:30–11:55 那种）、写进排期并自动 assign；排出来的任务自动独占 |
 | `task <序号> -f enlist` | 不切排布，把任务挂进**已有** session：优先孤立且正好同长的块；大块只从开头/结尾塞入 |
 | `task <序号> -e true`（`--exclusive true`） | **独占**：这一场 session 只能有它一条任务（裸写 `-e` = true，`-e false` 取消） |
@@ -628,7 +628,7 @@ task -t / task -f                      # 只看预设列表，不动任务
 
 ### `task -f end`
 
-`end` 是内置 formatter 之一（另一个是 `enlist`）。它按任务 `fields.duration`（也认
+`end` 是内置 formatter 之一（另外两个是 `enlist` / `repeat`）。它按任务 `fields.duration`（也认
 `duration_minutes` / `estimated_minutes` / `minutes` / `时长` / `预计时长`）排期：
 
 1. 取**当天最后一个还有空位的时段**（这就是 `end`：每天的结束时间不同，
@@ -727,6 +727,37 @@ formatter 通过 `task_hooks.collect_reservations()` 看到这段被占，**不�
 - 没有 `duration` → 明确警告，不落 `formatter`；
 - 所有位置都被占 / 装不下 → 明确报错；
 - 可选参数：`break_minutes=5`、`date=YYYY-MM-DD|today|tomorrow`。
+
+### `task -f repeat <session>`
+
+`repeat` 把任务**固定挂到用户点名的那一场已有 session** 上。它和 `end` / `enlist`
+都不同：
+
+- 不切 layout、不新造、不取消任何 session；
+- 目标只能用**起点**点名（推荐 `10:45`），或临时用 `#2` 表示当天从早到晚第 2 场；
+- 任务从目标场起点开始占「任务时长 + `break_minutes`（默认 0）」；
+- 目标场不存在、任务装不下、或目标场开头已被别的 formatter 占了 → 明确报错，
+  **不会悄悄改到别的场**。
+
+```text
+task 3 -f repeat 10:45      # 把 #3 固定到 10:45 那场
+task 3 -f repeat #2         # 或按当天第 2 场
+```
+
+它最重要的用法是挂在**重复任务本体**上：
+
+```text
+task id:1 -f repeat 10:45
+```
+
+本体的 formatter 仍然只存模板，随后每次生成 occurrence 子任务时都会继承并
+执行它；于是今天、明天、以后每个规则日的子任务都固定落在 10:45 那场，和
+`repeat.start` 的默认锚点无关。若某一周 10:45 那场被取消/改时长，formatter
+会明确报错让人处理，而不是把任务漂到最近的一场。
+
+`formatter.reservation` 同时记 `session_start` / `session_duration`（目标整场
+身份）和任务实际的 `start` / `end`。refresh 会校验目标场仍在、时长没变、
+任务还绑在上面；已经正确时不重写。
 
 **跨午夜的时段要按「同一根时间轴」比。** 一天最后那段常常是 `23:15–00:05`
 （「看书」那种），时段终点 `00:05` 读成 5 分钟的话，它的「窗口尾」就会比

@@ -1862,10 +1862,10 @@ wdh.messages = []
 check("task -f 受理", wdh.handle("task -f"), True)
 check_true("formatter 列表里有 end",
            any("end" in m[2] for m in wdh.messages))
-check("task -f 后面 Tab 补 end / enlist",
-      wdh.shell.complete("task -f "), ["end", "enlist"])
-check("task --formatter 后面 Tab 也补 end / enlist",
-      wdh.shell.complete("task --formatter "), ["end", "enlist"])
+check("task -f 后面 Tab 补 end / enlist / repeat",
+      wdh.shell.complete("task -f "), ["end", "enlist", "repeat"])
+check("task --formatter 后面 Tab 也补 end / enlist / repeat",
+      wdh.shell.complete("task --formatter "), ["end", "enlist", "repeat"])
 check_true("提示行认得 -f：说的是排期/end",
            "end" in wdh.shell.hint_line("task 3 -f"))
 

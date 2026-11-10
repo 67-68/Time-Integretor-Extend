@@ -5,13 +5,13 @@
 和「这条任务在这天怎么占时间」（formatter）都做成**具名预设函数**：
 
     task 3 -t <trigger> [参数...]      ← 给任务挂一个 create trigger
-    task 3 -f <formatter> [参数...]    ← 给任务挂一个排队算法；end / enlist 会当场执行
+    task 3 -f <formatter> [参数...]    ← 给任务挂一个排队算法；end / enlist / repeat 会当场执行
 
 两条设计原则
 ------------
 1. **预设函数是唯一入口**。命令里存下来的只是 ``{"name": ..., "params": ...,
    "args": ...}``，执行时再按名字查表。没有注册的函数一律报错，绝不猜测。
-2. **自动排期只排明天及以后**。``end`` / ``enlist`` 这类 formatter 的算法本身只管「哪一段
+2. **自动排期只排明天及以后**。``end`` / ``enlist`` / ``repeat`` 这类 formatter 的算法本身只管「哪一段
    时间可用」；调用方（trigger runner）负责传 ``allow_today=False``。这样
    「昨天（晚上）排好、第二天绝不临时加任务」是一条调用约定，而不是散落在
    各个函数里的 if。用户手动敲 ``task 3 -f end`` 是例外。
@@ -61,7 +61,8 @@ import task_store as ts
 TRIGGERS = {}
 FORMATTERS = {}
 
-#: ``end`` / ``enlist`` 默认在任务时长之外多留的休息分钟数。
+#: ``end`` / ``enlist`` 默认在任务时长之外多留的休息分钟数；
+#: ``repeat`` 默认 0（它只借用已有场次，不额外切时间）。
 DEFAULT_BREAK_MINUTES = 5
 
 #: formatter 的执行优先级：数字越小越早。``enlist`` 明确排在所有普通 formatter
@@ -958,6 +959,195 @@ def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
             "placement": placement, "exact_fit": bool(exact),
             "isolated": bool(source.get("isolated")),
             "conflicts": [], "created_at": _now()}
+
+
+# ---------------------------------------------------------------- formatter: repeat
+
+
+def _ordered_sessions(sessions):
+    """把候选 session 去重、按起点排序，给 ``repeat`` 的数字序号选择用。"""
+    out = []
+    seen = set()
+    for session in sessions or ():
+        if not isinstance(session, dict):
+            continue
+        got = _range_of(session)
+        if got is None:
+            continue
+        start = str(session.get("start") or "").strip()
+        dur = _session_duration(session)
+        if not start or not dur:
+            continue
+        key = (start, int(dur), int(got[0]))
+        if key in seen:
+            continue
+        seen.add(key)
+        rec = dict(session)
+        rec.update({"start_min": int(got[0]), "end_min": int(got[1]),
+                    "duration": int(dur), "start": start})
+        out.append(rec)
+    out.sort(key=lambda r: (int(r["start_min"]), int(r["duration"])))
+    return out
+
+
+def _repeat_target_session(raw, sessions, date=None):
+    """``repeat`` formatter 的 session 选择器 → 那一场 session。
+
+    支持两种写法：
+
+    * ``10:45`` / ``10:45:00``：按**起点**选，推荐用于重复任务（每周同一场）；
+    * ``#2`` / ``2``：按当天从早到晚的第 2 场选（临时用；布局变了会跟着变）。
+
+    只返回已有 session，绝不为了这个 formatter 新造或挪动排布。
+    """
+    text = str(raw if raw is not None else "").strip()
+    day = date or "这一天"
+    ordered = _ordered_sessions(sessions)
+    if not ordered:
+        raise HookError("formatter repeat：%s 没有任何已排的 session。" % day)
+    if not text:
+        raise HookError(
+            "formatter repeat 需要指定要固定挂到哪一场 session。写法："
+            "`task <序号> -f repeat 10:45`（按起点，重复任务推荐）或 "
+            "`-f repeat #2`（当天第 2 场）。可用场次：%s"
+            % "、".join("%s–%s" % (s.get("start"), s.get("end") or "?")
+                        for s in ordered[:6]))
+
+    idx = re.match(r"^#?(\d+)$", text)
+    if idx:
+        number = int(idx.group(1))
+        if number < 1 or number > len(ordered):
+            raise HookError(
+                "formatter repeat：%s 只有 %d 场 session，没有第 %d 场。可用：%s"
+                % (day, len(ordered), number,
+                   "、".join("%s–%s" % (s.get("start"), s.get("end") or "?")
+                            for s in ordered)))
+        return ordered[number - 1]
+    else:
+        # 允许 10:45:00 这种带秒的粘贴值；只取前两个冒号段。
+        match = re.match(r"^(\d{1,2}:\d{2})(?::\d{2})?$", text)
+        if not match:
+            raise HookError(
+                "formatter repeat：session 要写成 HH:MM（按起点）或 #N（当天第 N 场）；"
+                "你给的是 %r。可用场次：%s"
+                % (text, "、".join("%s–%s" % (s.get("start"), s.get("end") or "?")
+                                  for s in ordered[:6])))
+        start_min = parse_hhmm(match.group(1))
+        if start_min is None:
+            raise HookError("formatter repeat：时间超出范围：%r" % text)
+        if start_min % 15:
+            raise HookError(
+                "formatter repeat：Focusmate 只认 15 分钟整点，%r 不是合法起点；"
+                "可用场次：%s"
+                % (text, "、".join("%s–%s" % (s.get("start"), s.get("end") or "?")
+                                  for s in ordered)))
+        want = fmt_minutes(start_min)
+        for session in ordered:
+            if str(session.get("start")) == want:
+                return session
+        raise HookError(
+            "formatter repeat：%s 没有起点为 %s 的 session。可用场次：%s"
+            % (day, want, "、".join("%s–%s" % (s.get("start"), s.get("end") or "?")
+                                   for s in ordered)))
+
+
+@register_formatter(
+    "repeat",
+    params=("session", "break_minutes", "date"),
+    help="把任务**固定挂到指定的已有 session** 上；参数 session=HH:MM（推荐）"
+         "或 #N。挂在重复任务本体上时，每周每个 occurrence 都落同一场")
+def format_repeat(ctx, session=None, break_minutes=0, date=None):
+    """``task <id> -f repeat <session>`` 的算法。
+
+    ``session`` 是目标场次的**起点**（推荐 ``10:45``）或当天第几场
+    （``#2``）。和 ``end`` 的区别是：这里不切 layout、不新造、不取消 session，
+    只把任务绑到用户点名的那一场。任务从该场起点开始占「任务时长 + 休息」；
+    目标场必须真实存在，而且必须装得下任务。
+
+    这一点和重复任务配合时最有用：本体上的 formatter 会转嫁给每个 occurrence
+    子任务，所以 ``task id:<本体> -f repeat 10:45`` 的语义就是「以后每周的
+    这一次，都固定在那场 10:45 的 session 上完成」。如果那一周 10:45 那场
+    不存在（排布变了 / 被取消），这一条会明确报错，而不是悄悄改到别的场。
+    """
+    task = ctx.get("task") or {}
+    duration = task_duration(task)
+    if duration is None:
+        raise HookError(
+            "formatter repeat 需要任务的持续时间，但这%s没有 duration。先补一个，例如："
+            "`task modify %s duration 25`（也认 duration_minutes / minutes / 时长）"
+            % ("条任务", task.get("id", "N")))
+    # break_minutes 默认 0；parse_minutes(0) 会把 0 当成「没有」，所以这里
+    # 单独认 0 / "0"，其余再交给统一的分钟解析。
+    if break_minutes is None or str(break_minutes).strip() in ("", "0"):
+        break_got = 0
+    else:
+        break_got = parse_minutes(break_minutes)
+    if break_got is None:
+        raise HookError("formatter repeat 的 break_minutes 必须是非负整数；你给的是 %r"
+                        % (break_minutes,))
+    break_got = int(break_got)
+
+    sessions = [dict(s) for s in (ctx.get("sessions") or ()) if isinstance(s, dict)]
+    day = ctx.get("date") or date
+    source = _repeat_target_session(session, sessions, date=day)
+    session_start = _range_of(source)[0]
+    session_duration = _session_duration(source)
+    if not session_duration:
+        raise HookError("formatter repeat：目标 session 的时长认不出来。")
+    span = int(duration) + break_got
+    if span > int(session_duration):
+        raise HookError(
+            "formatter repeat：%s %s 那场只有 %d 分钟，装不下任务 %d 分钟"
+            "%s。换一场，或先改这个时段的排布。"
+            % (day, fmt_minutes(session_start), int(session_duration), int(duration),
+               (" + %d 分钟休息" % break_got) if break_got else ""))
+
+    task_id = ctx.get("task_id", task.get("id"))
+    reservations = [rec for rec in (ctx.get("reservations") or ())
+                    if task_id is None or rec.get("task_id") != task_id]
+    block = {"start_min": session_start, "end_min": session_start + span}
+    if not is_free(block, reservations):
+        raise HookError(
+            "formatter repeat：%s %s 那场的开头已经被别的 formatter 占了，"
+            "没法再把任务固定到这里。" % (day, fmt_minutes(session_start)))
+
+    session_end = _range_of(source)[1]
+    reservation = {
+        "date": source.get("date") or day,
+        "period_id": source.get("period_id"),
+        "start": fmt_minutes(session_start),
+        "end": fmt_minutes(session_start + span),
+        "start_min": session_start,
+        "end_min": session_start + span,
+        "session_start": fmt_minutes(session_start),
+        "session_end": fmt_minutes(session_end),
+        "session_duration": int(session_duration),
+        "duration": int(duration),
+        "break_minutes": break_got,
+        "task_id": task_id,
+        "exclusive": False,
+        "pinned": True,
+        "created_at": _now(),
+    }
+    chosen = {
+        "date": source.get("date") or day,
+        "start": fmt_minutes(session_start),
+        "end": fmt_minutes(session_end),
+        "duration": int(session_duration),
+        "period_id": source.get("period_id"),
+        "period_start": source.get("period_start"),
+        "period_end": source.get("period_end"),
+        "pinned": True,
+        "existing": True,
+        "source_start": source.get("start"),
+        "cut_period_id": None,
+        "cut_prefix": [],
+        "cut_prefix_exact": True,
+    }
+    return {"name": "repeat", "reservation": reservation, "session": chosen,
+            "new_session": False, "cut_period_id": None, "cut_prefix": [],
+            "target": fmt_minutes(session_start), "conflicts": [],
+            "created_at": _now()}
 
 
 # ---------------------------------------------------------------- 目标日期
