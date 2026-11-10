@@ -289,6 +289,40 @@ check("没挂 session 的任务不预报涨幅", wd.task_count_delta(store.get(l
 nolo = store.create(fields={"title": "没有 count"})
 check("没设 count 的任务不显示这一格", wd.task_count_label(store.get(nolo["id"])), "")
 
+print("\n-- 项目任务拆成多个 session part：显示原任务总 count + 跨 part 累计 --")
+part1 = store.create(fields={"title": "assignmentbook chap 5", "count": "1",
+                             "count_total": 3, "project_id": 1,
+                             "project_task": "pk-assignmentbook"})
+store.assign(part1["id"], {"date": ISO, "start": "11:00", "duration": 25})
+check_in("第一段：原任务 3 count，这一场 +1 → (0+1/3)",
+         "(0+1/3)", wd.task_cell_text([store.get(part1["id"])], 25))
+part1 = store.set_status(part1["id"], ts.STATUS_COMPLETED, reason="test-part")
+check_in("第一段完成后，历史 session 行仍是「开始前 0 + 这一场 1」",
+         "(0+1/3)", wd.task_cell_text([store.get(part1["id"])], 25))
+part2 = store.create(fields={"title": "assignmentbook chap 5", "count": "2",
+                             "count_total": 3, "project_id": 1,
+                             "project_task": "pk-assignmentbook"})
+store.assign(part2["id"], {"date": ISO, "start": "12:00", "duration": 50})
+check_in("第一段完成后，第二段：已投入 1 + 这一场 2 / 总 3",
+         "(1+2/3)", wd.task_cell_text([store.get(part2["id"])], 50))
+check_in("任务面板同样显示跨 part 累计",
+         "(1+2/3)", wd.task_index_title(store.get(part2["id"])))
+check("count_text 允许显式覆盖总上限和已投入",
+      ts.count_text(store.get(part2["id"]), 2, cap=3, invested=1), "(1+2/3)")
+
+# 模拟第二场收尾也记了 2 个 count：两条历史 session 行仍保持各自的
+# 「这一场开始前 + 这一场」快照，不拿现在总共 3/3 去回填第一行。
+store.credit_count(part2["id"], psv.session_key(ISO, "12:00"), 2)
+part2 = store.set_status(part2["id"], ts.STATUS_COMPLETED, reason="test-part2")
+check_in("第二段完成后，第一段历史行仍是 (0+1/3)",
+         "(0+1/3)", wd.task_cell_text([store.get(part1["id"])], 25))
+check_in("第二段历史行是 (1+2/3)",
+         "(1+2/3)", wd.task_cell_text([store.get(part2["id"])], 50))
+check_in("任务面板显示项目任务当前总进度 3/3",
+         "(3/3)", wd.task_index_title(store.get(part2["id"])))
+store.delete(part1["id"])
+store.delete(part2["id"])
+
 print("\n-- 默认 (0+1/1) 不在 session 表格 / 下方任务栏出现 --")
 plain = store.create(fields={"title": "flashcard review", "duration": "25"})
 store.assign(plain["id"], {"date": ISO, "start": "11:00", "duration": 50})

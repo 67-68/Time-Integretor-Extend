@@ -2268,6 +2268,171 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-10T21:26:41",
+      "task_id": 129,
+      "fields": {
+        "title": "assignmentbook chap 5",
+        "project": "SchoolReview",
+        "project_id": 2,
+        "project_task": "n3H98cVKzFR",
+        "duration": 25,
+        "notes": "父任务：physic review",
+        "count": 1,
+        "note": "拆分段 2/2（25 分钟）\n父任务：physic review",
+        "due": "2026-11-10T21:25:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-10",
+        "start": "21:00",
+        "end": "21:25",
+        "duration": 25,
+        "focusmate_session_id": "cc3befd2-c325-42f8-b237-b0be0bac1a3d"
+      },
+      "notes": "父任务：physic review",
+      "tags": [],
+      "manual": true,
+      "reason": "review-count",
+      "actual_minutes": null,
+      "status_at": "2026-11-10T21:26:41",
+      "omnifocus": {
+        "id": "n3H98cVKzFR",
+        "url": "omnifocus:///task/n3H98cVKzFR",
+        "title": "assignmentbook chap 5",
+        "linked_at": "2026-11-06T23:12:05"
+      },
+      "focusmate": {
+        "task_id": "147af956-496f-4923-bf0f-13b2a4cec780",
+        "title": "assignmentbook chap 5",
+        "description": "父任务：physic review",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-10T23:40:55",
+      "task_id": 202,
+      "fields": {
+        "title": "assignmentbook chap 5",
+        "project": "SchoolReview",
+        "project_id": 2,
+        "project_task": "n3H98cVKzFR",
+        "notes": "拆分段 1/2（50 分钟）\n父任务：physic review",
+        "duration": 50,
+        "count": 2,
+        "due": "2026-11-10T23:05:00",
+        "due_source": "session",
+        "count_invested": 2
+      },
+      "session": {
+        "index": 7,
+        "date": "2026-11-10",
+        "start": "22:15",
+        "end": "23:05",
+        "duration": 50,
+        "focusmate_session_id": "43d4c057-5917-4b02-81ed-3b221c3821ec"
+      },
+      "notes": "拆分段 1/2（50 分钟） 父任务：physic review",
+      "tags": [],
+      "manual": true,
+      "reason": "review-count",
+      "actual_minutes": null,
+      "status_at": "2026-11-10T23:40:55",
+      "omnifocus": {
+        "id": "n3H98cVKzFR",
+        "url": "omnifocus:///task/n3H98cVKzFR",
+        "title": "assignmentbook chap 5",
+        "linked_at": "2026-11-10T20:52:28"
+      },
+      "focusmate": {
+        "task_id": "1a898375-1895-48c3-a689-577693c6cfc1",
+        "title": "assignmentbook chap 5",
+        "description": "拆分段 1/2（50 分钟） 父任务：physic review",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-11T00:14:32",
+      "task_id": 158,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-10T23:40:00",
+        "due_source": "session",
+        "exclusive": true,
+        "count_invested": 1
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-count",
+      "actual_minutes": null,
+      "status_at": "2026-11-11T00:14:32",
+      "omnifocus": {
+        "id": "bXBKXt03Pgc",
+        "url": "omnifocus:///task/bXBKXt03Pgc",
+        "title": "flashcard review & new learn",
+        "linked_at": "2026-11-02T15:24:32"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "flashcard review & new learn",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-11T00:14:56",
+      "task_id": 202,
+      "fields": {
+        "title": "assignmentbook chap 5",
+        "project": "SchoolReview",
+        "project_id": 2,
+        "project_task": "n3H98cVKzFR",
+        "notes": "拆分段 1/2（50 分钟）\n父任务：physic review",
+        "duration": 50,
+        "count": 2,
+        "due": "2026-11-10T23:05:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 7,
+        "date": "2026-11-10",
+        "start": "22:15",
+        "end": "23:05",
+        "duration": 50,
+        "focusmate_session_id": "43d4c057-5917-4b02-81ed-3b221c3821ec"
+      },
+      "notes": "拆分段 1/2（50 分钟） 父任务：physic review",
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 50,
+      "status_at": "2026-11-11T00:14:56",
+      "omnifocus": {
+        "id": "n3H98cVKzFR",
+        "url": "omnifocus:///task/n3H98cVKzFR",
+        "title": "assignmentbook chap 5",
+        "linked_at": "2026-11-10T20:52:28",
+        "writeback": {
+          "completed": "2026-11-10T23:43:55"
+        }
+      },
+      "focusmate": {
+        "task_id": "1a898375-1895-48c3-a689-577693c6cfc1",
+        "title": "assignmentbook chap 5",
+        "description": "拆分段 1/2（50 分钟） 父任务：physic review",
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

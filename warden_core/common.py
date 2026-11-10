@@ -539,7 +539,7 @@ TASK_TABLE_COLUMNS = (
     ("exclusive", {"no_wrap": True}),
 )
 TASK_CONTENT_COLUMN = "内容"
-TASK_DYNAMIC_HIDDEN = {"due", "due_source", "count_invested", "project_id", "project_task", "notes", "note"}
+TASK_DYNAMIC_HIDDEN = {"due", "due_source", "count_invested", "count_total", "project_id", "project_task", "notes", "note"}
 
 #: 任务视图下默认折叠的列（汇总进「标记」和「备注」，仍可用 open <表头名> 展开）。
 TASK_AUTO_HIDDEN_COLUMNS = (

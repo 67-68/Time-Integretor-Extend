@@ -1278,9 +1278,10 @@ class DataView(View):
             remark_raw = w.task_remark_text(task)
             remark_txt = _crop_display(remark_raw, remark_max) if remark_raw else "—"
             dur_val = ts.task_minutes(task)
-            cnt_val = ts.count_text(task, w.task_count_delta(task))
-            if not cnt_val and ts.task_count(task) is not None:
-                cnt_val = str(ts.task_count(task))
+            cap_val, _invested_val = w.task_count_scope(task)
+            cnt_val = w.task_count_label(task, w.task_count_delta(task)).strip()
+            if not cnt_val and cap_val is not None:
+                cnt_val = str(cap_val)
             excl_val = "true" if th.is_exclusive(task) else "—"
             cells = {
                 "序号": Text(num_txt, style=style),

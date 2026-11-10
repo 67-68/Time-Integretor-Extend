@@ -311,8 +311,7 @@ class BoardMixin(object):
         dur = ts.task_minutes(task)
         if dur is not None:
             parts.append("dur=%dm" % dur)
-        cap = ts.task_count(task)
-        inv = ts.task_count_invested(task)
+        cap, inv = self.task_count_scope(task)
         delta = self.task_count_delta(task)
         if cap is not None or inv > 0:
             if cap is not None:
@@ -641,7 +640,10 @@ class BoardMixin(object):
             if task.get("formatter") and not ts.TaskStore.is_repeat_template(task):
                 prefix += "⏱"
             no = self.task_no(task)
-            count = self.task_count_label(task, delta)
+            if session_minutes is not None:
+                count = self.task_session_count_label(task, delta)
+            else:
+                count = self.task_count_label(task, delta)
             parts.append("%s%d: %s%s" % (prefix, no, count, title) if no else
                          "%s%s%s" % (prefix, count, title))
         return " | ".join(parts)
@@ -660,6 +662,11 @@ class BoardMixin(object):
         delta = ts.minutes_to_count(sess.get("duration")) or 0
         if not delta:
             return 0
+        # 项目任务拆段后，本地这条记录只分到一部分 count：这一场即使挂了
+        # 50 分钟 session，这段也可能只计划干 1 个 count，预报不能按整场算。
+        cap = ts.task_count(task)
+        if cap is not None:
+            delta = min(delta, cap)
         day = str(sess.get("date") or "").strip()
         if not day:
             return delta
@@ -668,11 +675,153 @@ class BoardMixin(object):
             return 0
         return delta
 
+    def task_count_scope(self, task):
+        """任务在界面上该用的 ``(最高 count, 已投入 count)``。
+
+        普通任务就是自己的 ``count`` / ``count_invested``。项目任务被 plan 拆成
+        多个 session part 时，本地每条记录的 ``count`` 只是**这一段**分到的量
+        （例如 75 分钟任务拆成 50 + 25，两个 part 的 count 是 2 和 1）；但界面上
+        用户要看的是原 OmniFocus 任务的总进度（3），以及所有 part 加起来的实际
+        投入。所以：
+
+        * 最高 count 优先用 ``fields.count_total``，旧数据则从项目清单里按
+          ``project_id + project_task`` 找回原任务的总 count；
+        * 已投入用同一项目任务的本地 part 汇总（完成 part 按它分到的 count，
+          进行中 part 按 ``count_invested``）。
+        """
+        cap = ts.task_count(task)
+        invested = ts.task_count_invested(task)
+        fields = (task or {}).get("fields") or {}
+        pk = str(fields.get(pj.PROJECT_TASK_FIELD) or "").strip()
+        if not pk:
+            return cap, invested
+        pid = fields.get(pj.PROJECT_ID_FIELD)
+
+        # 旧任务没有 count_total：从项目母体里找回原任务的总 count。
+        total = ts.parse_count(fields.get("count_total"))
+        if total is None or total <= 0:
+            try:
+                project = self.projects.by_id(pid) if pid is not None else None
+                if project is not None:
+                    item = pj.task_by_pk(project, pk)
+                    total = ts.parse_count((item or {}).get("count"))
+            except Exception:                   # noqa: BLE001 - 展示兜底
+                total = None
+        if total and total > 0:
+            cap = int(total)
+
+        # 同一个 OmniFocus 任务可能有多个本地 part，各自记自己的 count 账。
+        try:
+            aggregate = self._project_task_count_aggregates()
+            key = (str(pid) if pid is not None else "", pk)
+            if key in aggregate:
+                invested = aggregate[key]
+            elif pid is None:
+                # 旧数据可能没有 project_id；pk 已经足够定位同一条 OmniFocus 任务。
+                invested = sum(value for (other_pid, other_pk), value
+                               in aggregate.items() if other_pk == pk)
+        except Exception:                       # noqa: BLE001 - 展示兜底
+            pass
+        return cap, invested
+
+    def _project_task_count_aggregates(self):
+        """``{(project_id, project_task_pk): 累计已投入 count}``。
+
+        每个 frame 会为多条任务查这个账；按任务库文件的 mtime/size 缓存一次，
+        避免表格每画一行就把整个 tasks.json 重读一遍。
+        """
+        path = getattr(self.task_store, "path", "") or ""
+        try:
+            info = os.stat(path)
+            stamp = (path, info.st_mtime_ns, info.st_size)
+        except OSError:
+            stamp = (path, None, None)
+        cache = getattr(self, "_project_task_count_cache", None)
+        if cache is not None and cache[0] == stamp:
+            return cache[1]
+        out = {}
+        for other in self.task_store.list():
+            fields = (other or {}).get("fields") or {}
+            pk = str(fields.get(pj.PROJECT_TASK_FIELD) or "").strip()
+            if not pk:
+                continue
+            pid = fields.get(pj.PROJECT_ID_FIELD)
+            key = (str(pid) if pid is not None else "", pk)
+            out[key] = out.get(key, 0) + pj.contribution(other)
+        self._project_task_count_cache = (stamp, out)
+        return out
+
+    @staticmethod
+    def _session_order(session):
+        session = session or {}
+        return (str(session.get("date") or ""), str(session.get("start") or ""))
+
+    def task_session_count_baseline(self, task):
+        """session 表格里的「这一场开始前已经投入了几个 count」。
+
+        和任务面板不同，session 表格是历史行：一场 25 分钟干了 1 个 count，
+        之后再来第二场 50 分钟干活 2 个。第一行应该一直显示 ``(0+1/3)``，
+        第二行显示 ``(1+2/3)``；不能拿“现在总共 3”去回填第一行，变成
+        ``(2+1/3)`` 或 ``(3+1/3)``。
+
+        基线按场次时间排序累计：只算时间更早的 part，当前 part 自己的
+        ``count_invested`` 要减掉这一场已经记进去的那一笔。
+        """
+        fields = (task or {}).get("fields") or {}
+        pk = str(fields.get(pj.PROJECT_TASK_FIELD) or "").strip()
+        sess = (task or {}).get("session") or {}
+        current_key = psv.session_key(sess.get("date"), sess.get("start"))
+        own_credit = ((task or {}).get("count_credits") or {}).get(current_key)
+        try:
+            own_credit = int(own_credit) if own_credit is not None else None
+        except (TypeError, ValueError):
+            own_credit = None
+        if not pk:
+            invested = ts.task_count_invested(task)
+            if own_credit is not None:
+                invested = max(0, invested - own_credit)
+            return invested
+
+        pid = fields.get(pj.PROJECT_ID_FIELD)
+        current_order = self._session_order(sess)
+        baseline = 0
+        try:
+            for other in self.task_store.list():
+                other_fields = (other or {}).get("fields") or {}
+                if str(other_fields.get(pj.PROJECT_TASK_FIELD) or "").strip() != pk:
+                    continue
+                other_pid = other_fields.get(pj.PROJECT_ID_FIELD)
+                if (pid is not None and other_pid is not None
+                        and str(other_pid) != str(pid)):
+                    continue
+                if other.get("id") == task.get("id"):
+                    invested = ts.task_count_invested(other)
+                    if own_credit is not None:
+                        invested = max(0, invested - own_credit)
+                    baseline += invested
+                    continue
+                other_sess = other.get("session") or {}
+                # 没有 session 的历史完成记录没有可比较的时间点，保守算入；
+                # 有 session 的只算严格更早的场次。
+                if not other_sess or self._session_order(other_sess) < current_order:
+                    baseline += pj.contribution(other)
+        except Exception:                       # noqa: BLE001 - 展示兜底
+            return max(0, ts.task_count_invested(task) - (own_credit or 0))
+        return baseline
+
+    def task_session_count_label(self, task, delta):
+        """session 表格里那截 count：``(这一场开始前 + 这一场 / 总 count)``。"""
+        cap, _aggregate = self.task_count_scope(task)
+        invested = self.task_session_count_baseline(task)
+        text = ts.count_text(task, delta, cap=cap, invested=invested)
+        return (text + " ") if text else ""
+
     def task_count_label(self, task, delta=None):
         """任务格子里那截 ``(1+2/5) ``（带尾随空格）；没设 count 就是空串。"""
         if delta is None:
             delta = self.task_count_delta(task)
-        text = ts.count_text(task, delta)
+        cap, invested = self.task_count_scope(task)
+        text = ts.count_text(task, delta, cap=cap, invested=invested)
         return (text + " ") if text else ""
 
     def frame_width(self):

@@ -2015,6 +2015,23 @@ class ProjectMixin(object):
                       pj.PROJECT_FIELD: project.get("title") or "",
                       pj.PROJECT_ID_FIELD: item["project_id"],
                       pj.PROJECT_TASK_FIELD: item["pk"]}
+            # ``count`` 是这一场分到的份额（可能只是原任务的 1/3），
+            # ``count_total`` 才是 OmniFocus 原任务的总 count。两者分开存，
+            # 既保持 count↔duration 的本地排期语义，也避免把拆分 part 显示成
+            # 独立任务 ``(0+1/1)``、``(0+2/2)``。
+            total_count = ts.parse_count(item.get("total"))
+            if total_count is None:
+                total_count = ts.parse_count(item.get("count_total"))
+            if total_count is None:
+                try:
+                    project_row = self.projects.by_id(item["project_id"])
+                    project_task = pj.task_by_pk(project_row, item["pk"])
+                    total_count = ts.parse_count(
+                        (project_task or {}).get("count"))
+                except Exception:               # noqa: BLE001 - 展示兜底不该挡住建任务
+                    total_count = None
+            if total_count and total_count > 0:
+                fields["count_total"] = int(total_count)
             if item.get("note"):
                 fields["note"] = item["note"]
             if parent_pk:

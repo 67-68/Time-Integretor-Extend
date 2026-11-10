@@ -262,6 +262,41 @@ def _pick_child_subset(children, capacity_minutes):
     return dp[max(dp)]
 
 
+def _select_chunk_slots(slots, target_minutes):
+    """为一次拆段挑场次：总容量够 target，且**浪费最少**。
+
+    不能只用「容量从大到小」硬切：例如目标 75 分钟、空场是 50 + 25 + 50，
+    先拿两个 50 会切出 50 + 25，第二段被塞进 50 分钟的场（实际只干 25），
+    收尾和 count 展示都会对不上。这里先找容量和最接近目标的场次组合，
+    75 就会选 50 + 25 两个正好的场。
+    """
+    target = int(target_minutes or 0)
+    free = [slot for slot in slots or ()
+            if (int(slot.get("duration") or 0)
+                - int(slot.get("used_minutes") or 0)) > 0]
+    if target <= 0:
+        return []
+    dp = {0: []}
+    for slot in free:
+        minutes = (int(slot.get("duration") or 0)
+                   - int(slot.get("used_minutes") or 0))
+        if minutes <= 0:
+            continue
+        for total, chosen in list(dp.items()):
+            nxt = total + minutes
+            if nxt not in dp:
+                dp[nxt] = chosen + [slot]
+    candidates = [(total - target, len(chosen), total, chosen)
+                  for total, chosen in dp.items() if total >= target]
+    if not candidates:
+        return []
+    candidates.sort(key=lambda row: row[:3])
+    chosen = candidates[0][3]
+    # 同一组合里按时间顺序排，part 1/2 的顺序和真实场次一致。
+    return sorted(chosen, key=lambda slot: (str(slot.get("start") or ""),
+                                            int(slot.get("index") or 0)))
+
+
 def _schedule_children(items, slots, placements, unscheduled, notes):
     """把带子任务的父任务壳按 session 实际分钟数排进表。
 
@@ -328,6 +363,10 @@ def _schedule_children(items, slots, placements, unscheduled, notes):
                 "title": child.get("title") or child.get("pk"),
                 "duration": minutes,
                 "count": count,
+                # 这一段只占 count 的一部分；原 OmniFocus 任务的完整 count
+                # 用 total 一路带到本地任务，界面才能显示 ``(0+1/3)`` 而不是
+                # 把每一段误当成独立的一条 ``(0+1/1)`` / ``(0+2/2)``。
+                "total": int(child.get("count") or 0) or int(item.get("total") or 0),
                 "note": note,
                 "parent_pk": item.get("pk"),
                 "parent_title": item.get("title") or item.get("pk"),
@@ -372,7 +411,8 @@ def _schedule_children(items, slots, placements, unscheduled, notes):
             free_slots = [slot for slot in slots
                           if slot.get("used", 0) < slot.get("counts", 0)
                           and free_minutes(slot) > 0]
-            if sum(free_minutes(slot) for slot in free_slots) < target:
+            chosen_slots = _select_chunk_slots(free_slots, target)
+            if not chosen_slots:
                 unscheduled.append(dict(item,
                                         count=ts.minutes_to_count(target) or 0,
                                         remaining_count=ts.minutes_to_count(target) or 0,
@@ -381,11 +421,9 @@ def _schedule_children(items, slots, placements, unscheduled, notes):
                 notes.append("「%s」还有 %d 分钟没地方放（剩余场次总容量不够）"
                              % (child.get("title") or child.get("pk"), target))
                 continue
-            free_slots.sort(key=lambda s_: (-free_minutes(s_),
-                                            str(s_.get("start") or "")))
             chunks = []
             remaining = target
-            for slot in free_slots:
+            for slot in chosen_slots:
                 if remaining <= 0:
                     break
                 take = min(free_minutes(slot), remaining)

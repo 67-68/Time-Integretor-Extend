@@ -226,14 +226,20 @@ def task_count_invested(task):
     return got if got is not None and got > 0 else 0
 
 
-def count_text(task, delta=0):
+def count_text(task, delta=0, cap=None, invested=None):
     """界面上的 ``(1+2/5)``：已投入 + 这一场会涨的 / 最高；没设 count 就是 ``""``。
 
     ``delta`` 只在「挂在某一场 session 上」时有意义 = 那一场时长 / 25（往上取整）
     —— 它是**预报**，不是事实：真正记账发生在收尾的时候（见 warden.begin_review）。
+
+    ``cap`` / ``invested`` 可由调用方覆盖。项目任务被拆成多个 session part 时，
+    每个 part 的本地 ``count`` 只是这一段分到的量；展示时要用 OmniFocus 原任务
+    的总 count 和所有 part 的累计进度（见 ``Warden.task_count_scope``）。
     """
-    cap = task_count(task)
-    invested = task_count_invested(task)
+    if cap is None:
+        cap = task_count(task)
+    if invested is None:
+        invested = task_count_invested(task)
     try:
         extra = int(delta or 0)
     except (TypeError, ValueError):

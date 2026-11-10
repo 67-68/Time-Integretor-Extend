@@ -654,6 +654,35 @@ check("第二条 75 分钟 action 没被误报成排不下", _long_uns, [])
 check_true("提示 75 分钟拆成 2 段",
            any("拆成 2 段" in n and "50 + 25" in n for n in _long_more))
 
+print("== plan 落地拆分 part：每段仍记原 OmniFocus 任务的总 count ==")
+wd_parts = fresh(_long_rows)
+check("导入含两条 75 分钟 action 的项目",
+      wd_parts.handle("task import sop omnifocus:///project/p-long"), True)
+wd_parts.handle("day 1")
+wd_parts.handle("session T1 50 25")
+book_all(wd_parts)
+wd_parts.handle("plan +1")
+check_true("plan 打开", wd_parts.planning is not None)
+wd_parts.planning.handle("task 1 3")       # 75 分钟 = 3 count，拆到 50 + 25
+wd_parts.handle("complete")
+_part_locals = [t for t in wd_parts.task_store.list()
+                if (t.get("fields") or {}).get("project_task") == "long-a"]
+check("同一 action 落成两个 session part", len(_part_locals), 2)
+check("两段都记得原任务总 count = 3",
+      sorted((t["fields"].get("count_total") for t in _part_locals),
+             key=lambda x: x or 0), [3, 3])
+check("两段的本地 count 仍是各自分到的 2 / 1",
+      sorted(t["fields"].get("count") for t in _part_locals), [1, 2])
+check("session 时长仍是 50 / 25",
+      sorted((t.get("session") or {}).get("duration") for t in _part_locals),
+      [25, 50])
+_part_text = " | ".join(wd_parts.task_cell_text([t], (t.get("session") or {}).get("duration"))
+                        for t in _part_locals)
+check_true("界面不再把两段显示成独立任务 (0+1/1)/(0+2/2)",
+           "(0+1/1)" not in _part_text and "(0+2/2)" not in _part_text)
+check_true("两段合计显示原任务的 3 count",
+           "(0+1/3)" in _part_text and "(0+2/3)" in _part_text)
+
 print("== plan 落地子任务：session 里只出现子任务，note 标注父任务 ==")
 wd_sub = fresh(_sub_rows)
 check("导入含子任务的项目", wd_sub.handle("task import sop omnifocus:///project/p-sub"), True)
