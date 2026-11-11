@@ -7,6 +7,7 @@ from .common import (
     TASK_HOOK_KINDS,
     TASK_MARK_WORDS,
     TASK_SHORT_FLAGS,
+    _crop_display,
     repl_kit,
     sp,
     th,
@@ -57,6 +58,237 @@ def _hint(prefix, *items, note=""):
 
 def _hint_actions(*items, note=""):
     return _hint("动作", *items, note=note)
+
+
+# ---------------------------------------------------------------- 命令介绍窗
+#
+# repl_kit 的 hint 行只回答「这个位置能填什么」。这里再给 3 行「这个命令是
+# 干什么的」：
+#
+#     📖 task — 任务管理：新建 / 改字段 / 挂 session / 导入 OmniFocus
+#     ⌨ 用法  task <序号|create|...> [-a <场>] [-m ...]
+#     → 现在  任务 #3 -ac：挂到当前进行中或最近的 session
+#
+# 介绍行和 repl_kit 的提示行分开，是因为「参数取值」会随着每个词变，而
+# 「命令用途」应该稳定地留在屏幕上方；两者混成一行时，命令一长就什么都看不清。
+
+_CONTEXT_HEADS = {
+    "task": "任务管理：建任务 / 挂 session / 改状态 / 导入 OmniFocus",
+    "project": "项目管理：真正项目 pro / 阶段 / 当前 op / 项目任务",
+    "plan": "排期：资源分配 → 唤起任务 → 排进 session",
+    "conscription": "快速征召：按剩余时间挑一条合适任务",
+    "session": "session 管理：新增 / 改排 / 永久写进日历",
+    "period": "时段排布：按 T1/T2 重排当天 session",
+    "help": "帮助：当前视图全部命令与用法",
+    "open": "打开：切数据模型 / 看板口径 / 展开列",
+    "close": "折叠：收起当前表的一列",
+}
+
+_CONTEXT_USAGES = {
+    "task": "task <序号|create|import|...> [-a <场>|-ac] [-m complete|discard]",
+    "project": "pro <序号> [interrupt [--soft|--hard|--check]|-a <场>|-ac|...]",
+    "plan": "plan [-c|--current] [天数]  |  plan -s <场> -p <项目>",
+    "conscription": "conscription / cst [session序号|current]",
+    "session": "session <HH:MM> <25|50|75> [--permanent]",
+    "period": "period <T1> [25|50|75 ...]",
+}
+
+_VIEW_INTROS = {
+    "契约": ("契约 / 预约",
+             "session 预约、取消、静音、改标题；项目与任务在下方"),
+    "专注": ("专注",
+             "当前 session 倒计时、暂停次数、专注模式；只认 stop 和 Shift+Tab"),
+    "统计": ("统计",
+             "生涯累计、每日分布、永不重订名单；stat refresh 增量刷新"),
+    "数据": ("数据",
+             "open task / project / op 切换三种数据模型；filter 控制可见状态"),
+    "设置": ("设置",
+             "列出全部设置项；set <id> <value> 修改，不写 value 恢复默认"),
+    "琐事": ("琐事",
+             "空闲时处理一条 bind 项目的杂事；m 完成 / c 换一条 / q 退出"),
+}
+
+
+def _context_width(shell):
+    try:
+        return max(40, int(shell.console.width) - 1)
+    except Exception:                              # noqa: BLE001 - 离屏/测试兜底
+        return 100
+
+
+def _context_detail(command, args):
+    """给当前输入片段补一句「这一步具体在做什么」。
+
+    只覆盖最常用、也最容易记错的形状；其余命令回落到 usage/summary，
+    不在这里复述一整套帮助表。
+    """
+    name = str(getattr(command, "name", "") or "")
+    words = [str(x).lower() for x in (args or []) if str(x).strip()]
+
+    if name == "task":
+        if not words:
+            return "输入序号后看这条任务能做什么；或从 create / import 等动作开始"
+        # 后缀 flag 可能出现在序号前后，先按 flag 判断，再按动作词判断。
+        ref = next((w for w in words if w.isdigit() or w.startswith("id:")), "")
+        task_ref = (("任务 #%s" % ref) if ref.isdigit() else ref) if ref else "这条任务"
+        if any(tok in words for tok in ("-ac", "--assign-current")) or "current" in words:
+            return "%s -ac：挂到当前进行中或最近的 session" % task_ref
+        if any(tok in words for tok in ("-an",)) or "none" in words:
+            return "%s -an：从 session 下架" % task_ref
+        if any(tok in words for tok in ("-a", "--assign")):
+            return "%s -a：挂到指定的表格 #session" % task_ref
+        if "-m" in words or "--mark" in words:
+            mark = words[words.index("-m") + 1] if "-m" in words and words.index("-m") + 1 < len(words) else ""
+            if mark == "complete":
+                return "%s -m complete：只改本地状态并归档，不勾 Focusmate" % task_ref
+            if mark == "discard":
+                return "%s -m discard：只改本地状态，外部系统都不动" % task_ref
+            return "%s：手动改本地任务状态（不碰外部）" % task_ref
+        if "-f" in words or "--formatter" in words:
+            fmt = words[words.index("-f") + 1] if "-f" in words and words.index("-f") + 1 < len(words) else ""
+            if fmt == "end":
+                return "%s -f end：按任务时长在当天最后切一场 session 并自动挂上" % task_ref
+            if fmt == "repeat":
+                return "%s -f repeat：固定挂到点名的那一场已有 session" % task_ref
+            return "%s：挂 formatter 并按它排期" % task_ref
+        if "-e" in words or "--exclusive" in words:
+            return "%s -e：让这条任务独占整场 session" % task_ref
+        if ref:
+            return "%s：查看 / 选中这条任务" % task_ref
+
+        action = words[0]
+        details = {
+            "create": "新建任务；字段不校验，--repeat 可一步建每周重复",
+            "import": "读剪贴板导入 OmniFocus 任务或项目",
+            "assign": "把选中的任务挂到指定 session",
+            "select": "选中一条任务（裸序号也等价）",
+            "delete": "删除一条任务",
+            "modify": "修改任务字段（字段不校验）",
+            "note": "写任务备注，适合塞材料链接",
+            "repeat": "查看 / 设置每周重复规则",
+            "sync": "把 Focusmate 完成时间同步进本地归档",
+            "archive": "查看完成归档",
+            "link": "关联 OmniFocus 任务",
+            "swap": "两条任务互换面板顺序",
+            "done": "完成任务，并联动 Focusmate / OmniFocus",
+            "drop": "放弃任务，并联动 Focusmate / OmniFocus",
+            "duplicate": "复制一条任务",
+        }
+        # 动作可能写在 `task -a 3 create ...` 这种后缀后面，找第一个动作词。
+        for tok in words:
+            if tok in details:
+                return details[tok]
+        return "任务管理：动作 + 后缀（挂载 / 备注 / 状态 / trigger / formatter）"
+
+    if name in ("project", "pro"):
+        if not words:
+            return "真正项目 pro：阶段、当前 op、阶段推进与项目任务"
+        if "-ac" in words or "--assign-current" in words:
+            return "把该项目第一条可排任务挂到当前或最近的 session"
+        if "-a" in words or "--assign" in words:
+            return "把该项目第一条可排任务挂到指定 session"
+        if "interrupt" in words:
+            if "--check" in words or "-c" in words:
+                return "逐条检查软中断：不处理 / 入队 / 丢弃，最后合成一条 incubator 任务"
+            if "--hard" in words:
+                return "硬中断：下架当前场全部任务，再建一整场新任务挂回去"
+            return "软中断：保存建议并选 A/B/C，不下架当前任务"
+        if "create" in words:
+            return "新建真正项目 pro"
+        if "file" in words:
+            return "给项目关联一个文件，open + Enter 时顺便打开"
+        if "refresh" in words:
+            return "重新从 OmniFocus 读取该项目清单"
+        return "管理真正项目 pro 的阶段、关联 op 与项目任务"
+
+    if name == "plan":
+        if "-s" in words or "--session" in words or "-p" in words or "--project" in words:
+            return "sessional plan：把指定项目排进指定 session（追加，不整天重排）"
+        if "-c" in words or "--current" in words:
+            return "把今天正在进行的空 session 也纳入排期，只算完整的 25 分钟块"
+        return "分资源 → 唤起任务 → 排进 session；默认排今天"
+
+    if name in ("conscription", "cst"):
+        return "按目标 session 剩余时间每 5 分钟向下取档，挑一条合适任务征召"
+
+    if name == "session":
+        return "新增 / 改排 session；--permanent 才写进日历长期生效"
+    if name == "period":
+        return "按时段 T1/T2 重排当天所有 session"
+    if name == "help":
+        return "当前视图全部命令；help --task / --data 看数据视图详细说明"
+    if name == "open":
+        return "切换数据模型 / 看板口径，或展开某一列"
+    if name == "close":
+        return "折叠当前表的一列；--permanent 写进偏好"
+    return ""
+
+
+def context_hint_lines(shell, text=""):
+    """Prompt 上方的 3 行命令介绍窗。
+
+    返回 ``[(prompt_toolkit style, line), ...]``；始终返回 3 行，保证
+    ``WardenShell.dashboard_budget()`` 预留的高度和实际画出来的一致。
+    """
+    raw = str(text or "")
+    parts = raw.strip().split()
+    width = _context_width(shell)
+    if not parts:
+        view = getattr(shell, "view", None)
+        name = getattr(view, "name", "") if view is not None else ""
+        title, desc = _VIEW_INTROS.get(name, (name or "warden", "输入命令开始"))
+        return [
+            ("fg:ansicyan bold", _crop_display("📖  %s — %s" % (title, desc), width)),
+            ("fg:ansibrightblack",
+             _crop_display("⌨  输入命令后这里显示用途和用法；Tab 补全 · help 看全部命令", width)),
+            ("fg:ansibrightblack",
+             _crop_display("↕  PgUp / PgDn 翻长内容 · Shift+Tab 切下一个视图", width)),
+        ]
+
+    token = parts[0]
+    command = shell.registry.get(token)
+    matches = []
+    partial = False
+    if command is None:
+        matches = [candidate for candidate in shell.registry.completion_names(shell.verbose)
+                   if candidate.lower().startswith(token.lower())]
+        if matches:
+            partial = True
+            command = shell.registry.get(matches[0])
+    if command is None:
+        return [
+            ("fg:ansiyellow bold", _crop_display("❔  没认出命令「%s」" % token, width)),
+            ("fg:ansibrightblack",
+             _crop_display("⌨  Tab 补全 · help 看当前视图全部命令", width)),
+            ("fg:ansibrightblack",
+             _crop_display("→  输入已有命令的前几个字母时，这里会显示它的用途", width)),
+        ]
+
+    if partial and len(matches) > 1:
+        shown = "  ".join(matches[:6])
+        more = " …" if len(matches) > 6 else ""
+        return [
+            ("fg:ansicyan bold", _crop_display("🔎  「%s」匹配 %d 条命令" % (token, len(matches)), width)),
+            ("fg:ansibrightblack", _crop_display("⌨  " + shown + more, width)),
+            ("fg:ansibrightblack",
+             _crop_display("→  再输入一两个字母缩小范围；Tab 直接补全", width)),
+        ]
+
+    intro = _CONTEXT_HEADS.get(command.name) or getattr(command, "summary", "") or command.name
+    if partial:
+        head = "📖  %s → %s ─ %s" % (token, command.name, intro)
+    else:
+        head = "📖  %s ─ %s" % (command.name, intro)
+    usage = (_CONTEXT_USAGES.get(command.name)
+             or getattr(command, "usage", "") or command.name)
+    detail = _context_detail(command, parts[1:])
+    if not detail:
+        detail = "Tab 补全参数 · Enter 执行 · help 看当前视图全部命令"
+    return [
+        ("fg:ansicyan bold", _crop_display(head, width)),
+        ("fg:ansibrightblack", _crop_display("⌨  用法  " + usage, width)),
+        ("fg:ansiyellow", _crop_display("→  现在  " + detail, width)),
+    ]
 
 
 def _hint_day(parts):
@@ -148,7 +380,7 @@ def _task_command(w):
     return repl_kit.Command(
         name="task",
         handler=w.cmd_task,
-        summary="任务 CRUD / 挂到 session / 手动标记状态 / trigger + formatter / "
+        summary="任务管理：CRUD / 挂到 session / 手动标记状态 / trigger + formatter / "
                 "同步完成时间 / 导入 OmniFocus 项目",
         aliases=(),
         section="通用",

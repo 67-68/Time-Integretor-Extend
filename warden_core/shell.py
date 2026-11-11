@@ -44,6 +44,7 @@ class WardenShell(repl_kit.ReplShell):
         self.pin_bottom = bool(pin_bottom) # 把输入行永远钉在屏幕最底部
         self.frame_rev = 0                 # 状态变化计数：变了就必须重排版
         self.frame_key_hook = None         # (() -> tuple)：业务侧补充的帧键
+        self.context_hint_hook = None      # ((text) -> [(style, line), ...])：命令介绍窗
         self._frame_memo = None            # (key, ansi_text)
         self._ansi_memo = None             # (ansi_text, chunks)
         # 内部滚动：0 = 贴底（最新内容）。向上翻时离开底部，最多翻到整块
@@ -192,6 +193,10 @@ class WardenShell(repl_kit.ReplShell):
                       if footer else (scroll_hint + "\n"))
         if footer:
             chunks.extend(self._dashboard_chunks(footer))
+        # 命令介绍窗：固定 3 行，夹在视图栏和参数提示行之间。
+        for style, line in self.context_hint(text):
+            if line:
+                chunks.append((style, str(line) + "\n"))
         hint = self.hint_line(text)
         if hint:
             chunks.append((self.pt_hint_class, hint + "\n"))
@@ -208,9 +213,31 @@ class WardenShell(repl_kit.ReplShell):
             return list(to_formatted_text(ANSI(dashboard)))
         return [("", dashboard)]
 
+    def context_hint(self, text=""):
+        """Prompt 上方的命令介绍窗（2-3 行）。
+
+        默认实现从当前视图的命令注册表里取 summary / usage，再按输入片段
+        补一句具体说明。业务侧可以换 ``context_hint_hook``，但形状保持
+        ``[(prompt_toolkit style, text), ...]``，这样样式和高度都由这里统一。
+        """
+        hook = self.context_hint_hook
+        if hook is not None:
+            try:
+                value = hook(text)
+            except Exception:                     # noqa: BLE001 - 提示坏了别拖垮输入
+                value = None
+            if value:
+                return list(value)
+        try:
+            from .hints import context_hint_lines
+            return list(context_hint_lines(self, text))
+        except Exception:                         # noqa: BLE001
+            return []
+
     def dashboard_budget(self):
-        """看板画布的可用高度（终端总行数 - 底部视图栏/提示行/状态行/输入行）。"""
+        """看板画布的可用高度（终端总行数 - 底部视图栏/介绍窗/提示行/状态行/输入行）。"""
         reserved = 1                                  # 提示行
+        reserved += 3                                 # 命令介绍窗（固定三行）
         # 老版本 repl_kit 没有这个属性时，PromptSession 仍会预留 8 行。
         reserved += max(0, getattr(self, "reserve_space_for_menu", 8))
         try:

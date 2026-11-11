@@ -927,6 +927,29 @@ check("mute 第二个参数提示 on/off",
       and "off" in wd_hint.shell.hint_line("mute 3 "), True)
 check("session 第二个参数提示时长",
       "25" in wd_hint.shell.hint_line("session 11:15 "), True)
+
+print("== 命令介绍窗：prompt 上方固定 3 行，随输入片段变化 ==")
+_ctx_idle = wd_hint.shell.context_hint("")
+check("空闲时也有 3 行介绍", len(_ctx_idle), 3)
+check("空闲介绍点出当前视图", "契约" in _ctx_idle[0][1], True)
+_ctx_task = wd_hint.shell.context_hint("task")
+check("输入 task 后介绍任务管理", "任务管理" in _ctx_task[0][1], True)
+check("task 介绍窗给用法", "用法" in _ctx_task[1][1], True)
+_ctx_ac = wd_hint.shell.context_hint("task 3 -ac")
+check("task 3 -ac 解释挂到当前/最近 session",
+      "当前进行中或最近的 session" in _ctx_ac[2][1], True)
+_ctx_pro = wd_hint.shell.context_hint("pro 1 interrupt --check")
+check("pro interrupt --check 解释逐条检查",
+      "逐条检查软中断" in _ctx_pro[2][1], True)
+_ctx_part = wd_hint.shell.context_hint("tas")
+check("命令前缀 tas 能认出 task", "task" in _ctx_part[0][1], True)
+_ctx_unknown = wd_hint.shell.context_hint("zzz")
+check("未知命令给出补全提示", "没认出命令" in _ctx_unknown[0][1], True)
+_chrome_ctx = wd_hint.shell.chrome("task 3 -ac")
+_check_texts = [str(text) for _style, text in _chrome_ctx]
+_hint_at = next(i for i, text in enumerate(_check_texts) if text.startswith("参数: "))
+_ctx_at = next(i for i, text in enumerate(_check_texts) if "任务管理" in text)
+check("介绍窗在参数提示行上面", _ctx_at < _hint_at, True)
 help_labels = [label for _, rows in wd_hint.shell.sections() for label, _ in rows]
 check("help 表显示 usage（带参数）", "mute <n> on|off" in help_labels, True)
 
@@ -1091,10 +1114,12 @@ shell_fast.frame_text()
 check("跨过一秒 → 自然重排版（时钟得走）", _built["n"], 3)
 check("窗口大小变了也要重排版",
       (shell_fast.invalidate_frame(), shell_fast.frame_text(), _built["n"])[2], 4)
-# 快路径必须和框架原版拼出一样的东西（不然就是「快但画错了」）
+# 快路径必须和框架原版拼出一样的东西（不然就是「快但画错了」）。
+# WardenShell 比框架多一块固定 3 行的命令介绍窗，而且这块窗会占掉看板预算，
+# 所以看板本身本来就会少几行；这里比「看板之后」的提示/状态/提示符。
 _fast = [(style, text) for style, text in shell_fast.chrome("task ")]
 _slow = [(style, text) for style, text in w.repl_kit.ReplShell.chrome(shell_fast, "task ")]
-check("快路径和框架原版逐字一致", _fast, _slow)
+check("快路径的提示/状态/提示符和框架原版一致", _fast[-2:], _slow[-2:])
 
 print("== 打字不掉帧：日志只读尾巴（daemon 日志能长到几十 MB）==")
 _real_log = ks.LOG_FILE
