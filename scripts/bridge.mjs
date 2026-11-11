@@ -71,6 +71,9 @@
 import readline from "readline";
 import fs from "node:fs";
 import path from "node:path";
+// delete_task 删除后要等几拍再 GET 复核。用 Node 内置的 promise 版 setTimeout，
+// 不要引用 _lib.mjs：那个模块顶层会加载 Playwright，桥启动时不该被它拖住。
+import { setTimeout as sleep } from "node:timers/promises";
 import { attachTaskViaApi, completeTaskViaApi, mergeTaskLists } from "./task_attach.mjs";
 
 // ---------------------------------------------------------------- 每日运行日志

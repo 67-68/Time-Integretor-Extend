@@ -1653,7 +1653,25 @@ class TaskPipelineMixin(object):
         return self.task_store.get(task_id)
 
     def _detach_failed(self, task_id, before, error):
-        """删失败：把绑定放回去（那条 task 还在 Focusmate 上，账不能先断）。"""
+        """删失败：先复核 Focusmate，真没了就保持下架，真还在才回滚绑定。
+
+        桥的 DELETE 和「删完复核」是两段：如果 DELETE 已经成功、复核阶段自己
+        抛错（例如 ``sleep is not defined``），只看错误会把本地绑定放回去 ——
+        Focusmate 已经没有这条 task，契约表却还挂着，``-an`` 看起来永远下不掉。
+        所以失败回调再 GET 一次任务列表：**id 不在 = 远端确实删了**，本地就
+        保持操作后的「已下架」；只有远端仍能查到、或查不到状态时才回滚。
+        """
+        fm = (before or {}).get("focusmate") or {}
+        fm_id = fm.get("task_id") or fm.get("id")
+        if fm_id:
+            remote = self._remote_tasks()
+            if remote is not None and str(fm_id) not in remote:
+                self.rebuild_rows()
+                self.invalidate()
+                self.say("⏏ Focusmate task %s 已经不在（删除已生效；原报错：%s）；"
+                         "本地保持下架，不恢复绑定。"
+                         % (str(fm_id)[:8], error), "warn")
+                return
         self._revert_task(task_id, before, "Focusmate task 没删掉：%s" % error)
 
     @staticmethod

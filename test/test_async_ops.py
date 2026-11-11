@@ -435,6 +435,35 @@ check("表格里那条任务回到「赋闲」",
       [r.get("task_text") or "" for r in wd.rows if r["startLabel"] == "12:00"],
       [""])
 
+print("\n== 2.1 下架：DELETE 已生效、复核命令自己炸了 → 远端没了就不恢复绑定 ==")
+bridge = GateBridge()
+wd = mkwarden(bridge)
+seed_rows(wd)
+_lost = wd.task_store.create(fields={"title": "远端已删但本地曾被回滚"})
+_lost_row = [r for r in wd.rows if r["startLabel"] == "11:00"][0]
+_lost_session = {
+    "date": wd.sel_date.isoformat(), "start": _lost_row["startLabel"],
+    "end": _lost_row["endLabel"], "duration": _lost_row["durationMin"],
+    "focusmate_session_id": _lost_row["id"],
+}
+wd.task_store.assign(_lost["id"], _lost_session)
+wd.task_store.attach_focusmate(
+    _lost["id"], {"task_id": "ft-gone"}, session=_lost_session)
+bridge.attached["ft-gone"] = _lost_row["id"]
+
+# 重现桥里的真实事故：DELETE 已经生效，但删除后的复核阶段抛
+# ReferenceError（用户看到的 `sleep is not defined`），于是整条命令报错。
+_lost_before = copy.deepcopy(wd.task_store.get(_lost["id"]))
+wd.task_store.unassign(_lost["id"], reason="cmd-assign-none")   # 乐观下架
+bridge.attached.pop("ft-gone", None)                             # 远端其实已删
+wd._detach_failed(_lost["id"], _lost_before, "sleep is not defined（测试）")
+_lost_after = wd.task_store.get(_lost["id"])
+check("远端已经删掉：本地不复原绑定", _lost_after.get("session"), None)
+check("也不把 Focusmate task id 放回来",
+      (_lost_after.get("focusmate") or {}).get("task_id"), None)
+check_true("说明复核发现远端已经没了",
+           any("Focusmate task" in m[2] and "保持下架" in m[2] for m in wd.messages))
+
 print("\n== 3. re-action：重放全部失败行动（参数从盘上来）==")
 bridge.fail.pop("add_task", None)               # 网络好了
 console_lines = []

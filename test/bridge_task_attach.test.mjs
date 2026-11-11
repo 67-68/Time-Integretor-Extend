@@ -2,6 +2,7 @@
 //   node --test test/bridge_task_attach.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   attachTaskViaApi,
   completeTaskViaApi,
@@ -162,4 +163,14 @@ test("complete_task：完成之后从 /tasks 消失、在 /tasks/completed 里�
   assert.equal(out.task.completedAt, "2026-10-30T02:50:20.698791+00:00");
   assert.equal(state.active.length, 0);
   assert.equal(state.completed.length, 1);
+});
+
+test("bridge.delete_task 的复核延时函数有绑定（sleep is not defined 回归）", () => {
+  // 事故：DELETE 已成功，但删除后的 GET 复核调用了未定义的 sleep，整条命令报错，
+  // 本地把绑定又回滚回去，看起来像 task -an 永远下不掉。
+  const src = readFileSync(new URL("../scripts/bridge.mjs", import.meta.url), "utf8");
+  assert.match(src, /import \{ setTimeout as sleep \} from "node:timers\/promises"/,
+    "bridge.mjs 必须给 delete_task 的 sleep 一个明确绑定");
+  assert.match(src, /await sleep\(i === 0 \? 300 : 800\)/,
+    "删除后的复核仍要真的等待");
 });
