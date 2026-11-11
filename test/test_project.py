@@ -2061,6 +2061,138 @@ _session_tasks = [t for t in wd_re.task_store.list()
 check("同一天只剩第二轮排出来的 session 任务",
       len(_session_tasks), len(_plan2["items"]))
 
+print("== 16) period-first：容量、parallel / sequential 示例 ==")
+
+def _pslot(pid, start, end, blocks, auto=True):
+    return {"index": 1, "date": TOMORROW, "start": start, "end": end,
+            "duration": blocks * 25, "counts": blocks, "id": None,
+            "period_id": pid,
+            "period": {"id": pid, "date": TOMORROW, "start": start, "end": end},
+            "period_start": start, "period_end": end,
+            "period_total_minutes": blocks * 30, "period_blocks": blocks,
+            "period_auto": auto}
+
+
+def _pitem(title, minutes, mode="parallel"):
+    return {"project_id": 1,
+            "project": {"id": 1, "title": "PeriodProject", "task_type": mode},
+            "pk": title, "title": title,
+            "count": max(1, minutes // 25), "total": max(1, minutes // 25),
+            "minutes": minutes, "duration": minutes, "task_type": mode}
+
+
+_period_slots = [_pslot("T1", "09:00", "09:30", 1),
+                 _pslot("T2", "10:00", "12:30", 5)]
+_p_places, _p_uns, _p_notes, _p_layouts = pp.schedule_periods(
+    [_pitem("A", 25), _pitem("B", 50), _pitem("C", 75)], _period_slots)
+check("30 分钟 period 工作容量 25；150 分钟 period 工作容量 125",
+      [(s["period_blocks"], s["duration"]) for s in _period_slots],
+      [(1, 25), (5, 125)])
+check("parallel：P1 只放 A，P2 放 B + C",
+      [(p["item"]["title"], p["slot"]["start"], p["duration"])
+       for p in _p_places],
+      [("A", "09:00", 25), ("B", "10:00", 50), ("C", "11:00", 75)])
+check("parallel 自动生成的 session 是 25 / 50 / 75",
+      sorted(_p_layouts.values()), [[25], [50, 75]])
+check("parallel 没有漏排", _p_uns, [])
+
+_seq_items = [_pitem("B", 50, "sequential"), _pitem("A", 25, "sequential"),
+              _pitem("C", 75, "sequential")]
+_s_places, _s_uns, _s_notes, _s_layouts = pp.schedule_periods(
+    _seq_items, [_pslot("T1", "09:00", "09:30", 1),
+                 _pslot("T2", "10:00", "12:30", 5)])
+check("sequential：B 拆成 25 + 25，P2 再 A25 + C75",
+      [(p["item"]["title"], p["slot"]["start"], p["duration"], p["split"])
+       for p in _s_places],
+      [("B", "09:00", 25, True), ("B", "10:00", 25, True),
+       ("A", "10:30", 25, False), ("C", "11:00", 75, False)])
+check("sequential 自动布局是 25 / 25+25+75",
+      [_s_layouts[("2026-11-12", "T1", "09:00", "09:30")],
+       _s_layouts[("2026-11-12", "T2", "10:00", "12:30")]],
+      [[25], [25, 25, 75]])
+check("sequential 没有漏排", _s_uns, [])
+
+# 一个 session 最多一个 >=25 分钟任务；<25 可以叠进已有 session。
+_mix_places, _mix_uns, _mix_notes, _mix_layouts = pp.schedule_periods(
+    [_pitem("长 60", 60), _pitem("小 15", 15)],
+    [_pslot("T1", "10:00", "12:30", 5)])
+check("60 + 15 可以叠进同一个 75 分钟 session",
+      [(p["item"]["title"], p["duration"], p["stacked"]) for p in _mix_places],
+      [("长 60", 60, True), ("小 15", 15, True)])
+check("叠小任务不会多造 session", sorted(_mix_layouts.values()), [[75]])
+
+_split_places, _split_uns, _split_notes, _split_layouts = pp.schedule_periods(
+    [_pitem("甲 25", 25), _pitem("乙 25", 25)],
+    [_pslot("T1", "10:00", "12:30", 5)])
+check("两个 >=25 分钟任务不能塞进同一个 session",
+      [(p["item"]["title"], p["slot"]["start"]) for p in _split_places],
+      [("甲 25", "10:00"), ("乙 25", "10:30")])
+check("两个 25 分钟任务生成两个 session",
+      sorted(_split_layouts.values()), [[25, 25]])
+
+print("== 17) plan 无手动 layout：按任务反推 session，并写回中间层 ==")
+sp.save_layouts(sp.empty_layouts())
+wd_auto = fresh([dict(r) for r in _long_rows])
+wd_auto.omnifocus.rows = [dict(r) for r in _long_rows]
+wd_auto.handle("task import sop omnifocus:///project/p-long")
+wd_auto.handle("day 1")
+wd_auto.rewrite_data_csv_from_plan()
+wd_auto.rebuild_rows()
+book_all(wd_auto)
+wd_auto.handle("plan +1")
+check_true("自动 layout 的 plan 能打开", wd_auto.planning is not None)
+check("自动 layout 的容量按整个 period 算：T1 4 + T2 2 = 6 count",
+      wd_auto.planning.cap()["counts"], 6)
+wd_auto.planning.handle("task 1 3")
+wd_auto.handle("complete")
+_auto_layouts = sp.load_layouts()
+_T1_auto = _auto_layouts["layouts"][wd_auto.sel_date.isoformat()]["T1"]
+_T2_auto = _auto_layouts["layouts"][wd_auto.sel_date.isoformat()]["T2"]
+check("75 分钟任务生成一个 75 分钟 session，而不是 50+25",
+      (_T1_auto.get("source"), _T1_auto.get("durations")), ("auto", [75]))
+check("没有任务的 period 自动清空 session 内容",
+      (_T2_auto.get("source"), _T2_auto.get("durations")), ("auto", []))
+_auto_task = next(t for t in wd_auto.task_store.list()
+                  if (t.get("fields") or {}).get("project_task") == "long-a")
+check("任务挂到新生成的 75 分钟 session 上",
+      ((_auto_task.get("session") or {}).get("duration"),
+       (_auto_task.get("session") or {}).get("start")), (75, "11:00"))
+
+# 计划指纹没变 → refresh 不重排；指纹被人为改掉 → 下一次 refresh 自动重算一次。
+check("刚 plan 完，自动 layout 不是 dirty", wd_auto._auto_plan_dirty(wd_auto.sel_date), False)
+_sig_layouts = sp.load_layouts()
+_sig_layouts["layouts"][wd_auto.sel_date.isoformat()]["T1"]["plan_sig"] = ("stale",)
+sp.save_layouts(_sig_layouts)
+wd_auto.messages.clear()
+wd_auto.handle("refresh")
+check_true("refresh 发现计划变了才重算",
+           any("检测到计划变化" in t for t in texts(wd_auto)))
+check("重算后指纹已更新", wd_auto._auto_plan_dirty(wd_auto.sel_date), False)
+wd_auto.messages.clear()
+wd_auto.handle("refresh")
+check_true("计划没再变：第二次 refresh 不再重算",
+           not any("检测到计划变化" in t for t in texts(wd_auto)))
+
+print("== 18) 手动 layout 是硬约束；period T1 clear 清空内容 ==")
+sp.save_layouts(sp.empty_layouts())
+wd_manual = fresh([dict(r) for r in _long_rows])
+wd_manual.omnifocus.rows = [dict(r) for r in _long_rows]
+wd_manual.handle("task import sop omnifocus:///project/p-long")
+wd_manual.handle("day 1")
+wd_manual.handle("session T1 50 25")
+book_all(wd_manual)
+wd_manual.handle("plan +1")
+wd_manual.planning.handle("task 1 3")
+wd_manual.handle("complete")
+_manual_layout = sp.load_layouts()["layouts"][wd_manual.sel_date.isoformat()]["T1"]
+check("plan 不修改手动 layout",
+      (_manual_layout.get("source"), _manual_layout.get("durations")),
+      ("manual", [50, 25]))
+wd_manual.handle("period T1 clear")
+_cleared = sp.load_layouts()["layouts"][wd_manual.sel_date.isoformat()]["T1"]
+check("period T1 clear 清空 session 内容且保留自动重排能力",
+      (_cleared.get("source"), _cleared.get("durations")), ("auto", []))
+
 print()
 if fails:
     print("FAILED %d" % len(fails))

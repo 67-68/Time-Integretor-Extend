@@ -19,20 +19,22 @@
 先把「今天这台 4 个 count 给论文」定下来（人的判断），再让程序去挑具体哪几条任务、
 排进哪一场（机器的活）。混在一起问，人就得在脑子里同时装两件事。
 
-## 排任务的两条原则（用户给的原话）
+## 排任务：period-first
 
-1. **尽量让每个任务占有自己的独立 session** —— 一场 session 只放一个任务；
-2. **尽量让每个任务连续** —— 不把一条任务拆成「这一场 2 个 count、下一场 1 个」。
+旧的 ``schedule()`` 仍保留给单场 / 旧测试用；正式 ``plan`` 走
+:func:`schedule_periods()`：
 
-于是排法是「先求不拆的完美配对，配不上才拆」：
+1. **日历 period 不可变**，period 的工作容量 = ``floor(总分钟 / 30) * 25``；
+2. 手动 ``period T1 50 25`` 是硬约束，任务只能往里填；没有手动 layout 时，
+   由任务 duration 反推 25 / 50 / 75 的 session 布局；
+3. 一个 session 最多一个 ``>=25`` 分钟任务，``<25`` 的小任务可以叠进去；
+4. parallel 按 priority tag + OmniFocus 清单顺序，从最早 period 开始找能整条
+   放下的任务；整条都放不下时才拆段；
+5. sequential 按 OmniFocus 清单顺序从最早 period 往后填，当前 period 不够就
+   拆到后续 period，不为了少拆而跳场。
 
-- 把任务（要几个 count）和场次（能装几个 count）摆成二分图，跑一次最大匹配
-  （:func:`match_tasks_to_slots`，Kuhn 增广路）——**有不用拆的解就一定找到**，
-  而且按「浪费最小」挑场次；
-- 配不上的任务（比所有场次都长，或者场次数量不够）才拆开填，并且**明说是拆的**；
-- parallel 的匹配从最早的 session 开始，任务按「priority tag 分组 → OmniFocus
-  清单顺序」扫描；sequential 项目则严格按项目清单顺序从最早的场次往后填。
-  两条路径都稳定、可预期。
+这样用户给的 A25 / B50 / C75 例子会按 period 得到 25 + (50,75)，而不是先按
+data.csv 里默认的 50/25 session 硬塞。
 
 这个模块不联网、不依赖 rich；warden / 测试只调这里。
 """
@@ -41,6 +43,7 @@ from __future__ import annotations
 import datetime
 
 import project_store as pj
+import session_plan as sp
 import task_store as ts
 
 MINUTES_PER_COUNT = ts.MINUTES_PER_COUNT
@@ -849,6 +852,439 @@ def schedule(items, slots):
 
 
 # ---------------------------------------------------------------- 问人
+
+
+
+# ---------------------------------------------------------------- period-first 排期
+#
+# 用户口径（2026-11-11）：
+#   - 日历上的 period 是硬约束，总长度不变；
+#   - period 内可装的 session 由任务决定；
+#   - 1 count = 25 分钟工作，但一场 session 实际占 30 分钟（25 + 5 休息）；
+#     50 工作占 60，75 工作占 90；
+#   - 同一个 session 最多一个 >=25 分钟的任务；<25 分钟的小任务可以叠进去；
+#   - parallel / sequential 的任务顺序仍然各自跑，只是排序单位从 session 变成 period。
+
+def _ceil_session_minutes(minutes):
+    """任务分钟 → Focusmate 可预约的工作分钟（25/50/75）。"""
+    minutes = int(minutes or 0)
+    if minutes <= 0:
+        return None
+    for size in (25, 50, 75):
+        if minutes <= size:
+            return size
+    return None
+
+
+def _period_total_minutes(period):
+    got_s = sp.parse_hhmm((period or {}).get("start"))
+    got_e = sp.parse_hhmm((period or {}).get("end"))
+    if got_s is None or got_e is None:
+        return 0
+    start = got_s[0] * 60 + got_s[1]
+    end = got_e[0] * 60 + got_e[1]
+    if end <= start:
+        end += 24 * 60
+    return max(0, end - start)
+
+
+def _period_blocks(period):
+    """period 里能放几个 25 分钟工作块（每块连同休息占 30 分钟）。"""
+    return max(0, _period_total_minutes(period) // 30)
+
+
+def _period_key(period):
+    return (str(period.get("date") or ""), str(period.get("id") or ""),
+            str(period.get("start") or ""), str(period.get("end") or ""))
+
+
+def _auto_used_blocks(groups):
+    total = 0
+    for group in groups or ():
+        size = _ceil_session_minutes(group.get("work"))
+        if size:
+            total += size // MINUTES_PER_COUNT
+    return total
+
+
+def _new_auto_group():
+    return {"capacity": None, "work": 0, "has_long": False, "chunks": [], "slot": None}
+
+
+def _new_fixed_group(slot):
+    return {"capacity": int((slot or {}).get("duration") or 0),
+            "work": 0, "has_long": False, "chunks": [], "slot": slot}
+
+
+def _group_remaining(group):
+    if group.get("capacity") is None:
+        return max(0, 75 - int(group.get("work") or 0))
+    return max(0, int(group["capacity"]) - int(group.get("work") or 0))
+
+
+def _auto_can_hold(period, groups, group, add_minutes, is_long):
+    add_minutes = int(add_minutes or 0)
+    if add_minutes <= 0:
+        return False
+    if is_long and group.get("has_long"):
+        return False
+    if int(group.get("work") or 0) + add_minutes > 75:
+        return False
+    before = _auto_used_blocks(groups)
+    old_size = _ceil_session_minutes(group.get("work")) or 0
+    new_size = _ceil_session_minutes(int(group.get("work") or 0) + add_minutes) or 0
+    after = before - (old_size // MINUTES_PER_COUNT) + (new_size // MINUTES_PER_COUNT)
+    return after <= int(period.get("blocks") or 0)
+
+
+def _auto_can_new(period, groups, add_minutes):
+    size = _ceil_session_minutes(add_minutes)
+    if not size:
+        return False
+    return _auto_used_blocks(groups) + size // MINUTES_PER_COUNT <= int(period.get("blocks") or 0)
+
+
+def _add_chunk(period, groups, minutes, is_long, split_ok=False):
+    """把一个任务块放进某个 period 的 session 组。返回实际放下的分钟数。"""
+    minutes = int(minutes or 0)
+    if minutes <= 0:
+        return 0
+    auto = bool(period.get("auto"))
+    if not auto:
+        # 手动 layout：session 长度固定，任务只能往里填。
+        if is_long:
+            # 先找能整条放下的空 session；放不下才按 split_ok 拆进最早的空 session。
+            for group in groups:
+                if group.get("has_long"):
+                    continue
+                if _group_remaining(group) >= minutes:
+                    group["chunks"].append(minutes)
+                    group["work"] += minutes
+                    group["has_long"] = True
+                    return minutes
+            if split_ok:
+                for group in groups:
+                    if group.get("has_long"):
+                        continue
+                    room = _group_remaining(group)
+                    if room >= MINUTES_PER_COUNT:
+                        take = min(room, minutes)
+                        group["chunks"].append(take)
+                        group["work"] += take
+                        group["has_long"] = True
+                        return take
+            return 0
+        # 小任务：优先塞进已有 session 的剩余工作分钟。
+        for group in groups:
+            room = _group_remaining(group)
+            if room >= minutes:
+                group["chunks"].append(minutes)
+                group["work"] += minutes
+                return minutes
+        # 空 session 也算已有；如果没有空位，就说明这个 period 的手动 layout 已满。
+        return 0
+
+    # 自动 layout：先尽量塞进已有小空位；否则新建一个 session 组。
+    if is_long:
+        # 一个 group 只能有一个 >=25 的任务；先找只有小任务的组。
+        for group in groups:
+            if not group.get("has_long") and _auto_can_hold(period, groups, group, minutes, True):
+                group["chunks"].append(minutes)
+                group["work"] += minutes
+                group["has_long"] = True
+                return minutes
+        if _auto_can_new(period, groups, minutes):
+            group = _new_auto_group()
+            group["chunks"].append(minutes)
+            group["work"] = minutes
+            group["has_long"] = True
+            groups.append(group)
+            return minutes
+        if split_ok:
+            # 按剩余块数切一个能装进去的最大块；优先 75/50/25。
+            room_blocks = int(period.get("blocks") or 0) - _auto_used_blocks(groups)
+            max_work = max(0, room_blocks) * MINUTES_PER_COUNT
+            for size in (75, 50, 25):
+                if size <= minutes and size <= max_work:
+                    group = _new_auto_group()
+                    group["chunks"].append(size)
+                    group["work"] = size
+                    group["has_long"] = True
+                    groups.append(group)
+                    return size
+        return 0
+
+    # 小任务
+    for group in groups:
+        if _auto_can_hold(period, groups, group, minutes, False):
+            group["chunks"].append(minutes)
+            group["work"] += minutes
+            return minutes
+    if _auto_can_new(period, groups, minutes):
+        group = _new_auto_group()
+        group["chunks"].append(minutes)
+        group["work"] = minutes
+        groups.append(group)
+        return minutes
+    return 0
+
+
+def _task_units(items):
+    """把 distribute() 的任务/子任务摊成可排期的单元。"""
+    units = []
+    for item in items or ():
+        item = dict(item)
+        children = [dict(c) for c in item.get("children") or ()]
+        if children:
+            left = int(item.get("budget_minutes") or item.get("duration") or 0)
+            if left <= 0:
+                left = sum(int(c.get("duration") or 0) for c in children)
+            for child in children:
+                if left <= 0:
+                    break
+                full = int(child.get("duration") or 0)
+                take = min(full, left)
+                if take <= 0:
+                    continue
+                # 只剩一个零头预算时，不要从下一条大任务上切出 2 分钟碎片。
+                if take < full and take < MINUTES_PER_COUNT:
+                    break
+                rec = dict(item)
+                rec.update(child)
+                rec["duration"] = take
+                rec["count"] = int(child.get("count") or 0) or (ts.minutes_to_count(take) or 1)
+                # 父任务壳的 total 是整套子任务的合计；落到 session 的 part 必须
+                # 记**这个子任务自己**的原总 count，否则界面会把 3 count 显示成 6。
+                rec["total"] = (int(child.get("count_total") or 0)
+                                or int(child.get("count") or 0)
+                                or (ts.minutes_to_count(full) or 0))
+                units.append({"item": item, "rec": rec, "minutes": take,
+                              "remaining": take, "original": take,
+                              "long": take >= MINUTES_PER_COUNT,
+                              "parent": item, "parts": 0})
+                left -= take
+            continue
+        minutes = int(item.get("minutes") or 0)
+        if not minutes:
+            minutes = int(item.get("duration") or 0)
+        if not minutes:
+            minutes = int(item.get("count") or 0) * MINUTES_PER_COUNT
+        if minutes <= 0:
+            continue
+        units.append({"item": item, "rec": item, "minutes": minutes,
+                      "remaining": minutes, "original": minutes,
+                      "long": minutes >= MINUTES_PER_COUNT,
+                      "parent": None, "parts": 0})
+    return units
+
+
+def _place_sequential(units, periods):
+    pi = 0
+    for unit in units:
+        while unit["remaining"] > 0 and pi < len(periods):
+            period = periods[pi]
+            chunk = min(int(unit["remaining"]), 75)
+            placed = _add_chunk(period, period["groups"], chunk,
+                                chunk >= MINUTES_PER_COUNT, split_ok=True)
+            if placed:
+                unit["remaining"] -= placed
+                period["chunks"].append((unit, placed))
+                continue
+            pi += 1
+        if unit["remaining"] > 0:
+            unit["unscheduled"] = True
+
+
+def _unit_can_whole(period, unit):
+    remaining = int(unit.get("remaining") or 0)
+    if remaining <= 0:
+        return False
+    chunk = min(remaining, 75)
+    is_long = chunk >= MINUTES_PER_COUNT
+    for group in period.get("groups") or ():
+        if period.get("auto"):
+            # 自动 layout 先看新建/塞进小任务组的可能性；真正放置仍走 _add_chunk。
+            if is_long and group.get("has_long"):
+                continue
+            if is_long and _auto_can_hold(period, period["groups"], group, chunk, True):
+                return True
+            if not is_long and _auto_can_hold(period, period["groups"], group, chunk, False):
+                return True
+        else:
+            if is_long and group.get("has_long"):
+                continue
+            if _group_remaining(group) >= chunk:
+                return True
+    if period.get("auto"):
+        return _auto_can_new(period, period["groups"], chunk)
+    return False
+
+
+def _place_parallel(units, periods):
+    for period in periods:
+        moved = True
+        while moved:
+            moved = False
+            for unit in units:
+                if int(unit.get("remaining") or 0) <= 0:
+                    continue
+                chunk = min(int(unit["remaining"]), 75)
+                if chunk >= MINUTES_PER_COUNT:
+                    # 整条放得下才放；放不下留给后面的 period，避免 parallel 无缘无故拆任务。
+                    if not _unit_can_whole(period, unit):
+                        continue
+                placed = _add_chunk(period, period["groups"], chunk,
+                                    chunk >= MINUTES_PER_COUNT, split_ok=False)
+                if not placed:
+                    continue
+                unit["remaining"] -= placed
+                period["chunks"].append((unit, placed))
+                moved = True
+                break
+    for unit in units:
+        if int(unit.get("remaining") or 0) > 0:
+            unit["unscheduled"] = True
+
+
+def _periods_from_slots(slots):
+    """把当前 plan 的 session slots 汇总成 period 列表。"""
+    grouped = {}
+    order = []
+    for slot in slots or ():
+        period = dict(slot.get("period") or {})
+        if not period:
+            period = {"date": slot.get("date"), "id": slot.get("period_id") or "",
+                      "start": slot.get("period_start") or slot.get("start"),
+                      "end": slot.get("period_end") or slot.get("end")}
+        key = _period_key(period)
+        if key not in grouped:
+            period["date"] = period.get("date") or slot.get("date")
+            period["blocks"] = int(slot.get("period_blocks")
+                                   or _period_blocks(period))
+            period["total_minutes"] = int(slot.get("period_total_minutes")
+                                         or _period_total_minutes(period))
+            grouped[key] = {"period": period,
+                            "auto": bool(slot.get("period_auto")),
+                            "slots": [], "groups": [], "chunks": []}
+            order.append(key)
+        grouped[key]["slots"].append(slot)
+        if slot.get("period_auto"):
+            grouped[key]["auto"] = True
+    out = []
+    for key in order:
+        rec = grouped[key]
+        rec["period"]["auto"] = bool(rec["auto"])
+        if rec["auto"]:
+            rec["groups"] = []
+        else:
+            rec["groups"] = [_new_fixed_group(s) for s in rec["slots"]]
+        out.append(rec["period"] | {"_groups": rec["groups"],
+                                    "_chunks": rec["chunks"],
+                                    "_slots": rec["slots"]})
+    return out
+
+
+def schedule_periods(items, slots):
+    """period-first 排期：返回 ``(placements, unscheduled, notes, auto_layouts)``。
+
+    ``slots`` 里带 ``period_auto=True`` 的 period 会忽略旧 session 长度，按任务
+    重新生成 durations；手动 layout 的 period 保持原 session 长度，只往里填。
+    """
+    periods = _periods_from_slots(slots)
+    for period in periods:
+        period["groups"] = period["_groups"]
+        period["chunks"] = period["_chunks"]
+        period["auto"] = bool(period.get("auto"))
+    units = _task_units(items)
+    sequential = [u for u in units
+                  if _is_sequential_item(u.get("rec") or u.get("item") or {})]
+    parallel_units = [u for u in units
+                      if not _is_sequential_item(u.get("rec") or u.get("item") or {})]
+    _place_sequential(sequential, periods)
+    _place_parallel(parallel_units, periods)
+    # parallel 的原则是“能整条放就不拆”；如果扫完所有 period 仍有整条放不下的
+    # 任务，再做一次顺序拆段兜底，避免像 75 分钟任务遇到 50+25 这种明明有总
+    # 容量却报排不下。
+    leftovers = [u for u in parallel_units if int(u.get("remaining") or 0) > 0]
+    if leftovers:
+        _place_sequential(leftovers, periods)
+
+    placements = []
+    unscheduled = []
+    auto_layouts = {}
+    notes = []
+    for period in periods:
+        groups = [g for g in period["groups"] if int(g.get("work") or 0) > 0]
+        if period.get("auto"):
+            durations = []
+            for group in groups:
+                size = _ceil_session_minutes(group.get("work"))
+                if size:
+                    durations.append(size)
+            # 再算一次总块数，防止小任务增长把 period 撑爆。
+            if sum(d // MINUTES_PER_COUNT for d in durations) > int(period.get("blocks") or 0):
+                notes.append("「%s %s」自动排布超出 period 容量，已丢弃多余 session"
+                             % (period.get("id"), period.get("start")))
+                durations = durations[:int(period.get("blocks") or 0)]
+            auto_layouts[_period_key(period)] = durations
+            try:
+                sessions = sp.plan_period(period, durations)
+            except ValueError as e:
+                notes.append(str(e))
+                sessions = []
+        else:
+            sessions = [g.get("slot") for g in groups if g.get("slot")]
+            # 手动 layout 的 session 与 group 一一对应。
+        for group, session in zip(groups, sessions):
+            for part_idx, minutes in enumerate(group.get("chunks") or (), 1):
+                # chunks 这里只存了分钟，真正对应哪个 unit 由 period["chunks"] 顺序对齐；
+                # 为保持稳定，重新按 group 反查不可行，所以下面用临时 unit 顺序映射。
+                pass
+        # 逐个 group 生成 placement：period["chunks"] 是放置时记录的 (unit, minutes)，
+        # 分组边界通过 group 的 chunks 数量还原。
+        pchunks = list(period.get("chunks") or [])
+        cursor = 0
+        for group, session in zip(groups, sessions):
+            n = len(group.get("chunks") or [])
+            for _ in range(n):
+                if cursor >= len(pchunks):
+                    break
+                unit, minutes = pchunks[cursor]
+                cursor += 1
+                rec = unit["rec"]
+                unit["parts"] += 1
+                placements.append({
+                    "item": rec,
+                    "slot": session,
+                    "count": (int(minutes) // MINUTES_PER_COUNT
+                              if int(minutes) % MINUTES_PER_COUNT == 0
+                              else (ts.minutes_to_count(minutes) or 1)),
+                    "duration": int(minutes),
+                    "by_minutes": int(minutes) % MINUTES_PER_COUNT != 0,
+                    "split": False,
+                    "stacked": n > 1,
+                    "parent": unit.get("parent"),
+                    "period_id": period.get("id"),
+                    "_unit": unit,
+                })
+        # 没放下的 unit 只报一次。
+    for unit in units:
+        if int(unit.get("remaining") or 0) > 0:
+            rec = dict(unit["rec"])
+            rec["count"] = ts.minutes_to_count(unit["remaining"]) or 0
+            rec["remaining_count"] = rec["count"]
+            unscheduled.append(rec)
+    # 所有 part 都标成 split（不能只有后一段标，否则界面上第一段看不出是拆的）。
+    for place in placements:
+        unit = place.pop("_unit", None)
+        place["split"] = bool(unit and unit.get("parts", 0) > 1)
+    # 拆分说明
+    for unit in units:
+        if unit["parts"] > 1:
+            notes.append("「%s」%d 分钟按 period 顺序拆成 %d 段"
+                         % ((unit["rec"].get("title") or unit["rec"].get("pk")),
+                            unit["original"], unit["parts"]))
+    return placements, unscheduled, notes, auto_layouts
 
 
 class Allocator(object):

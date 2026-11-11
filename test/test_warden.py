@@ -953,6 +953,19 @@ check("介绍窗在参数提示行上面", _ctx_at < _hint_at, True)
 help_labels = [label for _, rows in wd_hint.shell.sections() for label, _ in rows]
 check("help 表显示 usage（带参数）", "mute <n> on|off" in help_labels, True)
 
+print("== help 是当前页：打开从顶部看，PgDn 往下；下一条命令替换旧页 ==")
+wd_help_scroll = mkwarden()
+wd_help_scroll.shell._terminal_rows = lambda: 14
+check("help 打开", wd_help_scroll.handle("help"), True)
+check_true("help 面板已挂上", wd_help_scroll.help_overlay is not None)
+_help_frame = wd_help_scroll.shell.frame_text()
+check_true("help 打开后滚到顶部（不是只剩下半截）",
+           wd_help_scroll.shell.scroll_offset > 0)
+check_true("顶部帧有上翻位置提示", "上翻" in plain(_help_frame))
+wd_help_scroll.intercept("task ")
+check("下一条命令收起 help", wd_help_scroll.help_overlay, None)
+check("下一条命令把滚动位置回到底部", wd_help_scroll.shell.scroll_offset, 0)
+
 print("== 看板比屏幕高：裁顶部，不裁底部（提示/状态/视图栏/输入行） ==")
 wd_frame = mkwarden()
 shell = wd_frame.shell

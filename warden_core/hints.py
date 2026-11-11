@@ -90,7 +90,7 @@ _CONTEXT_USAGES = {
     "plan": "plan [-c|--current] [天数]  |  plan -s <场> -p <项目>",
     "conscription": "conscription / cst [session序号|current]",
     "session": "session <HH:MM> <25|50|75> [--permanent]",
-    "period": "period <T1> [25|50|75 ...]",
+    "period": "period <T1> [25|50|75 ...] | period T1 clear",
 }
 
 _VIEW_INTROS = {
@@ -505,8 +505,9 @@ def _hint_period(parts):
         return repl_kit.Hint("参数", ("T1", "--permanent", "--off"),
                              note="静音这个时段（--permanent = 以后每个这个星期几都静音）")
     if len(parts) >= 2:
-        return repl_kit.Hint("时长", ("25", "50", "75"), note="可连续给多个；超时就报错")
-    return repl_kit.Hint("参数", ("T1", "50", "50", "mute T1"), note="按 25/50/75 排这个时段；"
+        return repl_kit.Hint("时长", ("25", "50", "75", "clear"),
+                             note="可连续给多个；超时就报错；clear = 清空这一段的 session")
+    return repl_kit.Hint("参数", ("T1", "50", "50", "clear", "mute T1"), note="按 25/50/75 排这个时段；"
                              "period mute T1 --permanent = 这个时段以后都静音")
 
 

@@ -2483,7 +2483,8 @@ class BoardMixin(object):
             ("session --permanent HH:MM LEN", "写进日历：按星期几重复的长期规则"),
             ("session HH:MM-HH:MM", "同上，但用起点–终点（如 11:15-12:05 → 50min）"),
             ("session T1 50 50", "按时段改排布：T1 的第一场从时段起点开始，超时就报错"),
-            ("period T1 25 25 25 25", "同 session T1 ...；只给 T1 = 撤销自定义，恢复默认"),
+            ("period T1 25 25 25 25", "同 session T1 ...；只给 T1 = 撤销自定义，恢复默认；"
+                                     "period T1 clear = 清空该 period 的 session 内容，保留时段本身"),
             ("set <id> <value>（设置视图）", "改设置；不写 value = 恢复默认。settings 重新列出全部"),
             ("warn on|off", "状态框里的警告显示开关（不写 = 取反）"),
             ("task create ...", "在「数据」视图的 task 模型建任务："
@@ -2591,6 +2592,12 @@ class BoardMixin(object):
         panel_main = Panel(t, title="[bold]命令（回车或敲任意命令关闭）[/]",
                            border_style="cyan", box=box.ROUNDED)
         self.help_overlay = panel_main
+        # 帮助是“当前页”：打开时从顶部开始看，PgDn 往下翻；关闭/下一条命令
+        # 时回到普通看板底部，旧 help 不残留。
+        try:
+            self.shell.scroll_offset = 10 ** 9
+        except Exception:                      # noqa: BLE001
+            pass
         self.invalidate()
         self.emit(panel_main)
         self.emit(
@@ -2703,6 +2710,10 @@ class BoardMixin(object):
         p_cmd = Panel(c, title="[bold]Task · 命令（回车或敲任意命令关闭）[/]",
                       border_style="cyan", box=box.ROUNDED)
         self.help_overlay = Group(p_detail, p_cmd)
+        try:
+            self.shell.scroll_offset = 10 ** 9
+        except Exception:                      # noqa: BLE001
+            pass
         self.invalidate()
         self.emit(p_cmd)
         self.emit("[dim]更多细节见 feature_intents/task.md；任务库字段不校验，"

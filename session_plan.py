@@ -381,19 +381,29 @@ def save_layouts(data, path=None):
     return layouts_path(path)
 
 
-def get_layout(layouts, day, period_id):
+def get_layout_record(layouts, day, period_id):
+    """返回原始 layout 记录；旧格式（裸 list）也统一成 dict。"""
     iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
     rec = (layouts.get("layouts") or {}).get(iso, {}).get(period_id)
-    if isinstance(rec, dict):
-        ds = rec.get("durations")
-    elif isinstance(rec, list):
-        ds = rec
-    else:
-        ds = None
+    if isinstance(rec, list):
+        return {"durations": rec, "source": "manual"}
+    return dict(rec) if isinstance(rec, dict) else None
+
+
+def layout_is_auto(layouts, day, period_id):
+    """这个 period 的 session 排布是不是任务排期自动生成的。"""
+    rec = get_layout_record(layouts, day, period_id)
+    return bool(rec and rec.get("source") == "auto")
+
+
+def get_layout(layouts, day, period_id):
+    record = get_layout_record(layouts, day, period_id)
+    ds = record.get("durations") if record is not None else None
     return _norm_durations(ds) if ds is not None else None
 
 
-def set_layout(day, period_id, durations, layouts_path_=None, download_path_=None):
+def set_layout(day, period_id, durations, layouts_path_=None, download_path_=None,
+               source="manual", plan_sig=None):
     """验证并保存一个时段的排布。成功返回 sessions；失败抛 ValueError且不落盘。"""
     day_iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
     periods = periods_for_date(download_path_, day_iso)
@@ -404,10 +414,14 @@ def set_layout(day, period_id, durations, layouts_path_=None, download_path_=Non
                             "、".join(p.get("id", "?") for p in periods) or "无"))
     sessions = plan_period(period, durations)       # 先验证；下面才写盘
     data = load_layouts(layouts_path_)
-    data.setdefault("layouts", {}).setdefault(day_iso, {})[period_id] = {
+    rec = {
         "durations": [int(d) for d in durations],
+        "source": str(source or "manual"),
         "updated_at": _now(),
     }
+    if plan_sig is not None:
+        rec["plan_sig"] = str(plan_sig)
+    data.setdefault("layouts", {}).setdefault(day_iso, {})[period_id] = rec
     save_layouts(data, layouts_path_)
     return sessions
 

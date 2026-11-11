@@ -228,6 +228,21 @@ class TaskPipelineMixin(object):
         start = cls._session_start_datetime(row)
         return start is None or start <= now
 
+    @classmethod
+    def _session_in_progress(cls, row, now=None):
+        """这一场是否**此刻正在**进行；已结束的过去场次不再保护。"""
+        now = now or datetime.datetime.now()
+        start = cls._session_start_datetime(row)
+        if start is None:
+            return True
+        try:
+            minutes = int((row or {}).get("duration") or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes <= 0:
+            minutes = 25
+        return start <= now < start + datetime.timedelta(minutes=minutes)
+
     def _split_started_sessions(self, rows):
         """把待处理场次拆成 (未开始可取消, 已开始必须保护)。
 
@@ -904,6 +919,16 @@ class TaskPipelineMixin(object):
             self.rebuild_rows()
         except Exception:                          # noqa: BLE001
             pass
+        # 自动 layout：只在“计划指纹”真的变了时重算；没有变化就一次都不重排。
+        # _replan_auto_day 只碰未来、未开始、plan 管理的 session，正在进行的
+        # session 由 _plan_slots / _session_already_started 保护。
+        try:
+            if self._auto_plan_dirty(day):
+                if self._replan_auto_day(day):
+                    result["auto_replanned"] = 1
+        except Exception as e:                     # noqa: BLE001 - 自动重排失败不挡刷新
+            result["errors"] += 1
+            self.say("自动 layout 重算失败（其余照常刷新）：%s" % e, "warn")
         try:
             projects = self.projects.active()
         except Exception as e:                     # noqa: BLE001 - 项目库坏了不挡 formatter

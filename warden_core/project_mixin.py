@@ -1,5 +1,6 @@
 """warden_core.project_mixin —— 项目表与 Day Binder 渲染、pro/op 命令、relate 导入导出、每日项目对账与 plan 排期。"""
 import datetime
+import json
 import os
 import re
 import time
@@ -19,6 +20,7 @@ from .common import (
     pp,
     repl_kit,
     sch,
+    sp,
     th,
     ts,
 )
@@ -2516,6 +2518,9 @@ class ProjectMixin(object):
                         or str(sess.get("start") or "")
                         != str(item.get("start") or "")):
                     continue
+                # 已经开始/正在进行/过去的 session 都是硬边界：重排只动未来。
+                if self._session_already_started(sess, now=self._now_dt()):
+                    continue
                 try:
                     self.task_store.unassign(task["id"], reason="plan-replaced")
                     detached += 1
@@ -2553,6 +2558,24 @@ class ProjectMixin(object):
         now = self._now_dt()
         is_today = (day == now.date())
         unbooked, busy, past, reserved = [], 0, 0, 0
+        try:
+            layouts = sp.load_layouts()
+        except Exception:                          # noqa: BLE001
+            layouts = {}
+        period_meta = {}
+        for period in self.periods_for_day(day):
+            pid = str(period.get("id") or "")
+            if pid:
+                rec = sp.get_layout_record(layouts, day, pid)
+                period_meta[pid] = {
+                    "period": dict(period),
+                    # 没有 layout = 交给任务排期自动生成；有 layout（含旧格式）
+                    # 但 source != auto = 手动硬约束。
+                    "auto": rec is None or rec.get("source") == "auto",
+                    "has_layout": rec is not None,
+                }
+        blocked_periods = set()
+        auto_period_ids = {pid for pid, meta in period_meta.items() if meta["auto"]}
         live_included, live_short, live_busy, live_unplanned = [], [], [], []
         try:
             reservations = th.collect_reservations(
@@ -2568,6 +2591,8 @@ class ProjectMixin(object):
             if start_dt is None or start_dt.date() != day:
                 continue
             if row.get("period_muted"):
+                if row.get("period_id"):
+                    blocked_periods.add(str(row.get("period_id")))
                 continue
             live = False
             end_dt = None
@@ -2578,6 +2603,8 @@ class ProjectMixin(object):
                 else:
                     if is_planned:
                         past += 1
+                    if row.get("period_id"):
+                        blocked_periods.add(str(row.get("period_id")))
                     continue
             # 普通 plan 仍只认 data.csv 里排好的场次；-c 的唯一例外是
             # **此刻正在进行**的真实 session（计划外但已经开打，且没挂任务）。
@@ -2592,6 +2619,8 @@ class ProjectMixin(object):
                 busy += 1
                 if live:
                     live_busy.append(row.get("startLabel") or "?")
+                if row.get("period_id"):
+                    blocked_periods.add(str(row.get("period_id")))
                 continue
             # formatter 已经占掉的时间是**硬约束**：项目 plan 只能看剩下的空场，
             # 绝不能把这条场次再分给项目、更不能回头改 formatter 的切割。
@@ -2604,6 +2633,8 @@ class ProjectMixin(object):
             if not th.is_free({"start_min": start_min, "end_min": end_min},
                               reservations):
                 reserved += 1
+                if row.get("period_id"):
+                    blocked_periods.add(str(row.get("period_id")))
                 continue
             duration = int(row.get("durationMin") or 0)
             slot_extra = {}
@@ -2620,6 +2651,8 @@ class ProjectMixin(object):
                                       % (row.get("startLabel") or "?",
                                          row.get("endLabel") or "?",
                                          remaining_min))
+                    if row.get("period_id"):
+                        blocked_periods.add(str(row.get("period_id")))
                     continue
                 duration = counts * pp.MINUTES_PER_COUNT
                 slot_extra = {"current": True,
@@ -2634,9 +2667,93 @@ class ProjectMixin(object):
                                   row.get("startLabel"), duration,
                                   row.get("id"), row.get("endLabel"))
             slot.update(slot_extra)
+            pid = str(row.get("period_id") or "")
+            meta = period_meta.get(pid) or {}
+            period = meta.get("period") or row.get("period") or {}
+            slot["period_id"] = pid
+            slot["period"] = dict(period) if period else None
+            slot["period_start"] = period.get("start")
+            slot["period_end"] = period.get("end")
+            slot["period_total_minutes"] = pp._period_total_minutes(period) if period else 0
+            slot["period_blocks"] = pp._period_blocks(period) if period else 0
+            slot["period_auto"] = bool(meta.get("auto")) and pid not in blocked_periods
             slots.append(slot)
             if row.get("id") is None:
                 unbooked.append(row.get("startLabel") or "?")
+        # 自动 layout 的 period：只要整段都空着，就用“整段工作容量”的伪 slot
+        # 参与 plan，而不是沿用 data.csv 里上一轮排出来的某几个 session。
+        # 这样重新 plan 时，任务可以重新决定这一段里的 session 长度；真正的
+        # session 布局会在 _plan_apply 里按任务重算并写回 data.csv。
+        seen_periods = {str(s.get("period_id") or "") for s in slots}
+        original_by_pid = {}
+        for slot in slots:
+            original_by_pid.setdefault(str(slot.get("period_id") or ""), []).append(slot)
+        auto_replace = set(auto_period_ids) - blocked_periods
+        if auto_replace:
+            slots[:] = [s for s in slots
+                        if str(s.get("period_id") or "") not in auto_replace]
+        for pid in sorted(auto_replace):
+            meta = period_meta.get(pid) or {}
+            period = meta.get("period") or {}
+            # 没有真实行、也没有 auto layout 记录：这多半是测试/外部拼出来的
+            # 单行数据，不要凭空替它加一个 period 资源。
+            if pid not in seen_periods and not meta.get("has_layout"):
+                slots.extend(original_by_pid.get(pid) or [])
+                continue
+            s_got = sp.parse_hhmm(period.get("start"))
+            e_got = sp.parse_hhmm(period.get("end"))
+            if s_got is None or e_got is None:
+                slots.extend(original_by_pid.get(pid) or [])
+                continue
+            p_start = datetime.datetime.combine(day, datetime.time(*s_got))
+            p_end = datetime.datetime.combine(day, datetime.time(*e_got))
+            if p_end <= p_start:
+                p_end += datetime.timedelta(days=1)
+            if p_start <= now and not (include_current and now < p_end):
+                slots.extend(original_by_pid.get(pid) or [])
+                continue
+            if mute_window_for(day, period.get("start"), period.get("end")):
+                slots.extend(original_by_pid.get(pid) or [])
+                continue
+            try:
+                reservations = th.collect_reservations(
+                    self.task_store.list(), day.isoformat())
+            except Exception:                      # noqa: BLE001
+                reservations = []
+            s_min = s_got[0] * 60 + s_got[1]
+            e_min = e_got[0] * 60 + e_got[1]
+            if e_min <= s_min:
+                e_min += 24 * 60
+            if not th.is_free({"start_min": s_min, "end_min": e_min}, reservations):
+                slots.extend(original_by_pid.get(pid) or [])
+                continue
+            blocks = pp._period_blocks(period)
+            if include_current and p_start <= now < p_end:
+                remaining = int((p_end - now).total_seconds() // 60)
+                blocks = min(blocks, remaining // pp.MINUTES_PER_COUNT)
+            if blocks <= 0:
+                slots.extend(original_by_pid.get(pid) or [])
+                continue
+            slots.append({
+                "index": len(slots) + 1,
+                "date": day.isoformat(),
+                "start": period.get("start"),
+                "end": period.get("end"),
+                "duration": blocks * pp.MINUTES_PER_COUNT,
+                "counts": blocks,
+                "id": None,
+                "period_id": pid,
+                "period": dict(period),
+                "period_start": period.get("start"),
+                "period_end": period.get("end"),
+                "period_total_minutes": pp._period_total_minutes(period),
+                "period_blocks": blocks,
+                "period_auto": True,
+                "current": bool(include_current and p_start <= now < p_end),
+            })
+        for slot in slots:
+            if str(slot.get("period_id") or "") in blocked_periods:
+                slot["period_auto"] = False
         if past:
             notes.append("今天已经过去的 %d 场不算空闲。" % past)
         if busy:
@@ -3084,6 +3201,107 @@ class ProjectMixin(object):
             "apply": lambda allocator, allocs: self._plan_apply(allocator, allocs),
         }
 
+    def _auto_plan_signature(self, day):
+        """自动 layout 的“计划指纹”：只有任务/分配真的变了才重排。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        bits = []
+        try:
+            projects = self.projects.plan_ops()
+        except Exception:                          # noqa: BLE001
+            projects = []
+        for project in projects:
+            plan = pj.plan_of(project, day) or {}
+            bits.append(("alloc", str(project.get("id")), int(plan.get("count") or 0)))
+        for task in self.task_store.list():
+            source = task.get("source") or {}
+            if source.get("kind") != "project":
+                continue
+            sess = task.get("session") or {}
+            if str(sess.get("date") or "") != iso:
+                continue
+            fields = task.get("fields") or {}
+            bits.append((
+                "task", str(task.get("id")),
+                str(fields.get("project_id") or ""),
+                str(fields.get("project_task") or ""),
+                int(fields.get("duration") or 0),
+                int(fields.get("count") or 0),
+                str(sess.get("start") or ""),
+                int(sess.get("duration") or 0),
+                str(ts.TaskStore.status_of(task)),
+            ))
+        return json.dumps(bits, ensure_ascii=False, sort_keys=True)
+
+    def _stamp_auto_plan_signature(self, day):
+        """把当前计划指纹写进这一天所有 auto layout 记录。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        try:
+            data = sp.load_layouts()
+        except Exception:                          # noqa: BLE001
+            return False
+        day_recs = (data.get("layouts") or {}).get(iso) or {}
+        sig = self._auto_plan_signature(day)
+        changed = False
+        for rec in day_recs.values():
+            if isinstance(rec, dict) and rec.get("source") == "auto":
+                rec["plan_sig"] = sig
+                changed = True
+        if changed:
+            sp.save_layouts(data)
+        return changed
+
+    def _auto_plan_dirty(self, day):
+        """auto layout 有没有因为任务排布变化而需要重算。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        try:
+            data = sp.load_layouts()
+        except Exception:                          # noqa: BLE001
+            return False
+        recs = [rec for rec in ((data.get("layouts") or {}).get(iso) or {}).values()
+                if isinstance(rec, dict) and rec.get("source") == "auto"]
+        if not recs:
+            return False
+        current = self._auto_plan_signature(day)
+        # 老记录没有 plan_sig：先当作基线，不主动重排，避免升级后第一次 refresh
+        # 把所有历史计划都掀掉。下一次 plan 会补上指纹。
+        return any(rec.get("plan_sig") is not None and rec.get("plan_sig") != current
+                   for rec in recs)
+
+    def _replan_auto_day(self, day):
+        """计划指纹变了：按当前分配重跑同一套 period-first 排期。"""
+        try:
+            plan_ops = self.projects.plan_ops()
+        except Exception:                          # noqa: BLE001
+            return False
+        allocs = []
+        for project in plan_ops:
+            plan = pj.plan_of(project, day) or {}
+            count = int(plan.get("count") or 0)
+            if count > 0:
+                allocs.append({"project_id": project.get("id"),
+                               "project": project, "count": count})
+        if not allocs:
+            return False
+        old = getattr(self, "_plan_replanning", False)
+        self._plan_replanning = True
+        try:
+            slots, _notes = self._plan_slots(day)
+        finally:
+            self._plan_replanning = old
+        if not slots:
+            return False
+        allocator = pp.Allocator(
+            day, plan_ops, slots, task_store=self.task_store,
+            hooks=self.plan_hooks(), pro_map=self._pro_display_map(plan_ops))
+        allocator.allocations = [{"project_id": a["project_id"], "count": a["count"]}
+                                 for a in allocs]
+        allocator.closed = True
+        self._plan_apply(allocator, allocs, append_to_plan=False)
+        self._stamp_auto_plan_signature(day)
+        self.say("♻️ 检测到计划变化：已按 period 重算未来 session，当前正在进行的场次没动。",
+                 "info")
+        return True
+
     def _plan_apply(self, allocator, allocs, append_to_plan=False):
         """分配完了：先记资源，再挑任务、排进 session。
 
@@ -3113,8 +3331,62 @@ class ProjectMixin(object):
         items, notes = pp.distribute(
             allocs, [a["project"] for a in allocs], invested,
             now=datetime.datetime.now(), exclude_pks=excluded)
-        placements, unscheduled, more = pp.schedule(items, allocator.slots)
+        # period-first：只要这一天的空场里有“自动 layout”的 period，就先把任务
+        # 按 period 排好，再根据任务反推 session durations；手动 layout 仍然
+        # 作为硬约束，只允许任务往里填。
+        placements, unscheduled, more, auto_layouts = pp.schedule_periods(
+            items, allocator.slots)
         notes = list(notes) + list(more)
+        # 先把新排布写进中间层并重算 data.csv；旧场次只取消未来、未开始的，
+        # _cancel_stale_period_sessions 内部会再保护开始中的场次。
+        period_by_key = {}
+        for slot in allocator.slots or ():
+            period = dict(slot.get("period") or {})
+            if not period:
+                continue
+            key = pp._period_key(period)
+            period_by_key[key] = period
+        for key, durations in (auto_layouts or {}).items():
+            period = period_by_key.get(key)
+            if not period:
+                continue
+            try:
+                new_sessions = sp.plan_period(period, durations)
+                dropped = self._task_bindings_dropped(period, new_sessions)
+                self._cancel_stale_period_sessions(period, new_sessions, dropped)
+                sp.set_layout(day, period.get("id"), durations, source="auto")
+            except ValueError as e:
+                notes.append("自动排布「%s」没落盘：%s" % (period.get("id"), e))
+        if auto_layouts:
+            try:
+                self.rewrite_data_csv_from_plan()
+                self.rebuild_rows()
+            except Exception as e:             # noqa: BLE001
+                self.say("自动排布已生成，但重算 data.csv 失败：%s" % e, "warn")
+            # 新 data.csv 的行号可能整体变了：按 (日期, 起点) 找回对应行。
+            # 旧 API session 可能还占着同一分钟但 duration 不同；这一轮已经
+            # 安排取消它，本地先把行改成新计划时长并当成「还没订上」，
+            # 避免任务错误地挂到旧 session 的 duration / meetingId 上。
+            by_start = {}
+            for idx, row in enumerate(self.rows, 1):
+                key = (str(row.get("date") or ""),
+                       str(row.get("startLabel") or ""))
+                if row.get("planned") and key not in by_start:
+                    by_start[key] = (idx, row)
+            for place in placements:
+                slot = place.get("slot") or {}
+                key = (str(slot.get("date") or day.isoformat()),
+                       str(slot.get("start") or ""))
+                got = by_start.get(key)
+                if not got:
+                    continue
+                idx, row = got
+                if int(row.get("durationMin") or 0) != int(slot.get("duration") or 0):
+                    row["durationMin"] = int(slot.get("duration") or 0)
+                    row["endLabel"] = slot.get("end") or row.get("endLabel")
+                    row["id"] = None
+                    row["focusmate_session_id"] = None
+                slot["index"] = idx
         for alloc in allocs:
             count = int(alloc["count"])
             if append_to_plan:
@@ -3242,6 +3514,7 @@ class ProjectMixin(object):
                      % (item.get("title"), int(item.get("count") or 0)), "warn")
         if failed:
             self.had_error = True
+        self._stamp_auto_plan_signature(day)
         self.invalidate()
         return {"placements": len(placements), "counts": total_counts,
                 "unscheduled": len(unscheduled), "notes": notes, "failed": failed,

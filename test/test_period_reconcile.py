@@ -263,6 +263,19 @@ check("没动过的场次绑定还在",
 check_true("没有清绑定的消息",
            not any("清掉任务" in m[2] for m in wd.messages))
 
+print("== 改排布不碰当前正在进行的 session ==")
+_period = {"id": "T6", "date": ISO, "start": "11:00", "end": "13:00",
+           "type": "工作", "name": "SAT", "calendar": "工作", "title": "SAT"}
+_running = wd.task_store.create({"title": "正在进行的任务"})
+wd.task_store.assign(_running["id"], {"index": 1, "date": ISO, "start": "11:00",
+                                     "duration": 50,
+                                     "focusmate_session_id": "s-running"})
+wd.clock_now = datetime.datetime.combine(TODAY, datetime.time(11, 10))
+_new_sessions = sp.plan_period(_period, [25, 50])
+wd.clear_task_bindings_for_layout(_period, _new_sessions)
+check("当前正在进行的 session 任务绑定不被清掉",
+      wd.task_store.get(_running["id"])["session"]["start"], "11:00")
+
 shutil.rmtree(TMP, ignore_errors=True)
 print()
 if fails:

@@ -954,6 +954,10 @@ class SessionMixin(object):
             return []
         cleared = []
         for task, key in drop:
+            sess = task.get("session") or {}
+            # 已经开始/正在进行的 session 不因改排布而丢当前任务绑定。
+            if self._session_in_progress(sess, now=self._now_dt()):
+                continue
             try:
                 self.task_store.unassign(task.get("id"), reason="layout-changed")
             except ValueError:
@@ -1390,6 +1394,12 @@ class SessionMixin(object):
             raise ValueError("时段 ID 要像 T1 / T2；你给的是 %r" % period_id)
         period_id = period_id.upper()
         durations = toks[1:]
+        # `period T1 clear` = 把这一段的 session 内容清空，但保留 period 本身；
+        # 之后可以重新 plan，让任务按 period 容量自动生成新 session。
+        clearing = bool(durations and str(durations[0]).lower()
+                        in ("clear", "reset", "清空", "清除"))
+        if clearing:
+            durations = []
 
         # 先刷新一次，拿到当前 API 里的真实 session（id / duration）。
         # 拉不到就别改 —— 否则没法判断旧场次要不要取消，会留下 50/25 并存。
@@ -1405,7 +1415,8 @@ class SessionMixin(object):
                              % (period_id, self.sel_date.isoformat(),
                                 "、".join(p.get("id", "?") for p in periods) or "无"))
         # 纯计算先验证；这里失败 = 零副作用。
-        effective = durations if durations else sp.default_durations(period)
+        effective = ([] if clearing else
+                     (durations if durations else sp.default_durations(period)))
         new_sessions = sp.plan_period(period, effective)
 
         # 排布一变，动过的场次上的任务绑定就该清掉；先算出来，好写进取消前的面板。
@@ -1439,13 +1450,17 @@ class SessionMixin(object):
             if not self._cancel_stale_period_sessions(period, new_sessions, dropped):
                 return False
 
-            if not durations:
+            if clearing:
+                sp.set_layout(self.sel_date, period_id, [], source="auto")
+                self.say("🧹 已清空 %s %s 的 session 内容；period 本身保留，下次 plan "
+                         "会按任务重新生成。" % (self.sel_date.isoformat(), period_id), "ok")
+            elif not durations:
                 removed = sp.remove_layout(self.sel_date, period_id)
                 if removed is None:
                     raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
                 self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
             else:
-                sp.set_layout(self.sel_date, period_id, durations)
+                sp.set_layout(self.sel_date, period_id, durations, source="manual")
                 body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
                                  for s in new_sessions)
                 self.say("✅ %s %s → %s" % (self.sel_date.isoformat(), period_id, body), "ok")

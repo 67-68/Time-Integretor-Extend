@@ -83,7 +83,9 @@
 每个真正项目只显示当前阶段对应的那一个 op（running → SOP / bottleneck →
 incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一次问完每个项目
 「分多少」（`task 1 4` / `task 1 clear` / `complete`），再按分到的 count 唤起任务、
-排进 session（一场一个任务、尽量不拆）。`pro <序号> interrupt` 默认开软中断：
+排进 period：日历 period 不可变，session 由任务时长反推（25/50/75 工作分钟 +
+5/10/15 休息）；手动 `period T1 50 25` 是硬约束，`period T1 clear` 清空内容。
+`pro <序号> interrupt` 默认开软中断：
 记录一条建议 → 选 A/B/C 类别；`--check` 逐条整理并生成 incubator 任务。
 `pro <序号> interrupt --hard` 才是硬中断当前场：全部任务下架 → 输入 title →
 新建整场任务挂回去。`cst` / `conscription` 按剩余时间快速征召一条合适任务。
@@ -106,6 +108,8 @@ incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一�
 提示行和 paper_tui 是同一套：空闲时由 `repl_kit.Hint` 排成
 `命令: session  cancel  mute   (Tab 切专注视图)`；输入命令后自动换成
 `Command.hint` 给的参数 / 取值 / 选项提示（`mute 3 ` → `取值: on  off`）。
+参数提示行上面另有固定 3 行命令介绍窗（`warden_core.hints.context_hint_lines`）：
+空输入显示当前视图，输入 `task` / `tas` / `task 3 -ac` 时显示用途、用法和当前片段解释。
 
 界面那一层**不在这个文件里**。提示行、Tab 补全、Shift+Tab 切视图、Ctrl+O 切专注模式、
 状态行的每秒刷新、看板的擦除与重画，全部由 `repl_kit`（prompt_toolkit）负责 ——
@@ -806,6 +810,12 @@ class Warden(
         # 如果上一帧开着 help 面板，敲回车或下一条命令时先收起它。
         if self.help_overlay is not None:
             self.help_overlay = None
+            # 下一条命令替换掉 help 这一页：滚动位置回到底部，旧内容不残留。
+            try:
+                self.shell.scroll_offset = 0
+                self.shell._max_scroll_offset = 0
+            except Exception:                  # noqa: BLE001
+                pass
             if not (line or "").strip():
                 self.invalidate()
                 return True

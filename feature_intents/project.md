@@ -355,16 +355,33 @@ q              放弃这次 plan（一个字节都不落）
 「3 个给任务 1 + 2 个给任务 2」）。项目清单里的活不够填满 → 少排，并如实说
 （那不是错误，是清单的事实）。
 
-`schedule()` 会先按每个 op 的 OmniFocus 项目规则分流：
+`schedule_periods()` 现在按 **period-first** 排：日历 period 是硬约束，session 是
+period 内由任务反推出来的结果。
 
-- **parallel**（默认 / 旧数据缺字段）：仍然是「最大匹配 + 尽量一场一个任务、
-  不无谓拆分」，但扫描顺序改成 **session-first**：从最早的 session 开始，依次
-  在任务队列里找第一条能整条放下的任务；同一优先级内，靠前的任务优先拿靠前的
-  session。最大匹配的兜底保证不会为了这个顺序把本来能整装的排法拆碎；
-- **sequential**：按 OmniFocus 清单顺序一个一个排，只从**最早还有空位的 session**
-  往后填，不做最优匹配，也不为了少拆而跳场。例：50 分钟任务遇到 25 / 25 / 50
-  三场时，先拆成 25 + 25 填满前两场，第三场留给下一条任务，而不是把它整条塞进
-  后面的 50 分钟场。
+- 1 count = 25 分钟工作；一场 25 分钟 session 实际占 30 分钟（工作 + 5 休息），
+  50 工作占 60、75 工作占 90。
+- period 的工作容量 = `floor(period 总分钟 / 30) × 25`；例如 30 分钟 period 装 25，
+  150 分钟 period 装 125。
+- **手动 layout 是硬约束**：`period T1 50 25` 写下的 session 长度不变，任务只能往里填；
+  `period T1 clear` 清空这一段的 session 内容，但保留 period 本身，之后下一次 plan
+  可以按任务重新生成。
+- 没有手动 layout 时，session duration 由当前任务反推：25/50/75；没有任务的
+  period 可以没有 session。
+- 同一个 session 最多一个 `>=25` 分钟任务；`<25` 分钟的小任务可以叠进已有 session，
+  例如 60 + 15 可以共用一场 75 分钟工作 session，但 25 + 50 不允许共用。
+- formatter 占掉的区间先于项目 plan 落地，项目 plan 只能使用剩下的时间资源。
+
+两种项目规则仍是：
+
+- **parallel**：按优先 priority tag 分组、组内按 OmniFocus 清单顺序；从最早的
+  period 开始，优先找能整条放下的任务。能整条放就不拆，扫完所有 period 仍有
+  整条放不下的才做拆段兜底；
+- **sequential**：按 OmniFocus 清单顺序一个一个排，只从最早的 period 往后填；
+  当前 period 装不下就拆到后续 period，不为了少拆而跳场。
+
+自动 layout 会记录一条「计划指纹」。只有项目分配或 plan 任务排布真的变了，
+`refresh` 才按 period 重算未来、未开始、plan 管理的 session；没变化就不重算。
+已经开始/正在进行的 session 不会被取消，也不会被自动 layout 改掉。
 
 项目表新增「排序」列，显示这次实际检测并使用的 `sequential` / `parallel`；
 `project <序号>` 详情、plan 资源面板也会显示同一口径。
@@ -414,8 +431,8 @@ parallel 的两条原则（用户原话）——**尽量让每个任务占有自
 
 ### sessional plan：`plan -s <session> -p <project>`
 
-不再走「先给项目分 count、再 complete」的问答，直接把**指定 session 的容量**
-当成这次分配给指定项目的 count，调用同一个 `distribute()` + `schedule()`：
+不再走「先给项目分 count、再 complete」的问答，直接把**指定 session 所在
+period 的工作容量**当成这次分配给指定项目的 count，调用同一套 period-first 排期：
 
 ```text
 plan -s 1 -p 2          # 把 Project #2 排进当前看板那天的 session #1
