@@ -1101,6 +1101,19 @@ check_true("omni_complete 也挡住了", "先不勾 OmniFocus 完成" in note)
 check("没记 writeback",
       (wd3.task_store.get(local["id"]).get("omnifocus") or {}).get("writeback"), None)
 # 再把剩下 1 count 干完 → 允许
+class _CountCompleteOmni(FakeOmniFocus):
+    def complete(self, pk, at=None, due=None, yes=True, timeout=None):
+        self.calls.append(("complete", pk))
+        return {"after": {"completed": True}}
+
+wb3 = w.Warden(Console(file=io.StringIO(), width=250, force_terminal=False),
+               FakeBridge(), no_clear=True, offline=True, net_async=False)
+wb3.task_store = wd3.task_store
+wb3.projects = wd3.projects
+wb3.omnifocus = _CountCompleteOmni(rows_ok)
+wb3.writeback_completions()
+check("后台写回扫描也守住项目部分完成（不 complete）",
+      [c for c in wb3.omnifocus.calls if c[0] == "complete"], [])
 local2 = wd3.task_store.create(
     {"title": "写引言", "count": 1, "project": "论文",
      "project_id": project["id"], "project_task": "t-intro"},
@@ -1109,6 +1122,14 @@ wd3.task_store.complete(local2["id"])
 allowed2, _why2 = pj.completion_guard(wd3.task_store.get(local2["id"]),
                                       wd3.projects, wd3.task_store)
 check("3/3 → 允许勾完成", allowed2, True)
+wb3.writeback_completions()
+check("两条完成记录共享一个 OmniFocus key：3/3 时只 complete 一次",
+      [c for c in wb3.omnifocus.calls if c[0] == "complete"],
+      [("complete", "t-intro")])
+check("两条完成记录都记了 writeback（下次不会各自再写）",
+      [bool(((wd3.task_store.get(t["id"]).get("omnifocus") or {})
+             .get("writeback") or {}).get("completed")) for t in (local, local2)],
+      [True, True])
 
 print("== 项目进度：干过的活算进剩余 count ==")
 stat2 = pj.stats(wd3.projects.by_id(project["id"]), wd3.task_store)

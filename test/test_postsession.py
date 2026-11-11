@@ -1463,6 +1463,38 @@ check("写过的不会再写一遍（重复表不会被推着走）", repeat_wd.
 check_true("只改挂还开着的记录（收工的那几条不动）",
            repeat_wd.task_store.is_open(store.get(tomorrow["id"])))
 
+print("== 写回扫描：同一个 OmniFocus occurrence 只 complete 一次 + 翻篇 ==")
+for old in store.list():
+    store.delete(old["id"])
+# 本地可能因为延期/项目 part 留下多条共享同一 OmniFocus key 的完成记录。
+done_a = store.create({"title": "今天这次 A"},
+                      omnifocus={"id": "pk-series", "title": "词汇题多 50 个"})
+done_b = store.create({"title": "今天这次 B"},
+                      omnifocus={"id": "pk-series", "title": "词汇题多 50 个"})
+still_open = store.create({"title": "下一次"},
+                          omnifocus={"id": "pk-series", "title": "词汇题多 50 个"})
+store.set_status(done_a["id"], ts.STATUS_COMPLETED, reason="test")
+store.set_status(done_b["id"], ts.STATUS_COMPLETED, reason="test")
+wb_wd = w.Warden(Console(file=io.StringIO(), width=160, force_terminal=False),
+                 FakeBridge(), no_clear=True, offline=True, net_async=False)
+wb_wd.task_store = store
+wb_wd.omnifocus = _RepeatOmni(clone_id="pk-next-week")
+wb_wd.writeback_completions()
+check("同一个 OminFocus key 只 complete 一次（不会连推两周）",
+      wb_wd.omnifocus.writes, [("complete", "pk-series", None)])
+check("同一 occurrence 的两条完成记录都记了 writeback",
+      [bool(((store.get(t["id"])["omnifocus"] or {}).get("writeback") or {})
+            .get("completed")) for t in (done_a, done_b)],
+      [True, True])
+check("还开着的那条改挂到下一次 occurrence",
+      (store.get(still_open["id"])["omnifocus"] or {}).get("id"), "pk-next-week")
+wb_wd.omnifocus.writes = []
+wb_wd.writeback_completions()
+check("再扫一次不会重复写", wb_wd.omnifocus.writes, [])
+check_true("同一完成记录再走 omni_complete 也不会重复写",
+           "不重复勾" in wb_wd.omni_complete(store.get(done_a["id"])))
+check("确实一次外部写都没发生", wb_wd.omnifocus.writes, [])
+
 # OmniFocus 说「这条已完成」时，别拿它把同一个 key 上还开着的兄弟记录也带成完成：
 # 兄弟里已经有一条是**我们自己写回**完成的，那这次完成就有归属了。
 print("== 写回：同一条 OmniFocus 不会把还开着的兄弟记录也带成完成 ==")

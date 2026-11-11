@@ -1068,18 +1068,48 @@ class NetMixin(object):
 
     def _apply_omnifocus_writeback(self, payload, args):
         payload = payload or {}
+        advanced_notes = []
         for item in payload.get("done") or []:
+            task_id = int(item["task_id"])
+            old_pk = str(item.get("pk") or "")
             try:
-                self.task_store.set_omnifocus_writeback(int(item["task_id"]),
-                                                        "completed")
+                task = self.task_store.get(task_id)
+            except (ValueError, TypeError):
+                continue
+            advanced, moved = self._omni_repeat_advance(
+                task, old_pk, item.get("res") or {})
+            if advanced:
+                advanced_notes.append(self._omni_repeat_note(
+                    advanced, (item.get("res") or {}).get("repeat_clone_id"), moved))
+            try:
+                self.task_store.set_omnifocus_writeback(task_id, "completed")
             except (ValueError, TypeError):
                 pass
+            # 同一 occurrence 的其他已完成本地镜像也已经由这一次写回归属，
+            # 不再各自去 complete 一遍。还开着的兄弟记录已由 advance 改挂下一次。
+            if old_pk:
+                for other in self.task_store.list():
+                    if other.get("id") == task_id:
+                        continue
+                    if ts.TaskStore.omnifocus_id(other) != old_pk:
+                        continue
+                    if self.task_store.status_of(other) != ts.STATUS_COMPLETED:
+                        continue
+                    wb = ((other.get("omnifocus") or {}).get("writeback") or {})
+                    if wb.get("completed"):
+                        continue
+                    try:
+                        self.task_store.set_omnifocus_writeback(
+                            other["id"], "completed")
+                    except (ValueError, TypeError):
+                        pass
         count = len(payload.get("done") or [])
         failed = payload.get("failed") or []
         if count:
-            self.say("✅ OmniFocus 写回 %d 条完成%s"
-                     % (count, ("；%d 条失败" % len(failed)) if failed else ""),
-                     "ok" if not failed else "warn")
+            suffix = "".join(note for note in advanced_notes if note)
+            self.say("✅ OmniFocus 写回 %d 条完成%s%s"
+                     % (count, ("；%d 条失败" % len(failed)) if failed else "",
+                        suffix), "ok" if not failed else "warn")
         self.invalidate()
         return count
 

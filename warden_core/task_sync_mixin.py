@@ -172,6 +172,32 @@ class TaskSyncMixin(object):
         return "；OmniFocus 那是重复任务，已经翻到下一次 %s，%d 条还没收工的本地记录改挂过去了" % (
             clone, len(moved))
 
+    def _omnifocus_write_claimed(self, task):
+        """这条 OmniFocus 完成是否已经由**另一条本地记录**写回过了。
+
+        项目任务 / 重复任务都可能在本地留下多条共享同一个 primary key 的记录。
+        一个 OmniFocus key 只代表**一次** occurrence；只要其中一条已经写回完成，
+        另一条就不能再 complete 一次，否则重复任务会被往前多推一周。
+        """
+        pk = ts.TaskStore.omnifocus_id(task)
+        if not pk:
+            return False
+        own = ((task.get("omnifocus") or {}).get("writeback") or {})
+        if own.get("completed"):
+            return True
+        want_id = task.get("id")
+        for other in self.task_store.list():
+            if other.get("id") == want_id:
+                continue
+            if ts.TaskStore.omnifocus_id(other) != pk:
+                continue
+            if self.task_store.status_of(other) != ts.STATUS_COMPLETED:
+                continue
+            wb = ((other.get("omnifocus") or {}).get("writeback") or {})
+            if wb.get("completed"):
+                return True
+        return False
+
     def omni_complete(self, task, minutes=None, at=None):
         """OmniFocus：完成 + 把截止时间写回 session 终点。返回一句人话。
 
@@ -191,6 +217,10 @@ class TaskSyncMixin(object):
             rl.log_event("omnifocus", "complete_blocked", reason="project-partial",
                          pk=pk, task_id=task.get("id"))
             return why
+        if self._omnifocus_write_claimed(task):
+            rl.log_event("omnifocus", "complete_skipped", reason="already-claimed",
+                         pk=pk, task_id=task.get("id"))
+            return "OmniFocus %s 那一次已经由另一条本地记录写回完成（不重复勾）" % pk
         enabled = self.omnifocus_enabled()
         fields = self._omni_log_fields(task, pk)
         due = self.omni_due_of(task)
@@ -415,19 +445,44 @@ class TaskSyncMixin(object):
             rl.log_event("omnifocus", "writeback_scan_skipped",
                          reason="disabled_or_unavailable")
             return []
+        pool = list(tasks if tasks is not None else self.task_store.list())
+        # 同一个 OmniFocus primary key 只写一次。重复任务/项目任务在本地可能留下
+        # 多条共享同一个 key 的完成记录；逐条写回会把 OmniFocus 的重复表连着
+        # 往前推两周（用户看到的「完成一次，下下周才有」）。
+        claimed = set()
+        for task in pool:
+            if ts.TaskStore.is_repeat_template(task):
+                continue
+            if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
+                continue
+            pk = ts.TaskStore.omnifocus_id(task)
+            wb = ((task.get("omnifocus") or {}).get("writeback") or {})
+            if pk and wb.get("completed"):
+                claimed.add(str(pk))
         todo = []
-        for task in (tasks if tasks is not None else self.task_store.list()):
+        seen_pks = set()
+        for task in pool:
             if ts.TaskStore.is_repeat_template(task):
                 # 本体不可完成；它的子任务共享同一条 OmniFocus 链接，写回由子任务做。
                 continue
             if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
                 continue
-            if not ts.TaskStore.omnifocus_id(task):
+            pk = ts.TaskStore.omnifocus_id(task)
+            if not pk:
                 continue
-            wb = ((task.get("omnifocus") or {}).get("writeback") or {})
-            if wb.get("completed"):
+            pk = str(pk)
+            if pk in claimed or pk in seen_pks:
+                continue
+            try:
+                allowed, why = pj.completion_guard(task, self.projects, self.task_store)
+            except Exception:                   # noqa: BLE001 - 账算不出来不该挡住完成
+                allowed, why = True, ""
+            if not allowed:
+                rl.log_event("omnifocus", "complete_blocked", reason="project-partial",
+                             pk=pk, task_id=task.get("id"), source="writeback_scan")
                 continue
             todo.append(task["id"])
+            seen_pks.add(pk)
         if not todo:
             rl.log_event("omnifocus", "writeback_scan_result", written=[])
             return []

@@ -50,7 +50,7 @@ class TaskPipelineMixin(object):
         if str(sess.get("date") or "") != iso:
             return False
         start = self._session_start_datetime(sess)
-        if start is None or start > datetime.datetime.now():
+        if start is None or start > self._now_dt():
             return False
         sid = str(sess.get("focusmate_session_id") or "").strip()
         if sid:
@@ -77,7 +77,7 @@ class TaskPipelineMixin(object):
             sessions = []
         if sessions:
             if strict_actual and self.authoritative and day <= datetime.date.today():
-                now = datetime.datetime.now()
+                now = self._now_dt()
                 sessions = [
                     sess for sess in sessions
                     if not (self._session_start_datetime(sess) is not None
@@ -458,7 +458,7 @@ class TaskPipelineMixin(object):
         day = day or self.sel_date
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         out = []
-        now = datetime.datetime.now()
+        now = self._now_dt()
         for task in self.task_store.list():
             if not ts.TaskStore.is_open(task):
                 continue

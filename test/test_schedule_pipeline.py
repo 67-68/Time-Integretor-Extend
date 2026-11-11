@@ -567,6 +567,9 @@ print("== 重复 occurrence：旧日期不会被 refresh 拖到今天，也不�
 wd_rep = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "13:00",
                  "type": "工作", "name": "重复", "calendar": "工作",
                  "title": "重复"}])
+# 这组用例讲的是「11:00 已经开始的幽灵场」；把时钟钉在中午，
+# 避免半夜跑测试时 11:00 其实还没到，用例假红。
+wd_rep.clock_now = datetime.datetime.combine(TODAY, datetime.time(12, 0))
 _parent = wd_rep.task_store.create({"title": "flashcard review & new learn",
                                     "duration": 25, "count": 1})
 _parent = wd_rep.task_store.set_repeat(
@@ -603,6 +606,7 @@ print("== refresh：被取消的已开始 session 上的任务会先下架，再
 wd_cancel = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
                     "type": "工作", "name": "取消场", "calendar": "工作",
                     "title": "取消场"}])
+wd_cancel.clock_now = datetime.datetime.combine(TODAY, datetime.time(12, 0))
 check("取消场：先排一场 50", wd_cancel.handle("period T1 50"), True)
 wd_cancel.reload_entries()
 # 本地说挂着 11:00，但 API 里没有任何这场（等同于 21:00 被取消）

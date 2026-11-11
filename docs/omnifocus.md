@@ -148,6 +148,13 @@ TUI 里的用法：`task import`（不给参数 = 读剪贴板导入并自动关
 写回扫的是「本地 `completed` + 有 primary key + `writeback.completed` 还没记」，
 所以补写是幂等的；一次 sync 里没有这种任务就**一个子进程都不起**。
 
+同一轮扫描按 **OmniFocus primary key 去重**：项目延期、拆 part 或历史转移可能在
+本地留下多条共享同一个 key 的已完成记录，但一个 key 只代表一次 occurrence，只能
+complete 一次。写回成功后会把这个 key 下所有已完成兄弟记录一起记上
+`writeback.completed`，不会下一次同步又各写一遍。项目任务还只完成了原任务的一部分
+count 时，后台写回扫描和 `omni_complete()` 一样走 `completion_guard()`，不勾
+OmniFocus 完成。
+
 ### 重复任务：OmniFocus 那边会「翻到下一次」
 
 `omnifocus_tasks.py set --complete` 打在**重复任务**上时，OmniFocus 的行为是
@@ -161,11 +168,13 @@ TUI 里的用法：`task import`（不给参数 = 读剪贴板导入并自动关
 | 把 `after.completed == false` 当失败 | 报「写回失败」、不记 writeback → 每次同步再写一遍 → OmniFocus 的重复表被一次次往前推 |
 | 不把新 key 接过来 | 本地还开着的记录（本体 / 明天的子任务）全挂在**旧 key**（已完成的那次）上 → 下一次的活在 OmniFocus 里永远勾不掉，还会被「OmniFocus 已完成」带成假完成 |
 
-所以 `omni_complete()` / `omni_drop()` 看见 `repeat_clone_id` 就：
+所以**所有写回完成的路**（`omni_complete()`、Focusmate 同步后的
+`writeback_completions()` 批量写回、收尾自动核对）看见 `repeat_clone_id` 都要：
 `repeat_advanced = true`（日志里能看到）、照常记 writeback、并调
 `task_store.advance_omnifocus(old_pk, new_pk)` 把**还开着的**本地记录改挂到新 key
 （旧 key 留在 `omnifocus.previous` 里备查；已经收工/放弃的记录留在旧 key 上，
-它们说的就是那一次已经结束的活）。
+它们说的就是那一次已经结束的活）。否则同一个 key 被重复 complete 会把重复表多推
+一周；这也是「本来每周一次，完成之后却下下周才有」的根因。
 
 `task <本体> drop` 会带 `--all-occurrences`：放弃「这一套」，而不是只放弃这一次
 （否则 OmniFocus 会照着重复规则继续生出下一次）。
