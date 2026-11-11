@@ -262,8 +262,8 @@ sess = {"index": 1, "date": T_ISO, "start": "11:00", "end": "11:25",
 wd.task_store.assign(old1["id"], sess)
 wd.task_store.assign(old2["id"], sess)
 wd.messages = []
-check("project 1 interrupt 默认就是 hard",
-      wd.handle("project 1 interrupt"), True)
+check("project 1 interrupt --hard 受理",
+      wd.handle("project 1 interrupt --hard"), True)
 check_true("进入等待 title 状态", wd.pending_interrupt is not None)
 check("两个旧任务都已下架",
       [(wd.task_store.get(t["id"]).get("session") or {}).get("start")

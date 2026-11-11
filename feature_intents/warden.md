@@ -140,8 +140,14 @@ op 3 relate --import [绝对路径]                   解析模板：资源准�
 pro / project       真正项目 Project (pro)：列表 / 详情 / create / -a / file / open / stage / op
 pro 1 -a            快捷切换阶段（running ↔ bottleneck），并关联新的 incubator op
                     （可直接跟 task import / op N；不跟则进入问答）
-pro 1 interrupt    硬中断当前进行中的 session：下架全部任务 → 输入 title →
-                    新建与整场等长的任务并挂回去（--hard 是默认值）
+pro 1 interrupt    软中断（默认）：记录一条建议 → 选 A/B/C 类别；不碰当前场
+pro 1 interrupt --check
+                    逐条检查软中断：1 不处理 / 2 入队 / 3 丢弃；最后选 25/50/75
+                    分钟生成任务，项目切 bottleneck，任务插到 incubator 最前面
+pro 1 interrupt --hard
+                    硬中断当前进行中的 session：下架全部任务 → 输入 title →
+                    新建与整场等长的任务并挂回去
+cst                快速征召：按剩余时间每 5 分钟取档，把合适任务塞进当前/下一场
 pro 1 file <路径>   关联“open + Enter 顺便打开”的文件
 open                切口径 + 顺便打开相关 pro 的文件
 plan [天数]         一次分配：每个 pro 只取当前阶段的 SOP/incubator op；

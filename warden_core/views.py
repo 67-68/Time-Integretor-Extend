@@ -138,6 +138,15 @@ class View(object):
                  ("warnings",), "通用", usage="warn [on|off]",
                  options=("on", "off"),
                  hint=_hint_actions("on", "off", note="不写就是取反")),
+            _cmd("conscription", w.cmd_conscription,
+                 "快速征召：把一条合适时长的任务塞进当前/下一场 session",
+                 ("cst", "征召", "抓任务"),
+                 usage="conscription / cst [session序号|current]",
+                 options=("current",),
+                 hint=_hint_actions("cst", "current",
+                                    note="进行中的场只有一条任务时优先用它的项目；"
+                                         "按剩余时间每 5 分钟向下取档；"
+                                         "不足 10 分钟先找 errand 项目")),
             _task_command(w),
         # say 用 lambda 晚绑定：换 console（测试、--exec）时输出跟着走
         ] + repl_kit.job_commands(w.jobs, say=lambda text: w.shell.print(text))
@@ -310,18 +319,20 @@ class ContractView(View):
                  "pro 1 -a | pro 1 interrupt | pro create",
                  ("pro", "pr", "项目"),
                  usage="pro [<序号> [-a <session>|-ac|--advance [op <N>|task import] | "
-                       "-m complete|discard | interrupt [--hard] | file <路径> | open | "
-                       "refresh | remove] | create <名称>]",
+                       "-m complete|discard | interrupt [--soft|--hard] [--check|--list] | "
+                       "file <路径> | open | refresh | remove] | create <名称>]",
                  options=("--advance", "-a", "-ac", "-m", "--mark", "complete", "discard",
-                          "active", "interrupt", "--hard", "create", "file", "open",
-                          "refresh", "remove", "check"),
+                          "active", "interrupt", "--soft", "-s", "--hard", "--check",
+                          "--list", "create", "file", "open", "refresh", "remove", "check"),
                  hint=_hint_actions("1", "1 -a 3", "1 -ac", "1 -m complete",
                                     "1 -m discard", "1 -m active",
+                                    "1 interrupt", "1 interrupt --check",
                                     "1 interrupt --hard", "create",
                                     note="pro = 真正项目（running/bottleneck）；"
                                          "-a <session> / -ac = 直接把该项目第一条任务挂到"
-                                         "指定场 / 当前场；-m complete|discard 只动本地状态，"
-                                         "默认 disposable filter 会隐藏")),
+                                         "指定场 / 当前场；interrupt 默认 soft（记录建议，"
+                                         "A/B/C 分类）；--check 逐条检查；-m complete|discard "
+                                         "只动本地状态，默认 disposable filter 会隐藏")),
             _cmd("op", w.cmd_op,
                  "管理 OmniFocus Project (op)：op | op 1 -m complete|discard | "
                  "op 1 sop|incubator | op 1 relate --export|--import | "
@@ -858,18 +869,20 @@ class DataView(View):
                  "pro 1 -a | pro 1 interrupt | pro create",
                  ("pro", "pr", "项目"),
                  usage="pro [<序号> [-a <session>|-ac|--advance [op <N>|task import] | "
-                       "-m complete|discard | interrupt [--hard] | file <路径> | open | "
-                       "refresh | remove] | create <名称>]",
+                       "-m complete|discard | interrupt [--soft|--hard] [--check|--list] | "
+                       "file <路径> | open | refresh | remove] | create <名称>]",
                  options=("--advance", "-a", "-ac", "-m", "--mark", "complete", "discard",
-                          "active", "interrupt", "--hard", "create", "file", "open",
-                          "refresh", "remove", "check"),
+                          "active", "interrupt", "--soft", "-s", "--hard", "--check",
+                          "--list", "create", "file", "open", "refresh", "remove", "check"),
                  hint=_hint_actions("1", "1 -a 3", "1 -ac", "1 -m complete",
                                     "1 -m discard", "1 -m active",
+                                    "1 interrupt", "1 interrupt --check",
                                     "1 interrupt --hard", "create",
                                     note="pro = 真正项目（running/bottleneck）；"
                                          "-a <session> / -ac = 直接把该项目第一条任务挂到"
-                                         "指定场 / 当前场；-m complete|discard 只动本地状态，"
-                                         "默认 disposable filter 会隐藏")),
+                                         "指定场 / 当前场；interrupt 默认 soft（记录建议，"
+                                         "A/B/C 分类）；--check 逐条检查；-m complete|discard "
+                                         "只动本地状态，默认 disposable filter 会隐藏")),
             _cmd("op", w.cmd_op,
                  "管理 OmniFocus Project (op)：op | op 1 -m complete|discard | "
                  "op 1 sop|incubator | op 1 relate --export|--import | "
@@ -1063,7 +1076,8 @@ class DataView(View):
             t.add_row(
                 str(row.get("number") or "—"),
                 str(row.get("id") or "—"),
-                Text(row.get("title") or "—", style="bold"),
+                Text(w.pro_display_title(raw_pro or row, fallback=row.get("title"))
+                     or "—", style="bold"),
                 Text((row.get("effective_stage") or row.get("stage") or "—")
                      + (" ⚠阶段按实际 op 推导" if row.get("stage_mismatch") else ""),
                      style="magenta"
@@ -1123,7 +1137,9 @@ class DataView(View):
             kind = row.get("op_type") or "未设类型"
             kind_style = ("magenta" if kind == "incubator"
                           else "cyan" if kind == "SOP" else "yellow")
-            pro_txt = row.get("pro_title") or "—"
+            pro_obj = row.get("pro") or {}
+            pro_txt = (w.pro_display_title(pro_obj, fallback=row.get("pro_title"))
+                       if pro_obj or row.get("pro_title") else "—")
             if row.get("pro_title") and row.get("pro_stage"):
                 pro_txt += " (%s)" % row.get("pro_stage")
             plan_txt = Text("✓", style="bold green") if row.get("id") in plan_ids else Text("—", style=STYLE_MUTED)

@@ -710,6 +710,8 @@ class ReviewMixin(object):
             return self.pending_relate_path_panel()
         if self.pending_interrupt is not None:
             return self.pending_interrupt_panel()
+        if self.pending_soft_interrupt is not None:
+            return self.pending_soft_interrupt_panel()
         if self.nostart is not None:
             return self.nostart_panel()
         if self.planning is not None:
@@ -796,8 +798,9 @@ class ReviewMixin(object):
             updated = self.projects.set_op_type(op_id, norm_type)
             num = self.projects.number_of(updated["id"]) or updated["id"]
             pro = self.projects.pro_for_op(updated)
-            pro_note = (" · 关联项目「%s」(%s)" % (pro.get("title"), pro.get("stage"))
-                        if pro else "")
+            pro_note = (" · 关联项目「%s」(%s)"
+                        % (self.pro_display_title(pro, fallback=pro.get("title")),
+                           pro.get("stage")) if pro else "")
             self.say("✅ op #%s「%s」已设为 %s%s。"
                      % (num, updated.get("title"), norm_type, pro_note), "ok")
             if self.pending_op_type:
@@ -829,7 +832,8 @@ class ReviewMixin(object):
         adv = self.pending_advance or {}
         body = Text()
         body.append("项目「%s」切换阶段：%s → %s\n"
-                    % (adv.get("pro_title") or "?",
+                    % (self.pro_display_title(
+                        adv.get("pro_id"), fallback=adv.get("pro_title") or "?"),
                        adv.get("from_stage") or "?",
                        adv.get("target_stage") or "?"),
                     style="bold")
@@ -857,7 +861,9 @@ class ReviewMixin(object):
         if low in ("q", "quit", "cancel", "abort", "取消", "放弃"):
             self.pending_advance = None
             self.say("⏹ 已取消项目「%s」的阶段切换（仍为 %s）。"
-                     % (adv.get("pro_title") or "?", adv.get("from_stage") or "?"), "info")
+                     % (self.pro_display_title(
+                         adv.get("pro_id"), fallback=adv.get("pro_title") or "?"),
+                        adv.get("from_stage") or "?"), "info")
             self.invalidate()
             return True
         parts = raw.split()

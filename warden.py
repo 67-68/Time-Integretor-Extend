@@ -83,8 +83,10 @@
 每个真正项目只显示当前阶段对应的那一个 op（running → SOP / bottleneck →
 incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一次问完每个项目
 「分多少」（`task 1 4` / `task 1 clear` / `complete`），再按分到的 count 唤起任务、
-排进 session（一场一个任务、尽量不拆）。`project <序号> interrupt --hard` 还能
-硬中断当前场：全部任务下架 → 输入 title → 新建整场任务挂回去。
+排进 session（一场一个任务、尽量不拆）。`pro <序号> interrupt` 默认开软中断：
+记录一条建议 → 选 A/B/C 类别；`--check` 逐条整理并生成 incubator 任务。
+`pro <序号> interrupt --hard` 才是硬中断当前场：全部任务下架 → 输入 title →
+新建整场任务挂回去。`cst` / `conscription` 按剩余时间快速征召一条合适任务。
 见 [`feature_intents/project.md`](feature_intents/project.md)。
 
 **收尾面板长在哪儿**：不是某个视图的内部件，而是 `repl_kit` 的**打断栏位**
@@ -488,6 +490,8 @@ class Warden(
         self.pending_relate_path = None
         # `project <序号> interrupt --hard` 清完当前场后，等用户输入新任务 title
         self.pending_interrupt = None
+        # 软中断问答：内容 → 类别 → 逐条 check → 25/50/75 分钟任务。
+        self.pending_soft_interrupt = None
         # 最近一次选中的真正项目 pro id + open 顺便打开过的文件记录
         self.selected_pro_id = None
         self.opened_files = []
@@ -837,6 +841,8 @@ class Warden(
             return self._answer_pending_relate_path(line)
         if self.pending_interrupt is not None:
             return self._answer_pending_interrupt(line)
+        if self.pending_soft_interrupt is not None:
+            return self._answer_pending_soft_interrupt(line)
 
         # 「到点没开始」那一问开着：p / x / s 先给它吃（和收尾互斥，见 _maybe_start_*）。
         prompt = getattr(self, "nostart", None)

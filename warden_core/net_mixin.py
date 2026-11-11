@@ -982,8 +982,9 @@ class NetMixin(object):
             head = "📁 导入项目" if created else "🔄 刷新项目"
             type_label = pj.normalize_op_type(project.get("op_type")) or "未设类型"
             pro = self.projects.pro_for_op(project)
-            pro_label = (" · 关联项目「%s」(%s)" % (pro.get("title"), pro.get("stage"))
-                         if pro else "")
+            pro_label = (" · 关联项目「%s」(%s)"
+                         % (self.pro_display_title(pro, fallback=pro.get("title")),
+                            pro.get("stage")) if pro else "")
             self.say("%s #%d「%s」[%s%s] → OmniFocus 项目 %s"
                      % (head, num, project.get("title"), type_label, pro_label,
                         (project.get("omnifocus") or {}).get("id") or "?"), "ok")

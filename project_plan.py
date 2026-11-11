@@ -955,7 +955,9 @@ class Allocator(object):
             got = self.allocation_of(project["id"])
             op_kind = pj.normalize_op_type(project.get("op_type")) or pj.OP_TYPE_SOP
             pro = self.pro_map.get(project["id"])
-            pro_txt = (" · pro:%s(%s)" % (pro.get("title"), pro.get("stage"))
+            pro_title = ((pro or {}).get("display_title")
+                         or (pro or {}).get("title"))
+            pro_txt = (" · pro:%s(%s)" % (pro_title, pro.get("stage"))
                        if pro else "")
             bits = ["[%s · %s%s]" % (op_kind, pj.task_type_of(project), pro_txt),
                     "剩余 %d count" % stat["remaining"],

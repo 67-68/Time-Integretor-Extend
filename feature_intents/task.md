@@ -310,7 +310,9 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `pro` / `project [序号] ...` | 管理真正项目 Project (pro)：列表 / 详情 / create / -a / file / open / stage / op |
 | `pro <序号> file <路径>` | 关联文件；敲 `open` + Enter 时顺便打开 |
 | `pro <序号> -a` / `--advance` | 快捷切换阶段（running ↔ bottleneck）并关联新的 op |
-| `pro <序号> interrupt [--hard]` | 硬中断当前进行中的 session：下架这一场所有任务，输入 title 后新建整场任务挂回去 |
+| `pro <序号> interrupt [--soft\|-s\|--hard]` | 默认软中断：记录建议并选 A/B/C；`--hard` 才是下架当前场建整场任务 |
+| `pro <序号> interrupt --soft --check` | 逐条检查软中断：不处理 / 入队 / 丢弃；最后生成 25/50/75 分钟的 incubator 任务 |
+| `conscription` / `cst` | 按当前场剩余时间（5 分钟一档）快速征召任务；优先当前任务所属项目，短时间优先 errand |
 | `plan` | 一次分配：每个 pro 按阶段取当前 SOP/incubator op，`complete` 一次应用并排任务（见 [`project.md`](project.md)） |
 | `task import -st`（`--single-task`） | 只导入这一条：不查重复设置、不问、不建本地 `repeat` |
 | `task <序号> link [链接]` | 不给链接 = 读剪贴板里那条 `omnifocus:///task/PK` |

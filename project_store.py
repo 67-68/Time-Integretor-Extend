@@ -103,6 +103,41 @@ TASK_TYPE_SEQUENTIAL = "sequential"
 TASK_TYPE_PARALLEL = "parallel"
 TASK_TYPES = (TASK_TYPE_SEQUENTIAL, TASK_TYPE_PARALLEL)
 
+#: 软中断（soft interrupt）：运行中冒出的、尚未处理的建议/问题。
+#: 它们不是 session 任务，只是项目上的一条待检查记录；检查后可以放进
+#: 队列（之后生成一条 incubator 任务）或丢弃（数据仍保留）。
+SOFT_INTERRUPT_PENDING = "pending"
+SOFT_INTERRUPT_QUEUED = "queued"
+SOFT_INTERRUPT_HANDLED = "handled"
+SOFT_INTERRUPT_DISCARDED = "discarded"
+SOFT_INTERRUPT_STATUSES = (SOFT_INTERRUPT_PENDING, SOFT_INTERRUPT_QUEUED,
+                           SOFT_INTERRUPT_HANDLED, SOFT_INTERRUPT_DISCARDED)
+SOFT_INTERRUPT_CATEGORY_LABELS = {
+    "A": "Bug",
+    "B": "摩擦（重复任务）",
+    "C": "局部优化假设",
+}
+
+
+def normalize_soft_category(value):
+    """``a`` / ``bug`` / ``摩擦`` → ``A`` / ``B`` / ``C``；认不出返回 None。"""
+    raw = str(value or "").strip()
+    low = raw.lower()
+    if not raw:
+        return None
+    if low[0] in SOFT_INTERRUPT_CATEGORY_LABELS:
+        return low[0].upper()
+    for key, label in SOFT_INTERRUPT_CATEGORY_LABELS.items():
+        if label.casefold() in low or key.casefold() == low:
+            return key
+    if "bug" in low or "问题" in raw:
+        return "A"
+    if "摩擦" in raw or "重复" in raw or "friction" in low:
+        return "B"
+    if "优化" in raw or "假设" in raw or "hypothesis" in low:
+        return "C"
+    return None
+
 
 def normalize_task_type(value):
     """OmniFocus 的项目排序规则 → ``sequential`` / ``parallel``。
@@ -702,7 +737,10 @@ def diff_tasks(local_tasks, remote_tasks):
                 out[pk] = task
         return out
 
-    local = index(local_tasks)
+    # local_only 是 relate / 软中断生成的任务，OmniFocus 里本来就没有对应
+    # primary key；不能把它们误判成「本地有、远端删了」。
+    local = index([task for task in (local_tasks or ())
+                   if not (task or {}).get("local_only")])
     remote = index(remote_tasks)
     added = [remote[pk] for pk in remote if pk not in local]
     removed = [local[pk] for pk in local if pk not in remote]
@@ -1033,6 +1071,29 @@ def _norm_plan(raw):
     return out
 
 
+def _norm_soft_interrupt(raw):
+    """一条软中断记录；坏记录返回 None。"""
+    if not isinstance(raw, dict):
+        return None
+    text = str(raw.get("text") or raw.get("content") or "").strip()
+    if not text:
+        return None
+    status = str(raw.get("status") or "").strip().lower()
+    if status not in SOFT_INTERRUPT_STATUSES:
+        status = SOFT_INTERRUPT_PENDING
+    return {
+        "id": str(raw.get("id") or "").strip() or "si-%d" % (abs(hash(text)) % 10**12),
+        "text": text,
+        "category": normalize_soft_category(raw.get("category")) or "",
+        "status": status,
+        "created_at": raw.get("created_at") or None,
+        "updated_at": raw.get("updated_at") or None,
+        "checked_at": raw.get("checked_at") or None,
+        "task_id": _as_int(raw.get("task_id")),
+        "note": str(raw.get("note") or ""),
+    }
+
+
 def _norm_project(raw):
     if not isinstance(raw, dict):
         return None
@@ -1122,6 +1183,10 @@ def _norm_pro(raw):
         "stage_locked": bool(raw.get("stage_locked", False)),
         "created_at": raw.get("created_at") or None,
         "updated_at": raw.get("updated_at") or None,
+        "soft_interrupts": [rec for rec in
+                             (_norm_soft_interrupt(x) for x in
+                              (raw.get("soft_interrupts") or ()))
+                             if rec is not None],
     }
 
 
@@ -2194,6 +2259,100 @@ class ProjectStore(object):
         self.save(store)
         return pro
 
+    # -- 软中断 -------------------------------------------------------
+    def soft_interrupts(self, pro_id, statuses=None):
+        """某个 ``pro`` 的软中断记录（默认全部，按创建时间/清单顺序）。
+
+        ``statuses`` 可以传单个状态或状态序列，例如 ``("pending",)``。
+        """
+        pro = self.pro_by_id(pro_id)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        wanted = None
+        if statuses is not None:
+            if isinstance(statuses, str):
+                wanted = {statuses}
+            else:
+                wanted = {str(x) for x in statuses}
+        out = []
+        for rec in pro.get("soft_interrupts") or ():
+            if wanted is None or rec.get("status") in wanted:
+                out.append(dict(rec))
+        return out
+
+    def soft_interrupt_count(self, pro_id, statuses=(SOFT_INTERRUPT_PENDING,
+                                                    SOFT_INTERRUPT_QUEUED)):
+        """软中断条数；默认数待检查和已入队（用来决定项目名前是否加 ❓）。"""
+        try:
+            return len(self.soft_interrupts(pro_id, statuses=statuses))
+        except (ValueError, TypeError):
+            return 0
+
+    def add_soft_interrupt(self, pro_id, text, category=None):
+        """记录一条软中断。``category`` 允许先空着，内容先保存。"""
+        clean = " ".join(str(text or "").split())
+        if not clean:
+            raise ValueError("软中断内容不能为空")
+        store = self.load()
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        records = pro.setdefault("soft_interrupts", [])
+        stamp = _now()
+        ident = "si-%s-%d" % (
+            datetime.datetime.now().strftime("%Y%m%d%H%M%S%f"), len(records) + 1)
+        rec = {
+            "id": ident,
+            "text": clean,
+            "category": normalize_soft_category(category) or "",
+            "status": SOFT_INTERRUPT_PENDING,
+            "created_at": stamp,
+            "updated_at": stamp,
+            "checked_at": None,
+            "task_id": None,
+            "note": "",
+        }
+        records.append(rec)
+        pro["updated_at"] = stamp
+        self.save(store)
+        return rec
+
+    def update_soft_interrupt(self, pro_id, interrupt_id, **changes):
+        """修改一条软中断（category / status / note / task_id）。
+
+        这是唯一的写入口，保证所有状态词都先归一化；返回更新后的记录。
+        """
+        store = self.load()
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        want = str(interrupt_id or "").strip()
+        for rec in pro.get("soft_interrupts") or ():
+            if str(rec.get("id") or "") != want:
+                continue
+            if "category" in changes:
+                got = normalize_soft_category(changes.get("category"))
+                if got is None and str(changes.get("category") or "").strip():
+                    raise ValueError("软中断类别只能是 A / B / C")
+                rec["category"] = got or ""
+            if "status" in changes:
+                status = str(changes.get("status") or "").strip().lower()
+                if status not in SOFT_INTERRUPT_STATUSES:
+                    raise ValueError("软中断状态只能是 %s"
+                                     % " / ".join(SOFT_INTERRUPT_STATUSES))
+                rec["status"] = status
+                if status != SOFT_INTERRUPT_PENDING:
+                    rec["checked_at"] = _now()
+            if "note" in changes:
+                rec["note"] = str(changes.get("note") or "")
+            if "task_id" in changes:
+                rec["task_id"] = _as_int(changes.get("task_id"))
+            rec["updated_at"] = _now()
+            pro["updated_at"] = rec["updated_at"]
+            self.save(store)
+            return dict(rec)
+        raise ValueError("项目（pro）%s 没有软中断 %s" % (pro_id, interrupt_id))
+
     def link_op_to_pro(self, op_id, pro_id, op_type=None):
         """把 ``op`` 关联到 ``pro``（可选顺带指定 ``op_type``）。"""
         store = self.load()
@@ -2547,6 +2706,29 @@ class ProjectStore(object):
                 rec = _norm_task(item, rank=start_rank + offset)
                 if rec is not None:
                     existing.append(rec)
+            project["synced_at"] = _now()
+            self.save(store)
+            return project
+        raise ValueError("没有项目 %s" % project_id)
+
+    def prepend_task(self, project_id, task):
+        """把一条任务放到项目清单最前面（软中断生成的 incubator 任务用）。
+
+        任务记录会按普通项目任务归一化；已有同 pk 时先删旧记录再插到最前，
+        保证重复调用不会产生两份。
+        """
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            rec = _norm_task(task, rank=0)
+            if rec is None:
+                raise ValueError("软中断任务没有 pk，不能插入项目清单")
+            existing = [x for x in (project.get("tasks") or [])
+                        if str(x.get("pk") or "") != str(rec.get("pk"))]
+            for index, item in enumerate([rec] + existing):
+                item["rank"] = index
+            project["tasks"] = [rec] + existing
             project["synced_at"] = _now()
             self.save(store)
             return project

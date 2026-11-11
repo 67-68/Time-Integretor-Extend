@@ -2855,6 +2855,42 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-11T19:15:30",
+      "task_id": 214,
+      "fields": {
+        "title": "难题 14",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "i0o1iM8RI8W",
+        "count_total": 3,
+        "count": 1,
+        "duration": 25,
+        "due": "2026-11-11T17:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 7,
+        "date": "2026-11-11",
+        "start": "17:00",
+        "end": "17:50",
+        "duration": 50,
+        "focusmate_session_id": "993ba55d-8d79-46d5-9e5e-3cfa0c327496"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "fac3a13d-42c5-41cb-87be-fed7ed0c7885",
+        "title": "难题 14",
+        "description": "",
+        "completed_at": "2026-11-11T09:27:48.355513+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "993ba55d-8d79-46d5-9e5e-3cfa0c327496"
+          }
+        ]
+      }
     }
   ]
 }

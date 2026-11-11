@@ -21,12 +21,22 @@ for _name, _file in (
     ("TI_PROJECT_SYNC_FILE", "project-sync.json"),
     ("TI_NOSTART_FILE", "nostart.json"),
     ("TI_TASK_ARCHIVE", "archive.json"),
+    ("TI_SINS_FILE", "sins.json"),
 ):
     os.environ[_name] = os.path.join(TMP, _file)
 
 spec = importlib.util.spec_from_file_location("warden", os.path.join(ROOT, "warden.py"))
 w = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(w)
+
+ks = w.ks
+ks.STATE_FILE = os.path.join(TMP, "state.json")
+ks.VERDICTS_FILE = os.path.join(TMP, "verdicts.json")
+ks.SINS_FILE = os.path.join(TMP, "sins.json")
+ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
+ks.LOCK_FILE = os.path.join(TMP, "keep_session.lock")
+ks.EXPECTED_FILE = os.path.join(TMP, "keep_session-expected.json")
+ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
 
 fails = []
 

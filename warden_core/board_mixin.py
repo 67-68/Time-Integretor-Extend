@@ -2254,7 +2254,7 @@ class BoardMixin(object):
                 self.say("⚠ 打开项目关联文件失败（%s）：%s" % (raw_file, e), "warn")
                 return None
         self.say("📂 已顺便打开项目「%s」关联文件：%s"
-                 % (pro.get("title") or pro.get("id"), raw_file), "ok")
+                 % (self.pro_display_title(pro, fallback=pro.get("id")), raw_file), "ok")
         return expanded
 
     def _pro_for_task(self, task):
@@ -2371,7 +2371,8 @@ class BoardMixin(object):
             if not pro.get("file"):
                 pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
                 raise ValueError("项目 #%s「%s」还没有关联文件；先用 `pro %s file <路径>` 绑定。"
-                                 % (pnum, pro.get("title"), pnum))
+                                 % (pnum, self.pro_display_title(pro, fallback=pro.get("title")),
+                                    pnum))
             return self._open_pro_file(pro)
         aliases = {"w": "working", "work": "working", "d": "detail", "all": "detail"}
         mode = aliases.get(text.lower(), text.lower())
@@ -2525,8 +2526,11 @@ class BoardMixin(object):
                                                "不再进入 active 列表、plan 和默认数据视图"),
             ("op <序号> -m complete|discard", "只改 OmniFocus op 的本地状态；completed / dropped "
                                               "不再进入 active 列表、plan 和默认数据视图"),
-            ("pro <序号> interrupt [--hard]", "硬中断当前进行中的 session：把这一场所有任务下架，"
-                                               "再让你输入 title，新建一条与整场等长的任务挂回去"),
+            ("pro <序号> interrupt [--soft|-s|--hard]", "默认软中断：保存一条建议/问题 → 选 A/B/C 类别，"
+                                                           "不下架当前任务；--hard = 清空当前场后建整场任务"),
+            ("pro <序号> interrupt --soft --check", "逐条检查软中断：1 不处理 / 2 入队 / 3 丢弃（保存数据）；"
+                                                     "最后选 25/50/75 分钟生成任务，项目自动切 bottleneck，"
+                                                     "任务插到 incubator 最前面"),
             ("pro <序号> file <路径>", "为项目 pro 关联一个文件，作为敲 `open` + Enter 之后顺便打开的文件"
                                        "（也可 `pro create <名> file=<路径>` 或 `pro <序号> open`）"),
             ("op [序号] [sop|incubator]", "管理 OmniFocus Project (op)：每个 op 必须是 SOP 或 incubator "
@@ -2534,8 +2538,12 @@ class BoardMixin(object):
             ("task import [sop|incubator]（项目）",
              "剪贴板里是 **OmniFocus 项目**（omnifocus:///project/PK）→ 进 op 库（也可 `op import sop|incubator`）："
              "需说明 SOP 或 incubator 类型；带 `project/…` 标签自动关联 pro；时长不齐整批拒绝"),
-            ("project [序号] [interrupt|refresh|remove|check]", "看 pro 与当前 op / 看 #1 详情与清单 / 硬中断当前场 / 重新去 "
-                                                       "OmniFocus 读一遍 / 撤掉 / check = 每日对账"),
+            ("project [序号] [interrupt|refresh|remove|check]", "看 pro 与当前 op / 看 #1 详情与清单 / "
+                                                       "软中断（默认）或 --hard 硬中断 / 重新去 OmniFocus 读一遍 / "
+                                                       "撤掉 / check = 每日对账"),
+            ("conscription / cst", "快速征召：把一条合适时长的任务塞进当前/下一场 session；"
+                                     "当前场只有一条任务时优先用它的项目；剩余分钟按 5 分钟向下取档；"
+                                     "不足 10 分钟先找 errand 项目"),
             ("plan [-c|--current] [天数]", "一次排期：每个真正项目只取当前阶段对应的那一个 op"
                             "（running → SOP / bottleneck → incubator），"
                             "分配 count + 自动挑任务挂 session。没有关联 pro 的孤立 op 不进 plan。"

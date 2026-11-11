@@ -101,7 +101,16 @@ op -m active id:1
     "op_ids": [1],
     "status": "active",                       // active / completed / dropped
     "status_at": null, "status_reason": null,
-    "created_at": "…", "updated_at": "…"
+    "created_at": "…", "updated_at": "…",
+    "soft_interrupts": [{                     // pro 上的软中断记录
+      "id": "si-20261111101500123456-1",
+      "text": "SAT 科学类双篇对比题总是超时 2 分钟",
+      "category": "A",                        // A / B / C
+      "status": "pending",                    // pending / queued / handled / discarded
+      "created_at": "…", "updated_at": "…", "checked_at": null,
+      "task_id": null,
+      "note": ""
+    }]
   }]
 }
 ```
@@ -489,28 +498,86 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `pro <序号> stage <running\|bottleneck>` | 直接设置阶段 |
 | `pro <序号> op <op序号>` | 关联已有 op |
 | `pro <序号> refresh` / `remove` | 刷新关联 op / 删除 pro |
-| `project <序号> interrupt [--hard]` | 硬中断当前进行中的 session：下架这一场所有任务，等 title 后新建整场任务挂回去 |
+| `pro <序号> interrupt [--soft\|-s]` | 软中断（默认）：保存一条建议/问题，选 A/B/C 类别；不碰 session |
+| `pro <序号> interrupt --soft --check` | 逐条检查软中断：不处理 / 入队 / 丢弃（保存数据）；最后生成 incubator 任务 |
+| `pro <序号> interrupt --hard` | 硬中断当前进行中的 session：下架这一场所有任务，等 title 后新建整场任务挂回去 |
+| `conscription` / `cst [session序号\|current]` | 按剩余时间快速征召一条合适任务挂进当前/下一场 |
 | `project <序号> refresh` / `remove` | 刷新该 pro 关联的 op / 删除 pro（op 仍用 `op ... remove`） |
 | `project refresh` / `project check` | 所有 op 刷一遍 / 每日对账 |
 | `plan` / `plan +1` / `plan -c` | 开始一次分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天；`-c` 把今天正在进行的空 session 也纳入 |
 | `plan -s <session> -p <project>` | sessional plan：把指定项目按自身 sequential/parallel 规则排进指定 session |
 | `task <序号> <count>` / `op <序号> <count>` / `clear` / `complete` / `q` | plan 里的那几句（`op` 与 `task` 同义，只是强调操作对象是 op） |
 
-### `project <序号> interrupt --hard`
+### `pro <序号> interrupt`：默认软中断
+
+软中断用于「正在做事时冒出一个值得记录、但不该立刻打断当前 session 的问题/建议」。
+它不碰当前场上的任何任务。
+
+```text
+pro 1 interrupt                # 默认 soft
+pro 1 interrupt --soft         # 等价
+pro 1 interrupt -s
+pro 1 interrupt --soft --check # 逐条检查
+pro 1 interrupt --soft --list  # 查看历史（含 discarded）
+```
+
+记录流程：
+
+1. 输入一条具体内容；
+2. 内容先落盘，再选择类别：
+   - **A · Bug**：现有 SOP 跑不通，或某个知识点反复做错；
+   - **B · 摩擦（重复任务）**：事情能做完，但每次都在机械操作上浪费体力；
+   - **C · 局部优化假设**：必须能写成可证伪的 A/B 边界，例如
+     「改动作 X，下个 session 预计快 Y 分钟」；
+3. `q` 放弃类别选择时，记录标为 `discarded`，原文不删除。
+
+只要有 `pending` / `queued` 软中断（还没生成任务或丢弃），项目名在项目表、
+数据视图、`project` 列表、plan 面板等地方都显示成 `❓项目名`。
+
+`--check` 逐条展示，类似 `inspect-due`：
+
+```text
+1 不处理（留在待检查队列）
+2 处理（放入队列）
+3 丢弃（保存数据，不再提醒）
+q 中止
+```
+
+全部检查完后询问任务时长 `25 / 50 / 75`。确认后：
+
+1. 本次入队的所有条目合成一条任务（标题取第一条，备注保留全部条目和类别）；
+2. 项目自动切到 `bottleneck`；
+3. 如果项目已有 incubator op，任务以 `local_only` 记录插到该 op 清单**最前面**，
+   并镜像成本地任务；没有 incubator op / 未绑定 OmniFocus 时，任务只落本地任务库，
+   不尝试写 OmniFocus；
+4. 入队条目状态改为 `handled` 并记下 `task_id`；问号消失。
+
+### `pro <序号> interrupt --hard`
 
 硬中断用于「正在这一场做着，但必须立刻换掉全部任务」：
 
-1. 只认**当前进行中**的 session（`live_session()`；不是下一场、也不是本地幽灵场）；
+1. 只认**当前进行中**的 session（`live_session()`；没有时退回最近已订的 upcoming）；
 2. 把这一场上所有未完成任务全部下架（`_task_detach`，Focusmate task 也删）；
 3. 进入打断栏位，要求输入新任务 title；
 4. 新建一条 `duration = 当前 session 长度` 的本地任务，自动设为独占，
-   并调用正常的 `assign_task_to` 挂回这场；
-5. `--hard` 是默认值；`interrupt` 不写参数也是 hard。软中断尚未定义。
+   并调用正常的 `assign_task_to` 挂回这场。
 
 ```text
-project 1 interrupt            # 默认 hard
-project 1 interrupt --hard     # 显式写法
+pro 1 interrupt --hard         # 显式硬中断
 ```
+
+### `conscription` / `cst`：快速征召
+
+`cst` 把一个现有任务快速塞进当前场（进行中优先，否则最近一场已订 upcoming）：
+
+- 目标场剩余时间按 **5 分钟一档向下取整**：剩 23 分钟只找 ≤20 分钟的任务；
+- 如果当前进行中的场**只有一条任务**，优先用这条任务所属的项目匹配；
+- 该项目的 OmniFocus 清单按顺序检查，第一条时长合适的叶子任务被选中；
+- 没有合适任务时，按 OmniFocus 项目顺序检查其他项目；
+- 剩余不足 10 分钟、当前项目没有 ≤10 分钟任务时，errand / 跑腿 / 杂事 / 琐事
+  项目排在其他项目前面，仍然只找当前档位内的短任务；
+- 项目库没有合适叶子时，再兜底找本地未排任务；
+- 选中后会正常走挂载/乐观网络路径，并在项目 `plans[day]` 里追加记录。
 
 ### `open` + Enter 顺便打开项目文件
 
