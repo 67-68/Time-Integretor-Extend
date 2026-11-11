@@ -150,6 +150,7 @@ FIELD_SPECS = (
     ("kind", "text", "vKind"),
     ("project", "text", "vProject"),
     ("project_id", "text", "vProjectId"),
+    ("task_type", "text", "vTaskType"),
     ("parent", "text", "vParent"),
     ("parent_id", "text", "vParentId"),
     ("in_inbox", "bool", "in inbox of t"),
@@ -269,9 +270,19 @@ on run
 				set vProjectObj to containing project of t
 				set vProject to ""
 				set vProjectId to ""
+				set vTaskType to ""
 				if vProjectObj is not missing value then
 					set vProject to name of vProjectObj
 					set vProjectId to id of vProjectObj
+					try
+						if sequential of vProjectObj then
+							set vTaskType to "sequential"
+						else
+							set vTaskType to "parallel"
+						end if
+					on error
+						set vTaskType to ""
+					end try
 				end if
 				set vParentObj to parent task of t
 				set vParent to ""
@@ -321,6 +332,21 @@ OMNIJS_SOURCE = r'''
   };
   const idOf = t => {
     try { return t.id.primaryKey; } catch (e) { return null; }
+  };
+  const taskTypeOf = t => {
+    const values = [];
+    const push = v => {
+      if (v !== undefined && v !== null) values.push(v);
+    };
+    try { push(t.containingProject && t.containingProject.taskType); } catch (e) {}
+    try { push(t.project && t.project.taskType); } catch (e) {}
+    try { push(t.taskType); } catch (e) {}
+    for (const v of values) {
+      const s = String(v).toLowerCase();
+      if (s.indexOf("sequential") >= 0) return "sequential";
+      if (s.indexOf("parallel") >= 0) return "parallel";
+    }
+    return "";
   };
   const inInboxTree = t => {
     let x = t;
@@ -392,6 +418,7 @@ OMNIJS_SOURCE = r'''
       kind: inbox ? "inbox" : (t.project ? "project_root" : "action"),
       project: project ? project.name : "",
       project_id: project ? idOf(project) : "",
+      task_type: taskTypeOf(t),
       parent: parent ? parent.name : "",
       parent_id: parent ? idOf(parent) : "",
       in_inbox: inbox,

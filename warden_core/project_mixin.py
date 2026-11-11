@@ -274,6 +274,7 @@ class ProjectMixin(object):
         t.add_column("#", justify="right", style="bold", no_wrap=True)
         t.add_column("项目 / 当前 op", no_wrap=True, overflow="crop")
         t.add_column("阶段 / 类型", no_wrap=True)
+        t.add_column("排序", no_wrap=True)
         t.add_column("剩余 count", justify="right", no_wrap=True)
         t.add_column("进度", justify="right", no_wrap=True)
         t.add_column("今天 plan", no_wrap=True)
@@ -299,11 +300,15 @@ class ProjectMixin(object):
             if not row.get("allowed", True):
                 type_txt += " ⏸"
                 type_style = STYLE_MUTED
+            task_type = pj.task_type_of(row)
+            task_type_style = ("yellow" if task_type == pj.TASK_TYPE_SEQUENTIAL
+                               else "cyan")
             op_title = (row.get("active_op") or {}).get("title") or "?"
             t.add_row(str(row["number"]),
                       Text("%s → %s" % (row.get("pro_title") or "?", op_title),
                            overflow="crop"),
                       Text(type_txt, style=type_style),
+                      Text(task_type, style=task_type_style),
                       Text(str(row.get("remaining") or 0), style="bold cyan"),
                       Text(row.get("progress_text") or "—", style=STYLE_MUTED),
                       Text(plan_txt, style="green" if row.get("allocated") else STYLE_MUTED),
@@ -314,7 +319,8 @@ class ProjectMixin(object):
                       Text(str(row.get("pk") or "")[:10] or "—"))
         total_remaining = sum(int(r.get("remaining") or 0) for r in rows)
         t.caption = ("%d 个活跃项目 · 剩余 %d count（%d 分钟）· 只显示当前阶段对应的 "
-                     "op（running=SOP / bottleneck=incubator）· `plan` 也按同一份清单分配"
+                     "op（running=SOP / bottleneck=incubator）· 排序列 = 该项目检测到的 "
+                     "OmniFocus 规则（sequential / parallel）· `plan` 也按同一份清单分配"
                      % (len(rows), total_remaining,
                         total_remaining * pp.MINUTES_PER_COUNT))
         return t
@@ -604,6 +610,7 @@ class ProjectMixin(object):
             pro create <名称> [file=<路径>]     创建真正项目 pro
             pro <序号> -m complete|discard      本地状态（默认数据视图 disposable 会隐藏）
             pro <序号> -m active                恢复 active（非 active 时建议 id:<内部id>）
+            pro <序号> -a <session> / -ac       直接把项目第一条任务挂到指定场 / 当前场
             pro <序号> -a / --advance [...]     快捷切换阶段（running ↔ bottleneck）并关联新 op
             pro <序号> file <路径|clear>        关联/清空项目的打开文件（open + enter 顺便打开）
             pro <序号> open                     打开该项目关联的文件
@@ -667,6 +674,19 @@ class ProjectMixin(object):
                 self.say("· 另有 %d 个未关联真正项目的 op；用 `op` 查看/关联。"
                          % len(orphans), "dim")
             return pro_rows
+        # 手工把项目第一条任务挂到某一场：project <序号> -a <session>
+        # / project <序号> -ac（当前这一场）。旧的 `pro <序号> -a op ...`
+        # 仍保留为阶段推进；只有 -a 后面跟 session 编号时才走这里。
+        if len(toks) >= 2:
+            flag = toks[1].lower()
+            if flag in ("-ac", "--assign-current"):
+                return self._project_assign_first(toks[0], "current")
+            if flag in ("-a", "--assign"):
+                if len(toks) >= 3 and toks[2].lower() not in ("op", "task", "import"):
+                    return self._project_assign_first(toks[0], toks[2])
+                if len(toks) == 2:
+                    raise ValueError("用法：project <序号> -a <session序号> 或 "
+                                     "project <序号> -ac（当前场）")
         action = toks[0].lower()
         if action in ("create", "new", "add", "新建", "创建"):
             return self._cmd_pro_create(toks[1:])
@@ -825,6 +845,129 @@ class ProjectMixin(object):
                             (" · 文件：%s" % pro["file"]) if pro.get("file") else ""),
                          "info")
             return self._project_detail(project)
+
+    # -- 项目任务直接挂场 ------------------------------------------------
+    def _project_op_for_token(self, token):
+        """project 序号 → 当前阶段 op；兼容直接给 op 序号/名字。"""
+        pro = None
+        try:
+            pro = self.projects.resolve_pro(token)
+        except ValueError:
+            pro = None
+        if pro is not None:
+            op = self.projects.current_op_for_pro(pro)
+            if op is None:
+                raise ValueError("项目「%s」当前阶段没有可用的 OmniFocus op"
+                                 % pro.get("title"))
+            return op, pro
+        op = self.projects.resolve(token)
+        return op, self.projects.pro_for_op(op)
+
+    def _first_project_leaf(self, op, parent=None):
+        """项目清单里按 OmniFocus 顺序拿到第一条可排的叶子任务。"""
+        invested = pj.invested_by_project(self.task_store).get(op["id"]) or {}
+        exclude = set()
+        now = datetime.datetime.now()
+        for task in self.task_store.list():
+            pid, _title, pk = ts.TaskStore.project_task_fields(task)
+            if (pk and str(pid) == str(op["id"]) and ts.TaskStore.is_open(task)
+                    and (task.get("formatter") or ts.task_is_deferred(task, now=now))):
+                exclude.add(str(pk))
+        items = pj.remaining_tasks(op, invested, now=now, exclude_pks=exclude)
+        if not items:
+            return None, None
+        first = items[0]
+        children = [dict(child) for child in first.get("children") or ()
+                    if int(child.get("duration") or 0) > 0]
+        if children:
+            parent = first
+            return children[0], parent
+        return first, None
+
+    def _wake_project_leaf(self, op, item, parent=None):
+        """把项目叶子任务变成可挂 session 的本地任务（复用已有镜像）。"""
+        item = dict(item or {})
+        pk = str(item.get("pk") or "").strip()
+        if not pk:
+            raise ValueError("项目任务没有 pk，不能挂 session")
+        total_count = ts.parse_count(item.get("count")) or ts.minutes_to_count(
+            item.get("duration"))
+        fields = {"title": item.get("title") or pk,
+                  pj.PROJECT_FIELD: op.get("title") or "",
+                  pj.PROJECT_ID_FIELD: op["id"],
+                  pj.PROJECT_TASK_FIELD: pk}
+        if total_count and total_count > 0:
+            fields["count_total"] = int(total_count)
+            fields["count"] = int(total_count)
+        if item.get("duration"):
+            fields["duration"] = int(item.get("duration"))
+        if item.get("note"):
+            fields["note"] = item["note"]
+        parent_pk = str((parent or {}).get("pk") or item.get("parent_id") or "").strip()
+        parent_title = (parent or {}).get("title") or item.get("parent") or ""
+        if parent_pk:
+            fields["note"] = ((fields.get("note") or "") + "\n父任务：%s"
+                              % (parent_title or parent_pk)).strip()
+        source = {"kind": "project", "id": pk,
+                  "url": of.task_url(pk), "title": item.get("title")}
+        if item.get("local_only"):
+            source["local_only"] = True
+            source["url"] = ""
+        if parent_pk:
+            source.update({"parent_id": parent_pk, "parent_title": parent_title})
+        existing = self._project_local_task(op["id"], pk)
+        if (existing is not None and ts.TaskStore.is_open(existing)
+                and not existing.get("session")):
+            return self.task_store.apply_project_plan(
+                existing["id"], fields, source=source)
+        return self.task_store.create(
+            fields,
+            omnifocus=None if item.get("local_only") else {
+                "id": pk, "url": of.task_url(pk),
+                "title": item.get("title") or pk},
+            source=source)
+
+    def _project_assign_first(self, project_token, session_token):
+        """``project N -a <session>`` / ``-ac``：第一条项目任务直接挂场。"""
+        op, pro = self._project_op_for_token(project_token)
+        item, parent = self._first_project_leaf(op)
+        if item is None:
+            raise ValueError("项目「%s」没有剩余的可排任务" % op.get("title"))
+        if session_token == "current":
+            idx, row = self.current_session()
+        else:
+            idx, row = self.pick(session_token)
+        date_iso = str(row.get("date") or self.sel_date.isoformat())
+        task = self._wake_project_leaf(op, item, parent=parent)
+        note = self._assign_task(task, str(idx), refresh=False,
+                                 allow_unbooked=True)
+        task = self.task_store.get(task["id"])
+        sess = task.get("session") or {}
+        pnum = (self.projects.pro_number_of(pro["id"]) if pro else
+                self.projects.number_of(op["id"]))
+        if str(sess.get("start") or "") == str(row.get("startLabel") or ""):
+            try:
+                self.projects.record_items(op["id"], self.sel_date, [{
+                    "pk": item.get("pk"), "task_id": task["id"],
+                    "count": int(item.get("count") or 0),
+                    "start": row.get("startLabel") or "",
+                    "duration": int(row.get("durationMin") or 0),
+                }], append=True)
+            except Exception:                   # noqa: BLE001 - 记账失败不挡挂载
+                pass
+            self.selected_task_id = task["id"]
+            self.rebuild_rows()
+            self.invalidate()
+            self.say("📌 Pro #%s「%s」第一条任务「%s」已挂到 session #%d（%s %s）%s"
+                     % (pnum or "?", op.get("title") or "?",
+                        self.task_store.focusmate_title(task, 40), idx,
+                        date_iso, row.get("startLabel") or "?",
+                        ("；%s" % note) if note else ""), "ok")
+        else:
+            self.say("⚠ Pro #%s「%s」第一条任务没挂到 session #%d：%s"
+                     % (pnum or "?", op.get("title") or "?", idx,
+                        note or "目标场拒绝了这次挂载"), "warn")
+        return task
 
     # -- 硬中断 --------------------------------------------------------
     def _start_project_interrupt(self, pro, tail_tokens=None):
@@ -1366,11 +1509,11 @@ class ProjectMixin(object):
         invested = pj.invested_by_project(self.task_store).get(project["id"]) or {}
         stat = pj.stats(project, self.task_store, invested)
         num = self.projects.number_of(project["id"]) or project["id"]
-        self.say("📁 #%d「%s」OmniFocus %s · 剩余 %d count · 进度 %s（%d/%d）"
+        self.say("📁 #%d「%s」OmniFocus %s · 排序 %s · 剩余 %d count · 进度 %s（%d/%d）"
                  % (num, project.get("title"),
                     ((project.get("omnifocus") or {}).get("id") or "?"),
-                    stat["remaining"], stat["progress_text"],
-                    stat["done"], stat["total"]), "cmd")
+                    pj.task_type_of(project), stat["remaining"],
+                    stat["progress_text"], stat["done"], stat["total"]), "cmd")
         if project.get("file"):
             self.say("   📄 关联文件：%s" % project.get("file"), "info")
         week = pj.weekly_yield(project.get("tasks") or [])
@@ -1803,6 +1946,9 @@ class ProjectMixin(object):
             plan                    今天（**默认就是今天**，和当前看的是哪天无关）
             plan -c / plan --current
                                     今天，并把**正在进行的空 session**也算进范围
+            plan -s <session> -p <project>
+                                    当前看板那天：把指定项目排进指定 session
+                                    （session 容量就是这次分配的 count）
             plan +1                 明天（plan 1 / plan 明天 / plan 2026-11-07 同义）
             plan -c 今天            同 plan -c（--current 只能用于今天）
             task 1 4                项目 #1 分 4 个 count（= 100 分钟）
@@ -1825,6 +1971,9 @@ class ProjectMixin(object):
                 or self.pending_interrupt is not None or self.review_active()):
             raise ValueError("先把手头那一问答完（收尾 / 到点没开始 / 导入确认 / 硬中断 title）"
                              "再来 plan。")
+        sessional = self._parse_sessional_plan_args(toks)
+        if sessional is not None:
+            return self._run_sessional_plan(*sessional)
         day, offset, include_current = self._parse_plan_args(toks)
         self.projects.ensure_tagged_pros()
         untyped = self.projects.untyped_linked_ops()
@@ -1897,6 +2046,119 @@ class ProjectMixin(object):
     #: `plan` 的日期参数里认的那几个人话
     PLAN_DAY_WORDS = {"今天": 0, "today": 0, "明天": 1, "tomorrow": 1,
                       "后天": 2, "大后天": 3, "昨天": -1, "yesterday": -1}
+
+    def _parse_sessional_plan_args(self, toks):
+        """``plan -s <session> -p <project>`` → ``(session, project, -c)``。
+
+        只处理 **sessional plan**；没出现 ``-s/--session`` 或 ``-p/--project``
+        时返回 None，交给普通 plan。这个模式不需要日期参数：session 序号按
+        当前看板那一张契约表算。
+        """
+        toks = [str(t).strip() for t in (toks or ()) if str(t).strip()]
+        has_session = any(t.lower() in ("-s", "--session")
+                          or t.lower().startswith("--session=") for t in toks)
+        has_project = any(t.lower() in ("-p", "--project")
+                          or t.lower().startswith("--project=") for t in toks)
+        if not has_session and not has_project:
+            return None
+        session_idx = project_idx = None
+        include_current = False
+        rest = []
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            low = tok.lower()
+            if low in ("-s", "--session"):
+                if i + 1 >= len(toks):
+                    raise ValueError("plan -s/--session 后面要跟 session 序号")
+                session_idx = ts.parse_count(toks[i + 1])
+                i += 2
+                continue
+            if low.startswith("--session="):
+                session_idx = ts.parse_count(tok.split("=", 1)[1])
+                i += 1
+                continue
+            if low in ("-p", "--project"):
+                if i + 1 >= len(toks):
+                    raise ValueError("plan -p/--project 后面要跟项目序号")
+                project_idx = ts.parse_count(toks[i + 1])
+                i += 2
+                continue
+            if low.startswith("--project="):
+                project_idx = ts.parse_count(tok.split("=", 1)[1])
+                i += 1
+                continue
+            if low in ("-c", "--current"):
+                include_current = True
+                i += 1
+                continue
+            rest.append(tok)
+            i += 1
+        if rest:
+            raise ValueError("sessional plan 只认 plan -s <session> -p <project>；"
+                             "不跟日期或其他参数（多出来：%s）" % " ".join(rest))
+        if session_idx is None or session_idx <= 0:
+            raise ValueError("plan -s 要一个正整数 session 序号（契约表上的 #）")
+        if project_idx is None or project_idx <= 0:
+            raise ValueError("plan -p 要一个正整数项目序号（Project 表上的 #）")
+        return int(session_idx), int(project_idx), include_current
+
+    def _run_sessional_plan(self, session_idx, project_idx, include_current=False):
+        """把某一项目排进指定 session：该 session 的 count 就是本次分配量。"""
+        day = self.sel_date
+        self.projects.ensure_tagged_pros()
+        untyped = self.projects.untyped_linked_ops()
+        if untyped:
+            self.check_untyped_ops(announce_import=False)
+            raise ValueError("还有 %d 个已关联真正项目的 OmniFocus 项目（op）没说明类型"
+                             "（SOP / incubator）；请先补全类型再 plan。"
+                             % len(untyped))
+        plan_ops = self.projects.plan_ops()
+        if not plan_ops:
+            raise ValueError("当前没有可排期的 OmniFocus 项目（op）")
+        if project_idx > len(plan_ops):
+            raise ValueError("项目序号 %d 超出范围：#1–#%d"
+                             % (project_idx, len(plan_ops)))
+        project = plan_ops[project_idx - 1]
+        self.rebuild_rows()
+        slots, notes = (self._plan_slots(day, include_current=True)
+                        if include_current else self._plan_slots(day))
+        for note in notes:
+            self.say("· %s" % note, "info")
+        slot = next((dict(s) for s in slots
+                     if int(s.get("index") or 0) == int(session_idx)), None)
+        if slot is None:
+            row = self.rows[session_idx - 1] if 0 < session_idx <= len(self.rows) else {}
+            why = ""
+            if row:
+                if self.task_store.tasks_for_session(
+                        str(row.get("date") or day.isoformat()),
+                        row.get("startLabel")):
+                    why = "：这一场已经挂着任务"
+                elif row.get("period_muted"):
+                    why = "：这一场在静音时段"
+                elif (row.get("endMs")
+                      and int(row["endMs"]) <= int(self._now_dt().timestamp() * 1000)):
+                    why = "：这一场已经结束"
+            raise ValueError("session #%d 不在 %s 的可排空场里%s"
+                             % (session_idx, day.isoformat(), why))
+        if int(slot.get("counts") or 0) <= 0:
+            raise ValueError("session #%d 不足 1 count（25 分钟），不能 plan"
+                             % session_idx)
+        pro_map = {op["id"]: self.projects.pro_for_op(op) for op in plan_ops}
+        allocator = pp.Allocator(
+            day, [project], [slot], task_store=self.task_store,
+            hooks=self.plan_hooks(), pro_map=pro_map)
+        allocs = [{"project_id": project["id"], "project": project,
+                   "count": int(slot["counts"])}]
+        self.say("📌 sessional plan：session #%d（%s %s，%d count）← 项目 #%d「%s」"
+                 "（%s 排序）"
+                 % (session_idx, day.isoformat(), slot.get("start"),
+                    int(slot["counts"]), project_idx, project.get("title"),
+                    pj.task_type_of(project)), "cmd")
+        summary = self._plan_apply(allocator, allocs, append_to_plan=True)
+        self.invalidate()
+        return summary
 
     def _parse_plan_args(self, toks):
         """``plan`` 的选项 → ``(day, offset, include_current)``。"""
@@ -2089,8 +2351,12 @@ class ProjectMixin(object):
             "apply": lambda allocator, allocs: self._plan_apply(allocator, allocs),
         }
 
-    def _plan_apply(self, allocator, allocs):
+    def _plan_apply(self, allocator, allocs, append_to_plan=False):
         """分配完了：先记资源，再挑任务、排进 session。
+
+        ``append_to_plan=True`` 给 sessional plan / 手工单场安排用：当天已有
+        的分配和 items 保留，只把这一次的结果追加进去，不覆盖整天计划。
+
 
         「尽量一场一个任务、尽量不拆开」在 :func:`project_plan.schedule` 里：先跑
         二分图匹配求「一对一站位」，配不上才拆、才往同一场里叠。
@@ -2112,16 +2378,20 @@ class ProjectMixin(object):
         placements, unscheduled, more = pp.schedule(items, allocator.slots)
         notes = list(notes) + list(more)
         for alloc in allocs:
-            self.projects.set_allocation(alloc["project_id"], day, alloc["count"])
+            count = int(alloc["count"])
+            if append_to_plan:
+                existing = pj.plan_of(alloc["project"], day) or {}
+                count += int(existing.get("count") or 0)
+            self.projects.set_allocation(alloc["project_id"], day, count)
         made, failed = {}, 0
         for place in placements:
             item = place["item"]
             slot = place["slot"]
             project = item["project"]
             url = of.task_url(item["pk"])
-            parent_pk = item.get("parent_pk") or place.get("parent", {}).get("pk")
-            parent_title = (item.get("parent_title")
-                            or place.get("parent", {}).get("title"))
+            parent = place.get("parent") or {}
+            parent_pk = item.get("parent_pk") or parent.get("pk")
+            parent_title = item.get("parent_title") or parent.get("title")
             fields = {"title": item.get("title") or item["pk"],
                       pj.PROJECT_FIELD: project.get("title") or "",
                       pj.PROJECT_ID_FIELD: item["project_id"],
@@ -2203,7 +2473,8 @@ class ProjectMixin(object):
                 self.say("⚠ 「%s」建好了但没挂到 session #%s：%s"
                          % (item.get("title"), slot["index"], e), "warn")
         for pid, records in made.items():
-            self.projects.record_items(pid, day, records)
+            self.projects.record_items(pid, day, records,
+                                       append=append_to_plan)
         self.rebuild_rows()
         total_counts = sum(int(p["count"]) for p in placements)
         self.say("🗂 %s 排好了：%d 条任务 → %d 场 session（共 %d count = %d 分钟）"

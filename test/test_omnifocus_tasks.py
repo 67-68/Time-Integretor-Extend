@@ -94,6 +94,11 @@ check("* → 全部字段", m.parse_field_list("*"), list(m.FIELDS))
 check("逗号子集去重、保序", m.parse_field_list("name,due,name"), ["name", "due"])
 check_raises("未知字段报 ValueError", lambda: m.parse_field_list("name,bogus"))
 
+check("task_type 字段在公开字段表里", "task_type" in m.FIELDS, True)
+check("OmniJS 读取项目 task_type", "task_type: taskTypeOf(t)" in m.OMNIJS_SOURCE, True)
+check("AppleScript 兜底读取 sequential 属性",
+      "sequential of vProjectObj" in m.build_script("applescript"), True)
+
 print("== build_script（两个引擎）==")
 ascript = m.build_script("applescript")
 check("applescript：读 flattened tasks", "flattened tasks" in ascript, True)

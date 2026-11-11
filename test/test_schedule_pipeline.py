@@ -612,7 +612,7 @@ wd_cancel.reload_entries()
 # 本地说挂着 11:00，但 API 里没有任何这场（等同于 21:00 被取消）
 _cancel_task = wd_cancel.task_store.create(
     {"title": "flashcard review & new learn", "duration": 25, "count": 1})
-_now_ms = int(datetime.datetime.now().timestamp() * 1000)
+_now_ms = int(wd_cancel.clock_now.timestamp() * 1000)
 _cancel_task = wd_cancel.task_store.assign(_cancel_task["id"], {
     "date": ISO, "start": "11:00", "end": "11:25", "duration": 25,
     "startMs": _now_ms - 5 * 60 * 1000,

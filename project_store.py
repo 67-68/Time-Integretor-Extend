@@ -96,6 +96,34 @@ OP_TYPE_SOP = "SOP"
 OP_TYPE_INCUBATOR = "incubator"
 OP_TYPES = (OP_TYPE_SOP, OP_TYPE_INCUBATOR)
 
+#: OmniFocus 项目自身的任务排序规则：顺序（sequential）或并行（parallel）。
+#: 这是**项目规则**，和上面的 SOP / incubator 类型是两个维度。
+TASK_TYPE_SEQUENTIAL = "sequential"
+TASK_TYPE_PARALLEL = "parallel"
+TASK_TYPES = (TASK_TYPE_SEQUENTIAL, TASK_TYPE_PARALLEL)
+
+
+def normalize_task_type(value):
+    """OmniFocus 的项目排序规则 → ``sequential`` / ``parallel``。
+
+    旧数据没有这个字段时返回 ``None``；调度层会把 ``None`` 当 parallel，
+    保持升级前「找最合适的 session」的行为。
+    """
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    if "sequential" in raw or raw in ("顺序", "串行"):
+        return TASK_TYPE_SEQUENTIAL
+    if "parallel" in raw or raw in ("并行",):
+        return TASK_TYPE_PARALLEL
+    return None
+
+
+def task_type_of(project):
+    """项目实际使用的调度算法；缺字段按 parallel 兼容旧数据。"""
+    return (normalize_task_type((project or {}).get("task_type"))
+            or TASK_TYPE_PARALLEL)
+
 #: 真正项目 Project (pro) 的两个阶段：running 允许 SOP op，bottleneck 允许 incubator op。
 STAGE_RUNNING = "running"
 STAGE_BOTTLENECK = "bottleneck"
@@ -970,6 +998,7 @@ def _norm_project(raw):
         "id": ident,
         "title": _one_line(raw.get("title") or (omnifocus or {}).get("title")) or ("项目 %d" % ident),
         "op_type": op_type,
+        "task_type": normalize_task_type(raw.get("task_type")) or TASK_TYPE_PARALLEL,
         "pro_id": pro_id,
         "project_tag": project_tag or "",
         "tags": tags,
@@ -1190,6 +1219,7 @@ def project_payload(row, rows, repeat_infos=None, now=None):
         "title": name,
         "url": project_url(pk),
         "op_type": op_type,
+        "task_type": normalize_task_type(row.get("task_type")) or TASK_TYPE_PARALLEL,
         "tags": all_tags,
         "project_tag": project_tag,
         "tasks": members,
@@ -1726,6 +1756,9 @@ class ProjectStore(object):
                 project["title"] = _one_line(payload.get("title")) or project["title"]
                 if op_type is not None:
                     project["op_type"] = op_type
+                task_type = normalize_task_type(payload.get("task_type"))
+                if task_type is not None:
+                    project["task_type"] = task_type
                 if tags:
                     project["tags"] = tags
                 if project_tag:
@@ -1749,6 +1782,8 @@ class ProjectStore(object):
                 "id": nid,
                 "title": _one_line(payload.get("title")) or ("项目 %s" % pk),
                 "op_type": op_type,
+                "task_type": normalize_task_type(payload.get("task_type"))
+                             or TASK_TYPE_PARALLEL,
                 "pro_id": pro_id,
                 "project_tag": project_tag or "",
                 "tags": tags,
@@ -2555,8 +2590,12 @@ class ProjectStore(object):
             return project
         raise ValueError("没有项目 %s" % project_id)
 
-    def record_items(self, project_id, day, items):
-        """记下「这一天真的排了哪些本地任务」（唤起完成的证据）。"""
+    def record_items(self, project_id, day, items, append=False):
+        """记下「这一天真的排了哪些本地任务」（唤起完成的证据）。
+
+        ``append=True`` 给 sessional plan / 手工 `project -a` 用：保留当天
+        已经排过的 items，而不是把整天的计划覆盖成这一次。
+        """
         store = self.load()
         key = day.isoformat() if hasattr(day, "isoformat") else str(day)
         for project in store["projects"]:
@@ -2564,7 +2603,21 @@ class ProjectStore(object):
                 continue
             plans = project.setdefault("plans", {})
             plan = plans.get(key) or {"count": 0, "items": []}
-            plan["items"] = [dict(item) for item in items or []]
+            fresh = [dict(item) for item in items or []]
+            if append:
+                old = [dict(item) for item in plan.get("items") or []]
+                keys = {(str(x.get("pk") or ""), str(x.get("start") or ""),
+                         str(x.get("task_id") or "")) for x in old}
+                for item in fresh:
+                    item_key = (str(item.get("pk") or ""),
+                                str(item.get("start") or ""),
+                                str(item.get("task_id") or ""))
+                    if item_key not in keys:
+                        old.append(item)
+                        keys.add(item_key)
+                plan["items"] = old
+            else:
+                plan["items"] = fresh
             plan["at"] = _now()
             plans[key] = plan
             self.save(store)
@@ -2595,6 +2648,7 @@ class ProjectStore(object):
                 "id": project["id"],
                 "title": project["title"],
                 "op_type": normalize_op_type(project.get("op_type")),
+                "task_type": task_type_of(project),
                 "pro": pro,
                 "pro_id": pro["id"] if pro else None,
                 "pro_title": pro.get("title") if pro else "",

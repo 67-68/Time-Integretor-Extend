@@ -121,6 +121,7 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
             continue
         budget = need * MINUTES_PER_COUNT
         took = 0
+        task_type = pj.task_type_of(project)
         excluded = (exclude_pks.get(pid) or exclude_pks.get(str(pid))
                     if isinstance(exclude_pks, dict) else exclude_pks)
         for item in pj.remaining_tasks(project, invested_map.get(pid) or {},
@@ -151,6 +152,7 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
                     "duration": int(item.get("duration") or 0),
                     "budget_minutes": min(budget, take * MINUTES_PER_COUNT),
                 })
+                rec["task_type"] = task_type
                 out.append(rec)
                 need -= take
                 budget -= take * MINUTES_PER_COUNT
@@ -167,6 +169,7 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
                     "minutes": minutes,
                     "small": True,
                     "budget_minutes": minutes,
+                    "task_type": task_type,
                 })
                 out.append(rec)
                 budget -= minutes
@@ -179,6 +182,7 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
             rec.update({
                 "count": take,
                 "minutes": minutes if take == int(item.get("remaining") or 0) else take * MINUTES_PER_COUNT,
+                "task_type": task_type,
             })
             out.append(rec)
             need -= take
@@ -208,7 +212,8 @@ def _match(items, slots):
     返回 ``{item_index: slot_index}``。没有完美匹配时返回能配上的那些 —— 配不上的
     由调用方拆开填。候选场次按「容量小的优先」试，浪费就小。
     """
-    caps = [int(s.get("counts") or 0) for s in slots]
+    caps = [max(0, int(s.get("counts") or 0) - int(s.get("used") or 0))
+            for s in slots]
     order = sorted(range(len(items)),
                    key=lambda i: (-int(items[i].get("count") or 0), i))
     candidates = {}
@@ -460,6 +465,171 @@ def _schedule_children(items, slots, placements, unscheduled, notes):
     return [slot for slot in slots
             if int(slot.get("used") or 0) < int(slot.get("counts") or 0)]
 
+def _slot_free_counts(slot):
+    return max(0, int((slot or {}).get("counts") or 0)
+               - int((slot or {}).get("used") or 0))
+
+
+def _slot_free_minutes(slot):
+    return max(0, int((slot or {}).get("duration") or 0)
+               - int((slot or {}).get("used_minutes") or 0))
+
+
+def _ordered_slots(slots):
+    """session 的时间顺序（顺序项目只认这个，不做最优匹配）。"""
+    return sorted(slots or (),
+                  key=lambda slot: (str(slot.get("start") or ""),
+                                    int(slot.get("index") or 0)))
+
+
+def _sequential_place_item(item, slots, placements, unscheduled, notes,
+                           parent=None):
+    """把一条任务按**时间顺序**塞进最早的 session。
+
+    sequential 项目的核心：不找「最合适」的空场，也不为了少拆而跳过前面的
+    小场。比如 50 分钟任务遇到 25 / 25 / 50 三场，就先拆成 25 + 25 填满
+    前两场，第三场保持空闲。
+    """
+    item = dict(item or {})
+    count = int(item.get("count") or 0)
+    if count <= 0:
+        return
+    ordered = _ordered_slots(slots)
+
+    # 短任务按真实分钟占位；仍然只往最早能放下的那一场走。
+    if item.get("small") or (0 < int(item.get("minutes") or 0) < MINUTES_PER_COUNT):
+        minutes = int(item.get("minutes") or 0)
+        for slot in ordered:
+            if _slot_free_minutes(slot) < minutes:
+                continue
+            stacked = int(slot.get("used_minutes") or 0) > 0
+            slot["used_minutes"] = int(slot.get("used_minutes") or 0) + minutes
+            used_count = ts.minutes_to_count(int(slot.get("used_minutes") or 0)) or 0
+            slot["used"] = min(int(slot.get("counts") or 0), used_count)
+            placements.append({
+                "item": item, "slot": slot, "count": count,
+                "duration": minutes, "split": False, "stacked": stacked,
+                "by_minutes": True, "sequential": True, "parent": parent,
+            })
+            return
+        unscheduled.append(item)
+        notes.append("「%s」%d 分钟在顺序排期里没地方放（前面的场次都装不下）"
+                     % (item.get("title") or item.get("pk"), minutes))
+        return
+
+    chunks = []
+    need = count
+    for slot in ordered:
+        free = _slot_free_counts(slot)
+        if free <= 0:
+            continue
+        take = min(free, need)
+        chunks.append((slot, take))
+        need -= take
+        if need <= 0:
+            break
+    if not chunks:
+        unscheduled.append(item)
+        notes.append("「%s」在顺序排期里没地方放（没有剩余 count）"
+                     % (item.get("title") or item.get("pk")))
+        return
+
+    want = count
+    for index, (slot, take) in enumerate(chunks, 1):
+        duration = take * MINUTES_PER_COUNT
+        part = dict(item, count=take, duration=duration)
+        if len(chunks) > 1:
+            part["part_index"] = index
+            part["part_total"] = len(chunks)
+        slot["used"] = int(slot.get("used") or 0) + take
+        slot["used_minutes"] = (int(slot.get("used_minutes") or 0)
+                                + duration)
+        placements.append({
+            "item": part,
+            "slot": slot,
+            "count": take,
+            "duration": duration,
+            "split": len(chunks) > 1,
+            "stacked": False,
+            "sequential": True,
+            "parent": parent,
+        })
+    if len(chunks) > 1:
+        notes.append("「%s」%d count 按项目顺序拆成 %d 场（%s）"
+                     % (item.get("title") or item.get("pk"), want, len(chunks),
+                        "、".join("%s %d" % (slot.get("start"), take)
+                                 for slot, take in chunks)))
+    if need > 0:
+        rest = dict(item, count=need,
+                    title=item.get("title") or item.get("pk"))
+        unscheduled.append(rest)
+        notes.append("「%s」还差 %d count 没地方放（顺序排期不跳场）"
+                     % (item.get("title") or item.get("pk"), need))
+
+
+def _schedule_sequential(items, slots, placements, unscheduled, notes):
+    """按项目顺序填 session（Sequential 项目规则）。
+
+    项目内的任务顺序就是 OmniFocus 清单顺序；每个任务从最早还有空位的
+    session 开始，装不下就顺着下一场继续，绝不为了「少拆」跳到后面的大场。
+    父任务壳仍以子任务为真实排期单位，但同样按清单顺序往前走。
+    """
+    for item in items or ():
+        children = [dict(child) for child in item.get("children") or ()
+                    if int(child.get("duration") or 0) > 0]
+        if not children:
+            _sequential_place_item(item, slots, placements, unscheduled, notes)
+            continue
+        budget = int(item.get("budget_minutes") or 0)
+        if budget <= 0:
+            budget = sum(int(child.get("duration") or 0) for child in children)
+        selected = []
+        left = budget
+        for child in children:
+            if left <= 0:
+                break
+            full = int(child.get("duration") or 0)
+            take = min(full, left)
+            if take <= 0:
+                continue
+            if take < full and take < MINUTES_PER_COUNT:
+                break
+            rec = dict(child)
+            rec["_full_minutes"] = full
+            rec["_alloc_minutes"] = take
+            rec["count"] = ts.minutes_to_count(take) or 1
+            rec["duration"] = take
+            rec["total"] = int(child.get("count") or 0) or int(item.get("total") or 0)
+            rec["task_type"] = pj.TASK_TYPE_SEQUENTIAL
+            if take < MINUTES_PER_COUNT:
+                rec["small"] = True
+                rec["minutes"] = take
+            selected.append(rec)
+            left -= take
+        for child in selected:
+            _sequential_place_item(child, slots, placements, unscheduled, notes,
+                                   parent=item)
+            full = int(child.get("_full_minutes") or 0)
+            alloc = int(child.get("_alloc_minutes") or 0)
+            if full > alloc:
+                notes.append("「%s」原 %d 分钟，本次只排前 %d 分钟"
+                             "（剩余 %d 分钟未分到本次资源）"
+                             % (child.get("title") or child.get("pk"), full, alloc,
+                                full - alloc))
+        if selected:
+            notes.append("「%s」按 sequential 顺序排了 %d 条子任务"
+                         % (item.get("title") or item.get("pk"), len(selected)))
+
+
+def _is_sequential_item(item):
+    item = item or {}
+    project = item.get("project") or {}
+    mode = (item.get("task_type")
+            or project.get("task_type")
+            or item.get("schedule_mode"))
+    return pj.normalize_task_type(mode) == pj.TASK_TYPE_SEQUENTIAL
+
+
 def _schedule_small_items(items, slots, placements, unscheduled, notes):
     """把短任务（实际时长 < 25 分钟）按分钟叠进空场次。
 
@@ -538,11 +708,21 @@ def schedule(items, slots):
     slots = [dict(s, used=0, used_minutes=0) for s in slots or []]
     items = [dict(i) for i in items or []]
     placements, unscheduled, notes = [], [], []
-    # 先排父任务壳（子任务能整条放就整条放；单场装不下才拆段，同一套尽量
-    # 放同一场），再排短任务（按分钟叠），最后把剩余容量交给普通任务。
-    slots = _schedule_children(items, slots, placements, unscheduled, notes)
-    items = [item for item in items if not item.get("children")]
-    items, slots = _schedule_small_items(items, slots, placements, unscheduled, notes)
+
+    # Sequential 项目先按时间顺序占掉最早的 session；Parallel 项目继续
+    # 使用原来的「最大匹配 + 最小浪费」算法吃剩下的容量。任务列表本身按
+    # 项目分配顺序稳定，所以两类项目混合时结果可预期。
+    sequential = [item for item in items if _is_sequential_item(item)]
+    parallel = [item for item in items if not _is_sequential_item(item)]
+    _schedule_sequential(sequential, slots, placements, unscheduled, notes)
+
+    # Parallel：先排父任务壳（子任务能整条放就整条放；单场装不下才拆段，
+    # 同一套尽量放同一场），再排短任务（按分钟叠），最后把剩余容量交给普通任务。
+    slots = _schedule_children(parallel, slots, placements, unscheduled, notes)
+    parallel = [item for item in parallel if not item.get("children")]
+    parallel, slots = _schedule_small_items(
+        parallel, slots, placements, unscheduled, notes)
+    items = parallel
     matched = _match(items, slots)
     for i in sorted(matched):
         item = items[i]
@@ -710,7 +890,7 @@ class Allocator(object):
             pro = self.pro_map.get(project["id"])
             pro_txt = (" · pro:%s(%s)" % (pro.get("title"), pro.get("stage"))
                        if pro else "")
-            bits = ["[%s%s]" % (op_kind, pro_txt),
+            bits = ["[%s · %s%s]" % (op_kind, pj.task_type_of(project), pro_txt),
                     "剩余 %d count" % stat["remaining"],
                     "进度 %s" % stat["progress_text"]]
             if plan and plan.get("count"):

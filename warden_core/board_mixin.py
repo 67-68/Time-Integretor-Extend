@@ -619,6 +619,54 @@ class BoardMixin(object):
             return "⤼" if ts.TRANSFER_TAG in (task.get("tags") or []) else "✗"
         return ts.STATUS_MARKS.get(ts.STATUS_ACTIVE) or "·"
 
+    def task_session_part_label(self, task):
+        """契约 task 行最前面的 session 计数：``0/2 `` / ``1/2 ``。
+
+        同一条 OmniFocus 项目任务被排进多个 session 时，这里显示「这是第几个
+        session / 一共几个 session」；单场任务不显示，避免每条都挂 ``0/1``。
+        计数是**从 0 开始的历史快照**：第一场 ``0/2``、第二场 ``1/2``，和
+        session 表格保留历史行的思路一致。
+        """
+        task = task or {}
+        fields = task.get("fields") or {}
+        pk = str(fields.get(pj.PROJECT_TASK_FIELD) or "").strip()
+        sess = task.get("session") or {}
+        if not pk or not sess.get("start"):
+            return ""
+        pid = fields.get(pj.PROJECT_ID_FIELD)
+        parts = []
+        try:
+            for other in self.task_store.list():
+                other_fields = (other or {}).get("fields") or {}
+                if str(other_fields.get(pj.PROJECT_TASK_FIELD) or "").strip() != pk:
+                    continue
+                other_pid = other_fields.get(pj.PROJECT_ID_FIELD)
+                if (pid is not None and other_pid is not None
+                        and str(other_pid) != str(pid)):
+                    continue
+                other_sess = (other or {}).get("session") or {}
+                if not other_sess.get("start"):
+                    continue
+                parts.append({
+                    "id": other.get("id"),
+                    "key": (str(other_sess.get("date") or ""),
+                            str(other_sess.get("start") or "")),
+                })
+        except Exception:                       # noqa: BLE001 - 展示兜底
+            return ""
+        # 同一场可能因重复刷新出现多个本地记录；按 session 去重后再编号。
+        uniq = {}
+        for part in parts:
+            uniq.setdefault(part["key"], part)
+        ordered = [uniq[key] for key in sorted(uniq)]
+        if len(ordered) <= 1:
+            return ""
+        current = (str(sess.get("date") or ""), str(sess.get("start") or ""))
+        for index, part in enumerate(ordered):
+            if part["key"] == current:
+                return "%d/%d " % (index, len(ordered))
+        return ""
+
     def task_cell_text(self, tasks, session_minutes=None):
         """契约表格 task 列的正文：``1: (1+2/5) 任务… | ✓3: 任务…``。
 
@@ -642,10 +690,16 @@ class BoardMixin(object):
             no = self.task_no(task)
             if session_minutes is not None:
                 count = self.task_session_count_label(task, delta)
+                session_count = self.task_session_part_label(task)
             else:
                 count = self.task_count_label(task, delta)
-            parts.append("%s%d: %s%s" % (prefix, no, count, title) if no else
-                         "%s%s%s" % (prefix, count, title))
+                session_count = ""
+            if no:
+                parts.append("%s%s%d: %s%s"
+                             % (session_count, prefix, no, count, title))
+            else:
+                parts.append("%s%s%s%s"
+                             % (session_count, prefix, count, title))
         return " | ".join(parts)
 
     @staticmethod

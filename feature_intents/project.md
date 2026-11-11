@@ -65,6 +65,7 @@ op -m active id:1
     "id": 1,                                  // op 序号 = 预览表上的 #
     "title": "论文写作 SOP",
     "op_type": "SOP",                         // SOP / incubator / null(待补全)
+    "task_type": "sequential",                // OmniFocus 项目排序规则：sequential / parallel
     "pro_id": 1,                              // 关联的真正项目 pro；null = 未关联
     "project_tag": "学术论文",                // 从 OmniFocus 标签 project/... 提取
     "tags": ["project/学术论文", "写作"],
@@ -345,7 +346,19 @@ q              放弃这次 plan（一个字节都不落）
 「3 个给任务 1 + 2 个给任务 2」）。项目清单里的活不够填满 → 少排，并如实说
 （那不是错误，是清单的事实）。
 
-`schedule()`：两条原则（用户原话）——**尽量让每个任务占有自己的独立 session**、
+`schedule()` 会先按每个 op 的 OmniFocus 项目规则分流：
+
+- **parallel**（默认 / 旧数据缺字段）：沿用原来的「最大匹配 + 最小浪费」算法，
+  给每个任务找最合适的 session；
+- **sequential**：按 OmniFocus 清单顺序一个一个排，只从**最早还有空位的 session**
+  往后填，不做最优匹配，也不为了少拆而跳场。例：50 分钟任务遇到 25 / 25 / 50
+  三场时，先拆成 25 + 25 填满前两场，第三场留给下一条任务，而不是把它整条塞进
+  后面的 50 分钟场。
+
+项目表新增「排序」列，显示这次实际检测并使用的 `sequential` / `parallel`；
+`project <序号>` 详情、plan 资源面板也会显示同一口径。
+
+parallel 的两条原则（用户原话）——**尽量让每个任务占有自己的独立 session**、
 **尽量让每个任务连续**（别把一条任务拆到两场）。所以：
 
 1. 先跑一次二分图**最大匹配**（任务 ↔ 场次，场次容量 ≥ 任务要的 count）：
@@ -369,6 +382,36 @@ q              放弃这次 plan（一个字节都不落）
 然后照常走 `task <序号> -a <#>` 那条路挂 session（Focusmate 那边建 task），
 `due` 由 `assign` 按 session 终点自动写。排完把「说好的 count」和「真排了哪几条」
 一起记进 `plans[day]`。
+
+### sessional plan：`plan -s <session> -p <project>`
+
+不再走「先给项目分 count、再 complete」的问答，直接把**指定 session 的容量**
+当成这次分配给指定项目的 count，调用同一个 `distribute()` + `schedule()`：
+
+```text
+plan -s 1 -p 2          # 把 Project #2 排进当前看板那天的 session #1
+plan --session 1 --project 2
+plan -c -s 1 -p 2       # 需要时可把当前进行中的 session 也纳入
+```
+
+- session 序号 = 契约表上的 `#`；project 序号 = Project 表 / `plan` 的 `#`；
+- 只接受空格、没挂任务、没被 formatter 占掉、没静音、未结束的 session；
+- 该项目自己的 `sequential / parallel` 规则照常生效；
+- 结果**追加**进当天的 `plans[day]`，不会覆盖当天已有的分配和 items；
+- 这条路径不打开交互分配面板，适合「这一场空出来了，就排这个项目」。
+
+### 快捷挂第一条：`project <序号> -a <session>` / `-ac`
+
+不做排期算法，直接把该项目当前清单里的**第一条可排叶子任务**唤起成本地任务，
+挂到指定 session：
+
+```text
+project 1 -a 3      # 第一条任务挂到 session #3
+project 1 -ac       # 第一条任务挂到当前/最近一场
+```
+
+它是手工捷径；需要按 sequential/parallel 规则挑任务、拆段时用 `plan -s`。
+旧的 `pro <序号> -a op <N>` / `--advance` 仍表示阶段切换，不冲突。
 
 ## 「今天还没 plan」会提醒
 
@@ -415,6 +458,7 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `pro` / `project` | 列出真正项目 pro 和 op 库 |
 | `pro create <名称> [file=<路径>] [stage=running\|bottleneck]` | 新建 / 更新真正项目 pro |
 | `pro <序号> -a` / `--advance [op <N>\|task import]` | 切换阶段（running ↔ bottleneck）并关联新的 op |
+| `project <序号> -a <session>` / `-ac` | 直接把该项目第一条任务挂到指定场 / 当前场 |
 | `pro <序号> file <路径\|clear>` | 关联 / 清空“`open` + Enter 顺便打开”的文件 |
 | `pro <序号> open` / `open pro <序号>` | 直接打开关联文件 |
 | `pro <序号> stage <running\|bottleneck>` | 直接设置阶段 |
@@ -424,6 +468,7 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `project <序号> refresh` / `remove` | 刷新该 pro 关联的 op / 删除 pro（op 仍用 `op ... remove`） |
 | `project refresh` / `project check` | 所有 op 刷一遍 / 每日对账 |
 | `plan` / `plan +1` / `plan -c` | 开始一次分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天；`-c` 把今天正在进行的空 session 也纳入 |
+| `plan -s <session> -p <project>` | sessional plan：把指定项目按自身 sequential/parallel 规则排进指定 session |
 | `task <序号> <count>` / `op <序号> <count>` / `clear` / `complete` / `q` | plan 里的那几句（`op` 与 `task` 同义，只是强调操作对象是 op） |
 
 ### `project <序号> interrupt --hard`

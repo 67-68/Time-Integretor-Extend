@@ -1853,6 +1853,112 @@ if _rel_path:
     check("op 文件字段已记上模板路径",
           wd_rel.projects.by_id(_inc_op["id"]).get("file"), _rel_path)
 
+
+print("== 9) OmniFocus 项目排序规则：sequential / parallel ==")
+_seq_rows = [
+    {"id": "p-seq", "name": "顺序项目", "kind": "project_root",
+     "task_type": "sequential", "completed": False, "dropped": False},
+    {"id": "seq-a", "name": "50 分钟任务", "kind": "action",
+     "project": "顺序项目", "estimated_minutes": 50,
+     "completed": False, "dropped": False},
+    {"id": "seq-b", "name": "25 分钟任务", "kind": "action",
+     "project": "顺序项目", "estimated_minutes": 25,
+     "completed": False, "dropped": False},
+]
+_seq_payload = pj.project_payload(_seq_rows[0], _seq_rows)
+check("payload 保留 OmniFocus task_type=sequential",
+      _seq_payload.get("task_type"), pj.TASK_TYPE_SEQUENTIAL)
+check("缺字段的旧 payload 默认 parallel",
+      pj.task_type_of({}), pj.TASK_TYPE_PARALLEL)
+_seq_project = dict(_seq_payload, id=99)
+_seq_items, _ = pp.distribute(
+    [{"project_id": 99, "project": _seq_project, "count": 4}], [_seq_project], {})
+_seq_slots = [pp.slot_record(1, ISO, "10:00", 25, "s1"),
+              pp.slot_record(2, ISO, "10:30", 25, "s2"),
+              pp.slot_record(3, ISO, "11:00", 50, "s3")]
+_seq_places, _seq_uns, _seq_notes = pp.schedule(_seq_items, _seq_slots)
+check("sequential：50 分钟任务先填最早的 25+25，不跳去后面的 50",
+      [(p["slot"]["start"], p["item"]["title"], p["count"])
+       for p in _seq_places],
+      [("10:00", "50 分钟任务", 1), ("10:30", "50 分钟任务", 1),
+       ("11:00", "25 分钟任务", 1)])
+check("sequential 拆段有说明",
+      any("按项目顺序拆成 2 场" in n for n in _seq_notes), True)
+
+print("== 10) plan -s / --session + -p / --project：单场 sessional plan ==")
+wd_ss = fresh([dict(r) for r in rows_ok], repetitions=None)
+wd_ss.omnifocus.rows = [dict(r, task_type="sequential") if r["id"] == "p-lunwen"
+                        else dict(r) for r in rows_ok]
+wd_ss.handle("task import sop omnifocus:///project/p-lunwen")
+check("导入后 op 保留 sequential 排序规则",
+      wd_ss.projects.active()[0].get("task_type"), pj.TASK_TYPE_SEQUENTIAL)
+plan_day(wd_ss)
+_ss_before = wd_ss.planning
+_summary = wd_ss.handle("plan -s 1 -p 1")
+check("sessional plan 不打开交互分配面板", wd_ss.planning, None)
+check("sessional plan 命令受理", _summary, True)
+_ss_project = wd_ss.projects.active()[0]
+_ss_plan = pj.plan_of(_ss_project, wd_ss.sel_date)
+check("sessional plan 记录本场 3 count 分配", int(_ss_plan["count"]), 3)
+check("sessional plan 记录 items", len(_ss_plan["items"]), 1)
+_ss_task = wd_ss.task_store.get(_ss_plan["items"][0]["task_id"])
+check("sessional plan 排进指定 session #1",
+      _ss_task.get("session", {}).get("start"), "11:00")
+check("sessional plan 沿用项目的 sequential 排序",
+      _ss_plan["items"][0]["start"], "11:00")
+
+print("== 11) project <序号> -a/-ac：直接拿第一条项目任务挂场 ==")
+wd_pa = fresh([dict(r) for r in rows_ok], repetitions=None)
+wd_pa.omnifocus.rows = [dict(r) for r in rows_ok]
+wd_pa.handle("task import sop omnifocus:///project/p-lunwen")
+plan_day(wd_pa)
+_pa_row = wd_pa.rows[0]
+_pa_ok = wd_pa.handle("project 1 -a 1")
+_pa_task = next((t for t in wd_pa.task_store.list()
+                 if (t.get("fields") or {}).get("project_task") == "t-intro"
+                 and t.get("session")), None)
+check("project -a 命令受理", _pa_ok, True)
+check("project -a 建出/复用了写引言",
+      (_pa_task or {}).get("fields", {}).get("project_task"), "t-intro")
+check("project -a 挂到指定 session",
+      (_pa_task or {}).get("session", {}).get("start"), _pa_row.get("startLabel"))
+check("project -a 保留原任务 count",
+      (_pa_task or {}).get("fields", {}).get("count"), 3)
+
+wd_pac = fresh([dict(r) for r in rows_ok], repetitions=None)
+wd_pac.omnifocus.rows = [dict(r) for r in rows_ok]
+wd_pac.handle("task import sop omnifocus:///project/p-lunwen")
+plan_day(wd_pac)
+_pac_ok = wd_pac.handle("project 1 -ac")
+_pac_row = wd_pac.rows[0]
+_pac_task = next((t for t in wd_pac.task_store.list()
+                  if (t.get("fields") or {}).get("project_task") == "t-intro"
+                  and t.get("session")), None)
+check("project -ac 命令受理", _pac_ok, True)
+check("project -ac 挂到当前/最近一场",
+      (_pac_task or {}).get("session", {}).get("start"), _pac_row.get("startLabel"))
+
+print("== 12) 契约 task 行最前面的 session 计数（0/2、1/2） ==")
+wd_sc = fresh()
+_sc_day = TODAY.isoformat()
+_sc1 = wd_sc.task_store.create(
+    {"title": "跨两场", "count": 1, "project_id": 999, "project_task": "pk-multi"},
+    source={"kind": "project", "id": "pk-multi", "title": "跨两场"})
+wd_sc.task_store.assign(_sc1["id"], {"date": _sc_day, "start": "10:00",
+                                     "end": "10:25", "duration": 25})
+_sc2 = wd_sc.task_store.create(
+    {"title": "跨两场", "count": 1, "project_id": 999, "project_task": "pk-multi"},
+    source={"kind": "project", "id": "pk-multi", "title": "跨两场"})
+wd_sc.task_store.assign(_sc2["id"], {"date": _sc_day, "start": "10:30",
+                                     "end": "10:55", "duration": 25})
+_t1 = wd_sc.task_store.get(_sc1["id"])
+_t2 = wd_sc.task_store.get(_sc2["id"])
+check("第一场 task 行前缀 0/2",
+      wd_sc.task_cell_text([_t1], 25).startswith("0/2 "), True)
+check("第二场 task 行前缀 1/2",
+      wd_sc.task_cell_text([_t2], 25).startswith("1/2 "), True)
+
+
 print()
 if fails:
     print("FAILED %d" % len(fails))

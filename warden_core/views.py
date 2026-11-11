@@ -293,25 +293,32 @@ class ContractView(View):
                  "一次分配：按每个项目的阶段取其当前 SOP/incubator op，再排任务",
                  ("排期", "分配"),
                  usage="plan [+1|今天|明天|YYYY-MM-DD] → "
-                       "task <序号> <count> | task <序号> clear | complete",
-                 options=("+1", "+2", "today", "明天", "complete", "task 1 4"),
+                       "task <序号> <count> | task <序号> clear | complete；"
+                       "或 plan -s <session> -p <project> 单场直排",
+                 options=("+1", "+2", "today", "明天", "complete", "task 1 4",
+                          "-s 1 -p 1"),
                  hint=_hint_actions("+1", "明天", "complete", "task 1 4", "task 1 clear",
+                                    "-s 1 -p 1",
                                     note="不带参数 = 今天；plan +1 = 明天；"
+                                         "plan -s <session> -p <project> = 把这个项目的"
+                                         "内容按该项目 sequential/parallel 规则排进这一场；"
                                          "每个项目只出现当前阶段对应的 op；超预算整条命令不执行")),
             _cmd("project", w.cmd_project,
                  "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -m complete|discard | "
                  "pro 1 -a | pro 1 interrupt | pro create",
                  ("pro", "pr", "项目"),
-                 usage="pro [<序号> [-a|--advance [op <N>|task import] | "
+                 usage="pro [<序号> [-a <session>|-ac|--advance [op <N>|task import] | "
                        "-m complete|discard | interrupt [--hard] | file <路径> | open | "
                        "refresh | remove] | create <名称>]",
-                 options=("--advance", "-a", "-m", "--mark", "complete", "discard",
+                 options=("--advance", "-a", "-ac", "-m", "--mark", "complete", "discard",
                           "active", "interrupt", "--hard", "create", "file", "open",
                           "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
-                                    "1 -a", "1 interrupt --hard", "create",
+                 hint=_hint_actions("1", "1 -a 3", "1 -ac", "1 -m complete",
+                                    "1 -m discard", "1 -m active",
+                                    "1 interrupt --hard", "create",
                                     note="pro = 真正项目（running/bottleneck）；"
-                                         "-m complete|discard 只动本地状态，"
+                                         "-a <session> / -ac = 直接把该项目第一条任务挂到"
+                                         "指定场 / 当前场；-m complete|discard 只动本地状态，"
                                          "默认 disposable filter 会隐藏")),
             _cmd("op", w.cmd_op,
                  "管理 OmniFocus Project (op)：op | op 1 -m complete|discard | "
@@ -832,25 +839,32 @@ class DataView(View):
                  "一次分配：按每个项目的阶段取其当前 SOP/incubator op，再排任务",
                  ("排期", "分配"),
                  usage="plan [+1|今天|明天|YYYY-MM-DD] → "
-                       "task <序号> <count> | task <序号> clear | complete",
-                 options=("+1", "+2", "today", "明天", "complete", "task 1 4"),
+                       "task <序号> <count> | task <序号> clear | complete；"
+                       "或 plan -s <session> -p <project> 单场直排",
+                 options=("+1", "+2", "today", "明天", "complete", "task 1 4",
+                          "-s 1 -p 1"),
                  hint=_hint_actions("+1", "明天", "complete", "task 1 4", "task 1 clear",
+                                    "-s 1 -p 1",
                                     note="不带参数 = 今天；plan +1 = 明天；"
+                                         "plan -s <session> -p <project> = 把这个项目的"
+                                         "内容按该项目 sequential/parallel 规则排进这一场；"
                                          "每个项目只出现当前阶段对应的 op；超预算整条命令不执行")),
             _cmd("project", w.cmd_project,
                  "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -m complete|discard | "
                  "pro 1 -a | pro 1 interrupt | pro create",
                  ("pro", "pr", "项目"),
-                 usage="pro [<序号> [-a|--advance [op <N>|task import] | "
+                 usage="pro [<序号> [-a <session>|-ac|--advance [op <N>|task import] | "
                        "-m complete|discard | interrupt [--hard] | file <路径> | open | "
                        "refresh | remove] | create <名称>]",
-                 options=("--advance", "-a", "-m", "--mark", "complete", "discard",
+                 options=("--advance", "-a", "-ac", "-m", "--mark", "complete", "discard",
                           "active", "interrupt", "--hard", "create", "file", "open",
                           "refresh", "remove", "check"),
-                 hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
-                                    "1 -a", "1 interrupt --hard", "create",
+                 hint=_hint_actions("1", "1 -a 3", "1 -ac", "1 -m complete",
+                                    "1 -m discard", "1 -m active",
+                                    "1 interrupt --hard", "create",
                                     note="pro = 真正项目（running/bottleneck）；"
-                                         "-m complete|discard 只动本地状态，"
+                                         "-a <session> / -ac = 直接把该项目第一条任务挂到"
+                                         "指定场 / 当前场；-m complete|discard 只动本地状态，"
                                          "默认 disposable filter 会隐藏")),
             _cmd("op", w.cmd_op,
                  "管理 OmniFocus Project (op)：op | op 1 -m complete|discard | "
