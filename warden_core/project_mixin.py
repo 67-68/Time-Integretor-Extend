@@ -1816,7 +1816,81 @@ class ProjectMixin(object):
         return Panel(body, title="[bold cyan]📁 项目对账[/]",
                      border_style="cyan", box=box.HEAVY)
 
-    def _plan_slots(self, day, include_current=False):
+    def _plan_owned_task_ids(self, day, rescindable_only=False):
+        """当天 project plan 记下的本地 task id。
+
+        ``rescindable_only=True`` 只收还没结束的任务：已经完成/放弃的旧计划
+        属于历史，不能因为重新 plan 就被当成空场复用。
+        """
+        out = set()
+        try:
+            projects = self.projects.list()
+        except Exception:                          # noqa: BLE001 - 坏库不挡正常 plan
+            return out
+        for project in projects or ():
+            plan = pj.plan_of(project, day) or {}
+            for item in plan.get("items") or ():
+                try:
+                    task_id = int(item.get("task_id"))
+                except (TypeError, ValueError):
+                    continue
+                if rescindable_only:
+                    try:
+                        task = self.task_store.get(task_id)
+                    except (ValueError, TypeError):
+                        continue
+                    if not ts.TaskStore.is_open(task):
+                        continue
+                out.add(task_id)
+        return out
+
+    def _reset_day_plans(self, day):
+        """重新 plan 前撤掉当天旧的 project plan / task 绑定。
+
+        普通 ``plan`` 是「这一天整体重排」：旧的 plan items 和它们挂着的
+        session 必须先下掉，否则第二次 plan 只看得见剩下的空场，旧内容会和
+        新排法并存。``plan -s`` / ``project -a`` 明确是追加，不走这里。
+
+        只动**仍然 open** 的旧计划任务；已经完成/放弃的任务保留历史绑定。
+        """
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        cleared_plans = cleared_items = detached = 0
+        try:
+            projects = self.projects.list()
+        except Exception:                          # noqa: BLE001
+            return {"plans": 0, "items": 0, "detached": 0}
+        for project in projects or ():
+            plan = pj.plan_of(project, day)
+            if not plan:
+                continue
+            items = list(plan.get("items") or ())
+            for item in items:
+                try:
+                    task = self.task_store.get(item.get("task_id"))
+                except (ValueError, TypeError):
+                    continue
+                if task.get("formatter") or not ts.TaskStore.is_open(task):
+                    continue
+                sess = task.get("session") or {}
+                if (str(sess.get("date") or "") != iso
+                        or str(sess.get("start") or "")
+                        != str(item.get("start") or "")):
+                    continue
+                try:
+                    self.task_store.unassign(task["id"], reason="plan-replaced")
+                    detached += 1
+                except ValueError:
+                    pass
+            self.projects.set_allocation(project.get("id"), day, 0)
+            cleared_plans += 1
+            cleared_items += len(items)
+        if cleared_plans:
+            self.say("♻️ 重排 %s：先撤掉旧 plan 的 %d 条任务，再从当前空场重新排"
+                     % (iso, cleared_items), "info")
+        return {"plans": cleared_plans, "items": cleared_items,
+                "detached": detached}
+
+    def _plan_slots(self, day, include_current=False, replan=None):
         """这一天的**可用空场** → ``(slots, notes)``。
 
         只排除三类：已经过去的（今天就按「现在」筛）、已经挂任务的、
@@ -1826,8 +1900,16 @@ class ProjectMixin(object):
         ``include_current=True`` 时，今天**已经开始但还没结束、且没挂任务**的那一场
         也纳入范围。此时只算剩下的完整 25 分钟块：例如 10:00–10:50 的场次在
         10:20 敲 ``plan -c``，容量是 1 count（25 分钟），不会按完整的 50 分钟骗人。
+
+        ``replan=True`` 给普通 ``plan`` 用：上一轮 plan 还没完成的本地任务不算
+        「占用」，因为这些旧计划会在 complete 时整体撤掉重排；用户自己的任务、
+        formatter 任务仍照常排除。
         """
+        if replan is None:
+            replan = bool(getattr(self, "_plan_replanning", False))
         slots, notes = [], []
+        plan_owned = (self._plan_owned_task_ids(day, rescindable_only=True)
+                      if replan else set())
         now = self._now_dt()
         is_today = (day == now.date())
         unbooked, busy, past, reserved = [], 0, 0, 0
@@ -1861,8 +1943,12 @@ class ProjectMixin(object):
             # **此刻正在进行**的真实 session（计划外但已经开打，且没挂任务）。
             if not is_planned and not live:
                 continue
-            if self.task_store.tasks_for_session(start_dt.date().isoformat(),
-                                                 row.get("startLabel")):
+            session_tasks = self.task_store.tasks_for_session(
+                start_dt.date().isoformat(), row.get("startLabel"))
+            if replan and session_tasks:
+                session_tasks = [task for task in session_tasks
+                                 if int(task.get("id") or 0) not in plan_owned]
+            if session_tasks:
                 busy += 1
                 if live:
                     live_busy.append(row.get("startLabel") or "?")
@@ -2015,8 +2101,13 @@ class ProjectMixin(object):
             self.rebuild_rows()
         except Exception:                          # noqa: BLE001 - 快照模式也能 plan
             pass
-        slots, notes = (self._plan_slots(day, include_current=True)
-                        if include_current else self._plan_slots(day))
+        old_replanning = getattr(self, "_plan_replanning", False)
+        self._plan_replanning = True
+        try:
+            slots, notes = (self._plan_slots(day, include_current=True)
+                            if include_current else self._plan_slots(day))
+        finally:
+            self._plan_replanning = old_replanning
         for note in notes:
             self.say("· %s" % note, "info")
         if not slots:
@@ -2362,6 +2453,11 @@ class ProjectMixin(object):
         二分图匹配求「一对一站位」，配不上才拆、才往同一场里叠。
         """
         day = allocator.day
+        # 普通 plan 是整天重排：先撤旧计划，避免旧任务占着场次、和新算法
+        # 排出来的内容并存在同一天。sessional plan / project -a 是追加语义，
+        # 保留当天已有计划。
+        if not append_to_plan:
+            self._reset_day_plans(day)
         invested = pj.invested_by_project(self.task_store)
         # formatter 任务 / 尚未到 defer 点的本地任务都不该被项目 plan 再算一遍。
         # 前者已经有自己的时间占位，后者现在根本还没进入可安排队列。
@@ -2488,6 +2584,9 @@ class ProjectMixin(object):
             parent = place.get("parent") or {}
             if parent:
                 tail += "，父任务「%s」" % (parent.get("title") or parent.get("pk"))
+            priority = pj.priority_label(item.get("priority"))
+            if priority:
+                tail += "，%s" % priority
             self.say("   %s(%d) ← %s / %s（%d count%s%s%s）"
                      % (place["slot"].get("start"), int(place["slot"].get("duration") or 0),
                         item["project"].get("title") or "?",

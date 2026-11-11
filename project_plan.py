@@ -30,7 +30,9 @@
   （:func:`match_tasks_to_slots`，Kuhn 增广路）——**有不用拆的解就一定找到**，
   而且按「浪费最小」挑场次；
 - 配不上的任务（比所有场次都长，或者场次数量不够）才拆开填，并且**明说是拆的**；
-- 顺序上按项目预览表格的顺序、项目内按 OmniFocus 清单顺序 —— 稳定、可预期。
+- parallel 的匹配从最早的 session 开始，任务按「priority tag 分组 → OmniFocus
+  清单顺序」扫描；sequential 项目则严格按项目清单顺序从最早的场次往后填。
+  两条路径都稳定、可预期。
 
 这个模块不联网、不依赖 rich；warden / 测试只调这里。
 """
@@ -131,6 +133,7 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
             minutes = int(item.get("minutes") or 0)
             if not minutes and int(item.get("remaining") or 0):
                 minutes = int(item.get("remaining") or 0) * MINUTES_PER_COUNT
+            priority = pj.task_priority_of(item)
             rec = {"project_id": pid,
                    "project": project,
                    "pk": item["pk"],
@@ -138,6 +141,8 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
                    "count": int(item.get("count") or 0),
                    "total": int(item.get("count") or 0),
                    "remaining": int(item.get("remaining") or 0)}
+            if priority is not None:
+                rec["priority"] = priority
             if item.get("children"):
                 # 父任务壳：真正的 session 内容是子任务。这里把整套剩余子任务
                 # 交给 schedule：能整条放就整条放，整条超过单场容量时才按
@@ -145,10 +150,19 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
                 take = min(int(item.get("remaining") or 0), need)
                 if take <= 0:
                     continue
+                children = []
+                for child in item.get("children") or []:
+                    child = dict(child)
+                    child_priority = pj.task_priority_of(child)
+                    if child_priority is None and priority is not None:
+                        child_priority = priority
+                    if child_priority is not None:
+                        child["priority"] = child_priority
+                    children.append(child)
                 rec.update({
                     "count": take,
                     "shell": True,
-                    "children": [dict(child) for child in item.get("children") or []],
+                    "children": children,
                     "duration": int(item.get("duration") or 0),
                     "budget_minutes": min(budget, take * MINUTES_PER_COUNT),
                 })
@@ -206,38 +220,83 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
 # ---------------------------------------------------------------- 排任务
 
 
-def _match(items, slots):
-    """Kuhn 增广路：任务 → 场次的一对一匹配（场次容量 >= 任务要的 count）。
+def _parallel_order_key(item, index):
+    """parallel 的候选顺序：先优先级分组，再保持 OmniFocus 清单顺序。
 
-    返回 ``{item_index: slot_index}``。没有完美匹配时返回能配上的那些 —— 配不上的
-    由调用方拆开填。候选场次按「容量小的优先」试，浪费就小。
+    ``P1`` 比 ``P2`` 先，显式 priority tag 比无 tag 先；同一组内完全沿用
+    ``distribute()`` 给出的顺序。sequential 项目不走这个排序。
+    """
+    priority = pj.task_priority_of(item)
+    return (0, priority, index) if priority is not None else (1, 0, index)
+
+
+def _slot_order_key(slot):
+    return (str((slot or {}).get("date") or ""),
+            str((slot or {}).get("start") or ""),
+            int((slot or {}).get("index") or 0))
+
+
+def _max_matching_count(items, slot_indices, caps):
+    """只数最多能配几对（容量 >= count），用于 session-first 的前瞻校验。"""
+    needs = [max(0, int((items[i] or {}).get("count") or 0))
+             for i in range(len(items))]
+    owner = {}
+
+    def try_assign(pos, seen):
+        if needs[pos] <= 0:
+            return False
+        for j in slot_indices:
+            if j in seen or caps[j] < needs[pos]:
+                continue
+            seen.add(j)
+            if j not in owner or try_assign(owner[j], seen):
+                owner[j] = pos
+                return True
+        return False
+
+    for pos in range(len(items)):
+        try_assign(pos, set())
+    return len(owner)
+
+
+def _match(items, slots):
+    """parallel 的整条任务匹配：session 从早到晚，任务按优先级+清单顺序找。
+
+    和旧版一样只做「一场一个任务、场次容量 >= 任务 count」的一对一匹配，
+    且用最大匹配保证“能不拆就一定不拆”；区别是**扫描顺序**：
+
+    1. session 按时间从早到晚；
+    2. 对每一场，从优先级最高的任务组开始、组内从清单第一条到最后一条，
+       选第一条能整条放下、且不会减少整体最大匹配数的任务。
+
+    因此靠前的 session 会优先拿到合适的任务，靠前/高优先级的任务也会优先
+    拿到靠前的 session；不会出现旧版“按任务大小先占场”导致的顺序倒挂。
     """
     caps = [max(0, int(s.get("counts") or 0) - int(s.get("used") or 0))
             for s in slots]
     order = sorted(range(len(items)),
-                   key=lambda i: (-int(items[i].get("count") or 0), i))
-    candidates = {}
-    for i in order:
-        need = int(items[i].get("count") or 0)
-        candidates[i] = sorted([j for j, cap in enumerate(caps) if cap >= need],
-                               key=lambda j: (caps[j], j))
-    owner = {}          # slot_index → item_index
-
-    def try_assign(i, seen):
-        for j in candidates.get(i) or []:
-            if j in seen:
+                   key=lambda i: _parallel_order_key(items[i], i))
+    slot_order = sorted(range(len(slots)), key=lambda j: _slot_order_key(slots[j]))
+    assigned = {}
+    for pos, slot_index in enumerate(slot_order):
+        remaining_slots = slot_order[pos + 1:]
+        remaining_indices = [i for i in order if i not in assigned]
+        if not remaining_indices:
+            break
+        remaining_objs = [items[i] for i in remaining_indices]
+        best = _max_matching_count(remaining_objs,
+                                   [slot_index] + remaining_slots, caps)
+        for offset, i in enumerate(remaining_indices):
+            need = int(items[i].get("count") or 0)
+            if need <= 0 or caps[slot_index] < need:
                 continue
-            seen.add(j)
-            if j not in owner or try_assign(owner[j], seen):
-                owner[j] = i
-                return True
-        return False
-
-    for i in order:
-        if int(items[i].get("count") or 0) <= 0:
-            continue
-        try_assign(i, set())
-    return {i: j for j, i in owner.items()}
+            rest = [obj for pos2, obj in enumerate(remaining_objs)
+                    if pos2 != offset]
+            after = _max_matching_count(rest, remaining_slots, caps)
+            if after + 1 == best:
+                assigned[i] = slot_index
+                break
+    return assigned
 
 
 def _pick_child_subset(children, capacity_minutes):
@@ -319,6 +378,10 @@ def _schedule_children(items, slots, placements, unscheduled, notes):
     for item in group_items:
         children = [dict(child) for child in item.get("children") or []
                     if int(child.get("duration") or 0) > 0]
+        # parallel 子任务也先按 priority tag 分组，组内保持 OmniFocus 顺序。
+        children = [child for _idx, child in sorted(
+            enumerate(children),
+            key=lambda pair: _parallel_order_key(pair[1], pair[0]))]
         budget = int(item.get("budget_minutes") or 0)
         if budget <= 0:
             budget = sum(int(child.get("duration") or 0) for child in children)
@@ -403,9 +466,11 @@ def _schedule_children(items, slots, placements, unscheduled, notes):
             if not candidates:
                 pending.append(child)
                 continue
-            slot = min(candidates, key=lambda s_: (free_minutes(s_) - target,
-                                                   free_minutes(s_),
-                                                   str(s_.get("start") or "")))
+            # 靠前的 session 先拿任务；同等条件下仍选余量最合适的场次。
+            slot = min(candidates, key=lambda s_: (
+                _slot_order_key(s_),
+                free_minutes(s_) - target,
+                free_minutes(s_)))
             add_part(child, slot, target)
 
         # 第二轮：整条放不下的，只有在所有剩余场次加起来足够时才拆。
@@ -649,17 +714,12 @@ def _schedule_small_items(items, slots, placements, unscheduled, notes):
             free_minutes = int(slot.get("duration") or 0) - int(slot.get("used_minutes") or 0)
             if free_minutes < minutes:
                 continue
-            # 优先装进「已经有短任务、且装完浪费最小」的场；其次用空场里容量
-            # 最小的（把大场留给后面 25 分钟整块的任务）。
-            used_minutes = int(slot.get("used_minutes") or 0)
-            candidates.append((0 if used_minutes > 0 else 1,
-                               free_minutes - minutes,
-                               int(slot.get("duration") or 0), slot))
+            candidates.append(slot)
         if not candidates:
             unscheduled.append(dict(item))
             continue
-        candidates.sort(key=lambda row: row[:3])
-        _already, _waste, _size, slot = candidates[0]
+        # parallel 的短任务也按 session 时间顺序找第一场装得下的。
+        slot = min(candidates, key=_slot_order_key)
         stacked = int(slot.get("used_minutes") or 0) > 0
         slot["used_minutes"] = int(slot.get("used_minutes") or 0) + minutes
         # 短任务按分钟占位；把 count 格子也同步了，让后面的匹配/余量逻辑
@@ -703,7 +763,8 @@ def schedule(items, slots):
     - ``stacked``：这场里除了它还塞了别的任务（空场不够时才这么干）。
 
     顺序就是两条原则的优先级：**先求一对一**（每场一个任务、每条任务一整场），
-    配不上才拆、才叠。
+    配不上才拆、才叠。parallel 的整条匹配按 session 时间从早到晚、任务按
+    priority tag 分组后从清单头到尾扫描；sequential 项目保持项目顺序。
     """
     slots = [dict(s, used=0, used_minutes=0) for s in slots or []]
     items = [dict(i) for i in items or []]
@@ -715,6 +776,12 @@ def schedule(items, slots):
     sequential = [item for item in items if _is_sequential_item(item)]
     parallel = [item for item in items if not _is_sequential_item(item)]
     _schedule_sequential(sequential, slots, placements, unscheduled, notes)
+
+    # Parallel 的任务选择顺序：先按 priority tag 分组，组内保持清单顺序。
+    original_parallel = [item for item in items if not _is_sequential_item(item)]
+    parallel = [item for _idx, item in sorted(
+        enumerate(original_parallel),
+        key=lambda pair: _parallel_order_key(pair[1], pair[0]))]
 
     # Parallel：先排父任务壳（子任务能整条放就整条放；单场装不下才拆段，
     # 同一套尽量放同一场），再排短任务（按分钟叠），最后把剩余容量交给普通任务。
@@ -1011,8 +1078,10 @@ class Allocator(object):
                     stat["remaining"], stat["progress_text"],
                     self.allocation_of(project["id"])), "info")
         for item in items[:8]:
-            self.say("   · %s（%d count，还剩 %d）"
-                     % (item.get("title"), int(item.get("count") or 0),
+            pri = pj.priority_label(pj.task_priority_of(item))
+            self.say("   · %s%s（%d count，还剩 %d）"
+                     % (("[%s] " % pri) if pri else "",
+                        item.get("title"), int(item.get("count") or 0),
                         int(item.get("remaining") or 0)), "info")
         if len(items) > 8:
             self.say("   …还有 %d 条" % (len(items) - 8), "info")

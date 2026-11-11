@@ -1959,6 +1959,108 @@ check("第二场 task 行前缀 1/2",
       wd_sc.task_cell_text([_t2], 25).startswith("1/2 "), True)
 
 
+print("== 13) OmniFocus priority tag：P1/P2 分组，组内按清单顺序 ==")
+check("P1 tag 解析", pj.normalize_priority("P1"), 1)
+check("priority/2 也认", pj.normalize_priority("priority/2"), 2)
+check("优先级/高 也认", pj.normalize_priority("优先级/高"), 1)
+check("普通 project tag 不当优先级",
+      pj.normalize_priority("project/论文"), None)
+_pri_rows = [
+    {"id": "p-pri", "name": "优先级项目", "kind": "project_root",
+     "completed": False, "dropped": False},
+    {"id": "pri-a", "name": "普通任务", "kind": "action",
+     "project": "优先级项目", "estimated_minutes": 25,
+     "tags": ["project/优先级项目"], "completed": False, "dropped": False},
+    {"id": "pri-b", "name": "P2 任务", "kind": "action",
+     "project": "优先级项目", "estimated_minutes": 25,
+     "tags": ["P2"], "completed": False, "dropped": False},
+    {"id": "pri-c", "name": "P1 任务", "kind": "action",
+     "project": "优先级项目", "estimated_minutes": 25,
+     "tags": ["P1"], "completed": False, "dropped": False},
+]
+_pri_payload = pj.project_payload(_pri_rows[0], _pri_rows)
+_pri_project = dict(_pri_payload, id=77)
+_pri_items, _ = pp.distribute(
+    [{"project_id": 77, "project": _pri_project, "count": 3}],
+    [_pri_project], {})
+check("每个 plan item 带优先级",
+      [(i["title"], i.get("priority")) for i in _pri_items],
+      [("普通任务", None), ("P2 任务", 2), ("P1 任务", 1)])
+_pri_slots = [pp.slot_record(1, ISO, "10:00", 25, "p1s"),
+              pp.slot_record(2, ISO, "10:30", 25, "p2s"),
+              pp.slot_record(3, ISO, "11:00", 25, "p3s")]
+_pri_places, _pri_uns, _pri_notes = pp.schedule(_pri_items, _pri_slots)
+check("parallel 先排 P1，再 P2，最后无优先级；同级内保序",
+      [(p["slot"]["start"], p["item"]["title"]) for p in _pri_places],
+      [("10:00", "P1 任务"), ("10:30", "P2 任务"), ("11:00", "普通任务")])
+
+print("== 14) parallel 改为 session-first：靠前场次先挑，且仍不做无谓拆分 ==")
+_seq2_rows = [
+    {"id": "p-sf", "name": "session-first", "kind": "project_root",
+     "completed": False, "dropped": False},
+    {"id": "sf-a", "name": "先列出的 25 分钟", "kind": "action",
+     "project": "session-first", "estimated_minutes": 25,
+     "completed": False, "dropped": False},
+    {"id": "sf-b", "name": "后列出的 50 分钟", "kind": "action",
+     "project": "session-first", "estimated_minutes": 50,
+     "completed": False, "dropped": False},
+]
+_sf_payload = pj.project_payload(_seq2_rows[0], _seq2_rows)
+_sf_project = dict(_sf_payload, id=88)
+_sf_items, _ = pp.distribute(
+    [{"project_id": 88, "project": _sf_project, "count": 3}],
+    [_sf_project], {})
+_sf_slots = [pp.slot_record(1, ISO, "10:00", 50, "sf50"),
+             pp.slot_record(2, ISO, "11:00", 25, "sf25")]
+_sf_places, _sf_uns, _sf_notes = pp.schedule(_sf_items, _sf_slots)
+check("先列任务不抢走大场导致后面的任务被无谓拆开",
+      [(p["slot"]["start"], p["item"]["title"], p["split"]) for p in _sf_places],
+      [("10:00", "后列出的 50 分钟", False),
+       ("11:00", "先列出的 25 分钟", False)])
+check("parallel session-first 没有漏排", _sf_uns, [])
+# 两个同容量场：靠前的任务一定先拿靠前的 session。
+_sf_slots2 = [pp.slot_record(1, ISO, "12:00", 25, "sf-a"),
+              pp.slot_record(2, ISO, "12:30", 25, "sf-b")]
+_sf_items2 = [dict(item) for item in _sf_items]
+_sf_places2, _sf_uns2, _ = pp.schedule(_sf_items2, _sf_slots2)
+check("同优先级靠前任务先拿靠前 session",
+      [(p["slot"]["start"], p["item"]["title"]) for p in _sf_places2],
+      [("12:00", "先列出的 25 分钟"), ("12:30", "后列出的 50 分钟")])
+
+print("== 15) 再次 plan 同一天：旧计划先撤掉，不和新计划并存 ==")
+wd_re = fresh([dict(r) for r in rows_ok], repetitions=None)
+wd_re.omnifocus.rows = [dict(r) for r in rows_ok]
+wd_re.handle("task import sop omnifocus:///project/p-lunwen")
+plan_day(wd_re)
+_messages_before = len(texts(wd_re))
+wd_re.handle("plan +1")
+check("第一次 plan 打开", wd_re.planning is not None, True)
+_cap1 = wd_re.planning.cap()["counts"]
+wd_re.planning.handle("task 1 2")
+wd_re.handle("complete")
+_plan1 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
+check("第一次 plan 记 2 count", int(_plan1["count"]), 2)
+_first_items = list(_plan1["items"])
+# 第二次 plan 应该仍能看见旧计划占掉的 session（重排而不是只捡剩下的空场）。
+wd_re.handle("plan +1")
+check("第二次 plan 打开", wd_re.planning is not None, True)
+check("旧计划占用的场次重新进入可选容量",
+      wd_re.planning.cap()["counts"], _cap1)
+wd_re.planning.handle("task 1 3")
+wd_re.messages.clear()
+wd_re.handle("complete")
+_plan2 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
+check("第二次 plan 覆盖而不是相加", int(_plan2["count"]), 3)
+check("第二次计划项记录的是新的 3 count 分配",
+      [int(i["count"]) for i in _plan2["items"]], [3])
+check_true("重排时明确说先撤旧 plan",
+           any("先撤掉旧 plan" in t for t in texts(wd_re)))
+_session_tasks = [t for t in wd_re.task_store.list()
+                  if (t.get("session") or {}).get("date") == wd_re.sel_date.isoformat()
+                  and (t.get("fields") or {}).get("project_id") == wd_re.projects.active()[0]["id"]]
+check("同一天只剩第二轮排出来的 session 任务",
+      len(_session_tasks), len(_plan2["items"]))
+
 print()
 if fails:
     print("FAILED %d" % len(fails))

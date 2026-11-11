@@ -73,6 +73,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import shutil
 import tempfile
 
@@ -123,6 +124,77 @@ def task_type_of(project):
     """项目实际使用的调度算法；缺字段按 parallel 兼容旧数据。"""
     return (normalize_task_type((project or {}).get("task_type"))
             or TASK_TYPE_PARALLEL)
+
+
+#: OmniFocus 没有独立的 priority 字段，优先级用 tag 表达。这里认这些写法：
+#: ``P1`` / ``p2``、``priority/1`` / ``priority:2``、``优先级/1``、
+#: ``高优先级`` / ``medium`` / ``low``。数字越小优先级越高；没有 priority tag
+#: 的任务排在所有显式优先级之后，同一优先级内仍按 OmniFocus 清单顺序。
+_PRIORITY_NUM_RE = re.compile(
+    r"^(?:p|prio(?:rity)?|优先级|优先)[\s_./:#-]*(\d+)$", re.I)
+_PRIORITY_BARE_NUM_RE = re.compile(r"^(\d+)(?:级|优先级)?$", re.I)
+_PRIORITY_WORD_RE = re.compile(
+    r"^(?:prio(?:rity)?|优先级|优先)?[\s_./:#-]*(high|medium|low|urgent|"
+    r"最高|高|中|普通|低)(?:优先级)?$", re.I)
+_PRIORITY_WORDS = {
+    "urgent": 0, "最高": 0,
+    "high": 1, "高": 1,
+    "medium": 2, "中": 2, "普通": 2,
+    "low": 3, "低": 3,
+}
+
+
+def normalize_priority(value):
+    """把 tag / 数字 / ``P2`` 规范成整数；认不出返回 ``None``。"""
+    if value is None or isinstance(value, bool):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return max(0, int(raw))
+    m = _PRIORITY_BARE_NUM_RE.match(raw)
+    if m:
+        return max(0, int(m.group(1)))
+    for token in (raw, raw.rsplit("/", 1)[-1]):
+        m = _PRIORITY_NUM_RE.match(token)
+        if m:
+            return max(0, int(m.group(1)))
+        m = _PRIORITY_WORD_RE.match(token)
+        if m:
+            return _PRIORITY_WORDS.get(m.group(1).lower(),
+                                       _PRIORITY_WORDS.get(m.group(1)))
+    return None
+
+
+def priority_from_tags(tags):
+    """从 OmniFocus tags 里取最小的优先级数字；没有 priority tag 返回 ``None``。"""
+    found = []
+    for raw in tags or ():
+        got = normalize_priority(raw)
+        if got is not None:
+            found.append(got)
+    return min(found) if found else None
+
+
+def task_priority_of(item):
+    """一条项目任务 / plan item 的优先级（数字，越小越优先）。
+
+    优先读已经算好的 ``priority`` 字段；否则从 OmniFocus 原始 ``tags`` 重算。
+    没有 tag 的任务返回 ``None``，调度时统一排在显式优先级之后。
+    """
+    item = item or {}
+    if "priority" in item:
+        got = normalize_priority(item.get("priority"))
+        if got is not None:
+            return got
+    return priority_from_tags(item.get("tags") or ())
+
+
+def priority_label(value):
+    """界面显示用：``None`` → 空串，``1`` → ``P1``。"""
+    got = normalize_priority(value)
+    return "P%d" % got if got is not None else ""
 
 #: 真正项目 Project (pro) 的两个阶段：running 允许 SOP op，bottleneck 允许 incubator op。
 STAGE_RUNNING = "running"

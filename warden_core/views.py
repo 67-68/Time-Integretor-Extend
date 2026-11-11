@@ -302,6 +302,8 @@ class ContractView(View):
                                     note="不带参数 = 今天；plan +1 = 明天；"
                                          "plan -s <session> -p <project> = 把这个项目的"
                                          "内容按该项目 sequential/parallel 规则排进这一场；"
+                                         "parallel 用 OmniFocus tag P1/P2 分优先级并按 session "
+                                         "从早到晚排；普通 plan 重排会先撤掉当天旧计划；"
                                          "每个项目只出现当前阶段对应的 op；超预算整条命令不执行")),
             _cmd("project", w.cmd_project,
                  "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -m complete|discard | "
@@ -848,6 +850,8 @@ class DataView(View):
                                     note="不带参数 = 今天；plan +1 = 明天；"
                                          "plan -s <session> -p <project> = 把这个项目的"
                                          "内容按该项目 sequential/parallel 规则排进这一场；"
+                                         "parallel 用 OmniFocus tag P1/P2 分优先级并按 session "
+                                         "从早到晚排；普通 plan 重排会先撤掉当天旧计划；"
                                          "每个项目只出现当前阶段对应的 op；超预算整条命令不执行")),
             _cmd("project", w.cmd_project,
                  "管理真正项目 Project (pro)：pro | pro 1 | pro 1 -m complete|discard | "

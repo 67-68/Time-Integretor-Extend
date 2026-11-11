@@ -2622,6 +2622,239 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-11T14:58:23",
+      "task_id": 215,
+      "fields": {
+        "title": "数学易错 5",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "hbO13Wv2PLr",
+        "count_total": 1,
+        "notes": "父任务：sat review",
+        "duration": 20,
+        "count": 1,
+        "due": "2026-11-11T21:25:00",
+        "due_source": "session"
+      },
+      "session": null,
+      "notes": "父任务：sat review",
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-11T14:58:23",
+      "omnifocus": {
+        "id": "hbO13Wv2PLr",
+        "url": "omnifocus:///task/hbO13Wv2PLr",
+        "title": "数学易错 5",
+        "linked_at": "2026-11-11T14:56:56"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "数学易错 5",
+        "description": "父任务：sat review",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-11T15:50:16",
+      "task_id": 185,
+      "fields": {
+        "title": "难题 15",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "fDxMWbuPjZY",
+        "duration": 50,
+        "notes": "父任务：SAT_Tasks",
+        "count": 2,
+        "count_total": 3,
+        "due": "2026-11-11T15:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-11-11",
+        "start": "15:00",
+        "end": "15:50",
+        "duration": 50,
+        "focusmate_session_id": "d909af4c-9c16-4f9c-9c0e-b6386eaa6a3b",
+        "previous_due": "2026-11-11T16:50:00"
+      },
+      "notes": "父任务：SAT_Tasks",
+      "focusmate": {
+        "task_id": "c60b0717-6821-4da3-8b90-549e76d84f1a",
+        "title": "难题 15",
+        "description": "父任务：SAT_Tasks",
+        "completed_at": "2026-11-11T07:49:52.624898+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "d909af4c-9c16-4f9c-9c0e-b6386eaa6a3b"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-11T16:03:17",
+      "task_id": 184,
+      "fields": {
+        "title": "难题 14",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "i0o1iM8RI8W",
+        "duration": 50,
+        "notes": "父任务：SAT_Tasks",
+        "count": 2,
+        "count_total": 3,
+        "due": "2026-11-11T16:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-11",
+        "start": "16:00",
+        "end": "16:50",
+        "duration": 50,
+        "focusmate_session_id": "d418b5de-5e46-452c-8e7e-4204fc34c72e",
+        "previous_due": "2026-11-11T17:50:00"
+      },
+      "notes": "父任务：SAT_Tasks",
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-11T16:03:17",
+      "omnifocus": {
+        "id": "i0o1iM8RI8W",
+        "url": "omnifocus:///task/i0o1iM8RI8W",
+        "title": "难题 14",
+        "linked_at": "2026-11-10T17:49:28"
+      },
+      "focusmate": {
+        "task_id": "ca389a99-0f94-4fc5-810b-2c8d4ba95243",
+        "title": "难题 14",
+        "description": "父任务：SAT_Tasks",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-11T16:04:19",
+      "task_id": 214,
+      "fields": {
+        "title": "难题 14",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "i0o1iM8RI8W",
+        "count_total": 3,
+        "count": 1,
+        "duration": 25,
+        "due": "2026-11-11T17:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 7,
+        "date": "2026-11-11",
+        "start": "17:00",
+        "end": "17:50",
+        "duration": 50,
+        "focusmate_session_id": "993ba55d-8d79-46d5-9e5e-3cfa0c327496"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-11T16:04:19",
+      "omnifocus": {
+        "id": "i0o1iM8RI8W",
+        "url": "omnifocus:///task/i0o1iM8RI8W",
+        "title": "难题 14",
+        "linked_at": "2026-11-11T14:56:55"
+      },
+      "focusmate": {
+        "task_id": "fac3a13d-42c5-41cb-87be-fed7ed0c7885",
+        "title": "难题 14",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-11T16:05:04",
+      "task_id": 212,
+      "fields": {
+        "title": "难题 15",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "fDxMWbuPjZY",
+        "count_total": 3,
+        "count": 2,
+        "duration": 50,
+        "due": "2026-11-11T20:50:00",
+        "due_source": "session"
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-11T16:05:04",
+      "omnifocus": {
+        "id": "fDxMWbuPjZY",
+        "url": "omnifocus:///task/fDxMWbuPjZY",
+        "title": "难题 15",
+        "linked_at": "2026-11-11T14:41:18"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "难题 15",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-11T16:50:18",
+      "task_id": 184,
+      "fields": {
+        "title": "难题 14",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "i0o1iM8RI8W",
+        "duration": 50,
+        "notes": "父任务：SAT_Tasks",
+        "count": 2,
+        "count_total": 3,
+        "due": "2026-11-11T16:50:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-11",
+        "start": "16:00",
+        "end": "16:50",
+        "duration": 50,
+        "focusmate_session_id": "d418b5de-5e46-452c-8e7e-4204fc34c72e",
+        "previous_due": "2026-11-11T17:50:00"
+      },
+      "notes": "父任务：SAT_Tasks",
+      "focusmate": {
+        "task_id": "ca389a99-0f94-4fc5-810b-2c8d4ba95243",
+        "title": "难题 14",
+        "description": "父任务：SAT_Tasks",
+        "completed_at": "2026-11-11T08:50:14.359010+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "d418b5de-5e46-452c-8e7e-4204fc34c72e"
+          }
+        ]
+      }
     }
   ]
 }
