@@ -1647,6 +1647,76 @@ wd_cross.sessions_for_day_plan = lambda day: [{
 _free_cross = wd_cross.free_plan_slots(_cross_day)
 check("free_plan_slots 也认跨午夜开始于今天的场次", len(_free_cross), 1)
 
+print("== 5d) plan -c：把当前正在进行的空 session 纳入范围 ==")
+wd_live = fresh()
+_live_day = TODAY
+_live_start = datetime.datetime.combine(_live_day, datetime.time(10, 0))
+_live_end = _live_start + datetime.timedelta(minutes=50)
+_live_row = {
+    "planned": True,
+    "date": _live_day.isoformat(),
+    "startMs": int(_live_start.timestamp() * 1000),
+    "endMs": int(_live_end.timestamp() * 1000),
+    "startLabel": "10:00", "endLabel": "10:50", "durationMin": 50,
+    "id": "sess-live", "title": "", "quiet": False, "matched": False,
+    "phase": "进行中", "period_muted": False,
+}
+wd_live.clock_now = datetime.datetime.combine(_live_day, datetime.time(10, 20))
+wd_live.rows = [dict(_live_row)]
+wd_live.task_store.tasks_for_session = lambda *args, **kwargs: []
+_live_slots, _live_notes = wd_live._plan_slots(_live_day)
+check("不带 -c：正在进行的场次仍算过去，不进入 plan", len(_live_slots), 0)
+_live_slots, _live_notes = wd_live._plan_slots(_live_day, include_current=True)
+check("带 -c：进行中且没任务的场次进入 plan", len(_live_slots), 1)
+if _live_slots:
+    check("只算剩余完整 count：10:20 时 50 分钟场只剩 30 分钟 → 1 count",
+          (_live_slots[0].get("current"), _live_slots[0].get("duration"),
+           _live_slots[0].get("counts"), _live_slots[0].get("remaining_minutes")),
+          (True, 25, 1, 30))
+check_true("面板说明当前场已纳入",
+           any("当前进行中的 session" in note for note in _live_notes))
+
+# 已经挂着任务 → 就算带 -c 也不纳入。
+wd_live.task_store.tasks_for_session = lambda *args, **kwargs: [{"id": 1}]
+_live_slots, _live_notes = wd_live._plan_slots(_live_day, include_current=True)
+check("当前场已经挂着任务 → -c 也不纳入", len(_live_slots), 0)
+check_true("并说清为什么没纳入",
+           any("已经挂着任务" in note for note in _live_notes))
+
+# data.csv 之外、但 Focusmate 里真实正在进行的空场，也允许 -c 临时使用。
+_live_unplanned = dict(_live_row, planned=False)
+wd_live.rows = [_live_unplanned]
+wd_live.task_store.tasks_for_session = lambda *args, **kwargs: []
+_live_slots, _live_notes = wd_live._plan_slots(_live_day, include_current=True)
+check("计划外但正在进行的真实空场也能被 -c 纳入", len(_live_slots), 1)
+check_true("说明它不会改 data.csv",
+           any("不会改 data.csv" in note for note in _live_notes))
+
+check("解析 plan -c", wd_live._parse_plan_args(["-c"]),
+      (TODAY, 0, True))
+check("解析 plan --current 今天", wd_live._parse_plan_args(["--current", "今天"]),
+      (TODAY, 0, True))
+try:
+    wd_live._parse_plan_args(["-c", "+1"])
+    check("-c 不应能和明天一起用", "没拒绝", "拒绝")
+except ValueError as e:
+    check_true("-c 和明天一起用被拒", "只能把" in str(e))
+
+# 走真正的命令入口，确认 flag 被一路传到 _plan_slots。
+wd_flag = fresh(rows_ok)
+wd_flag.omnifocus.rows = [dict(r) for r in rows_ok]
+wd_flag.handle("task import sop omnifocus:///project/p-lunwen")
+_seen_flag = {}
+def _fake_plan_slots(day, include_current=False):
+    _seen_flag["include_current"] = include_current
+    return [pp.slot_record(1, day.isoformat(), "12:15", 25, "s99")], []
+wd_flag._plan_slots = _fake_plan_slots
+wd_flag.handle("plan -c")
+check("plan -c 命令打开分配问答", wd_flag.planning is not None, True)
+check("命令入口把 include_current=True 传给空场收集",
+      _seen_flag.get("include_current"), True)
+wd_flag.handle("q")
+
 print("== 6) help 页面澄清 op / pro / task 三个数据模型的区别 ==")
 wd_help = fresh()
 wd_help.handle("help")

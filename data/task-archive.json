@@ -2507,6 +2507,76 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-11T10:32:23",
+      "task_id": 208,
+      "fields": {
+        "title": "语法难 20 个",
+        "duration": "25",
+        "project": "SAT_Tasks",
+        "count": 1,
+        "due": "2026-11-11T10:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 2,
+        "date": "2026-11-11",
+        "start": "09:45",
+        "end": "10:35",
+        "duration": 50,
+        "focusmate_session_id": "f53a852d-12e8-4792-88be-48452c613107"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "8ef6c318-a278-41aa-8dbf-1ad71621e2ec",
+        "title": "语法难 20 个",
+        "description": "",
+        "completed_at": "2026-11-11T02:25:54.336256+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "f53a852d-12e8-4792-88be-48452c613107"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-11T10:34:41",
+      "task_id": 125,
+      "fields": {
+        "title": "数学易错 5",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "hbO13Wv2PLr",
+        "duration": 20,
+        "notes": "父任务：sat review",
+        "count": 1,
+        "defer": "2026-11-08T00:00:00",
+        "due": "2026-11-11T10:35:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 2,
+        "date": "2026-11-11",
+        "start": "09:45",
+        "end": "10:35",
+        "duration": 50,
+        "focusmate_session_id": "f53a852d-12e8-4792-88be-48452c613107"
+      },
+      "notes": "父任务：sat review",
+      "focusmate": {
+        "task_id": "465a932e-aca9-4740-846d-826d0241debd",
+        "title": "数学易错 5",
+        "description": "父任务：sat review",
+        "completed_at": "2026-11-11T02:33:01.870640+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "f53a852d-12e8-4792-88be-48452c613107"
+          }
+        ]
+      }
     }
   ]
 }

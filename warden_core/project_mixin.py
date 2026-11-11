@@ -1673,26 +1673,29 @@ class ProjectMixin(object):
         return Panel(body, title="[bold cyan]📁 项目对账[/]",
                      border_style="cyan", box=box.HEAVY)
 
-    def _plan_slots(self, day):
+    def _plan_slots(self, day, include_current=False):
         """这一天的**可用空场** → ``(slots, notes)``。
 
         只排除三类：已经过去的（今天就按「现在」筛）、已经挂任务的、
         被 formatter 占掉的。**没订上 Focusmate 的场次照常计入**（notes 里点名），
         任务先本地挂到那场，等 daemon 订上之后 ``refresh --check`` 再补挂。
+
+        ``include_current=True`` 时，今天**已经开始但还没结束、且没挂任务**的那一场
+        也纳入范围。此时只算剩下的完整 25 分钟块：例如 10:00–10:50 的场次在
+        10:20 敲 ``plan -c``，容量是 1 count（25 分钟），不会按完整的 50 分钟骗人。
         """
         slots, notes = [], []
         now = self._now_dt()
-        now_ms = int(now.timestamp() * 1000)
-        is_today = (day == datetime.date.today())
+        is_today = (day == now.date())
         unbooked, busy, past, reserved = [], 0, 0, 0
+        live_included, live_short, live_busy, live_unplanned = [], [], [], []
         try:
             reservations = th.collect_reservations(
                 self.task_store.list(), day.isoformat())
         except Exception:                          # noqa: BLE001 - 坏任务不该挡 plan
             reservations = []
         for index, row in enumerate(self.rows, 1):
-            if not row.get("planned"):
-                continue
+            is_planned = bool(row.get("planned"))
             # 场次的归属看**开始时间**：今天 23:15 开始、明天 00:05 结束
             # 仍然是今天的一场。以前这里还要求 row["date"] 完全相等，
             # 一旦行来自 API、日期字段被写成了终点日，跨午夜场次就整场漏算。
@@ -1701,12 +1704,25 @@ class ProjectMixin(object):
                 continue
             if row.get("period_muted"):
                 continue
+            live = False
+            end_dt = None
             if is_today and start_dt <= now:
-                past += 1
+                end_dt = self._row_end_datetime(row, start=start_dt, fallback_day=day)
+                if include_current and end_dt is not None and now < end_dt:
+                    live = True
+                else:
+                    if is_planned:
+                        past += 1
+                    continue
+            # 普通 plan 仍只认 data.csv 里排好的场次；-c 的唯一例外是
+            # **此刻正在进行**的真实 session（计划外但已经开打，且没挂任务）。
+            if not is_planned and not live:
                 continue
             if self.task_store.tasks_for_session(start_dt.date().isoformat(),
                                                  row.get("startLabel")):
                 busy += 1
+                if live:
+                    live_busy.append(row.get("startLabel") or "?")
                 continue
             # formatter 已经占掉的时间是**硬约束**：项目 plan 只能看剩下的空场，
             # 绝不能把这条场次再分给项目、更不能回头改 formatter 的切割。
@@ -1720,10 +1736,36 @@ class ProjectMixin(object):
                               reservations):
                 reserved += 1
                 continue
-            slots.append(pp.slot_record(index, start_dt.date().isoformat(),
-                                        row.get("startLabel"),
-                                        row.get("durationMin"), row.get("id"),
-                                        row.get("endLabel")))
+            duration = int(row.get("durationMin") or 0)
+            slot_extra = {}
+            if live:
+                remaining_sec = max(0, int((end_dt - now).total_seconds()))
+                remaining_min = ((remaining_sec + 59) // 60
+                                 if remaining_sec else 0)
+                # 只排完整的 25 分钟块。余下的零头留给收尾/休息，不把它包装成
+                # 一个「这一场还能干 2 分钟」的假 count。
+                counts = min(duration // pp.MINUTES_PER_COUNT,
+                             remaining_min // pp.MINUTES_PER_COUNT)
+                if counts <= 0:
+                    live_short.append("%s–%s（剩余约 %d 分钟）"
+                                      % (row.get("startLabel") or "?",
+                                         row.get("endLabel") or "?",
+                                         remaining_min))
+                    continue
+                duration = counts * pp.MINUTES_PER_COUNT
+                slot_extra = {"current": True,
+                              "remaining_minutes": remaining_min}
+                live_included.append("%s–%s（剩余约 %d 分钟 → %d count）"
+                                     % (row.get("startLabel") or "?",
+                                        row.get("endLabel") or "?",
+                                        remaining_min, counts))
+                if not is_planned:
+                    live_unplanned.append(row.get("startLabel") or "?")
+            slot = pp.slot_record(index, start_dt.date().isoformat(),
+                                  row.get("startLabel"), duration,
+                                  row.get("id"), row.get("endLabel"))
+            slot.update(slot_extra)
+            slots.append(slot)
             if row.get("id") is None:
                 unbooked.append(row.get("startLabel") or "?")
         if past:
@@ -1735,6 +1777,20 @@ class ProjectMixin(object):
         if unbooked:
             notes.append("%s 还没订上 Focusmate，但仍计入空场（plan 排进去后，"
                          "等订上会自动挂任务）。" % "、".join(unbooked))
+        if live_included:
+            notes.append("当前进行中的 session #%s 已纳入：%s；只算剩下的完整 "
+                         "%d 分钟块。" % (" / #".join(
+                             str(s["index"]) for s in slots if s.get("current")),
+                             "、".join(live_included), pp.MINUTES_PER_COUNT))
+        if live_short:
+            notes.append("当前进行中的 %s 剩余不足 1 count，没纳入。"
+                         % "、".join(live_short))
+        if live_busy:
+            notes.append("当前进行中的 %s 已经挂着任务，没纳入。"
+                         % "、".join(live_busy))
+        if live_unplanned:
+            notes.append("%s 是计划外的真实 session，但正在进行的空场也按 -c "
+                         "纳入；不会改 data.csv。" % "、".join(live_unplanned))
         return slots, notes
 
     def cmd_plan(self, args=None):
@@ -1745,7 +1801,10 @@ class ProjectMixin(object):
         session（尽量一场一个任务、尽量不拆开）。
 
             plan                    今天（**默认就是今天**，和当前看的是哪天无关）
+            plan -c / plan --current
+                                    今天，并把**正在进行的空 session**也算进范围
             plan +1                 明天（plan 1 / plan 明天 / plan 2026-11-07 同义）
+            plan -c 今天            同 plan -c（--current 只能用于今天）
             task 1 4                项目 #1 分 4 个 count（= 100 分钟）
             task 1 2                再敲一次是**覆盖**（变成 2，不是 6）
             task 1 clear            清空 #1
@@ -1766,7 +1825,7 @@ class ProjectMixin(object):
                 or self.pending_interrupt is not None or self.review_active()):
             raise ValueError("先把手头那一问答完（收尾 / 到点没开始 / 导入确认 / 硬中断 title）"
                              "再来 plan。")
-        day, offset = self._plan_target(toks)
+        day, offset, include_current = self._parse_plan_args(toks)
         self.projects.ensure_tagged_pros()
         untyped = self.projects.untyped_linked_ops()
         if untyped:
@@ -1807,7 +1866,8 @@ class ProjectMixin(object):
             self.rebuild_rows()
         except Exception:                          # noqa: BLE001 - 快照模式也能 plan
             pass
-        slots, notes = self._plan_slots(day)
+        slots, notes = (self._plan_slots(day, include_current=True)
+                        if include_current else self._plan_slots(day))
         for note in notes:
             self.say("· %s" % note, "info")
         if not slots:
@@ -1837,6 +1897,21 @@ class ProjectMixin(object):
     #: `plan` 的日期参数里认的那几个人话
     PLAN_DAY_WORDS = {"今天": 0, "today": 0, "明天": 1, "tomorrow": 1,
                       "后天": 2, "大后天": 3, "昨天": -1, "yesterday": -1}
+
+    def _parse_plan_args(self, toks):
+        """``plan`` 的选项 → ``(day, offset, include_current)``。"""
+        include_current = False
+        date_toks = []
+        for tok in toks or []:
+            if str(tok).lower() in ("-c", "--current"):
+                include_current = True
+            else:
+                date_toks.append(tok)
+        day, offset = self._plan_target(date_toks)
+        if include_current and offset != 0:
+            raise ValueError("`-c/--current` 只能把**今天正在进行的 session** 纳入 "
+                             "plan；不能和明天/其他日期一起用。")
+        return day, offset, include_current
 
     def _plan_target(self, toks):
         """``plan`` 的参数 → ``(day, offset)``。不给参数 = **今天**（用户要求）。"""
@@ -1893,6 +1968,42 @@ class ProjectMixin(object):
             day = datetime.date.fromisoformat(str(raw_day))
             hour, minute = (int(x) for x in label.split(":")[:2])
             return datetime.datetime.combine(day, datetime.time(hour, minute))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _row_end_datetime(row, start=None, fallback_day=None):
+        """一行 session 的本地结束时间；优先 ``endMs``，再退到开始 + 时长。"""
+        raw_ms = (row or {}).get("endMs")
+        try:
+            if raw_ms is not None and int(raw_ms) > 946684800000:
+                return datetime.datetime.fromtimestamp(int(raw_ms) / 1000.0)
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+        if start is None:
+            start = ProjectMixin._row_start_datetime(row, fallback_day=fallback_day)
+        if start is None:
+            return None
+        try:
+            duration = int((row or {}).get("durationMin") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        if duration > 0:
+            return start + datetime.timedelta(minutes=duration)
+        raw_day = (row or {}).get("date")
+        if fallback_day is not None and not raw_day:
+            raw_day = fallback_day
+        if hasattr(raw_day, "isoformat"):
+            raw_day = raw_day.isoformat()
+        label = str((row or {}).get("endLabel")
+                    or (row or {}).get("end") or "").strip()
+        try:
+            day = datetime.date.fromisoformat(str(raw_day))
+            hour, minute = (int(x) for x in label.split(":")[:2])
+            end = datetime.datetime.combine(day, datetime.time(hour, minute))
+            if end <= start:
+                end += datetime.timedelta(days=1)
+            return end
         except (TypeError, ValueError):
             return None
 

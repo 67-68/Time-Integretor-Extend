@@ -2482,10 +2482,11 @@ class BoardMixin(object):
              "需说明 SOP 或 incubator 类型；带 `project/…` 标签自动关联 pro；时长不齐整批拒绝"),
             ("project [序号] [interrupt|refresh|remove|check]", "看 pro 与当前 op / 看 #1 详情与清单 / 硬中断当前场 / 重新去 "
                                                        "OmniFocus 读一遍 / 撤掉 / check = 每日对账"),
-            ("plan [天数]", "一次排期：每个真正项目只取当前阶段对应的那一个 op"
+            ("plan [-c|--current] [天数]", "一次排期：每个真正项目只取当前阶段对应的那一个 op"
                             "（running → SOP / bottleneck → incubator），"
                             "分配 count + 自动挑任务挂 session。没有关联 pro 的孤立 op 不进 plan。"
-                            "**默认今天**，plan +1 = 明天"),
+                            "**默认今天**，plan +1 = 明天；plan -c 把今天正在进行的空 session "
+                            "也纳入（只算剩下的完整 25 分钟块）"),
             ("task -t  /  --trigger", "列出 trigger（创建触发）预设；现在是空列表 —— "
                                         "框架已就位，注册函数后才有名字"),
             ("task <id> -t <preset> [参数...]", "挂创建触发：只有在预设条件成立时才建任务；"

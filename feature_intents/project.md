@@ -282,6 +282,10 @@ incubator 两套账。没有关联 pro 的孤立 op 不出现在这张表里，�
 - **场次按开始日期归属**：`23:15–00:05` 这种跨午夜的场次算在 23:15 那一天；
   判断用 `startMs` / 开始时间，不看到终点落在哪天，所以今天开始、明天结束的场次
   不会从今天的 plan 里漏掉。
+- **`plan -c` / `--current` 的例外**：今天已经开始、但还没结束、且**没挂任务**的
+  session 也可以纳入。容量只算剩下的完整 25 分钟块 —— 10:00–10:50 的场次在
+  10:20 敲 `plan -c`，只能分 1 count（25 分钟），不会按完整 50 分钟排一条做不完的
+  任务。计划外但实际正在进行的空 session 也允许临时使用，但**不会改 data.csv**。
 
 容量 = Σ 场次时长 ÷ 25 count（`1 count = 25 分钟`），同时给出「含每块 5 分钟休息」
 的分钟数（用户原话：*4 count = 100 分钟，如果加上 focusmate 25 分钟 session 的
@@ -291,9 +295,14 @@ incubator 两套账。没有关联 pro 的孤立 op 不出现在这张表里，�
 
 ```
 plan            今天（**和看板在看哪天无关**）
+plan -c         今天，并把正在进行的空 session 也纳入范围
+plan --current  同 plan -c
 plan +1         明天（plan 1 / plan 明天 / plan 2026-11-07 同义）
 plan -1         拒绝：过去的日子不用 plan
 ```
+
+`-c` / `--current` 只能和今天一起用（`plan -c +1` 会被拒绝）：它解决的是
+「这一场已经开始了，但还没挂任务，想现在就把剩下的时间排进去」，不是改日期。
 
 为什么不跟着 `day` 走（用户原话：「plan 默认 plan 今天」）：`plan` 是「给哪一天分资源」
 的**动作**，不是看板；晚上正看着明天时顺手敲 `plan`，想排的多半是今天剩下的空场。
@@ -414,7 +423,7 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `project <序号> interrupt [--hard]` | 硬中断当前进行中的 session：下架这一场所有任务，等 title 后新建整场任务挂回去 |
 | `project <序号> refresh` / `remove` | 刷新该 pro 关联的 op / 删除 pro（op 仍用 `op ... remove`） |
 | `project refresh` / `project check` | 所有 op 刷一遍 / 每日对账 |
-| `plan` / `plan +1` | 开始一次分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天 |
+| `plan` / `plan +1` / `plan -c` | 开始一次分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天；`-c` 把今天正在进行的空 session 也纳入 |
 | `task <序号> <count>` / `op <序号> <count>` / `clear` / `complete` / `q` | plan 里的那几句（`op` 与 `task` 同义，只是强调操作对象是 op） |
 
 ### `project <序号> interrupt --hard`
