@@ -7,7 +7,6 @@ from .common import (
     FM_PENDING,
     TASK_SESSION_CURRENT,
     TASK_SESSION_NONE,
-    ks,
     pj,
     sch,
     sp,
@@ -265,108 +264,29 @@ class TaskPipelineMixin(object):
                      % (len(protected), labels), "warn")
         return safe, protected
 
-    def _cancel_stale_sessions_for(self, day, period, new_sessions,
-                                  reason="formatter-cut"):
-        """计划里不再包含的**已订上**场次 → 真的去 Focusmate 取消。返回取消掉的行。
-
-        formatter 切出来的场次多半落在未来（草稿区，还没订上），但也有今天就切这种
-        已经订好的 —— 那就得取消，否则 50 分钟的旧场会跟新的 25 分钟并存（用户原话：
-        「实际上就是取消 + 约定一个 25 分钟的」）。
-
-        和 `cmd_period_layout` 那条路同一套顺序：**先**给 daemon 挂 ``expect_cancel``
-        单，再取消，再清 state —— 否则 daemon 下一轮会把 warden 自己干的活记成
-        「用户手动取消」的罪，全局锁死 TUI。
-        """
-        if self.offline:
-            return []
-        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
-        keep = set()
-        for sess in new_sessions or []:
-            try:
-                keep.add((str(sess.get("start")), int(sess.get("duration"))))
-            except (TypeError, ValueError):
-                continue
-        stale = []
-        for row in self._snapshot_rows(iso):
-            start = row.get("startLabel")
-            if not start or not row.get("id"):
-                continue
-            if sp.period_for_session([period], start) is None:
-                continue
-            try:
-                dur = int(row.get("durationMin"))
-            except (TypeError, ValueError):
-                dur = None
-            if (str(start), dur) in keep:
-                continue
-            stale.append(row)
-        stale, _protected = self._split_started_sessions(stale)
-        if not stale:
-            return []
-        try:
-            keys = [sch.key_of(day, row.get("startLabel")) for row in stale]
-        except (ValueError, TypeError):
-            keys = []
-        if keys:
-            ks.expect_cancel(sorted(keys), reason="%s:%s %s"
-                             % (reason, period.get("id"), iso))
-        cancelled = []
-        try:
-            for row in stale:
-                self.say("取消已经订上的旧场 %s–%s（%smin）：切割之后计划里不再包含它…"
-                         % (row.get("startLabel"), row.get("endLabel") or "?",
-                            row.get("durationMin") or "?"), "cmd")
-                # **乐观 + 后台**：先把它从本地表格拿掉，取消请求丢给单 worker。
-                # 这里以前直接 bridge.call("cancel")，formatter 切场时会在提示符
-                # 线程上等浏览器几十秒 —— 和「外部操作全异步」的约定不符。
-                before_index, _ = self._forget_api_row(row.get("id")) or (None, None)
-                action = self.net_action(
-                    "session.cancel",
-                    "取消旧场 %s %s" % (iso, row.get("startLabel") or "?"),
-                    {"startMs": row.get("startMs"), "meeting_id": row.get("id"),
-                     "date": iso, "start": row.get("startLabel")})
-                job = self.jobs.submit(
-                    action,
-                    on_fail=lambda error, _row=dict(row), _idx=before_index:
-                    self._row_op_failed("旧场 %s 取消" % _row.get("startLabel"),
-                                        _row, error, index=_idx))
-                if self.jobs.sync and (job.outcome is None or not job.outcome.ok):
-                    # 同步模式回调已经回滚；这一轮别再把它算成取消成功。
-                    self.had_error = True
-                    continue
-                cancelled.append(row)
-                self.say("✅ %s 旧场 %s %s"
-                         % ("已取消" if self.jobs.sync else "已排进后台取消",
-                            row.get("startLabel"), "" if self.jobs.sync else "（失败会自动放回）"),
-                         "ok")
-            if cancelled and not self.jobs.sync:
-                self.rebuild_rows()
-        finally:
-            self._forget_layout_state(cancelled)
-            if cancelled and iso == self.sel_date.isoformat():
-                gone = {r.get("id") for r in cancelled}
-                self.api_rows = [r for r in self.api_rows
-                                 if r.get("id") not in gone]
-        return cancelled
-
     def _apply_cut_layout(self, day, period, durations):
         """按 formatter 算出来的时长序列重排这个时段（可能不是选中的那天）。
 
-        顺序照抄 `cmd_period_layout`：先取消计划里不再包含的旧 API session，再写
-        layout，再清掉动过的场次上的任务绑定，最后重算 data.csv —— 反过来的话
-        daemon 会在缝隙里把旧的 50 分钟场订回来。
+        整串步骤照抄唯一事务 :meth:`commit_layout`（先取消计划里不再包含的旧
+        API session、再写 layout、再清动过的场次上的任务绑定、最后重算 data.csv）。
+        ``book=False``：预约由命令层（``_apply_formatter``）统一触发，这里不新造
+        外部动作 —— 这条方法也会被 refresh 的排布流水线间接调用。
         """
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         period_id = period.get("id")
-        new_sessions = sp.plan_period(period, durations or sp.default_durations(period))
-        cancelled = self._cancel_stale_sessions_for(day, period, new_sessions)
-        if durations:
-            sp.set_layout(day, period_id, durations)
-        else:
-            sp.remove_layout(day, period_id)
-        dropped = self.clear_task_bindings_for_layout(period, new_sessions)
+        result = self.commit_layout(
+            day, period, list(durations or []),
+            mode="set" if durations else "remove",
+            reason="formatter-cut", book=False, announce=False,
+            missing_ok=True)
+        new_sessions = result.get("sessions") or []
+        cancelled = result.get("cancelled") or []
+        dropped = result.get("cleared") or []
+        if not result.get("ok", True):
+            self.say("✂ %s %s 的排布没改成：旧场取消失败，保持原样。"
+                     % (iso, period_id), "error")
+            return "排布没改成"
         self.reload_periods()
-        self.rewrite_data_csv_from_plan()
         self.reload_entries()
         body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
                          for s in new_sessions) or "（这个时段当天不排了）"
@@ -879,10 +799,23 @@ class TaskPipelineMixin(object):
         3. defer 还没到点的任务不进入任何排期队列；本地任务 / 项目清单两边都查。
 
         返回 ``{"formatters": n, "invalidated": n, "detached": n, "errors": n}``。
+
+        整段包在 ``_suppress_book`` 里：refresh 是对账轮，**不新造外部动作**
+        （不订场）。这一轮里 formatter / 自动重排改出来的 data.csv 由 daemon
+        下一轮吃进去，或者由随后的 ``refresh --check`` 补订。
         """
         day = day or self.sel_date
         if hasattr(day, "datetime"):
             day = day.date()
+        old_suppress = getattr(self, "_suppress_book", False)
+        self._suppress_book = True
+        try:
+            return self._reconcile_schedule_pipeline(day, quiet=quiet)
+        finally:
+            self._suppress_book = old_suppress
+
+    def _reconcile_schedule_pipeline(self, day, quiet=False):
+        """`reconcile_schedule_pipeline` 的实作（不负责 _suppress_book 守卫）。"""
         result = {"formatters": 0, "invalidated": 0, "detached": 0, "errors": 0}
         # 先清掉过期且从未处理的重复 occurrence：它们绝不能再进入今天/明天的
         # formatter 队列（否则同名任务会越积越多，互相抢同一场 session）。
@@ -967,8 +900,15 @@ class TaskPipelineMixin(object):
             return None
         task = self._hook_task(result, "formatter", action)
         if ts.TaskStore.is_repeat_template(task):
-            return self._apply_formatter_to_repeat_template(task, spec)
-        return self._apply_formatter_to_task(task, spec, action=action)
+            done = self._apply_formatter_to_repeat_template(task, spec)
+        else:
+            done = self._apply_formatter_to_task(task, spec, action=action)
+        # formatter 剪断/新增了当天的 session → 新场次要有人订。
+        # 统一走 book()（唯一预约出口）；refresh 的自动重排被 _suppress_book 挡住，
+        # 那条路不新造外部动作。这一句放在命令层而不是 _apply_cut_layout 里，
+        # 是因为后者也服务于 refresh，不该自带外部副作用。
+        self.book(self.sel_date, why="formatter 改过排布，要把新场次订上")
+        return done
 
     def _apply_formatter_to_repeat_template(self, task, spec):
         """把 formatter 记在重复任务**本体**上，再落到子任务上。

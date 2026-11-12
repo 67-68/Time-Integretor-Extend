@@ -195,6 +195,16 @@ MESSAGE_KEEP = 12
 FAILED_ACTIONS_FILE = (os.environ.get("TI_FAILED_ACTIONS")
                        or os.path.join(HERE, "data", "failed-actions.json"))
 
+# 「跑一次就够」的动作：一次调用就把整个世界对完，不需要每个项目/每条再跑一遍。
+# 这些动作的参数里常带着「当时的快照」，每次失败都会长出一条新账；所以失败账要
+# 按名字合并（保留最新一次），`re-action` 也只重放一次 —— 用户原话：
+# 「类似『每日检查 OmniFocus 项目』这样的，运行一个就行的任务……如果失败，算一个
+# 失败就行了，因为我只需要做一个就可以检查完成全部」。
+COALESCE_ACTIONS = frozenset({
+    "omnifocus.project_sync",
+})
+
+
 # 读操作的「新鲜度」：状态框里那行「这份数据是什么时候来的」。
 # 新鲜 = 灰的、不吵你；过期 = 红色加粗 —— 表格里的 session 是几分钟前的，
 # 和「现在几点了」是两件事，别让你拿旧账做决定。

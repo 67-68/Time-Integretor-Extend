@@ -53,6 +53,11 @@ w = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(w)
 from rich.console import Console  # noqa: E402
 
+# 排布 / formatter / plan 改完之后统一走 `warden.book()` → `keep_session.py check`。
+# 测试里绝不许真起那个子进程：它会读**真的** data.csv 和 state 文件，bridge
+# 活着时还会真下单。需要断言「叫了 check」的用例自己局部覆盖 w.run_keep_session。
+w.run_keep_session = lambda *a, **kw: (0, "", "")
+
 sp, sch, ts, pj, ks = w.sp, w.sch, w.ts, w.pj, w.ks
 sch.DATA_CSV = os.path.join(TMP, "data.csv")
 sch.BACKUP_CSV = os.path.join(TMP, "data.csv.bak")

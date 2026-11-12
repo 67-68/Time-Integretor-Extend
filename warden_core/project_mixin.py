@@ -2535,48 +2535,80 @@ class ProjectMixin(object):
         return {"plans": cleared_plans, "items": cleared_items,
                 "detached": detached}
 
-    def _plan_slots(self, day, include_current=False, replan=None):
-        """这一天的**可用空场** → ``(slots, notes)``。
+    # -- 排期流水线的「阶段 1：period 层」 -------------------------------
+    def available_periods(self, day):
+        """这一天的时段层：``{period_id: {"period", "auto", "has_layout"}}``。
 
-        只排除三类：已经过去的（今天就按「现在」筛）、已经挂任务的、
-        被 formatter 占掉的。**没订上 Focusmate 的场次照常计入**（notes 里点名），
-        任务先本地挂到那场，等 daemon 订上之后 ``refresh --check`` 再补挂。
-
-        ``include_current=True`` 时，今天**已经开始但还没结束、且没挂任务**的那一场
-        也纳入范围。此时只算剩下的完整 25 分钟块：例如 10:00–10:50 的场次在
-        10:20 敲 ``plan -c``，容量是 1 count（25 分钟），不会按完整的 50 分钟骗人。
-
-        ``replan=True`` 给普通 ``plan`` 用：上一轮 plan 还没完成的本地任务不算
-        「占用」，因为这些旧计划会在 complete 时整体撤掉重排；用户自己的任务、
-        formatter 任务仍照常排除。
+        **这是排期的第一等输入**（用户要的「首先确定 period 时间，之后统一预约」）。
+        ``auto=True`` 表示这一段交给任务排期自己决定 session 长度（没有 layout，
+        或者 layout 是上一轮自动排出来的）；``auto=False`` 是手动硬约束，任务
+        只能往里填，排期不许改它的切分。
         """
-        if replan is None:
-            replan = bool(getattr(self, "_plan_replanning", False))
-        slots, notes = [], []
-        plan_owned = (self._plan_owned_task_ids(day, rescindable_only=True)
-                      if replan else set())
-        now = self._now_dt()
-        is_today = (day == now.date())
-        unbooked, busy, past, reserved = [], 0, 0, 0
         try:
             layouts = sp.load_layouts()
         except Exception:                          # noqa: BLE001
             layouts = {}
-        period_meta = {}
+        meta = {}
         for period in self.periods_for_day(day):
             pid = str(period.get("id") or "")
-            if pid:
-                rec = sp.get_layout_record(layouts, day, pid)
-                period_meta[pid] = {
-                    "period": dict(period),
-                    # 没有 layout = 交给任务排期自动生成；有 layout（含旧格式）
-                    # 但 source != auto = 手动硬约束。
-                    "auto": rec is None or rec.get("source") == "auto",
-                    "has_layout": rec is not None,
-                }
-        blocked_periods = set()
-        auto_period_ids = {pid for pid, meta in period_meta.items() if meta["auto"]}
-        live_included, live_short, live_busy, live_unplanned = [], [], [], []
+            if not pid:
+                continue
+            rec = sp.get_layout_record(layouts, day, pid)
+            meta[pid] = {
+                "period": dict(period),
+                # 没有 layout = 交给任务排期自动生成；有 layout（含旧格式）
+                # 但 source != auto = 手动硬约束。
+                "auto": rec is None or rec.get("source") == "auto",
+                "has_layout": rec is not None,
+            }
+        return meta
+
+    def _plan_notes(self, stats, slots):
+        """把 ``_row_slots`` / ``_auto_period_slots`` 攒下的统计说成人话。"""
+        notes = []
+        if stats.get("past"):
+            notes.append("今天已经过去的 %d 场不算空闲。" % stats["past"])
+        if stats.get("busy"):
+            notes.append("%d 场已经挂着任务了，不算空闲。" % stats["busy"])
+        if stats.get("reserved"):
+            notes.append("%d 场已经被 formatter 占掉，项目 plan 不会碰。"
+                         % stats["reserved"])
+        if stats.get("unbooked"):
+            notes.append("%s 还没订上 Focusmate，但仍计入空场（plan 排进去后，"
+                         "等订上会自动挂任务）。" % "、".join(stats["unbooked"]))
+        if stats.get("live_included"):
+            notes.append("当前进行中的 session #%s 已纳入：%s；只算剩下的完整 "
+                         "%d 分钟块。" % (" / #".join(
+                             str(s["index"]) for s in slots if s.get("current")),
+                             "、".join(stats["live_included"]),
+                             pp.MINUTES_PER_COUNT))
+        if stats.get("live_short"):
+            notes.append("当前进行中的 %s 剩余不足 1 count，没纳入。"
+                         % "、".join(stats["live_short"]))
+        if stats.get("live_busy"):
+            notes.append("当前进行中的 %s 已经挂着任务，没纳入。"
+                         % "、".join(stats["live_busy"]))
+        if stats.get("live_unplanned"):
+            notes.append("%s 是计划外的真实 session，但正在进行的空场也按 -c "
+                         "纳入；不会改 data.csv。" % "、".join(stats["live_unplanned"]))
+        return notes
+
+    def _row_slots(self, day, period_meta, *, include_current=False,
+                   replan=False, now=None):
+        """阶段 2：data.csv / API 里**真实存在**的场次 → 可排的 slot。
+
+        返回 ``(slots, blocked_periods, stats)``。任何一条被排除的场次都会把它
+        所属的 period 记进 ``blocked_periods``：那一段不再算「整段空着」，
+        自动排布不会去重切它。
+        """
+        now = now or self._now_dt()
+        is_today = (day == now.date())
+        plan_owned = (self._plan_owned_task_ids(day, rescindable_only=True)
+                      if replan else set())
+        slots, blocked_periods = [], set()
+        stats = {"past": 0, "busy": 0, "reserved": 0, "unbooked": [],
+                 "live_included": [], "live_short": [], "live_busy": [],
+                 "live_unplanned": []}
         try:
             reservations = th.collect_reservations(
                 self.task_store.list(), day.isoformat())
@@ -2590,9 +2622,10 @@ class ProjectMixin(object):
             start_dt = self._row_start_datetime(row, fallback_day=day)
             if start_dt is None or start_dt.date() != day:
                 continue
+            pid_of_row = str(row.get("period_id") or "")
             if row.get("period_muted"):
-                if row.get("period_id"):
-                    blocked_periods.add(str(row.get("period_id")))
+                if pid_of_row:
+                    blocked_periods.add(pid_of_row)
                 continue
             live = False
             end_dt = None
@@ -2602,9 +2635,9 @@ class ProjectMixin(object):
                     live = True
                 else:
                     if is_planned:
-                        past += 1
-                    if row.get("period_id"):
-                        blocked_periods.add(str(row.get("period_id")))
+                        stats["past"] += 1
+                    if pid_of_row:
+                        blocked_periods.add(pid_of_row)
                     continue
             # 普通 plan 仍只认 data.csv 里排好的场次；-c 的唯一例外是
             # **此刻正在进行**的真实 session（计划外但已经开打，且没挂任务）。
@@ -2616,11 +2649,11 @@ class ProjectMixin(object):
                 session_tasks = [task for task in session_tasks
                                  if int(task.get("id") or 0) not in plan_owned]
             if session_tasks:
-                busy += 1
+                stats["busy"] += 1
                 if live:
-                    live_busy.append(row.get("startLabel") or "?")
-                if row.get("period_id"):
-                    blocked_periods.add(str(row.get("period_id")))
+                    stats["live_busy"].append(row.get("startLabel") or "?")
+                if pid_of_row:
+                    blocked_periods.add(pid_of_row)
                 continue
             # formatter 已经占掉的时间是**硬约束**：项目 plan 只能看剩下的空场，
             # 绝不能把这条场次再分给项目、更不能回头改 formatter 的切割。
@@ -2632,9 +2665,9 @@ class ProjectMixin(object):
                 end_min = start_min + int(row.get("durationMin") or 0)
             if not th.is_free({"start_min": start_min, "end_min": end_min},
                               reservations):
-                reserved += 1
-                if row.get("period_id"):
-                    blocked_periods.add(str(row.get("period_id")))
+                stats["reserved"] += 1
+                if pid_of_row:
+                    blocked_periods.add(pid_of_row)
                 continue
             duration = int(row.get("durationMin") or 0)
             slot_extra = {}
@@ -2647,43 +2680,53 @@ class ProjectMixin(object):
                 counts = min(duration // pp.MINUTES_PER_COUNT,
                              remaining_min // pp.MINUTES_PER_COUNT)
                 if counts <= 0:
-                    live_short.append("%s–%s（剩余约 %d 分钟）"
-                                      % (row.get("startLabel") or "?",
-                                         row.get("endLabel") or "?",
-                                         remaining_min))
-                    if row.get("period_id"):
-                        blocked_periods.add(str(row.get("period_id")))
+                    stats["live_short"].append("%s–%s（剩余约 %d 分钟）"
+                                               % (row.get("startLabel") or "?",
+                                                  row.get("endLabel") or "?",
+                                                  remaining_min))
+                    if pid_of_row:
+                        blocked_periods.add(pid_of_row)
                     continue
                 duration = counts * pp.MINUTES_PER_COUNT
                 slot_extra = {"current": True,
                               "remaining_minutes": remaining_min}
-                live_included.append("%s–%s（剩余约 %d 分钟 → %d count）"
-                                     % (row.get("startLabel") or "?",
-                                        row.get("endLabel") or "?",
-                                        remaining_min, counts))
+                stats["live_included"].append(
+                    "%s–%s（剩余约 %d 分钟 → %d count）"
+                    % (row.get("startLabel") or "?", row.get("endLabel") or "?",
+                       remaining_min, counts))
                 if not is_planned:
-                    live_unplanned.append(row.get("startLabel") or "?")
+                    stats["live_unplanned"].append(row.get("startLabel") or "?")
             slot = pp.slot_record(index, start_dt.date().isoformat(),
                                   row.get("startLabel"), duration,
                                   row.get("id"), row.get("endLabel"))
             slot.update(slot_extra)
-            pid = str(row.get("period_id") or "")
-            meta = period_meta.get(pid) or {}
+            meta = period_meta.get(pid_of_row) or {}
             period = meta.get("period") or row.get("period") or {}
-            slot["period_id"] = pid
+            slot["period_id"] = pid_of_row
             slot["period"] = dict(period) if period else None
             slot["period_start"] = period.get("start")
             slot["period_end"] = period.get("end")
             slot["period_total_minutes"] = pp._period_total_minutes(period) if period else 0
             slot["period_blocks"] = pp._period_blocks(period) if period else 0
-            slot["period_auto"] = bool(meta.get("auto")) and pid not in blocked_periods
+            slot["period_auto"] = bool(meta.get("auto")) and pid_of_row not in blocked_periods
             slots.append(slot)
             if row.get("id") is None:
-                unbooked.append(row.get("startLabel") or "?")
-        # 自动 layout 的 period：只要整段都空着，就用“整段工作容量”的伪 slot
-        # 参与 plan，而不是沿用 data.csv 里上一轮排出来的某几个 session。
-        # 这样重新 plan 时，任务可以重新决定这一段里的 session 长度；真正的
-        # session 布局会在 _plan_apply 里按任务重算并写回 data.csv。
+                stats["unbooked"].append(row.get("startLabel") or "?")
+        return slots, blocked_periods, stats
+
+    def _auto_period_slots(self, day, period_meta, blocked_periods, slots, *,
+                           include_current=False, now=None):
+        """阶段 3：自动排布的 period 整段换成「工作容量」伪 slot。
+
+        只要整段都空着，就用整段工作容量参与 plan，而不是沿用 data.csv 里上一轮
+        排出来的某几个 session —— 这样重新 plan 时任务可以重新决定这一段里的
+        session 长度；真正的切分在 :meth:`commit_layout` 里按任务重算并写回
+        data.csv。
+
+        返回 ``(slots, blocked_periods)``（后者可能因为静音/被占而变大）。
+        """
+        now = now or self._now_dt()
+        auto_period_ids = {pid for pid, meta in period_meta.items() if meta["auto"]}
         seen_periods = {str(s.get("period_id") or "") for s in slots}
         original_by_pid = {}
         for slot in slots:
@@ -2754,30 +2797,44 @@ class ProjectMixin(object):
         for slot in slots:
             if str(slot.get("period_id") or "") in blocked_periods:
                 slot["period_auto"] = False
-        if past:
-            notes.append("今天已经过去的 %d 场不算空闲。" % past)
-        if busy:
-            notes.append("%d 场已经挂着任务了，不算空闲。" % busy)
-        if reserved:
-            notes.append("%d 场已经被 formatter 占掉，项目 plan 不会碰。" % reserved)
-        if unbooked:
-            notes.append("%s 还没订上 Focusmate，但仍计入空场（plan 排进去后，"
-                         "等订上会自动挂任务）。" % "、".join(unbooked))
-        if live_included:
-            notes.append("当前进行中的 session #%s 已纳入：%s；只算剩下的完整 "
-                         "%d 分钟块。" % (" / #".join(
-                             str(s["index"]) for s in slots if s.get("current")),
-                             "、".join(live_included), pp.MINUTES_PER_COUNT))
-        if live_short:
-            notes.append("当前进行中的 %s 剩余不足 1 count，没纳入。"
-                         % "、".join(live_short))
-        if live_busy:
-            notes.append("当前进行中的 %s 已经挂着任务，没纳入。"
-                         % "、".join(live_busy))
-        if live_unplanned:
-            notes.append("%s 是计划外的真实 session，但正在进行的空场也按 -c "
-                         "纳入；不会改 data.csv。" % "、".join(live_unplanned))
-        return slots, notes
+        return slots, blocked_periods
+
+    def _plan_slots(self, day, include_current=False, replan=None):
+        """这一天的**可用空场** → ``(slots, notes)``。
+
+        三层各管一件事，别再混在一个循环里：
+
+        1. :meth:`available_periods` —— **period 层**：这一天有哪些时段、哪些是
+           自动排布（排期可以自己决定 session 长度）。
+        2. :meth:`_row_slots` —— **行层**：data.csv / API 里真实存在的场次，
+           按「过去了 / 挂任务了 / 被 formatter 占了」筛掉，并记下哪些时段
+           因为被排除而不能再整段重排。
+        3. :meth:`_auto_period_slots` —— **容量层**：把「整段空着」的自动时段
+           换成一个「整段工作容量」的伪 slot，让 plan 重新决定切分。
+
+        只排除三类：已经过去的（今天就按「现在」筛）、已经挂任务的、
+        被 formatter 占掉的。**没订上 Focusmate 的场次照常计入**（notes 里点名），
+        任务先本地挂到那场，等 daemon 订上之后 ``refresh --check`` 再补挂。
+
+        ``include_current=True`` 时，今天**已经开始但还没结束、且没挂任务**的那一场
+        也纳入范围。此时只算剩下的完整 25 分钟块：例如 10:00–10:50 的场次在
+        10:20 敲 ``plan -c``，容量是 1 count（25 分钟），不会按完整的 50 分钟骗人。
+
+        ``replan=True`` 给普通 ``plan`` 用：上一轮 plan 还没完成的本地任务不算
+        「占用」，因为这些旧计划会在 complete 时整体撤掉重排；用户自己的任务、
+        formatter 任务仍照常排除。
+        """
+        if replan is None:
+            replan = bool(getattr(self, "_plan_replanning", False))
+        now = self._now_dt()
+        period_meta = self.available_periods(day)
+        slots, blocked, stats = self._row_slots(
+            day, period_meta, include_current=include_current,
+            replan=replan, now=now)
+        slots, blocked = self._auto_period_slots(
+            day, period_meta, blocked, slots,
+            include_current=include_current, now=now)
+        return slots, self._plan_notes(stats, slots)
 
     def cmd_plan(self, args=None):
         """``plan`` —— 把这一天剩下的空闲切成 count，分给项目，再自动排任务。
@@ -3296,18 +3353,20 @@ class ProjectMixin(object):
         allocator.allocations = [{"project_id": a["project_id"], "count": a["count"]}
                                  for a in allocs]
         allocator.closed = True
-        self._plan_apply(allocator, allocs, append_to_plan=False)
+        self._plan_apply(allocator, allocs, append_to_plan=False, book=False)
         self._stamp_auto_plan_signature(day)
         self.say("♻️ 检测到计划变化：已按 period 重算未来 session，当前正在进行的场次没动。",
                  "info")
         return True
 
-    def _plan_apply(self, allocator, allocs, append_to_plan=False):
+    def _plan_apply(self, allocator, allocs, append_to_plan=False, book=True):
         """分配完了：先记资源，再挑任务、排进 session。
 
         ``append_to_plan=True`` 给 sessional plan / 手工单场安排用：当天已有
         的分配和 items 保留，只把这一次的结果追加进去，不覆盖整天计划。
 
+        ``book=True`` 时末尾统一走 :meth:`book` 把执行区的场次订上；
+        refresh 的自动重排传 False（对账轮不新造外部动作）。
 
         「尽量一场一个任务、尽量不拆开」在 :func:`project_plan.schedule` 里：先跑
         二分图匹配求「一对一站位」，配不上才拆、才往同一场里叠。
@@ -3351,12 +3410,17 @@ class ProjectMixin(object):
             if not period:
                 continue
             try:
-                new_sessions = sp.plan_period(period, durations)
-                dropped = self._task_bindings_dropped(period, new_sessions)
-                self._cancel_stale_period_sessions(period, new_sessions, dropped)
-                sp.set_layout(day, period.get("id"), durations, source="auto")
+                # 走唯一事务：取消旧场 → 写 layout → 清绑定 → 重算 data.csv。
+                # 这里不预约（book=False）：整天重排的预约由 _plan_apply 末尾统一触发；
+                # refresh 的自动重排整轮都在 _suppress_book 里。
+                # write_csv=False：几个时段改完由下面统一重算一次，别每段整表重写。
+                self.commit_layout(day, period, durations, source="auto",
+                                   reason="auto-plan", book=False, announce=False,
+                                   write_csv=False)
             except ValueError as e:
                 notes.append("自动排布「%s」没落盘：%s" % (period.get("id"), e))
+            except Exception as e:             # noqa: BLE001 - 一段坏了不挡其余
+                notes.append("自动排布「%s」落盘出错：%s" % (period.get("id"), e))
         if auto_layouts:
             try:
                 self.rewrite_data_csv_from_plan()
@@ -3515,6 +3579,11 @@ class ProjectMixin(object):
         if failed:
             self.had_error = True
         self._stamp_auto_plan_signature(day)
+        # 排好的场次得有人去订 —— 统一走 book()（唯一预约出口）。
+        # 以前 plan 完成什么都不触发，只能等 daemon 下一轮或手动 refresh --check，
+        # 而 `period` / `session` 却是立刻订的：同一条流水线两个待遇。
+        if book:
+            self.book(day, why="plan 排完了，要把执行区的场次订上")
         self.invalidate()
         return {"placements": len(placements), "counts": total_counts,
                 "unscheduled": len(unscheduled), "notes": notes, "failed": failed,

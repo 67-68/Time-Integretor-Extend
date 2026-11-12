@@ -172,9 +172,37 @@ plan [天数]         一次分配：每个 pro 只取当前阶段的 SOP/incuba
   后台的旧场取消，**不创建新 session 订单、不在 Focusmate 建 task**。
 "缺"那几行刷一万遍也还是"缺"。订场只有一条路径 —— `keep_session.py` 的 daemon
 （`book_session` + API 复核），warden 里没有任何预订入口，也不该有：
-TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后触发一轮 `check`
-（`session` / `period` / `relocate` / `force-check`）。同理，任务视图里的
-`refresh` 只跑 `GET /v1/tasks` 同步完成时间，也不订场。
+TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后触发一轮 `check`。
+
+### 统一流水线：一个 `commit_layout()` + 一个 `book()`
+
+2026-11 重构前，这件事散在 4~5 处手抄的实现里，而且**只有 `period` 会立刻订**：
+`plan` 排好了却不订，得等 daemon 下一轮或手动 `refresh --check`。现在收成两个口子：
+
+| 阶段 | 唯一实现 | 谁调 |
+| --- | --- | --- |
+| ① 定 period 时间 | `available_periods(day)` | `_plan_slots` / 看板 |
+| ② 落排布 | `commit_layout(day, period, durations, mode=set/clear/remove)` | `period` / `plan` 自动排布 / formatter 切割 / 自动重排 |
+| ③ 写契约 | `commit_layout` 内部 `rewrite_data_csv_from_plan()` | 同上（`write_csv=False` 可让调用方最后统一写一次） |
+| ④ 预约 | `book(day, force=, wait=)` | 所有改了 data.csv 的**命令层**写入者末尾 |
+
+`commit_layout` 的顺序不能变（每一步都有事故背书）：纯计算验证 → 撤「永不重订」
+判决 → 拿 daemon 的 round lock → 写挂号单 → 取消旧场 → 写 layout → 清任务绑定 →
+重算 data.csv → 放锁。**所有入口都拿 round lock**，不再有「只有 `period` 守住」
+的破口。
+
+`book()` 是唯一预约出口：同步模式（测试 / `--exec`）走 `run_keep_session("check")`
+并等结果，异步模式丢给 `op_keep_session`（daemon 会补，不冻提示符）；
+`_release_browser()` 也只在它里面出现一次。两个守卫：
+
+- `_suppress_book`：refresh 的对账轮整段置位 —— **只对账、不新造外部动作**
+  （这是 `refresh` 原有的契约，现在由 `reconcile_schedule_pipeline` 一处守住）。
+- `_booking`：防重入，已经在订就不再嵌套。
+
+`offline` 守卫留在**调用方**（`cmd_period_layout` 本来就是 `if not self.offline`
+才订），`book()` 不替各条路重新定义离线语义。
+
+同理，任务视图里的 `refresh` 只跑 `GET /v1/tasks` 同步完成时间，也不订场。
 
 ### `refresh`：看板上每块组件都重新对一次账
 

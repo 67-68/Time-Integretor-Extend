@@ -99,6 +99,24 @@ apply=本地那半)`。所以 warden 关掉再开、断网恢复之后，照样�
 
 失败账同时进警告板（`source=网络`），文案里直接给出下一步命令。
 
+### 「跑一次就够」的动作：`coalesce`
+
+用户原话：「让 re-action 不要重复执行类似『每日检查 OmniFocus 项目（1 个）』
+这样的、运行一个就行的任务，他们如果失败，算一个失败就行了，因为我只需要做
+一个就可以检查完成全部。」
+
+`COALESCE_ACTIONS`（`warden_core/common.py`）里的动作（现在只有
+`omnifocus.project_sync`）在 `net_action()` 里被标成 `Action.coalesce=True`：
+这类动作一次调用就对完整个世界，参数里带的只是“当时的项目快照”，照老规矩
+（`name + args`）记账会一天长出几十条互不相同的账。
+
+- 记账：按 **name** 合并成一条（保留最新一次的参数，`attempts` 累加）；
+- 成功一次：这一类旧账全清（args 不同也清）；
+- `re-action`：同一 name 只重放一次；
+- 旧账本（没有 coalesce 字段的）：warden 启动时 `jobs.prune_failures()` 合并，
+  免得升级后第一次 re-action 把同一件事跑几十遍。
+
+
 ## 边界：哪些外部调用**不**进队列
 
 一次改好几场的“多步事务”里，**本地写**仍然同步跑（要么都改、要么都别改），

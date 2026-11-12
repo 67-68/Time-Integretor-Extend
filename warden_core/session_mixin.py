@@ -825,6 +825,20 @@ class SessionMixin(object):
         else:
             self.refresh()
         return True
+    def _layout_rows(self, day):
+        """改排布要看的「当前已订场次」。
+
+        **看板那一天用 ``self.rows``**（它就是刚拉回来的真数据，行号也在这里），
+        **别的天用快照**（formatter 会切明天/后天的场次）。以前这两条路各写一份
+        取数逻辑，现在统一在这里；``_snapshot_rows`` 在 sync 模式下会重问一次
+        bridge，拿看板那天的行去问会把手上这份真数据换成空快照。
+        """
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        if iso == self.sel_date.isoformat() and self.authoritative:
+            return [dict(row) for row in (self.rows or ())
+                    if str(row.get("date") or "") == iso]
+        return self._snapshot_rows(iso)
+
     def _period_row_is_stale(self, row, new_by_start):
         """这一行 API session 还符合新排布吗？（按起点 + 时长判断）"""
         start = row.get("startLabel")
@@ -857,19 +871,23 @@ class SessionMixin(object):
                 return lock
         return None
 
-    def _period_cancel_keys(self, period, new_sessions):
-        """这一时段里「改完排布之后就不该再存在」的 state key（给 daemon 挂号用）。"""
+    def _period_cancel_keys(self, period, new_sessions, day=None):
+        """这一时段里「改完排布之后就不该再存在」的 state key（给 daemon 挂号用）。
+
+        ``day`` 省略时退回 period 自带日期 / 看板那天（兼容老调用）。
+        """
         kept = set()
         for sess in new_sessions or []:
             try:
                 kept.add((str(sess.get("start")), int(sess.get("duration"))))
             except (TypeError, ValueError):
                 continue
-        date = period.get("date") or self.sel_date.isoformat()
+        date = (day.isoformat() if hasattr(day, "isoformat") else str(day or "")) \
+            or period.get("date") or self.sel_date.isoformat()
         keys = set()
         # 1) 表格里有 id、但新排布里没有同起点同时长的场次
-        for row in self.rows or []:
-            if not row.get("id") or row.get("date") != date:
+        for row in self._layout_rows(datetime.date.fromisoformat(date)):
+            if not row.get("id") or str(row.get("date") or "") != date:
                 continue
             start = row.get("startLabel")
             if sp.period_for_session([period], start) is None:
@@ -993,8 +1011,13 @@ class SessionMixin(object):
         except Exception as e:                        # noqa: BLE001
             self.say("清理旧 state 失败（daemon 可能多记一笔 sin）：%s" % e, "warn")
 
-    def _cancel_stale_period_sessions(self, period, new_sessions, dropped_tasks=()):
-        """改 layout 前，把旧排布里已经订上的 API session 对齐掉。
+    def _cancel_stale_period_sessions(self, day, period, new_sessions,
+                                      dropped_tasks=(), reason="layout-changed"):
+        """把「新排布里不再存在」的已订场次在 Focusmate 上取消掉。
+
+        **所有排布写入者共用的唯一一份实现。** 以前有两份：一份吃 ``self.rows``
+        （改今天）、一份吃 ``_snapshot_rows(iso)``（formatter 改别的天），逻辑
+        一模一样但已经分叉。现在统一按日期取快照，改今天和改明天走同一条路。
 
         为什么必须做：data.csv 换成 22:15(25)+22:45(25) 之后，API 里原先那场
         22:15(50) 不会自己消失；daemon 只补订、不擅自杀旧场，于是 50min/25min
@@ -1004,15 +1027,19 @@ class SessionMixin(object):
         有阻力的是**取消单场**（`cancel N` 那条路仍然要敲宣言，一点没放松）。
         为了不让人稀里糊涂丢东西，取消前照样把面板列出来，并把会被清掉的任务
         绑定一起写清楚。
+
+        返回 ``(cancelled, failed)``：cancelled 是被取消的行；failed=True 表示
+        同步模式下至少有一条取消失败（调用方据此别把新排布当成已生效）。
         """
-        if self.offline or not self.authoritative:
-            return True
-        new_by_start = {s["start"]: int(s["duration"]) for s in new_sessions}
+        if self.offline:
+            return [], False
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        new_by_start = {s["start"]: int(s["duration"]) for s in new_sessions or []}
         stale = []
-        for row in self.rows:
+        for row in self._layout_rows(day):
             if not row.get("id"):
                 continue
-            if row.get("date") != period.get("date"):
+            if str(row.get("date") or "") != iso:
                 continue
             if sp.period_for_session([period], row.get("startLabel")) is None:
                 continue
@@ -1020,7 +1047,7 @@ class SessionMixin(object):
                 stale.append(row)
         stale, _protected = self._split_started_sessions(stale)
         if not stale:
-            return True
+            return [], False
 
         past = [r for r in stale if r.get("zone") == "past"]
         live = [r for r in stale if r.get("zone") != "past"]
@@ -1028,7 +1055,14 @@ class SessionMixin(object):
             self.say("有 %d 场旧 session 已经过去；过去的场次不取消、不补订。"
                      % len(past), "warn")
         if not live:
-            return True
+            return [], False
+
+        # 挂号单必须写在真正取消**之前**：daemon 任何一轮看到「booked 但 API 没了」
+        # 都会先查它，命中就不记罪（一码一用，不掩护以后真的手动取消）。
+        keys = self._period_cancel_keys(period, new_sessions, day=day)
+        if keys:
+            ks.expect_cancel(sorted(keys), reason="%s:%s %s"
+                             % (reason, period.get("id"), iso))
 
         info = Table.grid(padding=(0, 2))
         info.add_column(style="bold", no_wrap=True)
@@ -1037,11 +1071,16 @@ class SessionMixin(object):
                      % (period.get("id"), period.get("start"), period.get("end"),
                         period.get("name") or period.get("type") or ""))
         for row in live:
-            info.add_row("要取消", "#%s  %s–%s（%smin）"
-                         % (self.rows.index(row) + 1, row.get("startLabel"),
+            try:
+                label = "#%d" % (self.rows.index(row) + 1)
+            except ValueError:
+                label = "—"          # 改的不是看板那一天，表格里没有行号
+            info.add_row("要取消", "%s  %s–%s（%smin）"
+                         % (label, row.get("startLabel"),
                             row.get("endLabel") or "?", row.get("durationMin") or "?"))
-        info.add_row("新排布", "  ".join("%s–%s(%d)"
-                                       % (s["start"], s["end"], s["duration"])
+        info.add_row("新排布", "  ".join("%s–%s(%s)"
+                                       % (s.get("start"), s.get("end"),
+                                          s.get("duration"))
                                        for s in new_sessions) or "（空）")
         for task in dropped_tasks:
             sess = task.get("session") or {}
@@ -1052,7 +1091,7 @@ class SessionMixin(object):
         self.emit(Panel(info, title="[bold yellow]⚠ 改排布：旧 session 会被取消[/]",
                         border_style="yellow", box=box.HEAVY))
 
-        cancelled = []
+        cancelled, failed = [], False
         try:
             for row in live:
                 self.say("取消旧 session %s–%s（%smin）…"
@@ -1065,9 +1104,8 @@ class SessionMixin(object):
                 before_index, _ = self._forget_api_row(row.get("id")) or (None, None)
                 action = self.net_action(
                     "session.cancel",
-                    "取消旧 session %s %s" % (row.get("date"),
-                                              row.get("startLabel") or "?"),
-                    {"date": row.get("date"), "start": row.get("startLabel"),
+                    "取消旧 session %s %s" % (iso, row.get("startLabel") or "?"),
+                    {"date": iso, "start": row.get("startLabel"),
                      "startMs": row.get("startMs"), "meeting_id": row.get("id")})
                 job = self.jobs.submit(
                     action,
@@ -1077,6 +1115,7 @@ class SessionMixin(object):
                                         _row, error, index=_idx))
                 if self.jobs.sync and (job.outcome is None or not job.outcome.ok):
                     self.had_error = True
+                    failed = True
                     continue
                 cancelled.append(row)
                 self.say("✅ %s旧 session %s"
@@ -1089,7 +1128,7 @@ class SessionMixin(object):
             # 清掉 state 里的旧 booked 记录，否则 daemon 下一轮会记一笔 sin 并锁死 TUI。
             # 同一个起点如果新排布还要用，它会以新 duration 重新进入待订队列。
             self._forget_layout_state(cancelled)
-        return True
+        return cancelled, failed
 
     # -- 静音时段（period mute） --------------------------------------
 
@@ -1365,6 +1404,121 @@ class SessionMixin(object):
             self.refresh(quiet=True)
         return made
 
+    # -- 排布落盘：整条流水线的唯一事务 --------------------------------
+    def commit_layout(self, day, period, durations, *, source=None,
+                      mode="set", dropped_tasks=None, reason="layout-changed",
+                      book=False, announce=True, write_csv=True,
+                      missing_ok=False):
+        """**唯一的排布落盘事务**：取消旧场 → 写 layout → 清绑定 → 重算 data.csv。
+
+        以前这一串被手抄了 5 份（``period`` / ``plan`` 自动排布 / formatter 切割 /
+        formatter 兜底加场 / CLI），每份的步骤顺序、是否拿 daemon 的 round lock、
+        是否写挂号单都不一样 —— 同一条铁律只有 1 份守住。现在全部走这里。
+
+        顺序不能变，每一步都有事故背书：
+
+        1. 纯计算先验证（``plan_period`` 失败 = 零副作用）；
+        2. 撤「永不重订」判决（重新排布 = 你又想要这几场）；
+        3. 拿 daemon 的 round lock（等不到就靠挂号单兜底）；
+        4. 写挂号单 → 取消旧场（顺序反了 daemon 会记一笔 sin 并锁死 TUI）；
+        5. 写 layout（**落盘成功之后**才动任务绑定，写失败就什么都不清）；
+        6. 重算 data.csv（下载层 + 所有 layout + 一次性 + 长期规则）；
+        7. 放开锁。
+
+        ``mode``：
+          * ``set``    —— 写 ``durations``（``source`` 默认 manual）；
+          * ``clear``  —— 写空排布，保留 period 本身（``period T1 clear``）；
+          * ``remove`` —— 删掉自定义排布，回落到默认。
+
+        ``book=True`` 时才在末尾统一预约（refresh 的自动重排传 False）。
+        ``write_csv=False`` 给「一次改好几个时段」的调用方用：由它最后统一重算
+        一次 data.csv，避免每段都整表重写一遍。
+
+        返回 ``{"ok", "sessions", "cancelled", "dropped", "failed"}``。
+        """
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        period_id = period.get("id")
+        if mode == "clear":
+            effective = []
+        elif mode == "remove":
+            effective = sp.default_durations(period)
+        else:
+            # 注意 ``[]`` 是「这个时段当天不排了」，不能当成「没给」回落默认排布。
+            effective = (list(durations) if durations is not None
+                         else sp.default_durations(period))
+        # 纯计算先验证；这里抛 ValueError = 零副作用。
+        new_sessions = sp.plan_period(period, effective)
+
+        # 排布一变，动过的场次上的任务绑定就该清掉；先算出来，好写进取消前的面板。
+        dropped = (self._task_bindings_dropped(period, new_sessions)
+                   if dropped_tasks is None else list(dropped_tasks))
+
+        # 重新排布 = 你又想要这几场：先撤掉「永不重订」的判决，否则认过罪的场次
+        # 永远补不回来（daemon 在 due 之前就把 abandoned 的 key 滤掉了）。
+        revived = ks.clear_abandoned(
+            [sch.key_of(day, s["start"]) for s in new_sessions])
+        if revived:
+            self.say("撤销 %d 条「永不重订」判决：这几场重新进 daemon 的下单队列。"
+                     % revived, "ok")
+
+        # 取消旧场 → 清 state → 写新排布 这三步必须和 daemon 的一轮互斥（同一把锁），
+        # 否则它会在缝隙里把 warden 自己干的活记成「你手动取消」的罪。
+        lock = self._acquire_round_lock(
+            on_wait=lambda: self.say("daemon 正在跑一轮，等它跑完再改排布（最多等 30 秒）…",
+                                     "cmd"))
+        if lock is None:
+            self.say("daemon 正在跑一轮（等不到 round lock），改成挂号单兜底："
+                     "会让它别把这次改动记成罪。", "warn")
+        cancelled, failed = [], False
+        cleared = []
+        try:
+            # 旧 API session 先对齐，否则 50min / 25min 会并存。
+            # 挂号单写在真正取消之前，由它内部负责（见 _cancel_stale_period_sessions）。
+            cancelled, failed = self._cancel_stale_period_sessions(
+                day, period, new_sessions, dropped, reason=reason)
+            if failed:
+                # 取消失败 = 新排布没生效，别再往下写 layout（否则 50/25 并存）。
+                return {"ok": False, "sessions": new_sessions,
+                        "cancelled": cancelled, "dropped": dropped,
+                        "cleared": [], "failed": True}
+
+            if mode == "clear":
+                sp.set_layout(day, period_id, [], source="auto")
+                if announce:
+                    self.say("🧹 已清空 %s %s 的 session 内容；period 本身保留，"
+                             "下次 plan 会按任务重新生成。" % (iso, period_id), "ok")
+            elif mode == "remove":
+                removed = sp.remove_layout(day, period_id)
+                if removed is None and not missing_ok:
+                    # 交互式 `period T1`（不带时长）才需要「本来就没有」这个提示；
+                    # 自动路径（formatter 切割）要的是「确保没有自定义排布」这个
+                    # 终态，本来就没有 = 已经达成，不该抛。
+                    raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
+                if announce:
+                    self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
+            else:
+                kwargs = {"source": source} if source else {}
+                sp.set_layout(day, period_id, effective, **kwargs)
+                if announce:
+                    body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
+                                     for s in new_sessions)
+                    self.say("✅ %s %s → %s" % (iso, period_id, body), "ok")
+
+            # 排布落盘之后才动任务绑定：没写进去就什么都不清。
+            cleared = self.clear_task_bindings_for_layout(period, new_sessions)
+
+            # 从下载层 + 所有 layout + 一次性 + 长期规则重新生成 data.csv。
+            if write_csv and self.rewrite_data_csv_from_plan() and announce:
+                self.say("data.csv 已按下载层重算（精确日期行）。", "info")
+        finally:
+            if lock is not None:
+                lock.__exit__(None, None, None)
+
+        if book:
+            self.book(day, why="排布变了，要把新场次订上")
+        return {"ok": True, "sessions": new_sessions, "cancelled": cancelled,
+                "dropped": dropped, "cleared": cleared, "failed": False}
+
     def cmd_period_layout(self, args):
         """period T1 50 50 / session T1 50 50 —— 改一个时段的 session 排布。
 
@@ -1414,79 +1568,20 @@ class SessionMixin(object):
             raise ValueError("没有时段 %s（%s 的时段：%s）"
                              % (period_id, self.sel_date.isoformat(),
                                 "、".join(p.get("id", "?") for p in periods) or "无"))
-        # 纯计算先验证；这里失败 = 零副作用。
-        effective = ([] if clearing else
-                     (durations if durations else sp.default_durations(period)))
-        new_sessions = sp.plan_period(period, effective)
-
-        # 排布一变，动过的场次上的任务绑定就该清掉；先算出来，好写进取消前的面板。
-        dropped = self._task_bindings_dropped(period, new_sessions)
-
-        # 重新排布 = 你又想要这几场：先撤掉「永不重订」的判决，否则认过罪的场次
-        # 永远补不回来（daemon 在 due 之前就把 abandoned 的 key 滤掉了）。
-        revived = ks.clear_abandoned(
-            [sch.key_of(self.sel_date, s["start"]) for s in new_sessions])
-        if revived:
-            self.say("撤销 %d 条「永不重订」判决：这几场重新进 daemon 的下单队列。"
-                     % revived, "ok")
-
-        # 取消旧场 → 清 state → 写新排布 这三步必须和 daemon 的一轮互斥（同一把锁），
-        # 否则它会在缝隙里把 warden 自己干的活记成「你手动取消」的罪。
-        lock = self._acquire_round_lock(
-            on_wait=lambda: self.say("daemon 正在跑一轮，等它跑完再改排布（最多等 30 秒）…",
-                                     "cmd"))
-        if lock is None:
-            self.say("daemon 正在跑一轮（等不到 round lock），改成挂号单兜底："
-                     "会让它别把这次改动记成罪。", "warn")
-        try:
-            # 挂号单要写在真正取消**之前**：daemon 任何一轮看到「booked 但 API 没了」
-            # 都会先查它，命中就不记罪（一码一用，不掩护以后真的手动取消）。
-            keys = self._period_cancel_keys(period, new_sessions)
-            if keys:
-                ks.expect_cancel(sorted(keys),
-                                 reason="layout-changed:%s %s" % (period_id, self.sel_date))
-
-            # 旧 API session 先对齐，否则 50min / 25min 会并存。
-            if not self._cancel_stale_period_sessions(period, new_sessions, dropped):
-                return False
-
-            if clearing:
-                sp.set_layout(self.sel_date, period_id, [], source="auto")
-                self.say("🧹 已清空 %s %s 的 session 内容；period 本身保留，下次 plan "
-                         "会按任务重新生成。" % (self.sel_date.isoformat(), period_id), "ok")
-            elif not durations:
-                removed = sp.remove_layout(self.sel_date, period_id)
-                if removed is None:
-                    raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
-                self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
-            else:
-                sp.set_layout(self.sel_date, period_id, durations, source="manual")
-                body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
-                                 for s in new_sessions)
-                self.say("✅ %s %s → %s" % (self.sel_date.isoformat(), period_id, body), "ok")
-
-            # 排布落盘之后才动任务绑定：没写进去就什么都不清。
-            self.clear_task_bindings_for_layout(period, new_sessions)
-
-            # 从下载层 + 所有 layout + 一次性 + 长期规则重新生成 data.csv。
-            # 写在 layout 成功之后。
-            if self.rewrite_data_csv_from_plan():
-                self.say("data.csv 已按下载层重算（精确日期行）。", "info")
-        finally:
-            if lock is not None:
-                lock.__exit__(None, None, None)
+        mode = ("clear" if clearing else
+                "remove" if not durations else "set")
+        # 纯计算先验证；这里失败 = 零副作用（plan_period 在 commit_layout 里跑）。
+        result = self.commit_layout(
+            self.sel_date, period,
+            [] if clearing else (durations or []),
+            source="auto" if clearing else "manual",
+            mode=mode, book=False, announce=True)
+        if not result["ok"]:
+            return False
 
         if not self.offline:
-            # 新排布里执行区的场次需要立刻补订；先让 bridge 放开 profile。
-            self._release_browser("daemon 下单要独占同一个 Chromium profile")
-            self.say("立刻触发一轮 check（keep_session.py check）…", "cmd")
-            rc, out, err = get_warden_global("run_keep_session", run_keep_session)("check", timeout=600)
-            for line in (out or "").splitlines()[-20:]:
-                self.say(line)
-            if rc != 0:
-                self.had_error = True
-                self.say("❌ check 退出码 %d%s（新契约已落盘，daemon 后续还会补）"
-                         % (rc, ("：" + err) if err else ""), "error")
+            # 新排布里执行区的场次需要立刻补订 —— 统一走 book()（唯一预约出口）。
+            self.book(self.sel_date, why="改完排布，要把新场次订上")
             self.rebuild_rows()
             self.refresh(quiet=True)
         return True
@@ -1557,16 +1652,8 @@ class SessionMixin(object):
             self.say("   ⚠ 这个时间已经过了：这一轮不会订（对下一个%s才生效）。"
                      % sch.cn_weekday_of_day(day), "warn")
 
-        self._release_browser("daemon 下单要独占同一个 Chromium profile")
-        self.say("立刻触发一轮 check（keep_session.py check）…", "cmd")
-        rc, out, err = get_warden_global("run_keep_session", run_keep_session)("check", timeout=600)
-        for line in (out or "").splitlines()[-20:]:
-            self.say(line)
-        if rc == 0:
-            self.say("✅ check 跑完。", "ok")
-        else:
-            self.had_error = True
-            self.say("❌ check 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
+        # 新加的这一场要立刻订上 —— 统一走 book()（唯一预约出口）。
+        self.book(day, why="加了一场，要把它订上")
         self.refresh()
         return True
 
@@ -1799,6 +1886,66 @@ class SessionMixin(object):
                      "warn")
         return fixed
 
+    # -- 预约：整条流水线的唯一出口 ------------------------------------
+    def book(self, day=None, *, why="", force=False, wait=None, announce=True):
+        """**唯一的预约出口**：让 daemon 跑一轮 check，把执行区的场次订满。
+
+        以前这件事散在四条路上各写一遍（``period`` / ``session`` /
+        ``refresh --check`` / ``force-check``），每条自己 ``_release_browser()``
+        再拼子进程参数；而 ``plan`` 完成时**一条都没有** —— 排好了却没人订，
+        只能等 daemon 下一轮。现在所有「改了 data.csv」的写入者末尾都调这里，
+        一条流水线一个出口。
+
+        下单逻辑不在这里重写：永远是薄封装 ``keep_session.py check``
+        （业务逻辑一份就够，和 schedule.py / download_calendar.py 同一个原则）。
+
+        ``force=True`` → ``check --force``（忽略重试上限/退避）。
+        ``wait`` 默认：同步模式（测试 / ``--exec``）必然等结果；异步模式不等，
+        daemon 会补，绝不冻住提示符。
+
+        **offline 守卫留在调用方**（``cmd_period_layout`` 本来就是
+        ``if not self.offline`` 才订）：这里只管「把动作统一」，不替各条路
+        重新定义离线语义。唯一的全局守卫是 ``_suppress_book``（refresh 的对账轮
+        只对账、不新造外部动作）。
+        """
+        if getattr(self, "_suppress_book", False):
+            return None
+        if getattr(self, "_booking", False):
+            return None                       # 已经在订了，别嵌套
+        self._booking = True
+        try:
+            self._release_browser(why or "daemon 下单要独占同一个 Chromium profile")
+            argv = ["check"] + (["--force"] if force else [])
+            label = "预约（keep_session %s）" % " ".join(argv)
+            if announce:
+                self.say("立刻触发一轮 %s…" % " ".join(["check"] + argv[1:]), "cmd")
+            if self.jobs.sync:
+                rc, out, err = get_warden_global(
+                    "run_keep_session", run_keep_session)(*argv, timeout=600)
+                for line in (out or "").splitlines()[-20:]:
+                    self.say(line)
+                if rc != 0:
+                    self.had_error = True
+                    self.say("❌ check 退出码 %d%s（契约已落盘，daemon 后续还会补）"
+                             % (rc, ("：" + err) if err else ""), "error")
+                    return False
+                if announce:
+                    self.say("✅ check 跑完。", "ok")
+                return True
+            do_wait = True if wait is None else bool(wait)
+            job = self.op_keep_session(argv, label, wait=do_wait)
+            if not do_wait:
+                return True
+            outcome = job.outcome
+            if outcome is None or not outcome.ok:
+                self.had_error = True
+                self.say("❌ check 没跑成%s（契约已落盘，daemon 下一轮还会补）"
+                         % (("：" + outcome.error) if outcome else ""), "error")
+                return False
+            return True
+        finally:
+            self._booking = False
+
     def check_bookings(self):
         """该订没订上的 session → 让 daemon 补一轮。返回修了几场。"""
         missing = [r for r in self.rows
@@ -1810,13 +1957,9 @@ class SessionMixin(object):
                          for r in missing[:5])
         self.say("⚠ %d 场该订却没订上：%s —— 叫 daemon 补一轮（check）…"
                  % (len(missing), names), "warn")
-        self._release_browser("daemon 下单要独占同一个 Chromium profile")
-        job = self.op_keep_session(["check"], "对账（keep_session check）", wait=True)
-        outcome = job.outcome
-        if outcome is None or not outcome.ok:
-            self.had_error = True
-            self.say("❌ check 没跑成%s（计划照旧留着，daemon 下一轮还会补）"
-                     % (("：" + outcome.error) if outcome else ""), "error")
+        ok = self.book(self.sel_date, why="对账：补订缺的场次",
+                       wait=True, announce=False)
+        if ok is False:
             return 0
         return len(missing)
 
@@ -1968,15 +2111,8 @@ class SessionMixin(object):
         下单逻辑不在这里重写：薄封装 `keep_session.py check --force`。
         """
         self.say("force-check：忽略重试上限/退避，对执行区所有没订上的 session 各试一次…", "cmd")
-        self._release_browser("daemon 下单要独占同一个 Chromium profile")
-        rc, out, err = get_warden_global("run_keep_session", run_keep_session)("check", "--force", timeout=600)
-        for line in (out or "").splitlines()[-40:]:
-            self.say(line)
-        if rc == 0:
-            self.say("✅ force-check 跑完。", "ok")
-        else:
-            self.had_error = True
-            self.say("❌ force-check 退出码 %d%s" % (rc, ("：" + err) if err else ""), "error")
+        self.book(self.sel_date, why="force-check：强制重订", force=True,
+                  wait=True, announce=False)
         self.refresh()
         return True
 

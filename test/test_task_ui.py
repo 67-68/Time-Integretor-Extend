@@ -71,6 +71,13 @@ def _no_network(*a, **kw):
 ks.fetch_session_details = _no_network
 ks.fetch_sessions = _no_network
 
+# 排布 / formatter 改完之后统一走 `warden.book()` → `keep_session.py check`。
+# 测试里绝不许真起那个子进程：它会读**真的** data.csv 和 state 文件，bridge
+# 活着时还会真下单。这里钉成空实现，需要断言「叫了 check」的用例自己在局部
+# 覆盖 w.run_keep_session（见下面 refresh --check 那一节）。
+_orig_run_keep_session = w.run_keep_session
+w.run_keep_session = lambda *a, **kw: (0, "", "")
+
 ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
 ks.IDLE_STATE_FILE = os.path.join(TMP, "idle.json")
 ks.IDLE_MODE_FILE = os.path.join(TMP, "mode.json")

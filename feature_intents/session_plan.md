@@ -73,6 +73,15 @@ iCloud 日历（只 工作 / 空闲，今天 + 7 天）
 而且那几场被判「永不重订」，新排布里的场次永远补不回来（2026-10-27 真踩过：
 `period T3 50 75` 之后 `20:00` / `21:00` 各记一笔 `booked-but-missing`）。
 
+> **2026-11 起这三件套只有一份实现**：`warden_core.session_mixin.commit_layout()`。
+> 以前 `period` / `plan` 自动排布 / formatter 切割 / formatter 兜底加场 / CLI
+> 各抄了一遍，而且**只有 `period` 那条路拿了 round lock** —— 同一条铁律，5 个
+> 入口只有 1 个守住。现在所有写入者都走 `commit_layout`，它内部依次做：
+> 纯计算验证 → 撤「永不重订」判决 → 拿 round lock → 写挂号单 → 取消旧场 →
+> 写 layout → 清任务绑定 → 重算 data.csv → 放锁。
+> 取消旧场也只有一份：`_cancel_stale_period_sessions(day, period, new_sessions)`
+> （吃 `_layout_rows(day)`：看板那天用 `self.rows`，别的天用快照）。
+
 1. **同一把 round lock**：这三个步骤包在 `keep_session.round_lock()` 里，和 daemon
    的一轮互斥。等不到锁（daemon 在下单，可能几十秒）会提示并最多等 30 秒；
    实在等不到就照常改，用第 2 条兜底。

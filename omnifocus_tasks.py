@@ -730,6 +730,52 @@ def _looks_like_missing_app(stderr):
     return any(hint in lowered for hint in _MISSING_APP_HINTS)
 
 
+def _host_app():
+    """跑 osascript 的那个「责任 App」。
+
+    TCC 的授权对象是**拉起来的那个终端 App**（osascript 的 responsible
+    process），不是 OmniFocus，也不是「终端」这个泛称。在 iTerm2 里跑 warden
+    却去勾了「终端」，等于没给 —— 这个坑真踩过。``TERM_PROGRAM`` 是终端自己
+    留下的、最靠谱的那条线索；认不出来就返回空，让用户自己看一眼。
+    """
+    table = {
+        "iTerm.app": ("iTerm2", "com.googlecode.iterm2"),
+        "Apple_Terminal": ("终端", "com.apple.Terminal"),
+        "vscode": ("Visual Studio Code", "com.microsoft.VSCode"),
+        "WarpTerminal": ("Warp", "dev.warp.Warp-Stable"),
+        "WezTerm": ("WezTerm", "com.github.wez.wezterm"),
+        "ghostty": ("Ghostty", "com.mitchellh.ghostty"),
+        "Hyper": ("Hyper", "co.zeit.hyper"),
+        "Tabby": ("Tabby", "org.tabby"),
+    }
+    return table.get((os.environ.get("TERM_PROGRAM") or "").strip(), ("", ""))
+
+
+def _permission_message(stderr):
+    """TCC 拒绝时的多行说明。
+
+    **最后一行要是「下一步做什么」**：warden 的失败账只显示 stderr 的最后一行，
+    把人指到设置面板的那句话不能埋在中间。
+    """
+    app, bundle = _host_app()
+    lines = [
+        "macOS 拒绝了自动化权限（TCC：这个进程不许向 OmniFocus 发 Apple 事件；"
+        "-10004 / -1743）。",
+        "  原始错误：%s" % (stderr or "(没有 stderr)"),
+        "  要授权的是「跑 warden 的那个 App」，不是「终端」这个泛称：在 iTerm2 里"
+        "跑却勾了「终端」等于没给；改完不用重启 warden。",
+    ]
+    if bundle:
+        lines.append("  还是不行就清掉旧决定再跑一次，让它重新弹框："
+                     "tccutil reset AppleEvents %s" % bundle)
+        lines.append("  下一步：系统设置 → 隐私与安全性 → 自动化 → 勾上「%s」里的 "
+                     "OmniFocus" % app)
+    else:
+        lines.append("  下一步：系统设置 → 隐私与安全性 → 自动化 → 给跑 warden 的"
+                     "终端勾上 OmniFocus")
+    return "\n".join(lines)
+
+
 def run_osascript(script, timeout=DEFAULT_TIMEOUT, osascript=OSASCRIPT):
     """把脚本从 stdin 喂给 osascript，返回 stdout 文本（UTF-8 解码）。"""
     executable = osascript if os.path.isfile(osascript) else shutil.which(osascript)
@@ -756,13 +802,7 @@ def run_osascript(script, timeout=DEFAULT_TIMEOUT, osascript=OSASCRIPT):
     stderr = proc.stderr.decode("utf-8", "replace").strip()
     if proc.returncode != 0:
         if _looks_like_permission_denied(stderr):
-            raise OsascriptError(
-                "macOS 拒绝了自动化权限。\n"
-                "  系统设置 → 隐私与安全性 → 自动化 → 勾上（终端 / iTerm / 宿主程序）里的 OmniFocus，然后重跑。\n"
-                "  原始错误：%s" % (stderr or "(没有 stderr)"),
-                3,
-                "permission",
-            )
+            raise OsascriptError(_permission_message(stderr), 3, "permission")
         if _looks_like_missing_app(stderr):
             raise OsascriptError(
                 "找不到 / 起不来 OmniFocus（没装？改名了？）。\n"

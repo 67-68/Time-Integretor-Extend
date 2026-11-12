@@ -226,6 +226,7 @@ from warden_core import (  # noqa: E402,F401
     BridgeError,
     BoardMixin,
     CN_WEEKDAY_CHARS,
+    COALESCE_ACTIONS,
     COMMAND_REFRESH_GAP,
     ChoreMixin,
     ChoreView,
@@ -563,6 +564,13 @@ class Warden(
         #: 每份数据是什么时候拿到的：{"session": epoch, "task": epoch, "stat": epoch}
         self.read_at = {}
         self._register_net_actions()
+        # 旧账本里「每日检查」可能攒了几十条（args 带快照，永远不相等）。这类
+        # 动作跑一次就够，启动时把旧的合并成一条 —— 否则 re-action 会挨个重放，
+        # 明明只需要检查一次却跑几十次。
+        try:
+            self.jobs.prune_failures(sorted(COALESCE_ACTIONS))
+        except Exception:                      # noqa: BLE001 - 账本坏了不挡启动
+            pass
         # 提示行 / 补全 / 视图切换 / 状态行的定时刷新 / 帧的擦除重画，
         # 全部交给 repl_kit（prompt_toolkit 按单元格 diff，只写变化的那几格）。
         shell_kwargs = dict(

@@ -4,6 +4,7 @@ import time
 
 from .bridge import BridgeError
 from .common import (
+    COALESCE_ACTIONS,
     FM_PENDING,
     IMPORT_PENDING,
     SRC_CALENDAR,
@@ -47,8 +48,13 @@ class NetMixin(object):
         self._net_dirty = True
 
     def net_action(self, name, label, args=None, source=SRC_FOCUSMATE):
-        """一条可重放的外部动作。``source`` 决定面板上的 ``[focusmate]`` 这种标签。"""
-        return repl_kit.Action(name, label, dict(args or {}), source=source)
+        """一条可重放的外部动作。``source`` 决定面板上的 ``[focusmate]`` 这种标签。
+
+        ``COALESCE_ACTIONS`` 里的动作（一次调用就对完整个世界的那种）会被标成
+        ``coalesce``：失败账按名字只留一条，``re-action`` 也只重放一次。
+        """
+        return repl_kit.Action(name, label, dict(args or {}), source=source,
+                               coalesce=name in COALESCE_ACTIONS)
 
     def op_keep_session(self, argv, label, timeout=600, wait=False, on_ok=None):
         """跑一次 keep_session.py（下单/对账/启停 daemon）—— 走后台队列。

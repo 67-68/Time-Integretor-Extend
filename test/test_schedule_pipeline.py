@@ -43,6 +43,11 @@ w = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(w)
 from rich.console import Console  # noqa: E402
 
+# 排布 / formatter / plan 改完之后统一走 `warden.book()` → `keep_session.py check`。
+# 测试里绝不许真起那个子进程：它会读**真的** data.csv 和 state 文件，bridge
+# 活着时还会真下单。需要断言「叫了 check」的用例自己局部覆盖 w.run_keep_session。
+w.run_keep_session = lambda *a, **kw: (0, "", "")
+
 sp, sch, ts, ks, pj, pp = w.sp, w.sch, w.ts, w.ks, w.pj, w.pp
 sch.DATA_CSV = os.path.join(TMP, "data.csv")
 sch.BACKUP_CSV = os.path.join(TMP, "data.csv.bak")
@@ -510,19 +515,22 @@ except AttributeError:
     pass
 _guard_period = wd_guard.periods_for_day(TODAY)[0]
 wd_guard.bridge.calls = []
-_guard_cancelled = wd_guard._cancel_stale_sessions_for(
+# 以前这里有两条路（formatter 切割 / 改排布）各一份取消实现；现在统一成一份
+# `_cancel_stale_period_sessions(day, period, new_sessions)`，返回 (cancelled, failed)。
+_guard_cancelled, _guard_failed = wd_guard._cancel_stale_period_sessions(
     TODAY, _guard_period, [{"start": "11:30", "duration": 25}],
     reason="refresh-test")
-check("guard：formatter 取消路径跳过进行中的场次", _guard_cancelled, [])
-check("guard：formatter 取消路径没有发 cancel",
+check("guard：取消路径跳过进行中的场次", _guard_cancelled, [])
+check("guard：取消路径没报失败", _guard_failed, False)
+check("guard：取消路径没有发 cancel",
       [c[0] for c in wd_guard.bridge.calls if c[0] == "cancel"], [])
 # 即使表格 zone 被错误标成 locked（时间偏差的典型表现），也只按实际 startMs 判定。
 _guard_row["zone"] = "locked"
 wd_guard.rows = [dict(_guard_row)]
 wd_guard.bridge.calls = []
-_guard_ok = wd_guard._cancel_stale_period_sessions(
-    _guard_period, [{"start": "11:30", "duration": 25}])
-check("guard：排布取消路径仍返回成功", _guard_ok, True)
+_guard_ok, _guard_failed2 = wd_guard._cancel_stale_period_sessions(
+    TODAY, _guard_period, [{"start": "11:30", "duration": 25}])
+check("guard：zone 标错时仍然不报失败", _guard_failed2, False)
 check("guard：zone 标错也不发 cancel",
       [c[0] for c in wd_guard.bridge.calls if c[0] == "cancel"], [])
 

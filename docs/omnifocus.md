@@ -41,6 +41,38 @@ python3 omnifocus_tasks.py set --id <PK> --add-tag 写作 --yes
 退出码：`0` 成功 / `1` 失败 / `2` 参数错 / `3` **自动化权限被拒（TCC）** /
 `4` 预览未写 / `5` 任务不存在 / `6` 标签问题 / `7` 拒绝改 project_root。
 
+### 自动化权限（TCC）：授权对象是「跑 osascript 的那个 App」
+
+这条踩过两次，记清楚：
+
+- OmniFocus 是沙盒 App，任何进程给它发 Apple 事件都要 TCC 的「自动化」授权；
+- 授权对象是**责任进程**，也就是把 warden / osascript 拉起来的那个终端 App。
+  warden 的 TUI 是 `warden-summon.applescript` 在 **iTerm2** 里开的，所以该勾的是
+  「自动化 → iTerm2 → OmniFocus」。**勾「终端」不等于给了** —— 名字像而已；
+- `Warden.app` 只需要「控制 iTerm2」那一项（它只管把窗口叫到前台），跟
+  OmniFocus 权限无关；
+- 被拒时的表现是**秒回**而不是卡住：`-10004`（errAEPrivilegeError）或 `-1743`，
+  0.2 秒就退。秒回说明这条拒绝**已经被记住**，等不到弹框 —— 要重新弹框得先
+  `tccutil reset AppleEvents <bundle id>`（iTerm2 是 `com.googlecode.iterm2`）；
+- 判断是不是权限问题，别只看某一条命令：`osascript -e 'tell application "OmniFocus"
+  to get name of front document'` 这种最简单的读也会一起失败，那就是整条
+  Apple 事件通道被拒，跟脚本内容无关。
+
+`run_osascript` 会把这三件事写进 stderr（**最后一行**是「下一步做什么」，
+warden 的失败账只显示最后一行）：
+
+```
+macOS 拒绝了自动化权限（TCC：这个进程不许向 OmniFocus 发 Apple 事件；-10004 / -1743）。
+  原始错误：…
+  要授权的是「跑 warden 的那个 App」，不是「终端」这个泛称…
+  还是不行就清掉旧决定再跑一次，让它重新弹框：tccutil reset AppleEvents com.googlecode.iterm2
+  下一步：系统设置 → 隐私与安全性 → 自动化 → 勾上「iTerm2」里的 OmniFocus
+```
+
+终端名从 `TERM_PROGRAM` 认（iTerm.app / Apple_Terminal / vscode / Warp / WezTerm /
+Ghostty / Hyper / Tabby），认不出来就只说「给跑 warden 的终端」。
+
+
 - `--due` 是**修饰**，不是独占操作：`--complete --due …` 一条命令跑完
   （收尾「缺漏完成补充」就是靠这个把「完成 + 截止时间」一起写回去）。
 - 标签操作和状态/截止时间操作**不能混在一条命令里**（要分两次跑）。
