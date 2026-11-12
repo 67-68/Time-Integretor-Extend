@@ -315,11 +315,9 @@ end run
 # ---------------------------------------------------------------- 生成脚本
 
 
-OMNIJS_SOURCE = r'''
+OMNIJS_TEMPLATE = r'''
 (() => {
-  const all = (typeof flattenedTasks !== "undefined")
-    ? flattenedTasks
-    : database.flattenedTasks;
+  const all = {{TASKS_SOURCE}};
   const pad = n => (n < 10 ? "0" + n : "" + n);
   const iso = d => {
     if (!d) return null;
@@ -407,11 +405,13 @@ OMNIJS_SOURCE = r'''
     }
     return names.join("/");
   };
+{{REPETITION_HELPER}}
   const rows = [];
   for (const t of all) {
     const inbox = inInboxTree(t);
     const project = t.containingProject;
     const parent = t.parent;
+    const rep = {{REPETITION_GET}}(t);
     rows.push({
       id: idOf(t),
       name: t.name || "",
@@ -439,12 +439,67 @@ OMNIJS_SOURCE = r'''
       next: isNext(t),
       blocked: isBlocked(t),
       children: t.children.length,
-      note: t.note || ""
+      note: t.note || ""{{REPETITION_FIELDS}}
     });
   }
   return JSON.stringify({ tool: "omnifocus_tasks", version: 1, rows: rows });
 })()
 '''
+
+#: 重复规则字段：只在 `--with-repetition` 时要。
+#:
+#: 以前是「每条任务再起一个 osascript」查一遍：一个活跃任务 0.26s，健康库
+#: （4 个项目 / 28 条活跃任务）每次对账就是 ~7 秒纯等待。这些字段本来就在
+#: 同一份 OmniFocus 数据库里，顺手在那一次遍历里带出来即可。默认关闭：多读
+#: 一次 `repetitionRule` 是有成本的（1715 条的库要多花 ~0.3s），不需要的人别付。
+REPETITION_FIELDS = (
+    "repetition_rule",
+    "repetition_method",
+    "repetition_schedule_type",
+    "repetition_anchor_date_key",
+    "repetition_catch_up",
+    "repetition_next",
+)
+
+_REPETITION_HELPER = r'''
+  const repInfo = t => {
+    let rule = null;
+    try { rule = t.repetitionRule || null; } catch (e) {}
+    const out = {
+      repetition_rule: null, repetition_method: null,
+      repetition_schedule_type: null, repetition_anchor_date_key: null,
+      repetition_catch_up: null, repetition_next: null
+    };
+    if (!rule) return out;
+    try { out.repetition_rule = rule.ruleString || null; } catch (e) {}
+    try { out.repetition_method = rule.method ? String(rule.method) : null; } catch (e) {}
+    try { out.repetition_schedule_type = rule.scheduleType ? String(rule.scheduleType) : null; } catch (e) {}
+    try { out.repetition_anchor_date_key = rule.anchorDateKey ? String(rule.anchorDateKey) : null; } catch (e) {}
+    try { out.repetition_catch_up = !!rule.catchUpAutomatically; } catch (e) {}
+    try { out.repetition_next = iso(rule.firstDateAfterDate(new Date())); } catch (e) {}
+    return out;
+  };
+'''
+
+_REPETITION_FIELDS_JS = "".join(
+    ",\n      %s: rep.%s" % (name, name) for name in REPETITION_FIELDS)
+
+#: 不带重复信息时，行对象里一个字段都不多出来（输出形状和旧版完全一样）。
+_NO_REPETITION_HELPER = ""
+_NO_REPETITION_GET = "(() => ({}))"
+
+#: 全量来源：`flattenedTasks`（OmniJS / 旧版 database 两种写法都兜住）。
+_FULL_TASKS_SOURCE = ('((typeof flattenedTasks !== "undefined") ? flattenedTasks'
+                      ' : database.flattenedTasks)')
+
+#: 老入口：**已经替换好的**默认版本（不带重复字段、读全部任务）。测试和
+#: `--script` 都拿它做逐字节比较，所以这里必须是不含占位符的成品，而不是模板。
+OMNIJS_SOURCE = (OMNIJS_TEMPLATE
+                 .replace("{{REPETITION_HELPER}}", _NO_REPETITION_HELPER)
+                 .replace("{{REPETITION_GET}}", _NO_REPETITION_GET)
+                 .replace("{{REPETITION_FIELDS}}", "")
+                 .replace("{{TASKS_SOURCE}}", _FULL_TASKS_SOURCE))
+
 
 
 SET_OMNIJS_TEMPLATE = r'''
@@ -625,9 +680,39 @@ def _applescript_string(text):
     return '"' + escaped + '"'
 
 
-def build_omnijs_script(js_source=None, chunk_size=600, header=None):
-    """Omni Automation 快路径：把 JS 通过 evaluate javascript 交给 OmniFocus。"""
-    js = (OMNIJS_SOURCE if js_source is None else js_source).strip("\n")
+def _substitute_repetition(js, with_repetition):
+    """把模板里的重复规则占位符换成「算」或「不算」两个版本。"""
+    if with_repetition:
+        return (js.replace("{{REPETITION_HELPER}}", _REPETITION_HELPER)
+                  .replace("{{REPETITION_GET}}", "repInfo")
+                  .replace("{{REPETITION_FIELDS}}", _REPETITION_FIELDS_JS))
+    return (js.replace("{{REPETITION_HELPER}}", _NO_REPETITION_HELPER)
+              .replace("{{REPETITION_GET}}", _NO_REPETITION_GET)
+              .replace("{{REPETITION_FIELDS}}", ""))
+
+
+def _ids_source(ids):
+    """只取指定 primary key 的那几条（增量补读用）。"""
+    return ('(function(){const out=[];for (const id of %s){const t=Task.byIdentifier(id);'
+            'if (t) out.push(t);}return out;})()'
+            % json.dumps([str(i) for i in ids], ensure_ascii=False,
+                         separators=(",", ":")))
+
+
+def build_omnijs_script(js_source=None, chunk_size=600, header=None,
+                        with_repetition=False, ids=None):
+    """Omni Automation 快路径：把 JS 通过 evaluate javascript 交给 OmniFocus。
+
+    ``ids`` 给了就只读这些 primary key（增量补读）：同一个行构造器，不另写一份。
+    """
+    if js_source is None:
+        js = _substitute_repetition(OMNIJS_TEMPLATE, with_repetition)
+        js = js.replace("{{TASKS_SOURCE}}",
+                        _ids_source(ids) if ids is not None else _FULL_TASKS_SOURCE)
+    else:
+        js = js_source.replace("{{TASKS_SOURCE}}",
+                               _ids_source(ids) if ids is not None else _FULL_TASKS_SOURCE)
+    js = js.strip("\n")
     chunks = [js[i : i + chunk_size] for i in range(0, len(js), chunk_size)] or [""]
     lines = [header or "-- 由 omnifocus_tasks.py 生成：Omni Automation 快路径（只读）"]
     lines.append("set js to " + _applescript_string(chunks[0]))
@@ -680,12 +765,12 @@ def build_applescript_script():
 ENGINES = ("auto", "omnijs", "applescript")
 
 
-def build_script(engine="omnijs"):
+def build_script(engine="omnijs", with_repetition=False, ids=None):
     """返回指定引擎的 osascript 源码。纯函数，方便 --script / 测试。"""
     if engine == "applescript":
         return build_applescript_script()
     if engine == "omnijs":
-        return build_omnijs_script()
+        return build_omnijs_script(with_repetition=with_repetition, ids=ids)
     raise ValueError("未知引擎：%r" % (engine,))
 
 
@@ -764,6 +849,9 @@ def _permission_message(stderr):
         "  原始错误：%s" % (stderr or "(没有 stderr)"),
         "  要授权的是「跑 warden 的那个 App」，不是「终端」这个泛称：在 iTerm2 里"
         "跑却勾了「终端」等于没给；改完不用重启 warden。",
+        "  另一种可能：这条命令跑在沙箱里（AI agent 的 bash 沙箱 / App Sandbox "
+        "辅助进程）。沙箱会把 Apple 事件自己拦下来，报的也是 -10004 —— "
+        "先在普通终端里重跑一次对照，别急着去改系统设置。",
     ]
     if bundle:
         lines.append("  还是不行就清掉旧决定再跑一次，让它重新弹框："
@@ -776,14 +864,19 @@ def _permission_message(stderr):
     return "\n".join(lines)
 
 
-def run_osascript(script, timeout=DEFAULT_TIMEOUT, osascript=OSASCRIPT):
-    """把脚本从 stdin 喂给 osascript，返回 stdout 文本（UTF-8 解码）。"""
+def run_osascript(script, timeout=DEFAULT_TIMEOUT, osascript=OSASCRIPT, language=None):
+    """把脚本从 stdin 喂给 osascript，返回 stdout 文本（UTF-8 解码）。
+
+    ``language="JavaScript"`` 走 JXA：``whose(...)`` 这类谓词只在那条路上才能
+    下推给 OmniFocus 自己算（OmniJS 不暴露 modificationDate 查询）。
+    """
     executable = osascript if os.path.isfile(osascript) else shutil.which(osascript)
     if not executable:
         raise OsascriptError("找不到 osascript：%s" % osascript, 1, "osascript")
+    cmd = [executable] + (["-l", language] if language else [])
     try:
         proc = subprocess.run(
-            [executable],
+            cmd,
             input=script.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -819,6 +912,212 @@ def run_osascript(script, timeout=DEFAULT_TIMEOUT, osascript=OSASCRIPT):
         # osascript 有时会往 stderr 打警告；转发出去，别污染 stdout 的数据
         print("omnifocus_tasks: [osascript] " + stderr, file=sys.stderr)
     return proc.stdout.decode("utf-8", "replace")
+
+
+
+BATCH_JS = r"""
+(() => {
+  const args = {{ARGS}};
+  const reply = obj => Object.assign({ tool: "omnifocus_tasks_batch", version: 1 }, obj);
+  const pad = n => (n < 10 ? "0" + n : "" + n);
+  const iso = d => {
+    if (!d) return null;
+    try {
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+        + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    } catch (e) {
+      return null;
+    }
+  };
+  const idOf = o => {
+    try { return o.id.primaryKey; } catch (e) { return null; }
+  };
+  const snapshot = t => ({
+    id: idOf(t),
+    completed: !!t.completed,
+    dropped: !!(t.dropDate),
+    completion_date: iso(t.completionDate),
+    drop_date: iso(t.dropDate),
+    due: iso(t.dueDate)
+  });
+  if (typeof Task === "undefined" || typeof Task.byIdentifier !== "function") {
+    return JSON.stringify(reply({ ok: false, error: "omnijs_unavailable",
+      message: "当前 OmniFocus 不支持 Task.byIdentifier" }));
+  }
+  const results = [];
+  for (const item of (args.ops || [])) {
+    const pk = String(item.id || "");
+    const taskId = item.task_id;
+    let task = null;
+    try { task = Task.byIdentifier(pk); } catch (e) { task = null; }
+    if (!task) { results.push({ id: pk, task_id: taskId, ok: false, error: "not_found" }); continue; }
+    try {
+      const before = snapshot(task);
+      const op = String(item.op || "complete");
+      if (op === "complete") {
+        if (before.completed) {
+          // 幂等：已经完成的绝不再 markComplete 一次 —— 重复任务会被连推两轮。
+          results.push({ id: pk, task_id: taskId, ok: true, skipped: "already_completed",
+                         before: before, after: before, changed: [] });
+          continue;
+        }
+        let afterTask = (item.at ? task.markComplete(new Date(item.at))
+                                 : task.markComplete()) || task;
+        // 截止时间是「修饰」：和单条那条路保持同一个顺序（先完成，再把这次
+        // occurrence 的 due 改成本场终点），别去动下一次的排期。
+        if (item.due) { task.dueDate = new Date(item.due); afterTask = task; }
+        const after = snapshot(afterTask);
+        const clone = (idOf(afterTask) !== idOf(task)) ? idOf(afterTask) : null;
+        const changed = [];
+        for (const key of ["completed", "dropped", "completion_date", "drop_date", "due"]) {
+          if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(key);
+        }
+        results.push({ id: pk, task_id: taskId, ok: true, before: before, after: after,
+                       changed: changed, repeat_clone_id: clone });
+      } else if (op === "drop") {
+        if (before.dropped) {
+          results.push({ id: pk, task_id: taskId, ok: true, skipped: "already_dropped",
+                         before: before, after: before, changed: [] });
+          continue;
+        }
+        const afterTask = (item.at
+          ? task.drop(!!item.all_occurrences, new Date(item.at))
+          : task.drop(!!item.all_occurrences)) || task;
+        const after = snapshot(afterTask);
+        const clone = (idOf(afterTask) !== idOf(task)) ? idOf(afterTask) : null;
+        results.push({ id: pk, task_id: taskId, ok: true, before: before, after: after,
+                       changed: JSON.stringify(before) === JSON.stringify(after) ? [] : ["dropped"],
+                       repeat_clone_id: clone });
+      } else {
+        results.push({ id: pk, task_id: taskId, ok: false, error: "bad_op" });
+      }
+    } catch (e) {
+      results.push({ id: pk, task_id: taskId, ok: false, error: "exception",
+                     message: String(e) });
+    }
+  }
+  return JSON.stringify(reply({ ok: true, results: results }));
+})()
+"""
+
+
+def build_batch_script(payload, chunk_size=600):
+    """一次 osascript 处理多条 complete/drop（本地优先写回的 flush）。"""
+    js = BATCH_JS.replace(
+        "{{ARGS}}",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    ).strip("\n")
+    return build_omnijs_script(js, chunk_size=chunk_size,
+                               header="-- 由 omnifocus_tasks.py 生成：批量写回（complete/drop）")
+
+
+def parse_batch_output(text):
+    """解析 batch 的输出；形状不对抛 ValueError。"""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("OmniFocus 没有返回批量写回结果（空输出）")
+    try:
+        data = json.loads(raw.splitlines()[-1])
+    except (ValueError, IndexError):
+        raise ValueError("批量写回返回的不是 JSON：%r" % raw[:160]) from None
+    if not isinstance(data, dict) or data.get("tool") != "omnifocus_tasks_batch":
+        raise ValueError("批量写回信封不对")
+    if not data.get("ok"):
+        raise ValueError(data.get("message") or data.get("error") or "批量写回失败")
+    if not isinstance(data.get("results"), list):
+        raise ValueError("批量写回里没有 results")
+    return data
+
+# ---------------------------------------------------------------- 增量变化查询
+#
+# OmniFocus 没有「动作流水 / change feed」这样的东西，但 JXA 的
+# ``whose({modificationDate: {_greaterThanEquals: since}})`` 是**下推**到
+# OmniFocus 内部执行的谓词 —— 不用把 1715 条任务逐条搬到 JS 里，实测 1 小时窗口
+# 43ms、24 小时窗口 232ms（OmniJS 逐条遍历要 2.9s，全量取字段 4.8s）。
+#
+# 注意两条硬限制（Omni Group 官方 MCP 的 ADR-0026 也这么写）：
+#   1. 删除**没有信号**：被删的对象没有 modificationDate 可查，只能定期全量对 id；
+#   2. 只能查到「谁变了」，字段级差异还得按 id 重新读一遍（那一步我们用 OmniJS
+#      批量取整行，200 条约 0.69s）。
+
+CHANGES_JXA = r'''
+function run(argv) {
+  const since = new Date({{SINCE}});
+  const ofApp = Application("OmniFocus");
+  ofApp.includeStandardAdditions = false;
+  const doc = ofApp.defaultDocument;
+  const out = [];
+  const collect = (collection, kind) => {
+    let raw;
+    try {
+      raw = collection.whose({ modificationDate: { _greaterThanEquals: since } })();
+    } catch (e) {
+      // 谓词被拒（老版本 / 查询引擎抽风）：让 Python 端退回全量，别给半截答案。
+      throw new Error("whose 查询失败：" + e);
+    }
+    for (let i = 0; i < raw.length; i++) {
+      try {
+        out.push({kind: kind, id: raw[i].id(),
+                  modified: raw[i].modificationDate().toISOString()});
+      } catch (e) {}
+    }
+  };
+  collect(doc.flattenedTasks, "task");
+  collect(doc.flattenedProjects, "project");
+  return JSON.stringify({tool: "omnifocus_changes", count: out.length, changes: out});
+}
+'''
+
+
+def build_changes_script(since_iso):
+    """``since_iso`` 之后变过的任务 / 项目（JXA，只读）。纯函数，方便测试。"""
+    return CHANGES_JXA.replace("{{SINCE}}", json.dumps(str(since_iso))).strip("\n")
+
+
+def parse_changes_output(text):
+    """解析 ``build_changes_script`` 的输出；形状不对抛 ValueError。"""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("OmniFocus 没有返回变化列表（空输出）")
+    try:
+        data = json.loads(raw.splitlines()[-1])
+    except (ValueError, IndexError):
+        raise ValueError("变化查询返回的不是 JSON：%r" % raw[:160]) from None
+    if not isinstance(data, dict) or data.get("tool") != "omnifocus_changes":
+        raise ValueError("变化查询信封不对：%r" % (list(data)[:6] if isinstance(data, dict) else data))
+    items = data.get("changes")
+    if not isinstance(items, list):
+        raise ValueError("变化查询里没有 changes 数组")
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        pk = str(item.get("id") or "")
+        if not pk:
+            continue
+        out.append({"kind": str(item.get("kind") or "task"), "id": pk,
+                    "modified": item.get("modified")})
+    return out
+
+
+def since_to_iso(value):
+    """``--since`` 的值 → 带时区的 ISO 字符串（epoch 秒 / ISO 都认）。"""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("--since 不能为空")
+    try:
+        return datetime.datetime.fromtimestamp(float(text)).astimezone().isoformat(
+            timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    raw = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        raise ValueError("--since 要 ISO-8601 或 epoch 秒，收到 %r" % text) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.isoformat(timespec="seconds")
 
 
 # ---------------------------------------------------------------- 解析 / 转类型
@@ -947,7 +1246,7 @@ def _coerce_json(kind, value):
     raise ValueError("期望字符串，收到 %r" % (value,))
 
 
-def parse_json_rows(text):
+def parse_json_rows(text, extra=()):
     """解析 Omni Automation 快路径返回的 JSON 信封。
 
     要求是 ``{"tool": "omnifocus_tasks", "version": 1, "rows": [...]}``：
@@ -980,6 +1279,14 @@ def parse_json_rows(text):
                 raise ValueError("第 %d 条记录的 %s 字段有问题：%s" % (index, name, e)) from None
         if row["kind"] not in ("action", "inbox", "project_root"):
             raise ValueError("第 %d 条记录的 kind 非法：%r" % (index, row["kind"]))
+        # 顺势带回来的字段（重复规则）不在 FIELD_SPECS 里：照原样收，别用一个
+        # 「所有字段都必须是已知字段」的规则把它们扔掉（这就是它们曾经全变 null 的原因）。
+        for name in extra or ():
+            value = obj.get(name)
+            if name == "repetition_catch_up":
+                row[name] = None if value is None else bool(value)
+            else:
+                row[name] = None if value is None else str(value)
         rows.append(row)
     return rows
 
@@ -1042,8 +1349,12 @@ def _tsv_cell(value):
     )
 
 
-def write_rows(rows, fields, fmt="jsonl", header=False):
-    """把行写进 stdout；只做序列化，不做任何筛选。"""
+def write_rows(rows, fields, fmt="jsonl", header=False, extra=()):
+    """把行写进 stdout；只做序列化，不做任何筛选。
+
+    ``extra`` 是「不在 --fields 里、但这一趟顺手拿到了」的字段（现在是重复规则），
+    只往 JSONL 里追加；TSV 的列仍然只由 ``--fields`` 决定，别改老形状。
+    """
     out = sys.stdout
     if fmt == "tsv":
         if header:
@@ -1051,8 +1362,11 @@ def write_rows(rows, fields, fmt="jsonl", header=False):
         for row in rows:
             out.write("\t".join(_tsv_cell(row.get(name)) for name in fields) + "\n")
         return
+    extra = tuple(name for name in (extra or ()) if name not in fields)
     for row in rows:
         obj = {name: row.get(name) for name in fields}
+        for name in extra:
+            obj[name] = row.get(name)
         out.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
@@ -1078,6 +1392,18 @@ def build_parser():
         default="all",
         metavar="LIST",
         help="逗号分隔的字段名，或 all（默认）。顺序即输出顺序。",
+    )
+    parser.add_argument(
+        "--ids",
+        default="",
+        metavar="JSON",
+        help="只读这些 primary key（JSON 数组，增量补读用）；默认读全部",
+    )
+    parser.add_argument(
+        "--with-repetition",
+        action="store_true",
+        help="顺手把重复规则字段（%s）也带出来；"
+             "省得为每条任务再单独起一次 osascript" % ",".join(REPETITION_FIELDS),
     )
     parser.add_argument(
         "--header",
@@ -1132,11 +1458,23 @@ def main_list(argv=None):
         parser.error(str(e))
     if args.timeout <= 0:
         parser.error("--timeout 必须是正数")
+    ids = None
+    if args.ids:
+        try:
+            ids = json.loads(args.ids)
+        except ValueError as e:
+            parser.error("--ids 要 JSON 数组：%s" % e)
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            parser.error("--ids 要是字符串数组")
 
     engines = ["omnijs", "applescript"] if args.engine == "auto" else [args.engine]
+    # 指定 ids 只能走 omnijs（AppleScript 兜底没有按 pk 取行的写法）。
+    if ids is not None:
+        engines = ["omnijs"]
 
     if args.script:
-        sys.stdout.write(build_script(engines[0]))
+        sys.stdout.write(build_script(engines[0], with_repetition=args.with_repetition,
+                                      ids=ids))
         return 0
 
     if sys.platform != "darwin":
@@ -1145,7 +1483,7 @@ def main_list(argv=None):
 
     started = time.monotonic()
     for index, engine in enumerate(engines):
-        script = build_script(engine)
+        script = build_script(engine, with_repetition=args.with_repetition, ids=ids)
         _note(args, "正在用 %s 读取 OmniFocus（首次会弹自动化权限框，等一下）…" % engine)
         try:
             text = run_osascript(script, timeout=args.timeout, osascript=args.osascript)
@@ -1162,7 +1500,9 @@ def main_list(argv=None):
             return e.code
 
         try:
-            rows = parse_json_rows(text) if engine == "omnijs" else parse_rows(text)
+            extra = REPETITION_FIELDS if (engine == "omnijs" and args.with_repetition) else ()
+            rows = (parse_json_rows(text, extra=extra) if engine == "omnijs"
+                    else parse_rows(text))
         except ValueError as e:
             if engine == "omnijs" and index + 1 < len(engines):
                 print(
@@ -1177,7 +1517,9 @@ def main_list(argv=None):
 
         elapsed = time.monotonic() - started
         _note(args, "读到 %d 条任务，用时 %.1fs（%s）" % (len(rows), elapsed, engine))
-        write_rows(rows, fields, fmt=args.format, header=args.header)
+        extra = (REPETITION_FIELDS if args.with_repetition and args.format == "jsonl"
+                 else ())
+        write_rows(rows, fields, fmt=args.format, header=args.header, extra=extra)
         return 0
 
     print("omnifocus_tasks: 所有引擎都失败了", file=sys.stderr)
@@ -1417,6 +1759,95 @@ def build_set_payload(args):
     }
 
 
+def build_changes_parser():
+    parser = argparse.ArgumentParser(
+        prog="omnifocus_tasks.py changes",
+        description="只读：列出 since 之后改动过的 OmniFocus 任务 / 项目（JXA whose 下推）。"
+                    " 删除没有信号，需要调用方定期全量对账。",
+    )
+    parser.add_argument("--since", required=True,
+                        help="ISO-8601（本地时间可省略时区）或 epoch 秒")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help="osascript 超时秒数（默认 %.0f）" % DEFAULT_TIMEOUT)
+    parser.add_argument("--osascript", default=OSASCRIPT,
+                        help="osascript 路径（默认 %(default)s）")
+    return parser
+
+
+def main_changes(argv=None):
+    parser = build_changes_parser()
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.error("--timeout 必须是正数")
+    try:
+        since = since_to_iso(args.since)
+    except ValueError as e:
+        parser.error(str(e))
+    if sys.platform != "darwin":
+        print("omnifocus_tasks: 只能在 macOS 上跑（需要 osascript + OmniFocus）",
+              file=sys.stderr)
+        return 1
+    script = build_changes_script(since)
+    try:
+        text = run_osascript(script, timeout=args.timeout,
+                             osascript=args.osascript, language="JavaScript")
+    except OsascriptError as e:
+        print("omnifocus_tasks: %s" % e, file=sys.stderr)
+        return e.code
+    try:
+        changes = parse_changes_output(text)
+    except ValueError as e:
+        print("omnifocus_tasks: %s" % e, file=sys.stderr)
+        return 1
+    for item in changes:
+        print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def build_batch_parser():
+    parser = argparse.ArgumentParser(
+        prog="omnifocus_tasks.py batch",
+        description="一次 osascript 处理多条 complete/drop（读 stdin 的 "
+                    '{"ops":[{"id","op","due","at","all_occurrences","task_id"}]}）。',
+    )
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help="osascript 超时秒数（默认 %.0f）" % DEFAULT_TIMEOUT)
+    parser.add_argument("--osascript", default=OSASCRIPT,
+                        help="osascript 路径（默认 %(default)s）")
+    return parser
+
+
+def main_batch(argv=None):
+    parser = build_batch_parser()
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.error("--timeout 必须是正数")
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except ValueError as e:
+        parser.error("stdin 要是 JSON：%s" % e)
+    if not isinstance(payload, dict) or not isinstance(payload.get("ops"), list):
+        parser.error('stdin 要是 {"ops": [...]}')
+    if sys.platform != "darwin":
+        print("omnifocus_tasks: 只能在 macOS 上跑（需要 osascript + OmniFocus）",
+              file=sys.stderr)
+        return 1
+    script = build_batch_script(payload)
+    try:
+        text = run_osascript(script, timeout=args.timeout, osascript=args.osascript)
+    except OsascriptError as e:
+        print("omnifocus_tasks: %s" % e, file=sys.stderr)
+        return e.code
+    try:
+        data = parse_batch_output(text)
+    except ValueError as e:
+        print("omnifocus_tasks: %s" % e, file=sys.stderr)
+        return 1
+    sys.stdout.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return 0
+
+
 def main_set(argv=None):
     parser = build_set_parser()
     args = parser.parse_args(argv)
@@ -1489,6 +1920,10 @@ def main(argv=None):
         argv = sys.argv[1:]
     if argv and argv[0] == "set":
         return main_set(argv[1:])
+    if argv and argv[0] == "changes":
+        return main_changes(argv[1:])
+    if argv and argv[0] == "batch":
+        return main_batch(argv[1:])
     if argv and argv[0] == "list":
         return main_list(argv[1:])
     return main_list(argv)

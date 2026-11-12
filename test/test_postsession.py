@@ -303,7 +303,9 @@ check("get 按 primary key 找", client.get("pk2")["name"], "复习")
 check("get 找不到 → None", client.get("nope"), None)
 check("第二次读走缓存（不重复起子进程）", client.calls, 1)
 client.list_tasks(refresh=True)
-check("refresh=True 真的再读一次", client.calls, 2)
+# 增量读：先问一次 changes（假脚本不管参数，照样吐两行 → 两条都算「变了」），
+# 再按 id 补读一次。所以是 1（首次全量）+ 2（刷新那轮）。
+check("refresh=True 真的再读一次（changes + 补读）", client.calls, 3)
 
 
 def client_with_rc(rc, out="", err="boom"):

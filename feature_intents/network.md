@@ -142,6 +142,33 @@ bridge 自己有一把命令锁，所以和队列并发时协议不会错乱；�
 （补订 session、补挂 task、拆独占冲突）。那条修复链是同步的 —— 它必须拿着对完账
 的数据一路改下去，中途让位给队列只会让“修一半”。
 
+## 并行：按 source 分 lane（`workers`）
+
+队列原来是**一个** worker，串行干所有外部动作。用户反馈「网络拉取太慢」之后
+改成 `JobRunner(workers=3)`，但**不是**「谁空谁上」：
+
+- 同一条 lane（`Action.source`：focusmate / omnifocus / keep_session / calendar）
+  仍然严格串行 —— 浏览器桥、`osascript`、`keep_session` 子进程各自只有一份状态，
+  同源并发会互相踩；
+- 不同 lane 才并行。真正能重叠的是「浏览器」和「`osascript`」，而 `refresh`
+  正好是三块互不相干的读：拉 session（bridge）、拉 task（bridge，跟上一块自动
+  串行）、OmniFocus 项目对账（osascript）。
+
+`refresh` 因此从「等一次、再等一次、再等一次」改成**提交三块、只等一次**：
+    refresh → refresh_task_state → _refresh_project_tasks → wait_net()
+
+## 重复规则：并进那一次全量读取
+
+`omnifocus.project_sync` 以前是「list 一遍 + 每条活跃任务再起一个 osascript 查
+`repetitionInfo`」。1715 条的库、28 条活跃任务，实测：
+
+    老路径：list 5.46s + 28 × 0.26s = 12.5s
+    新路径：list --with-repetition 5.1s + 0s（全是缓存查找）= 5.1s
+
+`list --with-repetition` 在**同一次**遍历里把 `repetition_*` 字段带回来（默认关闭：
+多读一个 `repetitionRule` 有成本，不需要的调用方别付）；`Client.repetition_info()`
+先查缓存行，缓存没带这些字段才退回单条 `osascript`。字段逐个对过，新旧路径 0 差异。
+
 ## 落盘位置
 
     data/failed-actions.json     失败账（gitignore：每台机器自己一份；重放靠它）

@@ -56,7 +56,18 @@ python3 omnifocus_tasks.py set --id <PK> --add-tag 写作 --yes
   `tccutil reset AppleEvents <bundle id>`（iTerm2 是 `com.googlecode.iterm2`）；
 - 判断是不是权限问题，别只看某一条命令：`osascript -e 'tell application "OmniFocus"
   to get name of front document'` 这种最简单的读也会一起失败，那就是整条
-  Apple 事件通道被拒，跟脚本内容无关。
+  Apple 事件通道被拒，跟脚本内容无关；
+- **沙箱里的 -10004 不是 TCC**。seatbelt / App Sandbox 会直接拦下 Apple 事件，
+  报的同样是 errAEPrivilegeError。2026-11 踩过：AI agent 的 bash 沙箱里跑
+  `omnifocus_tasks.py` 得到 -10004，差点误判成「用户没授权」，其实 iTerm2 早
+  就给了 —— 换一个没沙箱的终端一跑就通。所以先问「这条命令是谁拉起来的」。
+
+### 为什么失败账里的「每日检查」永远清不掉（已修）
+
+`_note_success` 用 `name + args` 认「同一条」，而每日检查的 args 里带的是**当时
+的项目快照**，每次都不一样 → 成功一次也只会清掉参数完全相同的那条，旧账留在
+面板上，看起来像「每天都在失败」。现在这类动作标成 `coalesce`：账只留一条，
+成功一次就清掉整类（见 `feature_intents/network.md`）。
 
 `run_osascript` 会把这三件事写进 stderr（**最后一行**是「下一步做什么」，
 warden 的失败账只显示最后一行）：
@@ -82,6 +93,58 @@ Ghostty / Hyper / Tabby），认不出来就只说「给跑 warden 的终端」�
   `effective_dropped` 是 OmniFocus 计算的**有效状态**。父任务完成或放弃后，
   子任务可能自己的 `completed=false`，但 `taskStatus` / `effective*` 已经是
   Completed / Dropped。项目导入用有效状态判断任务能不能排、要不要检查时长。
+
+### 读得快一点：`--with-repetition`
+
+`list` 默认不带重复规则。对账/导入要判断「这条任务会不会重复产生」时，老做法是
+每条活跃任务再起一个 `osascript` 查 `repetitionInfo`（0.26s/条）。现在：
+
+```bash
+python3 omnifocus_tasks.py --with-repetition      # 同一次遍历顺手带回来
+```
+
+多出来的字段（`repetition_rule` / `_method` / `_schedule_type` /
+`_anchor_date_key` / `_catch_up` / `_next`）只在这条命令里出现，TSV 的列不变。
+`omnifocus.Client.repetition_info()` 先查缓存行，缓存没带才退回单条查询。
+warden 的项目对账走的就是这条路：12.5s → 5.1s（28 条活跃任务实测）。
+
+### 读取：全量 + 增量（`changes` 子命令）
+
+OmniFocus **没有**动作流水 / change feed；但它有 `modificationDate`，而且 JXA 的
+`whose({modificationDate: {_greaterThanEquals: since}})` 是**下推**给 OmniFocus
+自己执行的谓词 —— 不用把 1715 条任务逐条搬进 JS。OmniJS 不暴露这个查询（只能
+逐条遍历，1715 条空转就要 2.9s），所以变化查询走 JXA，补读走的还是 OmniJS。
+
+```bash
+python3 omnifocus_tasks.py changes --since "2026-11-12T08:00:00"   # 一行一条 JSONL
+python3 omnifocus_tasks.py list --ids '["pk1","pk2"]' --with-repetition
+```
+
+实测（1715 条库）：
+
+| 操作 | 耗时 |
+|---|---|
+| 全量 `list`（含重复规则） | 4.8–6.2s |
+| JXA `whose` 1 小时窗口（2 条命中） | 0.04s |
+| JXA `whose` 24 小时窗口（23 条） | 0.23s |
+| 按 id 批量补读 200 条整行 | 0.69s（3.4ms/条） |
+| **增量一整轮（查询 + 补读）** | **0.25s** |
+
+调度规则（`Client._read_locked`）：
+
+1. 没有快照 / 距上次全量超过 `INCREMENTAL_WINDOW`（默认 600s）→ **全量**；
+2. 否则问 `changes`：命中的任务 id 少于 `INCREMENTAL_MAX`（默认 200）且没有项目
+   变化 → 只补读这些行，合并进快照；否则全量；
+3. `changes` 自己失败（权限、谓词被拒）→ 全量，**不拿半截结果冒充「没变化」**；
+4. 补读时保持快照原有的 `--with-repetition` 形状，别让同一份快照一半有重复字段。
+
+**删除只有全量能发现**（Omni Group 自己的 MCP ADR-0026 也是这么写的），所以
+「超过 10 分钟没读过 → 全量」既是性能保护（`whose` 的代价随命中数线性涨，攒太久
+的变化查询自己就要十几秒），也顺手把定期全量对账做到了 10 分钟级。
+
+> 为什么不用数据库文件 mtime 做缓存键：它只在真写时变，但「你正在用软件」时
+> OmniFocus 一直在被改（你自己 + 同步），缓存几乎总失效；反过来空闲时它不动，
+> 可那时也没人需要读。所以走 `whose` 查询，不用文件指纹。
 
 ## 2. `omnifocus.py`：链接解析 + 子进程
 

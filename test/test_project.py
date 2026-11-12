@@ -171,8 +171,10 @@ class FakeOmniFocus(object):
     def why_unavailable(self):
         return ""
 
-    def list_tasks(self, refresh=False, fields=None, timeout=None):
+    def list_tasks(self, refresh=False, fields=None, timeout=None,
+                   with_repetition=False):
         self.calls.append(("list", refresh))
+        self.calls.append(("with_repetition", with_repetition))
         return [dict(r) for r in self.rows]
 
     def get(self, pk, refresh=False):

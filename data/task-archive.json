@@ -3032,6 +3032,50 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-12T17:55:23",
+      "task_id": 217,
+      "fields": {
+        "title": "assignment book 5. 6 correct",
+        "project": "SchoolReview",
+        "project_id": 2,
+        "project_task": "jsdUNNkiUrb",
+        "duration": 75,
+        "notes": "父任务：SchoolReview",
+        "count": 3,
+        "due": "2026-11-12T17:20:00",
+        "due_source": "session",
+        "count_invested": 3
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-11-12",
+        "start": "16:30",
+        "end": "17:20",
+        "duration": 50,
+        "focusmate_session_id": "5b42be5a-f162-46b5-a56b-d616c6c2fa05",
+        "previous_due": "2026-11-12T10:55:00"
+      },
+      "notes": "父任务：SchoolReview",
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 75,
+      "status_at": "2026-11-12T17:55:23",
+      "omnifocus": {
+        "id": "jsdUNNkiUrb",
+        "url": "omnifocus:///task/jsdUNNkiUrb",
+        "title": "assignment book 5. 6 correct",
+        "linked_at": "2026-11-12T09:39:04"
+      },
+      "focusmate": {
+        "task_id": "d84fe352-7600-4611-8aa9-b33e68fa2ba9",
+        "title": "assignment book 5. 6 correct",
+        "description": "父任务：SchoolReview",
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

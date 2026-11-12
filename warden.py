@@ -191,7 +191,8 @@ warden 只提供内容。
 
 环境变量：
     FOCUSMATE_PROFILE_DIR     浏览器 profile 目录（默认 ~/.focusmate-mcp/browser-data）
-    WARDEN_BRIDGE_IDLE_MS     bridge 空闲关浏览器的毫秒数（默认 120000）
+    WARDEN_BRIDGE_IDLE_MS     bridge 空闲关浏览器的毫秒数（默认 0 = 不关；关掉后
+                              下一枪要等浏览器冷启动十几秒）
     WARDEN_BRIDGE_HEADED=1    有头模式（看它怎么点）
     WARDEN_CLEAR=0            等价 --no-clear
 
@@ -559,6 +560,9 @@ class Warden(
             store=FAILED_ACTIONS_FILE,
             title="网络",
             on_change=self._net_touched,
+            # 3 条 lane 并行：focusmate（浏览器）、omnifocus（osascript）、
+            # keep_session/calendar（子进程）。同一条 lane 内仍然严格串行。
+            workers=3,
         )
         self._net_dirty = False
         #: 每份数据是什么时候拿到的：{"session": epoch, "task": epoch, "stat": epoch}
@@ -1076,8 +1080,10 @@ def parse_args(argv=None):
                     help="【已废弃，无效果】以前是退化成追加；现在擦除重画由 repl_kit 管")
     ap.add_argument("--offline", action="store_true", help="不碰浏览器，只用 state.json 里的快照")
     ap.add_argument("--headed", action="store_true", help="浏览器有头模式（看它怎么操作）")
-    ap.add_argument("--idle-ms", type=int, default=None,
-                    help="bridge 空闲多少毫秒后放开浏览器（默认 120000；0=不放开）")
+    ap.add_argument("--idle-ms", type=int, default=0,
+                    help="bridge 空闲多少毫秒后放开浏览器（默认 0 = 不放开："
+                         "关掉浏览器下次冷启动要十几秒，用户反馈「网络拉取太慢」；"
+                         "想省内存就传 120000 之类的值）")
     ap.add_argument("--profile-dir", default=None, help="浏览器 profile 目录（默认用 _lib 的默认值）")
     ap.add_argument("--install-deps", action="store_true", help="把 rich 装到 temp/pylibs")
     return ap.parse_args(argv)

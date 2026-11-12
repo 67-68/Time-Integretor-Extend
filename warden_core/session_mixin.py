@@ -1715,13 +1715,14 @@ class SessionMixin(object):
         self.jobs.begin(2 + (1 if project_sync else 0), title="刷新（refresh）")
         self.forget_caches()
         pulled = self.refresh()
-        # 「再对一次账」必须拿着刚拉回来的账：后台模式下这里等它落地
-        self.wait_net()
         self.refresh_task_state()
-        self.wait_net()
         if project_sync:
             self._refresh_project_tasks()
-            self.wait_net()
+        # 三块读互相独立：session / task 走浏览器（bridge 自己串行），项目对账走
+        # osascript —— 队列按 source 分 lane，不同 lane 并行。所以这里**只等一次**：
+        # 老写法按 snapshot → task → project 一等再等，把本来可以重叠的 3–6 秒
+        # 也串起来了（用户反馈「网络拉取太慢」）。
+        self.wait_net()
         # refresh 的排期流水线：formatter 先占时间，项目 plan 后校验。
         # 必须在刚拉回的 session 账上跑，否则会把已取消的场次当成资源。
         try:

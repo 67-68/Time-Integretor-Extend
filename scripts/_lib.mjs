@@ -238,11 +238,35 @@ async function readToken(page) {
   });
 }
 
+/**
+ * 页面现在是不是「登录页」。
+ *
+ * 为什么先问这一句再重载：登录态失效时，三次 reload × 5s 等下来要几十秒才报错
+ * （实测一条 task pull 跑了 57 秒），而这几十秒里页面一直停在 /login —— reload
+ * 一万次也变不出 token。看出来就立刻 die，把「去登录」这句话直接还给人。
+ */
+async function looksLoggedOut(page) {
+  try {
+    const url = String(page.url() || "");
+    if (/\/(login|signin|signup|auth)\b/i.test(url)) return true;
+    // 密码框比邮箱框可靠：应用页面里也可能出现 type=email 的输入（设置/搜索），
+    // 误判成「未登录」会直接 die，比慢十几秒更糟。
+    return await page.evaluate(
+      () => !!document.querySelector('input[type="password"]'),
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
 /** 拿一个没过期的 token；过期就让页面自己刷新（reload）。 */
 export async function getToken(page, { attempts = 3 } = {}) {
   for (let i = 0; i < attempts; i++) {
     const tok = await readToken(page);
     if (tok && jwtExpMs(tok) > Date.now() + 30_000) return tok;
+    if (await looksLoggedOut(page)) {
+      die(`拿不到 Firebase token：页面停在登录页（profile 里没有登录态），先跑一次登录。${describeProfile()}`);
+    }
     log(`token ${tok ? "即将/已过期" : "读不到"}，让页面刷新一次（${i + 1}/${attempts}）…`);
     await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
     await page.waitForTimeout(5000);

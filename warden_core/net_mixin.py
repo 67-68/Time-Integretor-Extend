@@ -460,7 +460,9 @@ class NetMixin(object):
         local_projects = list(args.get("projects") or [])
         rep.label("每日检查 OmniFocus 项目（%d 个）" % len(local_projects))
         rep.progress(0.05)
-        rows = self.omnifocus.list_tasks(refresh=True)
+        # 顺带把重复规则带回来：下面 _project_repeat_infos 会逐条问
+        # repetition_info，以前每条起一个 osascript（0.26s × 28 ≈ 7s）。
+        rows = self.omnifocus.list_tasks(refresh=True, with_repetition=True)
         by_pk = {str(row.get("id") or ""): row for row in rows or ()}
         out = []
         for index, local in enumerate(local_projects, 1):

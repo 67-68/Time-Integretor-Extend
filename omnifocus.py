@@ -46,6 +46,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import html as html_mod
 import json
 import os
@@ -780,6 +781,22 @@ def python_bin():
     return os.environ.get("OMNIFOCUS_PYTHON") or sys.executable or "python3"
 
 
+#: 全量对账周期：增量只能补「变了的」，删除没有信号（OmniFocus 不暴露），
+#: 所以每隔这么久做一次全量对 id 对账。环境变量方便调参 / 测试。
+FULL_SCAN_TTL = float(os.environ.get("OMNIFOCUS_FULL_SCAN_TTL") or 1800)
+#: 一次变化超过这么多条就不如全量读（全量 4.8s，补读 3.4ms/条 + 进程启动）。
+INCREMENTAL_MAX = int(os.environ.get("OMNIFOCUS_INCREMENTAL_MAX") or 200)
+#: 变化查询的时间窗往前多问这么多秒，防止秒级截断 / 时钟漂移漏掉边界。
+INCREMENTAL_OVERLAP = 60.0
+#: 只有「距上次读取不超过这么久」才走增量。
+#:
+#: 为什么有这个上限：``whose`` 的代价和**命中条数**成正比（约 9ms/条取 id）。
+#: 攒了一小时的变化可能在几十条到几百条，一次变化查询自己就要十几秒 —— 比
+#: 5 秒全量还亏。超过这个窗口就直接全量：反正删除也只有全量能发现，这等于把
+#: 「定期全量对账」做成 10 分钟级。
+INCREMENTAL_WINDOW = float(os.environ.get("OMNIFOCUS_INCREMENTAL_WINDOW") or 600)
+
+
 class Client(object):
     """``omnifocus_tasks.py`` 的子进程封装 + 一点点缓存。"""
 
@@ -793,6 +810,20 @@ class Client(object):
         self.clock = clock or time.monotonic
         self._cache = None
         self._cache_at = 0.0
+        #: 缓存里那批行是不是带着重复规则字段（``list --with-repetition``）。
+        #: 没带的话，``repetition_info`` 只有走「单条 osascript」那条老路。
+        self._cache_repetition = False
+        #: 快照：id → 行。增量读取靠它做合并；删除只能靠全量对账发现。
+        self._rows_by_id = {}
+        #: 上次读取**发起**的墙钟时刻（epoch 秒）；变化查询从这之前一点开始问。
+        #: 注意不能用 self.clock（那是 monotonic，拿来当 epoch 会把 since 算到
+        #: 1970 年 → whose 命中全部 1715 条 → 单次查询 50 秒，真踩过）。
+        self._snapshot_epoch = 0.0
+        #: 上次**全量**读取的时刻（monotonic，给 TTL 用）。
+        self._full_mono = 0.0
+        self.full_scan_ttl = FULL_SCAN_TTL
+        self.wall_clock = time.time
+        self.incremental_max = INCREMENTAL_MAX
         self.calls = 0
         # 收尾的后台核对线程和主线程可能同时问 OmniFocus；子进程本身没问题，
         # 但缓存和「一次只起一个 osascript」得串起来。
@@ -819,8 +850,11 @@ class Client(object):
         return "找不到 osascript：%s" % self.osascript
 
     # -- 底层 ---------------------------------------------------------
-    def _run(self, args, timeout=None, expect_jsonl=False):
-        """跑一次子进程；返回 (退出码, stdout, stderr)。"""
+    def _run(self, args, timeout=None, expect_jsonl=False, stdin_text=None):
+        """跑一次子进程；返回 (退出码, stdout, stderr)。
+
+        ``stdin_text`` 给 ``batch`` 用：ops 走 stdin，别塞进命令行（会长、还要转义）。
+        """
         if not self.available():
             raise OmniFocusError(self.why_unavailable(), kind="unavailable", exit_code=1)
         cmd = [self.python, self.script] + [str(a) for a in args]
@@ -831,6 +865,7 @@ class Client(object):
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                input=stdin_text,
                 timeout=timeout if timeout is not None else self.timeout,
             )
         except subprocess.TimeoutExpired:
@@ -903,35 +938,168 @@ class Client(object):
         )
 
     # -- 读 -----------------------------------------------------------
-    def list_tasks(self, refresh=False, fields=None, timeout=None):
-        """全部任务（JSONL → list[dict]）。默认带 20 秒缓存。"""
+    def list_tasks(self, refresh=False, fields=None, timeout=None,
+                   with_repetition=False):
+        """全部任务（JSONL → list[dict]）。默认带 20 秒缓存。
+
+        ``with_repetition=True`` 时那一趟顺手把重复规则字段带回来（``list
+        --with-repetition``）。对账/导入以前是「每条任务再起一个 osascript 查
+        repetitionInfo」—— 1715 条的库上 28 条活跃任务 ≈ 7 秒纯等待；带回来之后
+        ``repetition_info`` 变成一次字典查找。
+        """
         now = self.clock()
         with self._lock:
-            if (not refresh and self._cache is not None
-                    and (now - self._cache_at) < CACHE_TTL):
+            usable = (self._cache is not None
+                      and (now - self._cache_at) < CACHE_TTL)
+            if (not refresh and usable
+                    and (not with_repetition or self._cache_repetition)):
                 rows = self._cache
+            elif fields:
+                # --fields 是「只要这几列」，形状和快照不一样，不进缓存。
+                return self._fetch_rows(None, fields=fields, timeout=timeout)
             else:
-                args = ["list"]
-                if fields:
-                    args += ["--fields", ",".join(fields)]
-                rc, out, err = self._run(args, timeout=timeout)
-                self._raise_for(rc, out, err, "读 OmniFocus 任务")
-                rows = []
-                for line in (out or "").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        raise OmniFocusError("读回来的不是 JSON 行：%r" % line[:120],
-                                             kind="error", exit_code=1) from None
-                self._cache = rows
-                self._cache_at = now
-        if fields:
-            want = list(fields)
-            return [{k: row.get(k) for k in want} for row in rows]
+                rows = self._read_locked(now, timeout=timeout,
+                                         with_repetition=with_repetition)
         return rows
+
+    # -- 读取：全量 / 增量 ---------------------------------------------
+    def _fetch_rows(self, ids=None, fields=None, timeout=None,
+                    with_repetition=False):
+        """跑一次 ``list``（``ids`` 给了就只取这几条），返回行列表。"""
+        args = ["list"]
+        if ids is not None:
+            args += ["--ids", json.dumps([str(i) for i in ids],
+                                         ensure_ascii=False, separators=(",", ":"))]
+        if fields:
+            args += ["--fields", ",".join(fields)]
+        if with_repetition:
+            args.append("--with-repetition")
+        rc, out, err = self._run(args, timeout=timeout)
+        self._raise_for(rc, out, err, "读 OmniFocus 任务")
+        rows = []
+        for line in (out or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                raise OmniFocusError("读回来的不是 JSON 行：%r" % line[:120],
+                                     kind="error", exit_code=1) from None
+        return rows
+
+    def _changes_since(self, since, timeout=None):
+        """问 OmniFocus「``since`` 之后谁变了」（JXA whose 下推）。
+
+        返回 ``(任务 id 列表, 项目 id 列表)``；查不了返回 None —— 调用方退回全量，
+        **不拿半截结果冒充「没变化」**。
+        """
+        try:
+            iso = datetime.datetime.fromtimestamp(since).astimezone().isoformat(
+                timespec="seconds")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+        try:
+            rc, out, err = self._run(["changes", "--since", iso], timeout=timeout or 60)
+        except OmniFocusError:
+            return None
+        if rc != 0:
+            return None
+        task_ids, project_ids = [], []
+        for line in (out or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except ValueError:
+                return None
+            pk = str(item.get("id") or "")
+            if not pk:
+                continue
+            if str(item.get("kind") or "task") == "project":
+                project_ids.append(pk)
+            else:
+                task_ids.append(pk)
+        return task_ids, project_ids
+
+    def _read_locked(self, now, timeout=None, with_repetition=False):
+        """拿最新一份快照：能增量就增量，不能就全量。调用方需持锁。
+
+        为什么增量值得：JXA ``whose`` 是下推查询（1 小时窗口 ~43ms / 24 小时
+        ~232ms），命中几条就只补读几条（批读 ~3.4ms/条）；而全量一次 4.8s。
+        OmniJS 逐条遍历反而更慢（1715 条裸遍历 2.9s），所以**只能用 JXA 查**。
+        """
+        age = now - self._full_mono
+        can_incremental = (bool(self._rows_by_id) and self._full_mono > 0
+                           and (not with_repetition or self._cache_repetition)
+                           and age < self.full_scan_ttl
+                           and age < INCREMENTAL_WINDOW)
+        if can_incremental:
+            got = self._changes_since(self._snapshot_epoch - INCREMENTAL_OVERLAP,
+                                      timeout=timeout)
+            if got is not None:
+                task_ids, project_ids = got
+                # 项目改名/状态变化没法靠补读任务行反映，直接全量（很少发生）。
+                if not project_ids and len(task_ids) <= self.incremental_max:
+                    if task_ids:
+                        # 快照里带重复字段，补读也必须带：否则合并后同一份快照
+                        # 里有的行有 repetition_*、有的没有，repetition_info 会
+                        # 悄悄退回单条 osascript。
+                        want_rep = bool(with_repetition or self._cache_repetition)
+                        self._merge_rows(self._fetch_rows(
+                            task_ids, timeout=timeout,
+                            with_repetition=want_rep))
+                    self._snapshot_epoch = self.wall_clock()
+                    self._cache_at = now
+                    return self._cache or []
+        rows = self._fetch_rows(None, timeout=timeout,
+                                with_repetition=with_repetition)
+        self._rows_by_id = {str(row.get("id")): row for row in rows
+                            if str(row.get("id") or "")}
+        self._cache = rows
+        self._cache_at = now
+        self._cache_repetition = bool(with_repetition)
+        self._full_mono = now
+        self._snapshot_epoch = self.wall_clock()
+        return rows
+
+    def _merge_rows(self, rows):
+        """把补读到的行并进快照（保序：替换原位、新的追在末尾）。"""
+        if not rows:
+            return
+        for row in rows:
+            pk = str(row.get("id") or "")
+            if not pk:
+                continue
+            self._rows_by_id[pk] = row
+        self._cache = list(self._rows_by_id.values())
+
+    def flush(self, ops, timeout=None):
+        """一次 osascript 处理多条 complete/drop。返回 ``{"results": [...]}``。
+
+        本地优先写回用它：``task done`` 只改本地，空闲 / refresh 时把这些攒着的
+        账一次写回去（N 条任务 = 1 个进程，而不是 N 个）。
+        """
+        payload = {"ops": [dict(op) for op in (ops or [])]}
+        if not payload["ops"]:
+            return {"results": []}
+        rc, out, err = self._run(
+            ["batch"], timeout=timeout or self.timeout,
+            stdin_text=json.dumps(payload, ensure_ascii=False))
+        self._raise_for(rc, out, err, "写回 OmniFocus")
+        text = (out or "").strip()
+        try:
+            data = json.loads(text.splitlines()[-1]) if text else {}
+        except (ValueError, IndexError):
+            raise OmniFocusError("批量写回返回的不是 JSON：%r" % text[:120],
+                                 kind="error", exit_code=1) from None
+        if not isinstance(data, dict) or not data.get("ok"):
+            raise OmniFocusError(
+                (data or {}).get("message") or (data or {}).get("error")
+                or "批量写回失败", kind="error", exit_code=1)
+        self.invalidate()
+        return data
 
     def get(self, pk, refresh=False):
         """按 primary key 找一条；找不到返回 None。"""
@@ -959,6 +1127,9 @@ class Client(object):
         if not pk:
             raise OmniFocusError("没有 OmniFocus primary key，查不了重复规则",
                                  kind="bad_args", exit_code=2)
+        cached = self._cached_repetition(pk)
+        if cached is not None:
+            return cached
         script = build_repetition_script(pk)
         with self._lock:
             out = self._run_applescript(script, timeout=timeout)
@@ -967,9 +1138,46 @@ class Client(object):
         except ValueError as e:
             raise OmniFocusError("查重复规则失败：%s" % e, kind="error", exit_code=1) from None
 
+    @staticmethod
+    def _repetition_from_row(row):
+        """``list --with-repetition`` 的一行 → 和 ``repetition_info()`` 同形状的 dict。"""
+        if not row or "repetition_rule" not in row:
+            return None
+        rule = row.get("repetition_rule")
+        return {
+            "repeated": bool(rule),
+            "id": str(row.get("id") or ""),
+            "name": str(row.get("name") or ""),
+            "rule_string": rule,
+            "method": row.get("repetition_method"),
+            "schedule_type": row.get("repetition_schedule_type"),
+            "anchor_date_key": row.get("repetition_anchor_date_key"),
+            "catch_up_automatically": row.get("repetition_catch_up"),
+            "due": row.get("due"),
+            "defer": row.get("defer"),
+            "planned": row.get("planned"),
+            "next": row.get("repetition_next"),
+            "estimated_minutes": row.get("estimated_minutes"),
+        }
+
+    def _cached_repetition(self, pk):
+        """缓存里那条任务要是带着重复字段，直接给；否则 None（走单条查询）。"""
+        with self._lock:
+            rows = self._cache if self._cache_repetition else None
+        for row in rows or ():
+            if str(row.get("id") or "") == pk:
+                return self._repetition_from_row(row)
+        return None
+
     def invalidate(self):
+        """作废「当前缓存」但**保留快照**：下次读取走增量（只补变了的行）。
+
+        写操作之后我们自己就知道改了哪条；真删了东西的情况由
+        :data:`FULL_SCAN_TTL` 的全量对账兜底。
+        """
         self._cache = None
         self._cache_at = 0.0
+        # _cache_repetition 不动：快照里的行还带着重复字段，别让它下次白读一遍。
 
     # -- 写 -----------------------------------------------------------
     def set_task(self, pk, *flags, yes=True, timeout=None, allow_project_root=False):
