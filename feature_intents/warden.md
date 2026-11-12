@@ -847,9 +847,11 @@ python3 warden.py install-deps
 - 契约表格下面那块任务面板**按位置连号排**（还是原来那一张表，不拆）：`未挂 session`
   的排最前，之后一场 session 一段（按开始时间）、段内按任务 ID 升序，同类的挨在一起
   （详见 `task.md`）。
-- `task` 入口长出四个位置动作：`-an`（下架）/ `-ac`（当前这一场）/
+- `task` 入口长出位置动作：`-an`（下架）/ `-ac`（当前这一场）/
   `3 swap 5`（互换位置）/ `-s 5 -a 6`（整场转移）；紧凑写法由 repl_kit 的
-  `ShortFlag` 统一展开，补全和提示都跟着走。
+  `ShortFlag` 统一展开，补全和提示都跟着走。`-act N`（`--assign-count N`）
+  只改任务当前这一场要记几个 count，必须挂上 session 后用；例如
+  `task 5 -ac -act 2` 先挂当前场、再把本场设为 2，不改任务总 count / 时长。
 - 任务命令里的数字是**序号 = 面板上的第几条**（1 起、连续、随 refresh/收工重排），
   不是内部 id；面板上没有的任务用 `id:N` 显式指定（详见 `task.md`）。
 - `refresh --check`（`-c`）：重拉 + 对账（该订没订上 → 叫 daemon 补；该挂没挂上 →

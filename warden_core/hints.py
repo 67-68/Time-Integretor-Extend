@@ -85,7 +85,7 @@ _CONTEXT_HEADS = {
 }
 
 _CONTEXT_USAGES = {
-    "task": "task <序号|create|import|...> [-a <场>|-ac] [-m complete|discard]",
+    "task": "task <序号|create|import|...> [-a <场>|-ac] [-act N] [-m complete|discard]",
     "project": "pro <序号> [interrupt [--soft|--hard|--check]|-a <场>|-ac|...]",
     "plan": "plan [-c|--current] [天数]  |  plan -s <场> -p <项目>",
     "conscription": "conscription / cst [session序号|current]",
@@ -131,6 +131,12 @@ def _context_detail(command, args):
         # 后缀 flag 可能出现在序号前后，先按 flag 判断，再按动作词判断。
         ref = next((w for w in words if w.isdigit() or w.startswith("id:")), "")
         task_ref = (("任务 #%s" % ref) if ref.isdigit() else ref) if ref else "这条任务"
+        if any(tok in words for tok in ("-act", "--assign-count", "--assigned-count", "--act")):
+            pos = next((i for i, tok in enumerate(words)
+                        if tok in ("-act", "--assign-count", "--assigned-count", "--act")), -1)
+            value = words[pos + 1] if 0 <= pos < len(words) - 1 else "N"
+            return "%s -act %s：把这一场 session 要记的 count 设为 %s（需先挂场）" \
+                % (task_ref, value, value)
         if any(tok in words for tok in ("-ac", "--assign-current")) or "current" in words:
             return "%s -ac：挂到当前进行中或最近的 session" % task_ref
         if any(tok in words for tok in ("-an",)) or "none" in words:
@@ -386,14 +392,14 @@ def _task_command(w):
         section="通用",
         usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
               " ... [-a <编号|none|current>] [-s <编号>] [-n 备注] [-e true|false]"
-              " [-m complete|discard] [-c 5|+2|-1]"
+              " [-m complete|discard] [-c 5|+2|-1] [-act N]"
               " [-t <trigger> [参数...]] [-f <formatter> [参数...]]",
         # 把 flag 放在 action 词前面：补全列表有 20 项上限，flag 被挤到后面
         # 就等于「有这个选项但 Tab 永远看不到」。
         # 紧凑短选项（-an/-ac/-m/-t/-f）由 task_completer 的 short 表补，不要
         # 在 options 里再写一遍 —— 否则 Tab 菜单里会出现两个一模一样的候选。
         options=("--assign", "-a", "--note", "-n", "--from", "-s", "--exclusive", "-e",
-                 "--mark", "--count", "--trigger",
+                 "--mark", "--count", "--assign-count", "--trigger",
                  "--formatter", "--repeat", "--single-task",
                  "create", "import", "delete", "modify", "note", "assign", "select",
                  "swap", "repeat", "sync", "archive", "inspect-due"),
@@ -426,6 +432,9 @@ def task_completer(w, prior):
     if words and words[-1] in ("--count", "-c"):
         # count 后面就是一个整数；把最常用的三个形状摆出来（+1 / +2 / -1）。
         return ["+1", "+2", "-1"]
+    if words and words[-1] in ("--assign-count", "--assigned-count", "-act", "--act"):
+        # 这一场记几个 count：给几个常用正整数，具体值仍可直接输入。
+        return ["1", "2", "3"]
     if words and words[-1] in TASK_HOOK_FLAGS["trigger"]:
         # 默认没有 trigger —— 返回空列表就是「空的 function 列表」。
         return list(th.preset_names("trigger"))
@@ -751,6 +760,10 @@ def _hint_task(parts):
         return repl_kit.Hint("取值", ("true", "false"),
                              note="独占 = 这一场 session 只能有它一条任务"
                                   "（end formatter 排出来的任务自动独占；裸写 -e 就是 true）")
+    if any(tok in words for tok in ("-act", "--assign-count", "--assigned-count", "--act")):
+        return repl_kit.Hint("取值", ("<正整数>",),
+                             note="只改**这一场**要记的 count，不改任务总 count / 时长；"
+                                  "例：task 5 -ac -act 2（先挂当前场，再把本场设为 2）")
     if any(tok in words for tok in ("-an", "-ac")):
         return repl_kit.Hint("参数", ("（不用再跟东西）",),
                              note="-an ≡ -a none（下架）· -ac ≡ -a current（当前这一场）")
@@ -770,11 +783,12 @@ def _hint_task(parts):
         if len(head) == 1:
             return repl_kit.Hint("动作", ("swap", "duplicate", "drop", "done", "link",
                                           "-m complete|discard", "-f end", "-e true",
-                                          "-a <编号>"),
+                                          "-a <编号>", "-act N"),
                                  note="数字是面板序号（swap 5 = 和第 5 条换位置）"
                                       " · -m 手动标状态 · -f end 排到当天最后一段"
                                       " · -e true 独占一整场 · -a none 下架"
-                                      " · -a current 挂到当前这一场")
+                                      " · -a current 挂到当前这一场"
+                                      " · -act N 改这一场记几个 count")
         head = head[1:]
     action = head[0] if head else ""
     if action in ("import", "粘贴", "导入"):

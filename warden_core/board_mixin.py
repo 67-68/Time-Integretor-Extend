@@ -713,14 +713,20 @@ class BoardMixin(object):
         if not task or not ts.TaskStore.is_open(task):
             return 0
         sess = task.get("session") or {}
-        delta = ts.minutes_to_count(sess.get("duration")) or 0
+        # ``-act/--assign-count`` 手改了**这一场**的 count：它优先于按
+        # session 时长算出来的默认涨幅，但不改任务的 fields.count / duration。
+        assigned = ts.task_session_assigned_count(task)
+        if assigned is not None:
+            delta = assigned
+        else:
+            delta = ts.minutes_to_count(sess.get("duration")) or 0
+            # 项目任务拆段后，本地这条记录只分到一部分 count：这一场即使挂了
+            # 50 分钟 session，这段也可能只计划干 1 个 count，预报不能按整场算。
+            cap = ts.task_count(task)
+            if cap is not None:
+                delta = min(delta, cap)
         if not delta:
             return 0
-        # 项目任务拆段后，本地这条记录只分到一部分 count：这一场即使挂了
-        # 50 分钟 session，这段也可能只计划干 1 个 count，预报不能按整场算。
-        cap = ts.task_count(task)
-        if cap is not None:
-            delta = min(delta, cap)
         day = str(sess.get("date") or "").strip()
         if not day:
             return delta
@@ -867,6 +873,9 @@ class BoardMixin(object):
         """session 表格里那截 count：``(这一场开始前 + 这一场 / 总 count)``。"""
         cap, _aggregate = self.task_count_scope(task)
         invested = self.task_session_count_baseline(task)
+        assigned = ts.task_session_assigned_count(task)
+        if assigned is not None:
+            delta = assigned
         text = ts.count_text(task, delta, cap=cap, invested=invested)
         return (text + " ") if text else ""
 
@@ -2688,6 +2697,8 @@ class BoardMixin(object):
             ("task <序号> -a <session|none|current>", "挂上/下架/挂当前场"),
             ("task <序号> -n <备注>", "顺手写备注"),
             ("task <序号> -c 5|+2|-1", "设 count / 加进度 / 减进度"),
+            ("task <序号> -act N", "只改当前这一场要记的 count（先挂 session）"),
+            ("task <序号> assign-count N", "同上，子命令写法"),
             ("task <序号> -e true|false", "独占 / 取消独占"),
             ("task <序号> -m complete|discard", "只改本地状态（不碰外部系统）"),
             ("project <序号> -m complete|discard", "修改 pro 本地状态；默认 disposable filter 隐藏"),

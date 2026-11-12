@@ -216,11 +216,12 @@ BOARD_MUTATING_COMMANDS = frozenset({
 
 # task 里只有这些子命令/后缀会改账本；`task 3` / `task select 3` 只是换选中项。
 TASK_MUTATING_ACTIONS = frozenset({
-    "create", "import", "delete", "modify", "note", "assign", "duplicate",
-    "drop", "done", "link", "repeat", "sync", "swap", "archive",
+    "create", "import", "delete", "modify", "note", "assign", "assign-count",
+    "duplicate", "drop", "done", "link", "repeat", "sync", "swap", "archive",
 })
 TASK_MUTATING_FLAGS = (
     "-a", "--assign", "-n", "--note", "-m", "--mark", "-c", "--count",
+    "-act", "--assign-count", "--assigned-count", "--act",
     "-e", "--exclusive", "-t", "--trigger", "-f", "--formatter",
     "-s", "--from",
 )
@@ -264,6 +265,9 @@ TASK_SESSION_CURRENT = ("current", "cur", "now", "当前", "现在", "这一场"
 TASK_SHORT_FLAGS = (
     repl_kit.ShortFlag("-an", ("--assign", "none"), note="从 session 下架"),
     repl_kit.ShortFlag("-ac", ("--assign", "current"), note="挂到当前这一场"),
+    # `-act` 展开成 `--assign-count`，后面跟这一场要记几个 count：
+    # `task 5 -ac -act 2` = 先挂当前场，再把本场 count 覆盖成 2。
+    repl_kit.ShortFlag("-act", ("--assign-count",), note="设置这一场的 count"),
     # `-m` 展开成 `--mark`，后面那个词（complete / discard）照常跟着：
     # `task 3 -m complete` ≡ `task 3 --mark complete`。
     repl_kit.ShortFlag("-m", ("--mark",), note="手动标记 complete/discard"),

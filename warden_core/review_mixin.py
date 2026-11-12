@@ -314,21 +314,26 @@ class ReviewMixin(object):
             cap = ts.task_count(task)
             if cap is None:
                 continue                     # 没设 count 的任务：这一场不记账
+            # 这一场被 `-act/--assign-count` 手动改过：按覆盖值记账，不再
+            # 用整场时长。没改过就保持原来的「时长 / 25」。
+            task_delta = ts.task_session_assigned_count(task)
+            if task_delta is None:
+                task_delta = delta
             credited = None
             try:
-                credited = self.task_store.credit_count(task["id"], key, delta)
+                credited = self.task_store.credit_count(task["id"], key, task_delta)
             except (ValueError, TypeError) as e:      # noqa: BLE001 - 记账失败不该挡住收尾
                 self.say("⚠ 给任务 %s 记 count 失败：%s"
                          % (self.task_label(task), e), "warn")
             fresh = self.task_store.get(task["id"])
             invested = ts.task_count_invested(fresh)
-            state = {"cap": cap, "invested": invested, "delta": delta,
+            state = {"cap": cap, "invested": invested, "delta": task_delta,
                      "credited": credited is not None,
                      "maxed": invested >= cap}
             out[fresh["id"]] = state
             if credited is not None:
                 self.say("🧮 任务 %s 记了 %d 个 count：%d/%d%s"
-                         % (self.task_label(fresh), delta, invested, cap,
+                         % (self.task_label(fresh), task_delta, invested, cap,
                             "（够数了，收尾时问你：再要 count 还是直接完成）"
                             if state["maxed"] else ""), "ok")
         return out

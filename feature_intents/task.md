@@ -56,7 +56,8 @@ data/task-archive.json   完成归档（只增；按 task+focusmate+completedAt 
     ],
     "count_credits": {"2026-10-27T11:00": 2},   // 哪一场已经给它记过 count（幂等）
     "session": {"date": "2026-10-26", "start": "11:00", "end": "11:50",
-                "duration": 50, "focusmate_session_id": "..."},
+                "duration": 50, "focusmate_session_id": "...",
+                "assigned_count": 1},   // 可选：本场覆盖，-act 写入
     "focusmate": {"task_id": "...", "session_id": "...", "completed_at": "..."}
   }]
 }
@@ -135,6 +136,25 @@ task 3 -c -1     进度 -1（最低 0）
   勾 Focusmate + 写回 OmniFocus（不是另开一套「悄悄标完成」的岔路）。
 - 设定 count 时如果已投入比新上限还大，进度会被压到新上限。
 - 和 `-s/--from` 批量不能一起用（进度是单条任务的东西）。
+
+### `-act/--assign-count`（本场覆盖）
+
+`-c` 改的是任务/本地 part 的**总量**；`-act` 只改任务当前这一场 session 要记几个
+count，两者是两本账：
+
+```text
+task 5 -ac -act 2      # 先挂到当前场，再把本场要记的 count 设为 2
+task 5 -act 1          # 已经挂着时，只把本场改成 1
+task 5 assign-count 1  # 同一个动作的子命令写法
+```
+
+- 只能用在**已经挂上 session** 的任务上；没挂时先用 `-a <场>` / `-ac`。
+- 写入 `task["session"]["assigned_count"]`，**不动** `fields.count` /
+  `fields.duration`，也不进自动排期指纹 —— 所以不会触发一次多余重排。
+- 契约表格 / 任务面板中间的预报数改成这个值；收尾记账也按这个值，
+  不再按整场 `duration / 25`。
+- 值必须是正整数；超出任务本段上限或整场容量会提示，但值仍保存。
+- 没有挂 session 的 `-act` 明确报错，不改任何账本。
 
 ### 界面上的 `(1+2/5)`
 
@@ -294,6 +314,8 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task <序号> -f end` | 按任务 `duration` 在当天最后一段的**尾巴上切一场**（11:30–11:55 那种）、写进排期并自动 assign；排出来的任务自动独占 |
 | `task <序号> -f enlist` | 不切排布，把任务挂进**已有** session：优先孤立且正好同长的块；大块只从开头/结尾塞入 |
 | `task <序号> -e true`（`--exclusive true`） | **独占**：这一场 session 只能有它一条任务（裸写 `-e` = true，`-e false` 取消） |
+| `task <序号> -act N`（`--assign-count N`） | **本场 count 覆盖**：只改这一场要记几个 count，不动任务总 count / 时长；可写 `task 5 -ac -act 2` 先挂再改 |
+| `task <序号> assign-count N` | 上一条的子命令写法（任务必须已经挂上 session） |
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |
 | `task archive [N]` | 看归档：按完成日期分组、最近 N 条（默认 5） |
 | `task <任何动作> ... --assign <N>` | 跑完顺手把产出的任务挂到表格 #N（`-a` / `--assign=N` 同义） |

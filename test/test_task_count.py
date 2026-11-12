@@ -415,6 +415,85 @@ try:
 except ValueError:
     check("裸 -c 要报错", True, True)
 
+# ---------------------------------------------------------------- 7. 本场 assign-count
+print("\n== 7. -act/--assign-count：只改这一场要记几个 count ==")
+wd7 = mkwarden()
+_start = datetime.datetime.now() - datetime.timedelta(minutes=5)
+_end = _start + datetime.timedelta(minutes=50)
+_label = _start.strftime("%H:%M")
+wd7.api_rows = [{
+    "startMs": int(_start.timestamp() * 1000),
+    "endMs": int(_end.timestamp() * 1000),
+    "startLabel": _label, "endLabel": _end.strftime("%H:%M"),
+    "durationMin": 50, "id": "sess-live", "title": "", "quiet": False,
+    "matched": False,
+}]
+wd7.rows_source = "bridge"
+wd7.rebuild_rows()
+act = wd7.task_store.create(fields={
+    "title": "本场 count", "count": "5", "count_total": 5,
+    "project_id": 1, "project_task": "pk-act",
+})
+act_no = wd7.task_no(act)
+check("没挂场时不预报 count",
+      wd7.task_count_delta(wd7.task_store.get(act["id"])), 0)
+check("task 5 -ac -act 2 受理",
+      wd7.handle("task %d -ac -act 2" % act_no), True)
+act = wd7.task_store.get(act["id"])
+check("先挂到当前场，再写本场 assigned_count=2",
+      (act["session"].get("start"), act["session"].get("assigned_count")),
+      (_label, 2))
+check("任务的 fields.count 没被改", ts.task_count(act), 5)
+check("任务的 duration 没被改", act["fields"].get("duration"), 125)
+check("子命令写法 task N assign-count 2 也受理",
+      (wd7.handle("task %d assign-count 2" % act_no),
+       wd7.task_store.get(act["id"])["session"].get("assigned_count")),
+      (True, 2))
+check("_act 1 只改本场预报",
+      (wd7.handle("task %d -act 1" % act_no),
+       wd7.task_store.get(act["id"])["session"].get("assigned_count")),
+      (True, 1))
+act = wd7.task_store.get(act["id"])
+check("本场预报变成 1", wd7.task_count_delta(act), 1)
+check_in("契约表格显示 (0+1/5)", "(0+1/5)",
+         wd7.task_cell_text([act], 50))
+check_in("任务面板显示 (0+1/5)", "(0+1/5)", wd7.task_index_title(act))
+
+entry_act = {"key": psv.session_key(datetime.date.today(), _label),
+             "date": ISO, "start": _label, "end": _end.strftime("%H:%M"),
+             "duration": 50}
+wd7.begin_review(entry_act, sync=False)
+act = wd7.task_store.get(act["id"])
+check("收尾按覆盖值只记 1 个 count（不是整场 2 个）",
+      ts.task_count_invested(act), 1)
+check("覆盖值也写进幂等台账",
+      (act.get("count_credits") or {}).get(entry_act["key"]), 1)
+check_in("记完账后历史 session 行仍显示 (0+1/5)", "(0+1/5)",
+         wd7.task_cell_text([act], 50))
+wd7.close_review(note="test-act")
+
+loose_act = wd7.task_store.create(fields={"title": "没挂场", "count": "2"})
+try:
+    wd7._apply_assign_count(loose_act, 1)
+    check("没挂 session 时 -act 要报错", "没报错", "ValueError")
+except ValueError:
+    check("没挂 session 时 -act 要报错", True, True)
+check("错误路径没有往任务上写覆盖值",
+      wd7.task_store.get(loose_act["id"])["session"], None)
+
+check_true("-act 在短选项表里（-act ≡ --assign-count）",
+           any(flag.token == "-act" and "--assign-count" in flag.expands
+               for flag in w.TASK_SHORT_FLAGS))
+check_true("补全能补 -act 的正整数取值",
+           "2" in w.task_completer(wd7, ["task", "1", "-act"]))
+check("-act 的 =value 写法也认",
+      w.Warden._split_assign_count(["-act=2", "1"]), (2, ["1"]))
+try:
+    w.Warden._split_assign_count(["-act", "0"])
+    check("-act 0 要报错", "没报错", "ValueError")
+except ValueError:
+    check("-act 0 要报错", True, True)
+
 # ---------------------------------------------------------------- 收尾
 if fails:
     print("\n%d 条失败：" % len(fails))

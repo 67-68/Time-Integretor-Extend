@@ -1211,15 +1211,15 @@ wd4 = fresh_warden()
 _shell = wd4.shell
 check("task 后面能 Tab 到紧凑写法",
       [c for c in _shell.complete("task ") if c.startswith("-")],
-      ["-an", "-ac", "-m", "-t", "-f", "-st", "-e", "-c", "--assign", "-a",
+      ["-an", "-ac", "-act", "-m", "-t", "-f", "-st", "-e", "-c", "--assign", "-a",
        "--note", "-n", "--from", "-s", "--exclusive", "-e", "--mark", "--count",
-       "--trigger", "--formatter"])
+       "--assign-count"])
 check("task 后面 Tab 补的是**面板序号**（1..N 连续，不是内部 id）",
       [c for c in _shell.complete("task ") if c.isdigit()],
       [str(i) for i in range(1, len(wd4.task_panel_order()) + 1)])
 check("敲了 -a 之后 Tab 补的是紧凑写法",
       [c for c in _shell.complete("task -a") if c.startswith("-") and c != "-a"],
-      ["-an", "-ac"])
+      ["-an", "-ac", "-act"])
 # 行数不写死：`-f end` 会在「当天最后一段」的尾巴上切一场新 session
 # （见后面的「切割」一节），data.csv 因此可能多一行。
 check("-a 后面补「编号 + none + current」（不再混进一堆动作词）",
@@ -1236,6 +1236,11 @@ check("-m 的提示行说的是手动改本地状态",
       "手动改本地状态" in _shell.hint_line("task 3 -m"), True)
 check("-an / -ac 打完了：提示说不用再跟东西",
       "-an ≡ -a none" in _shell.hint_line("task -an"), True)
+check("-act 的提示说的是改这一场 count",
+      "这一场" in _shell.hint_line("task 3 -act") and
+      "count" in _shell.hint_line("task 3 -act"), True)
+check("-act 也进了 Tab 补全",
+      "2" in _shell.complete("task 3 -act "), True)
 check("提示行认得「动作写在 ID 后面」",
       "互换位置" in _shell.hint_line("task 32 swap"), True)
 check("裸 ID 后面提示它能干什么",

@@ -2924,6 +2924,114 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-11T23:53:35",
+      "task_id": 177,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-11T23:40:00",
+        "due_source": "session",
+        "exclusive": true
+      },
+      "session": {
+        "index": 12,
+        "date": "2026-11-11",
+        "start": "23:15",
+        "end": "23:40",
+        "duration": 25,
+        "focusmate_session_id": "33f44d8a-671f-4168-8df9-2c9587e3f02a",
+        "previous_due": "2026-11-11T15:50:00"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "702917d3-d650-4ca3-9c9c-a30a63d05399",
+        "title": "flashcard review & new learn",
+        "description": "",
+        "completed_at": "2026-11-11T15:40:12.522605+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "33f44d8a-671f-4168-8df9-2c9587e3f02a"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-12T09:54:32",
+      "task_id": 130,
+      "fields": {
+        "title": "assignmentbook chap 6",
+        "project": "SchoolReview",
+        "project_id": 2,
+        "project_task": "iG-ENS1yOZc",
+        "duration": 75,
+        "notes": "父任务：physic review",
+        "count": 3,
+        "count_invested": 2,
+        "due": "2026-11-12T10:20:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 1,
+        "date": "2026-11-12",
+        "start": "09:30",
+        "end": "10:20",
+        "duration": 50,
+        "focusmate_session_id": "07963cda-6d2d-460f-b24a-8c8aeb967c6c"
+      },
+      "notes": "父任务：physic review",
+      "focusmate": {
+        "task_id": "55c14422-b00e-42fd-8f68-25ca009596b6",
+        "title": "assignmentbook chap 6",
+        "description": "父任务：physic review",
+        "completed_at": "2026-11-12T01:50:47.531577+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "07963cda-6d2d-460f-b24a-8c8aeb967c6c"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-12T10:20:12",
+      "task_id": 130,
+      "fields": {
+        "title": "assignmentbook chap 6",
+        "project": "SchoolReview",
+        "project_id": 2,
+        "project_task": "iG-ENS1yOZc",
+        "duration": 75,
+        "notes": "父任务：physic review",
+        "count": 3,
+        "count_invested": 2,
+        "due": "2026-11-12T10:20:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 1,
+        "date": "2026-11-12",
+        "start": "09:30",
+        "end": "10:20",
+        "duration": 50,
+        "focusmate_session_id": "07963cda-6d2d-460f-b24a-8c8aeb967c6c"
+      },
+      "notes": "父任务：physic review",
+      "focusmate": {
+        "task_id": "55c14422-b00e-42fd-8f68-25ca009596b6",
+        "title": "assignmentbook chap 6",
+        "description": "父任务：physic review",
+        "completed_at": "2026-11-12T02:19:27.211468+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "07963cda-6d2d-460f-b24a-8c8aeb967c6c"
+          }
+        ]
+      }
     }
   ]
 }

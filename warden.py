@@ -29,6 +29,8 @@
    + OmniFocus 单向联动。
    `task create/delete/modify/assign/select/repeat/duplicate/drop/done/link/import/sync`；
    `task <序号> -m complete|discard` 是**只改本地账本**的手动状态标记（不碰外部）；
+   `task <序号> -act N`（`--assign-count N`）只改**当前这一场**要记几个 count
+   （`task 5 -ac -act 2` = 先挂当前场，再把本场设为 2；不改任务总 count / 时长）；
    `task <序号> -t <trigger>` / `-f <formatter>` 是具名预设函数框架
    （trigger 默认为空，formatter 有 `end`：在当天最后一段的尾巴上**切一场**
    任务大小的 session、把那个时段剪断（原来那场 50 分钟消失）并自动 assign；

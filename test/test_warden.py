@@ -938,6 +938,9 @@ check("task 介绍窗给用法", "用法" in _ctx_task[1][1], True)
 _ctx_ac = wd_hint.shell.context_hint("task 3 -ac")
 check("task 3 -ac 解释挂到当前/最近 session",
       "当前进行中或最近的 session" in _ctx_ac[2][1], True)
+_ctx_act = wd_hint.shell.context_hint("task 5 -ac -act 2")
+check("task 5 -ac -act 2 解释改这一场的 count",
+      "这一场" in _ctx_act[2][1] and "count" in _ctx_act[2][1], True)
 _ctx_pro = wd_hint.shell.context_hint("pro 1 interrupt --check")
 check("pro interrupt --check 解释逐条检查",
       "逐条检查软中断" in _ctx_pro[2][1], True)

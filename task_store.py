@@ -87,6 +87,10 @@ MINUTES_PER_COUNT = 25
 COUNT_KEY = "count"
 COUNT_INVESTED_KEY = "count_invested"
 COUNT_CREDITS_KEY = "count_credits"
+#: 单场覆盖：任务的 ``session`` 里可以写「这一场只记几个 count」。
+#: 它不改 ``fields.count``（那是这个本地 part 的总量），也不进自动排期指纹；
+#: 只影响界面中间的涨幅和收尾记账。键名带 assigned，和项目里的 allocation 区分开。
+SESSION_ASSIGNED_COUNT_KEY = "assigned_count"
 
 #: 任务持续时间的字段别名。第一个是推荐写法，其余是为了兼容手写数据。
 #: ``task_hooks`` 直接 import 这个名字，别再复制一份。
@@ -224,6 +228,18 @@ def task_count_invested(task):
     fields = (task or {}).get("fields") or {}
     got = parse_count(fields.get(COUNT_INVESTED_KEY))
     return got if got is not None and got > 0 else 0
+
+
+def task_session_assigned_count(task):
+    """任务在当前 session 上被手动指定的 count（没设就是 ``None``）。
+
+    ``fields.count`` 是这条本地任务/part 的总量；这里的值是**这一场**的
+    覆盖值，只影响界面预报和收尾记账。它故意不写进 plan 指纹，避免一次
+    手工调整触发自动重排。
+    """
+    session = (task or {}).get("session") or {}
+    got = parse_count(session.get(SESSION_ASSIGNED_COUNT_KEY))
+    return got if got is not None and got > 0 else None
 
 
 def count_text(task, delta=0, cap=None, invested=None):
@@ -1108,6 +1124,27 @@ class TaskStore(object):
                 fields[COUNT_INVESTED_KEY] = invested
             else:
                 fields.pop(COUNT_INVESTED_KEY, None)
+
+        return self._mutate(task_id, apply)
+
+    def set_session_count(self, task_id, count):
+        """设置任务**当前这一场 session** 的 count（不动任务总量/时长）。
+
+        这个值存在 ``task["session"]["assigned_count"]``：界面上的
+        ``(已投入+这一场/总量)`` 中间那截、以及收尾记账都改用它。必须先
+        ``assign`` 到一场 session；未挂载时抛 ``ValueError``。
+        """
+        want = parse_count(count)
+        if want is None or want <= 0:
+            raise ValueError("这一场的 count 必须是正整数；你给的是 %r" % (count,))
+
+        def apply(task):
+            session = task.get("session") or {}
+            if not session.get("date") or not session.get("start"):
+                raise ValueError("任务 %s 还没挂到 session；先用 -a <场> / -ac 挂上，"
+                                 "再设置这一场的 count。" % task.get("id"))
+            session[SESSION_ASSIGNED_COUNT_KEY] = int(want)
+            task["session"] = session
 
         return self._mutate(task_id, apply)
 

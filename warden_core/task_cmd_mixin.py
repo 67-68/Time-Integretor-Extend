@@ -40,6 +40,12 @@ class TaskCmdMixin(object):
           ``--from <session ID>``（``-s`` 同义）= 批量：那一场上的**全部**任务
           ``--trigger <预设> [参数...]``（``-t`` 同义）= 挂创建触发（框架；默认空）
           ``--formatter <预设> [参数...]``（``-f`` 同义）= 挂排期算法并当场执行
+          ``--assign-count <N>``（``-act`` 同义）= 覆盖**这一场**要记的 count
+
+        ``-act`` 只能作用于已经挂到 session 上的任务；它可以和 ``-ac`` / ``-a``
+        组合，先挂载再改本场 count：
+            task 5 -ac -act 2     ← 挂到当前场，并把本场 count 设为 2
+            task 5 -act 1         ← 已经挂着时，只把本场 count 改成 1
 
         ``-m/--mark`` 是**账本动作**，不代替 ``done`` / ``drop`` 的外部联动：
           - ``complete`` = 本地 completed + 归档；不勾 Focusmate，不当场写 OmniFocus
@@ -90,6 +96,7 @@ class TaskCmdMixin(object):
         exclusive, kept = self._split_exclusive(kept)
         mark_status, kept = self._split_mark(kept)
         count_spec, kept = self._split_count(kept)
+        assign_count_spec, kept = self._split_assign_count(kept)
         trigger_tokens, kept = self._split_hook(kept, "trigger")
         formatter_tokens, kept = self._split_hook(kept, "formatter")
 
@@ -123,10 +130,10 @@ class TaskCmdMixin(object):
             return self._apply_bulk(source, assign_to)
         if not kept and mark_status is None and trigger_spec is None \
                 and formatter_spec is None and exclusive is None \
-                and count_spec is None:
+                and count_spec is None and assign_count_spec is None:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
                              "或后缀 -e/--exclusive / -m/--mark / -c/--count"
-                             " / -t/--trigger / -f/--formatter")
+                             " / -act/--assign-count / -t/--trigger / -f/--formatter")
         # 异步 action（import 这类要先读外面世界的）拿走**同一份**后缀，
         # 后台那半件事落地之后自己套 —— 和同步路径完全一样的那套 _apply_suffix_chain。
         self._import_suffix_doc = {
@@ -135,6 +142,7 @@ class TaskCmdMixin(object):
             "exclusive": exclusive,
             "mark_status": mark_status,
             "count_spec": count_spec,
+            "assign_count_spec": assign_count_spec,
             "trigger_spec": trigger_spec,
             "formatter_spec": formatter_spec,
         }
@@ -166,6 +174,7 @@ class TaskCmdMixin(object):
                 "exclusive": exclusive,
                 "mark_status": mark_status,
                 "count_spec": count_spec,
+                "assign_count_spec": assign_count_spec,
                 "trigger_spec": trigger_spec,
                 "formatter_spec": formatter_spec,
             }
@@ -178,7 +187,8 @@ class TaskCmdMixin(object):
                 self._apply_suffix_chain(
                     one, action, note_text=note_text, assign_to=assign_to,
                     exclusive=exclusive, mark_status=mark_status,
-                    count_spec=count_spec, trigger_spec=trigger_spec,
+                    count_spec=count_spec, assign_count_spec=assign_count_spec,
+                    trigger_spec=trigger_spec,
                     formatter_spec=formatter_spec)
             return result.last
         if note_text is not None:
@@ -195,6 +205,8 @@ class TaskCmdMixin(object):
             result = self._apply_trigger(result, trigger_spec, action)
         if formatter_spec is not None:
             result = self._apply_formatter(result, formatter_spec, action)
+        if assign_count_spec is not None:
+            result = self._apply_assign_count(result, assign_count_spec, action) or result
         return result
 
     @staticmethod
@@ -411,6 +423,48 @@ class TaskCmdMixin(object):
             spec = value
         return spec, kept
 
+    @staticmethod
+    def _split_assign_count(toks):
+        """把 ``--assign-count N`` / ``-act N`` / ``-act=N`` 从参数里摘出来。
+
+        它和 ``-c/--count`` 是两本账：
+
+            -c 5        改这条任务/本地 part 的最高 count（时长跟着变）
+            -act 2      只改**当前这一场**要记的 count（任务总量/时长不动）
+
+        ``-act`` 是紧凑写法。取值只能是一个正整数；必须等任务已经挂上 session
+        才能落地，所以调用方要把它排在 ``-a`` / ``-ac`` 后面执行。
+        """
+        spec = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = str(toks[i])
+            low = tok.lower()
+            if low in ("--assign-count", "--assigned-count", "-act", "--act"):
+                if i + 1 >= len(toks):
+                    raise ValueError("`-act/--assign-count` 后面要跟这一场记几个 "
+                                     "count（例如 task 5 -ac -act 2）")
+                value = str(toks[i + 1]).strip()
+                i += 2
+            elif (low.startswith("--assign-count=")
+                  or low.startswith("--assigned-count=")
+                  or low.startswith("-act=")
+                  or low.startswith("--act=")):
+                value = tok.split("=", 1)[1].strip()
+                i += 1
+            else:
+                kept.append(tok)
+                i += 1
+                continue
+            if spec is not None:
+                raise ValueError("`-act/--assign-count` 一次只能给一个值。")
+            if not re.match(r"^\d+$", value) or int(value) <= 0:
+                raise ValueError("`-act/--assign-count` 只认正整数；"
+                                 "你给的是 %r" % value)
+            spec = int(value)
+        return spec, kept
+
     def _apply_count(self, task, spec, action="count"):
         """把 ``-c`` 落到任务上：设定最高 count，或者推进/退回已投入的 count。
 
@@ -451,6 +505,78 @@ class TaskCmdMixin(object):
                     ts.count_to_minutes(after) or 0,
                     ("，原来是 %d" % before) if before else ""), "ok")
         return task
+
+    def _apply_assign_count(self, result, spec, action="assign-count"):
+        """``-act/--assign-count``：只改任务**当前这一场**要记几个 count。
+
+        必须在 ``-a`` / ``-ac`` 之后执行（``task 5 -ac -act 2``）。它写进
+        ``session.assigned_count``，不改 ``fields.count`` / ``fields.duration``，
+        所以不会把自动排期指纹弄脏、触发一次多余重排。
+        """
+        task = result if isinstance(result, dict) and result.get("id") is not None else None
+        if task is None and self.selected_task_id is not None:
+            try:
+                task = self.task_store.get(self.selected_task_id)
+            except ValueError:
+                task = None
+        if task is None:
+            raise ValueError("`-act/--assign-count` 要跟一条任务："
+                             "`task 5 -ac -act 2`，或先 `task select 5`。")
+        task = self.task_store.get(task["id"])
+        if not ts.TaskStore.is_open(task):
+            raise ValueError("任务 %s 已经收工/放弃，不能改这一场的 count。"
+                             % self.task_label(task))
+        session = task.get("session") or {}
+        if not session.get("date") or not session.get("start"):
+            raise ValueError("任务 %s 还没挂到 session；先 `task %s -ac`（或 `-a <场>`）"
+                             "挂上，再用 `-act N` 设置这一场的 count。"
+                             % (self.task_label(task), self.task_label(task)))
+        before = ts.task_session_assigned_count(task)
+        task = self.task_store.set_session_count(task["id"], int(spec))
+        session = task.get("session") or {}
+        cap = ts.task_count(task)
+        session_cap = ts.minutes_to_count(session.get("duration"))
+        notes = []
+        if cap is not None and int(spec) > cap:
+            notes.append("超过任务这一段的 count 上限 %d，收尾记账会被压住" % cap)
+        if session_cap is not None and int(spec) > session_cap:
+            notes.append("超过这一场的整场容量 %d 个 count" % session_cap)
+        self.say("✅ 任务 %s 在 %s %s 这一场的 count = %d%s%s"
+                 % (self.task_label(task), session.get("date"),
+                    session.get("start"), int(spec),
+                    ("（原来是 %d）" % before) if before is not None else "",
+                    ("；注意：" + "；".join(notes)) if notes else ""),
+                 "ok" if not notes else "warn")
+        return task
+
+    def cmd_task_assign_count(self, args):
+        """``task <序号> assign-count <N>``：设置任务当前这一场的 count。
+
+        等价于后缀写法 ``task <序号> -act N``（``--assign-count N``）。任务必须
+        已经挂上 session；它不能替代 ``-a`` / ``-ac``，只能改已挂那一场的值。
+        """
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks:
+            raise ValueError("用法：task <序号> assign-count <正整数>"
+                             "（或 task <序号> -act N）")
+        if len(toks) > 2:
+            raise ValueError("task assign-count 只认「序号 + 一个正整数」")
+        if len(toks) == 1:
+            task = None
+            if self.selected_task_id is not None:
+                try:
+                    task = self.task_store.get(self.selected_task_id)
+                except ValueError:
+                    task = None
+            if task is None:
+                raise ValueError("task assign-count 要跟任务序号：task 5 assign-count 2")
+            value = toks[0]
+        else:
+            task = self.resolve_task(toks[0])
+            value = toks[1]
+        if not re.match(r"^\d+$", value) or int(value) <= 0:
+            raise ValueError("assign-count 只认正整数；你给的是 %r" % value)
+        return self._apply_assign_count(task, int(value), "assign-count")
 
     @staticmethod
     def _count_progress_text(out):
@@ -708,6 +834,8 @@ class TaskCmdMixin(object):
                 return self.cmd_task_link([action] + rest[1:])
             if verb in ("swap", "调换", "换位"):
                 return self.cmd_task_swap([action] + rest[1:])
+            if verb in ("assign-count", "assign_count", "act", "本场count"):
+                return self.cmd_task_assign_count([action] + rest[1:])
         if action == "duplicate" or action in ("dup", "copy", "复制"):
             return self.cmd_task_duplicate(rest)
         if action == "import" or action in ("粘贴", "导入"):
@@ -732,6 +860,8 @@ class TaskCmdMixin(object):
             return self.cmd_task_note(rest)
         if action == "assign":
             return self.cmd_task_assign(rest)
+        if action in ("assign-count", "assign_count", "act", "本场count"):
+            return self.cmd_task_assign_count(rest)
         if action in ("archive", "history", "归档"):
             return self.cmd_task_archive(rest)
         if action in ("repeat", "recurring"):
@@ -762,8 +892,8 @@ class TaskCmdMixin(object):
                                  "要挂到 session 用 -a/--assign（例如 task %s -a %s）。%s"
                                  % (action, action, action, rest[0], hint))
             return self.cmd_task_select([action])
-        raise ValueError("未知 task 动作 %r（create/delete/modify/assign/select/repeat/"
-                         "duplicate/drop/done/link/import/sync/archive；"
+        raise ValueError("未知 task 动作 %r（create/delete/modify/assign/assign-count/"
+                         "select/repeat/duplicate/drop/done/link/import/sync/archive；"
                          "也可以直接写任务 ID，如 task 8 ≡ task select 8）" % action)
 
     def cmd_task_archive(self, args, limit=5):
@@ -1228,12 +1358,15 @@ class TaskCmdMixin(object):
 
     def _apply_suffix_chain(self, task, action, note_text=None, assign_to=None,
                             exclusive=None, mark_status=None, count_spec=None,
-                            trigger_spec=None, formatter_spec=None):
+                            assign_count_spec=None, trigger_spec=None,
+                            formatter_spec=None):
         """按固定顺序把一条任务的后缀跑完：
-        note → count → exclusive → assign → mark → trigger → formatter。
+        note → count → exclusive → assign → mark → trigger → formatter → assign-count。
 
         count 排在 formatter 前面是有意的：``task create ... -c 3 -f end`` 里
         ``-f end`` 要按「刚刚设好的时长」去切 session（count 3 = 75 分钟）。
+        assign-count 排在最后，是为了让 ``-ac -act 2``（以及 formatter 重新
+        落场）改到的都是**最终**那一场。
 
         这是 `cmd_task` 和 `task import` 共用的那一段；一次导入多条时由
         :meth:`_apply_import_suffix` 对**每一条**各跑一遍。
@@ -1252,10 +1385,12 @@ class TaskCmdMixin(object):
             task = self._apply_trigger(task, trigger_spec, action) or task
         if formatter_spec is not None:
             task = self._apply_formatter(task, formatter_spec, action) or task
+        if assign_count_spec is not None:
+            task = self._apply_assign_count(task, assign_count_spec, action) or task
         return task
 
     def _apply_import_suffix(self, task, suffix):
-        """把 `task import` 后面挂的 -n / -a / -m / -t / -f 落到**真正导入的任务**上。
+        """把 `task import` 后面挂的 -n / -a / -m / -act / -t / -f 落到导入任务上。
 
         ``task`` 可以是单条任务，也可以是 :class:`ImportBatch`（一次导入多条）——
         后一种情况后缀逐条套，不是只套最后一条。重复任务本体会在这些动作里被导向
@@ -1275,6 +1410,7 @@ class TaskCmdMixin(object):
                     exclusive=suffix.get("exclusive"),
                     mark_status=suffix.get("mark_status"),
                     count_spec=suffix.get("count_spec"),
+                    assign_count_spec=suffix.get("assign_count_spec"),
                     trigger_spec=suffix.get("trigger_spec"),
                     formatter_spec=suffix.get("formatter_spec"))
             return last if last is not None else task.last
@@ -1286,6 +1422,7 @@ class TaskCmdMixin(object):
             exclusive=suffix.get("exclusive"),
             mark_status=suffix.get("mark_status"),
             count_spec=suffix.get("count_spec"),
+            assign_count_spec=suffix.get("assign_count_spec"),
             trigger_spec=suffix.get("trigger_spec"),
             formatter_spec=suffix.get("formatter_spec"))
 
