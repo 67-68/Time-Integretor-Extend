@@ -209,6 +209,28 @@ TUI 里的用法：`task import`（不给参数 = 读剪贴板导入并自动关
 超时/被杀只影响这一次调用，TUI 不会被拖进去。`Client` 顺便带 20 秒缓存
 （一次收尾会连着问好几次「这条完成了没」）。
 
+### 写回：本地优先 + 批量 flush（`temp/omnifocus-outbox.json`）
+
+用户原话：「本地修改状态（之后 refresh 的时候更新，包括 focusmate 任务。比如说
+空闲 90s 自动 refresh）」+「空闲的时候（刷新完成之后另外一次）间隔 600s」。
+
+所以 `task done` / `task drop` **不再当场起 osascript**：
+
+1. 只往 `temp/omnifocus-outbox.json` 记一笔意图（`{id, op, task_id, due, at}`，
+   同一 `(op, pk)` 只留最新一次）；
+2. 空闲 **≥90s** 时 flush 一次，之后仍空闲每 **600s** 一次；`refresh`、`task sync`、
+   退出、下次启动也会 flush（崩溃不丢：outbox 在盘上）；
+3. flush 把攒的账**合成一次** osascript（`python3 omnifocus_tasks.py batch`，ops 走
+   stdin）：N 条 = 1 个进程，而不是 N 个；
+4. 写成功 → 落 `writeback.completed/dropped` + 重复任务按 `repeat_clone_id` 改挂，
+   并清掉 outbox 那几条；写失败 → **留在 outbox**（本地不回滚 —— 用户看到的 ✓ 就是
+   真的），下一轮再写。
+
+`jobs.sync`（`--exec` / 测试）没有「之后」，仍然当场写，行为不变。
+
+读空闲用 Quartz 的 `CGEventSourceSecondsSinceLastEventType`（~0.2ms），不要在每帧
+里去起 `ioreg` 子进程（40–80ms，会卡帧）。
+
 ## 3. warden：什么时候写、写什么
 
 | 动作 | 本地 | Focusmate | OmniFocus |

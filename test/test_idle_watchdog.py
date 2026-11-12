@@ -93,6 +93,9 @@ check("结束后（11:00）返回 None", ks.current_session(entries(), NOW.repla
 # ---------------------------------------------------------------- hid_idle_seconds
 
 print("== hid_idle_seconds：解析 ioreg 的纳秒 ==")
+# Quartz 快路径会先返回真·空闲秒数；这段专门测 ioreg 解析，把它关掉。
+_real_cg = ks._cg_idle_seconds
+ks._cg_idle_seconds = lambda: None
 _real_run = ks.subprocess.run
 
 
@@ -106,6 +109,7 @@ check("纳秒 → 秒", ks.hid_idle_seconds(), 1234567890 / 1e9)
 ks.subprocess.run = lambda *a, **k: _Done("没有这个字段\n")
 check("读不到 HIDIdleTime → None", ks.hid_idle_seconds(), None)
 ks.subprocess.run = _real_run
+ks._cg_idle_seconds = _real_cg
 
 
 # ---------------------------------------------------------------- 主流程

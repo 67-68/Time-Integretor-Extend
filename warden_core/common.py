@@ -195,6 +195,93 @@ MESSAGE_KEEP = 12
 FAILED_ACTIONS_FILE = (os.environ.get("TI_FAILED_ACTIONS")
                        or os.path.join(HERE, "data", "failed-actions.json"))
 
+#: 本地优先写回的待发队列（task done/drop 只记这里，空闲/refresh 时一次性写回）。
+OMNIFOCUS_OUTBOX_FILE = (os.environ.get("TI_OMNIFOCUS_OUTBOX")
+                         or os.path.join(TEMP, "omnifocus-outbox.json"))
+
+
+class OmniOutbox(object):
+    """OmniFocus 写回的「待发队列」：``{"ops": [{id, op, task_id, due, at, ...}]}``。
+
+    为什么要有它：以前 ``task done`` 当场起一个 osascript（0.22s/条），而且写失败
+    要回滚本地标记。用户要的是「本地先改，之后 refresh 的时候更新」—— 所以动作
+    只往这里记一笔，等 flush（空闲 90s / refresh / 退出 / 下次启动）一次写回去。
+
+    同一条任务只留最后一次意图（后写覆盖先写）；落盘是原子写，崩了也不丢。
+    """
+
+    def __init__(self, path=None, clock=None):
+        self.path = path or OMNIFOCUS_OUTBOX_FILE
+        self.clock = clock or __import__("time").time
+        self.ops = []
+        self._load()
+
+    # -- 落盘 ---------------------------------------------------------
+    def _load(self):
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            self.ops = []
+            return
+        items = data.get("ops") if isinstance(data, dict) else data
+        self.ops = [dict(item) for item in (items or ()) if isinstance(item, dict)]
+
+    def save(self):
+        try:
+            directory = os.path.dirname(os.path.abspath(self.path))
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump({"updated_at": self.clock(), "ops": self.ops},
+                          handle, ensure_ascii=False)
+            os.replace(tmp, self.path)
+            return True
+        except OSError:
+            return False
+
+    # -- 增删 ---------------------------------------------------------
+    @staticmethod
+    def key_of(op):
+        return "%s:%s" % (str(op.get("op") or "complete"), str(op.get("id") or ""))
+
+    def put(self, op):
+        """记一条意图；同一个 (op, pk) 只留最新那次。"""
+        op = dict(op)
+        if not op.get("id"):
+            return False
+        op.setdefault("at", None)
+        key = self.key_of(op)
+        self.ops = [item for item in self.ops if self.key_of(item) != key]
+        op.setdefault("queued_at", self.clock())
+        self.ops.append(op)
+        self.save()
+        return True
+
+    def remove(self, keys):
+        wanted = {str(k) for k in (keys or ())}
+        if not wanted:
+            return 0
+        before = len(self.ops)
+        self.ops = [item for item in self.ops if self.key_of(item) not in wanted]
+        if len(self.ops) != before:
+            self.save()
+        return before - len(self.ops)
+
+    def clear(self):
+        count = len(self.ops)
+        self.ops = []
+        self.save()
+        return count
+
+    def __len__(self):
+        return len(self.ops)
+
+    def __iter__(self):
+        return iter(list(self.ops))
+
+
 # 「跑一次就够」的动作：一次调用就把整个世界对完，不需要每个项目/每条再跑一遍。
 # 这些动作的参数里常带着「当时的快照」，每次失败都会长出一条新账；所以失败账要
 # 按名字合并（保留最新一次），`re-action` 也只重放一次 —— 用户原话：

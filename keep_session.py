@@ -851,14 +851,52 @@ def start_pause(now=None):
     return True, pause_status(now), ""
 
 
-def hid_idle_seconds():
-    """最近一次键盘/鼠标/触控板输入到现在的秒数（ioreg HIDIdleTime，纳秒 / 1e9）。
+_CG_EVENT = None
+_CG_TRIED = False
 
-    非 macOS、ioreg 出错、输出里没有该字段 → None。调用方据此跳过本轮，
+
+def _cg_idle_seconds():
+    """Quartz 的空闲秒数（``CGEventSourceSecondsSinceLastEventType``），~0.2ms。
+
+    和 ioreg 子进程（40–80ms）比便宜三个数量级 —— warden 每帧都要问一次空闲，
+    用子进程会变成「为了知道有没有空闲而卡帧」。取不到就返回 None，退回 ioreg。
+    """
+    global _CG_EVENT, _CG_TRIED
+    if sys.platform != "darwin":
+        return None
+    if not _CG_TRIED:
+        _CG_TRIED = True
+        try:
+            import ctypes
+            import ctypes.util
+            lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("ApplicationServices"))
+            lib.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+            lib.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32,
+                                                                   ctypes.c_uint32]
+            _CG_EVENT = lib
+        except Exception:                      # noqa: BLE001 - 退回 ioreg
+            _CG_EVENT = None
+    if _CG_EVENT is None:
+        return None
+    try:
+        # 0 = kCGEventSourceStateCombinedSessionState，0xFFFFFFFF = any input event
+        return float(_CG_EVENT.CGEventSourceSecondsSinceLastEventType(0, 0xFFFFFFFF))
+    except Exception:                          # noqa: BLE001
+        return None
+
+
+def hid_idle_seconds():
+    """最近一次键盘/鼠标/触控板输入到现在的秒数。
+
+    先走 Quartz（~0.2ms），拿不到再退回 ioreg（HIDIdleTime，纳秒 / 1e9）。
+    非 macOS、两种都出错 → None。调用方据此跳过本轮，
     **绝不把「读不到」误判成「没输入」**。
     """
     if sys.platform != "darwin":
         return None
+    fast = _cg_idle_seconds()
+    if fast is not None:
+        return fast
     try:
         out = subprocess.run([IOREG_BIN, "-c", "IOHIDSystem"],
                              check=False, capture_output=True, text=True, timeout=5).stdout

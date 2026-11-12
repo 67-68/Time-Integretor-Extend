@@ -244,7 +244,9 @@ from warden_core import (  # noqa: E402,F401
     Group,
     HERE,
     IMPORT_PENDING,
+    OMNIFOCUS_OUTBOX_FILE,
     ImportBatch,
+    OmniOutbox,
     MESSAGE_KEEP,
     MESSAGE_SHOW,
     NET_PENDING,
@@ -565,6 +567,12 @@ class Warden(
             workers=3,
         )
         self._net_dirty = False
+        #: 本地优先写回的待发队列：task done/drop 只记这里，空闲 / refresh 时
+        #: 一次性批量写回 OmniFocus（每条起一个 osascript 是延迟的大头）。
+        self.omni_outbox = OmniOutbox(OMNIFOCUS_OUTBOX_FILE)
+        #: 空闲写回的节拍：每 5 秒看一次空闲；≥90s 写一次，之后每 600s 一次。
+        self._omni_idle_checked = 0.0
+        self._omni_idle_flush_at = 0.0
         #: 每份数据是什么时候拿到的：{"session": epoch, "task": epoch, "stat": epoch}
         self.read_at = {}
         self._register_net_actions()

@@ -6,6 +6,7 @@ from .bridge import BridgeError
 from .common import (
     FM_PENDING,
     SRC_OMNIFOCUS,
+    ks,
     of,
     pj,
     rl,
@@ -198,6 +199,49 @@ class TaskSyncMixin(object):
                 return True
         return False
 
+    def _maybe_flush_omnifocus(self, now=None):
+        """本地优先写回的触发：空闲 ≥90s 写一次，之后仍空闲每 600s 一次。
+
+        用户原话：「本地修改状态（之后 refresh 的时候更新，包括 focusmate 任务。
+        比如说空闲 90s 自动 refresh）」，补充：「空闲的时候（刷新完成之后另外
+        一次）间隔 600s」。
+
+        只在真的有人在**用**的时候攒账（``omni_complete`` 只写 outbox）；这一拍
+        是「人停了 90 秒」才把账一次性写回 OmniFocus。``jobs.sync``（--exec/
+        测试）没有「之后」，直接当场写。
+        """
+        if self.offline:
+            return False
+        if self.jobs.sync:
+            return self.flush_omnifocus()
+        now = now if now is not None else time.time()
+        if now - getattr(self, "_omni_idle_checked", 0.0) < 5.0:
+            return False
+        self._omni_idle_checked = now
+        try:
+            idle = ks.hid_idle_seconds()
+        except Exception:                      # noqa: BLE001 - 读不到空闲就不判
+            idle = None
+        if idle is None:
+            return False
+        if idle < 90:
+            self._omni_idle_flush_at = 0.0     # 有人在动：下一段空闲重新算
+            return False
+        last = getattr(self, "_omni_idle_flush_at", 0.0)
+        if last and now - last < 600:
+            return False
+        self._omni_idle_flush_at = now
+        flushed = self.flush_omnifocus()
+        # 另一半球：读也等到空闲再做（数据 stale 才刷，别每 5 秒叫一次浏览器）。
+        try:
+            if (not self.read_at.get("session")
+                    or now - self.read_at["session"] > 600):
+                self.refresh(quiet=True)
+                self.refresh_task_state()
+        except Exception:                      # noqa: BLE001 - 刷不动就等下一拍
+            pass
+        return flushed
+
     def omni_complete(self, task, minutes=None, at=None):
         """OmniFocus：完成 + 把截止时间写回 session 终点。返回一句人话。
 
@@ -230,6 +274,14 @@ class TaskSyncMixin(object):
             rl.log_event("omnifocus", "complete_skipped", reason="disabled_or_unavailable",
                          **fields)
             return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
+        if self.net_async:
+            # **本地优先**：只记一笔待发，不碰 OmniFocus。水位到了（空闲 90s /
+            # refresh / 退出 / 下次启动）再一次性批量写回 —— 每条起一个 osascript
+            # 是这套延迟的主要来源，而且写失败还要回滚本地标记。
+            self.omni_outbox.put({"id": pk, "op": "complete", "task_id": task["id"],
+                                  "due": due or None, "at": at})
+            rl.log_event("omnifocus", "complete_queued", **fields)
+            return "OmniFocus %s 完成已记本地账（空闲 / refresh 时批量写回）" % pk[:8]
         before = copy.deepcopy(task)
         try:
             self.task_store.set_omnifocus_writeback(task["id"], "completed")
@@ -273,6 +325,11 @@ class TaskSyncMixin(object):
             rl.log_event("omnifocus", "drop_skipped", reason="disabled_or_unavailable",
                          **fields)
             return "OmniFocus 关着（set omnifocus on 打开）→ 只改了本地"
+        if self.net_async:
+            self.omni_outbox.put({"id": pk, "op": "drop", "task_id": task["id"],
+                                  "at": at, "all_occurrences": bool(all_occurrences)})
+            rl.log_event("omnifocus", "drop_queued", **fields)
+            return "OmniFocus %s 放弃已记本地账（空闲 / refresh 时批量写回）" % pk[:8]
         before = copy.deepcopy(task)
         try:
             self.task_store.set_omnifocus_writeback(task["id"], "dropped")
@@ -483,12 +540,84 @@ class TaskSyncMixin(object):
                 continue
             todo.append(task["id"])
             seen_pks.add(pk)
-        if not todo:
+        # 扫描到的完成 + 攒在 outbox 里的意图，合成一批，一次 osascript 写完。
+        ops = self.pending_writebacks(pool)
+        if not ops:
             rl.log_event("omnifocus", "writeback_scan_result", written=[])
             return []
-        rl.log_event("omnifocus", "writeback_scan_start", pending=len(todo))
-        action = self.net_action("omnifocus.writeback",
-                                 "写回 OmniFocus（%d 条）" % len(todo),
-                                 {"task_ids": todo}, source=SRC_OMNIFOCUS)
+        rl.log_event("omnifocus", "writeback_scan_start", pending=len(ops))
+        self.flush_omnifocus(ops)
+        return [(op.get("task_id"), "丢后台了") for op in ops]
+
+    # -- 本地优先写回：outbox + 批量 flush --------------------------------
+    def pending_writebacks(self, pool=None):
+        """攒着没写回 OmniFocus 的账 → ops 列表。
+
+        两个来源：
+        1. ``omni_outbox``：``task done/drop`` 的**显式意图**（本地优先，最多可
+           能已经躺了十几分钟）；
+        2. 扫描：本地已完成、但 writeback 标记还是空的记录（收尾/手工标完成
+           走的就是这条路）。
+
+        同一个 ``(op, pk)`` 只留一条 —— 重复任务被连推两轮就是这么来的。
+        """
+        ops = {}
+        outbox = getattr(self, "omni_outbox", None)
+        for item in (outbox if outbox is not None else ()):
+            pk = str(item.get("id") or "")
+            if pk:
+                ops["%s:%s" % (str(item.get("op") or "complete"), pk)] = dict(item)
+        pool = list(pool if pool is not None else self.task_store.list())
+        claimed = set()
+        for task in pool:
+            if ts.TaskStore.is_repeat_template(task):
+                continue
+            if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
+                continue
+            pk = ts.TaskStore.omnifocus_id(task)
+            if pk and ((task.get("omnifocus") or {}).get("writeback") or {}).get("completed"):
+                claimed.add(str(pk))
+        for task in pool:
+            if ts.TaskStore.is_repeat_template(task):
+                continue
+            if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
+                continue
+            pk = ts.TaskStore.omnifocus_id(task)
+            if not pk:
+                continue
+            pk = str(pk)
+            wb = ((task.get("omnifocus") or {}).get("writeback") or {})
+            if pk in claimed or wb.get("completed"):
+                continue
+            try:
+                allowed, _why = pj.completion_guard(task, self.projects, self.task_store)
+            except Exception:                   # noqa: BLE001 - 账算不出来不该挡住完成
+                allowed = True
+            if not allowed:
+                rl.log_event("omnifocus", "complete_blocked", reason="project-partial",
+                             pk=pk, task_id=task.get("id"), source="writeback_scan")
+                continue
+            ops.setdefault("complete:%s" % pk, {
+                "id": pk, "op": "complete", "task_id": task["id"],
+                "due": self.omni_due_of(task) or None})
+        return list(ops.values())
+
+    def flush_omnifocus(self, ops=None):
+        """把待发的写回交给后台队列（一个 osascript 处理 N 条）。
+
+        注意不看 ``self.offline``：离线模式说的是 Focusmate 网络，OmniFocus 是
+        本地应用，断网也该写。
+        """
+        try:
+            if not self.omnifocus_enabled():
+                return False
+        except Exception:                      # noqa: BLE001 - 检查失败就当关着
+            return False
+        ops = list(ops if ops is not None else self.pending_writebacks())
+        if not ops:
+            return False
+        action = self.net_action("omnifocus.flush",
+                                 "写回 OmniFocus（%d 条）" % len(ops),
+                                 {"ops": ops}, source=SRC_OMNIFOCUS)
         self.jobs.submit(action, persist=False)
-        return [(task_id, "丢后台了") for task_id in todo]
+        return True

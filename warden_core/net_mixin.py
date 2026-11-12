@@ -123,6 +123,9 @@ class NetMixin(object):
                            apply=self._apply_omnifocus_drop)
         self.jobs.register("omnifocus.writeback", self.net_omnifocus_writeback,
                            apply=self._apply_omnifocus_writeback)
+        # 本地优先写回：一次 osascript 处理 N 条 complete/drop（空闲 / refresh 触发）。
+        self.jobs.register("omnifocus.flush", self.net_omnifocus_flush,
+                           apply=self._apply_omnifocus_flush)
         # ── 别的进程：keep_session（下单/对账/daemon）与日历同步 ──
         self.jobs.register("keep_session.run", self.net_keep_session,
                            apply=self._apply_keep_session)
@@ -539,6 +542,122 @@ class NetMixin(object):
         rep.progress(1.0)
         rep.log("OmniFocus %s 已放弃" % pk[:8], "ok")
         return {"pk": pk, "res": res or {}, "advanced": advanced}
+
+    def net_omnifocus_flush(self, args, rep):
+        """把攒在本地的那批完成/放弃**一次**写回 OmniFocus。**写**操作。
+
+        ``ops`` 是 ``[{id, op, task_id, due, at, all_occurrences}]``；一条失败不挡
+        其余，失败的留在 outbox 里等下一次 flush。
+        """
+        ops = [dict(op) for op in (args.get("ops") or []) if op]
+        rep.label("写回 OmniFocus（%d 条）" % len(ops))
+        rep.progress(0.05)
+        flush = getattr(self.omnifocus, "flush", None)
+        if flush is not None:
+            data = flush(ops)
+            results = data.get("results") or []
+        else:
+            # 兼容只有 complete/drop 的客户端（老替身 / 将来的别的实现）：
+            # 一条一条写，形状和批量返回对齐。
+            results = []
+            for op in ops:
+                pk = str(op.get("id") or "")
+                try:
+                    if str(op.get("op")) == "drop":
+                        res = self.omnifocus.drop(
+                            pk, at=op.get("at"),
+                            all_occurrences=bool(op.get("all_occurrences")))
+                    else:
+                        res = self.omnifocus.complete(pk, at=op.get("at"),
+                                                      due=op.get("due"))
+                    item = dict(res or {})
+                    item.update({"id": pk, "task_id": op.get("task_id"),
+                                 "op": op.get("op") or "complete", "ok": True})
+                    results.append(item)
+                except Exception as exc:       # noqa: BLE001 - 单条失败不挡其余
+                    results.append({"id": pk, "task_id": op.get("task_id"),
+                                    "op": op.get("op"), "ok": False,
+                                    "message": str(exc)})
+        by_id = {str(op.get("id") or ""): op for op in ops}
+        done, dropped, failed = [], [], []
+        for item in results:
+            pk = str(item.get("id") or "")
+            src = by_id.get(pk) or {}
+            key = "%s:%s" % (str(src.get("op") or item.get("op") or "complete"), pk)
+            if not item.get("ok"):
+                failed.append([src.get("task_id"),
+                               item.get("message") or item.get("error") or "写回失败"])
+                continue
+            entry = {"task_id": src.get("task_id"), "pk": pk, "res": item, "key": key}
+            if str(src.get("op") or item.get("op")) == "drop":
+                dropped.append(entry)
+            else:
+                done.append(entry)
+        rep.progress(1.0)
+        written = len(done) + len(dropped)
+        rep.log("写回 %d 条%s" % (written,
+                                ("；%d 条失败" % len(failed)) if failed else ""),
+                "ok" if not failed else "warn")
+        if failed and not written:
+            raise ValueError("全部写回失败：%s" % failed[0][1])
+        return {"done": done, "dropped": dropped, "failed": failed}
+
+    def _apply_omnifocus_flush(self, payload, args):
+        """flush 的本地那半：落 writeback 标记 + 重复任务改挂 + 清 outbox。"""
+        payload = payload or {}
+        done = payload.get("done") or []
+        dropped = payload.get("dropped") or []
+        failed = payload.get("failed") or []
+        notes = []
+        for entries, what in ((done, "completed"), (dropped, "dropped")):
+            for item in entries:
+                task_id = item.get("task_id")
+                try:
+                    task = self.task_store.get(int(task_id))
+                except (ValueError, TypeError):
+                    continue
+                advanced, moved = self._omni_repeat_advance(
+                    task, str(item.get("pk") or ""), item.get("res") or {})
+                try:
+                    self.task_store.set_omnifocus_writeback(task["id"], what)
+                except (ValueError, TypeError):
+                    pass
+                if advanced:
+                    notes.append(self._omni_repeat_note(
+                        advanced, (item.get("res") or {}).get("repeat_clone_id"), moved))
+                if what == "completed":
+                    # 同一 occurrence 的其他已完成镜像也算写过了
+                    old_pk = str(item.get("pk") or "")
+                    for other in self.task_store.list():
+                        if other.get("id") == task["id"]:
+                            continue
+                        if ts.TaskStore.omnifocus_id(other) != old_pk:
+                            continue
+                        if self.task_store.status_of(other) != ts.STATUS_COMPLETED:
+                            continue
+                        wb = ((other.get("omnifocus") or {}).get("writeback") or {})
+                        if wb.get("completed"):
+                            continue
+                        try:
+                            self.task_store.set_omnifocus_writeback(
+                                other["id"], "completed")
+                        except (ValueError, TypeError):
+                            pass
+        outbox = getattr(self, "omni_outbox", None)
+        if outbox is not None:
+            outbox.remove([item.get("key") for item in (done + dropped)])
+        written = len(done) + len(dropped)
+        if written:
+            suffix = "、".join(notes)
+            self.say("✅ OmniFocus 写回 %d 条%s%s"
+                     % (written, ("；%d 条失败（留着下次再写）" % len(failed))
+                        if failed else "", ("；" + suffix) if suffix else ""),
+                     "ok" if not failed else "warn")
+        elif failed:
+            self.say("⚠️ OmniFocus 写回 %d 条全失败（留在本地账上，下次再写）：%s"
+                     % (len(failed), failed[0][1]), "warn")
+        self.invalidate()
+        return written
 
     def net_omnifocus_writeback(self, args, rep):
         """把「Focusmate 说完成了」的那几条一次性写回 OmniFocus。**写**操作。

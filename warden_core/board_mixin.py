@@ -2168,6 +2168,10 @@ class BoardMixin(object):
         except Exception:                          # noqa: BLE001 - 项目对账坏了也不能没帧
             pass
         try:
+            self._maybe_flush_omnifocus()
+        except Exception:                          # noqa: BLE001 - 写回坏了也不能没帧
+            pass
+        try:
             self._maybe_sync_chore_mode()
         except Exception:                          # noqa: BLE001 - 空闲屏坏了也不能没帧
             pass

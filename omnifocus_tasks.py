@@ -954,11 +954,13 @@ BATCH_JS = r"""
     try {
       const before = snapshot(task);
       const op = String(item.op || "complete");
+      const base = { id: pk, task_id: taskId, op: op };
       if (op === "complete") {
         if (before.completed) {
           // 幂等：已经完成的绝不再 markComplete 一次 —— 重复任务会被连推两轮。
-          results.push({ id: pk, task_id: taskId, ok: true, skipped: "already_completed",
-                         before: before, after: before, changed: [] });
+          results.push(Object.assign({}, base, { ok: true,
+                         skipped: "already_completed",
+                         before: before, after: before, changed: [] }));
           continue;
         }
         let afterTask = (item.at ? task.markComplete(new Date(item.at))
@@ -972,12 +974,13 @@ BATCH_JS = r"""
         for (const key of ["completed", "dropped", "completion_date", "drop_date", "due"]) {
           if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(key);
         }
-        results.push({ id: pk, task_id: taskId, ok: true, before: before, after: after,
-                       changed: changed, repeat_clone_id: clone });
+        results.push(Object.assign({}, base, { ok: true, before: before, after: after,
+                       changed: changed, repeat_clone_id: clone }));
       } else if (op === "drop") {
         if (before.dropped) {
-          results.push({ id: pk, task_id: taskId, ok: true, skipped: "already_dropped",
-                         before: before, after: before, changed: [] });
+          results.push(Object.assign({}, base, { ok: true,
+                         skipped: "already_dropped",
+                         before: before, after: before, changed: [] }));
           continue;
         }
         const afterTask = (item.at
@@ -985,9 +988,9 @@ BATCH_JS = r"""
           : task.drop(!!item.all_occurrences)) || task;
         const after = snapshot(afterTask);
         const clone = (idOf(afterTask) !== idOf(task)) ? idOf(afterTask) : null;
-        results.push({ id: pk, task_id: taskId, ok: true, before: before, after: after,
+        results.push(Object.assign({}, base, { ok: true, before: before, after: after,
                        changed: JSON.stringify(before) === JSON.stringify(after) ? [] : ["dropped"],
-                       repeat_clone_id: clone });
+                       repeat_clone_id: clone }));
       } else {
         results.push({ id: pk, task_id: taskId, ok: false, error: "bad_op" });
       }

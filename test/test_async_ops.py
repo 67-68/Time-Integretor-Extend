@@ -578,39 +578,47 @@ wd = mkwarden(bridge)
 wd.offline = False
 task = wd.task_store.create(fields={"title": "写论文"})
 wd.task_store.link_omnifocus(task["id"], "pk-1")
+note = wd.omni_complete(wd.task_store.get(task["id"]))
+check("本地优先：只记本地账，不立刻写 OmniFocus", "已记本地账" in note, True)
+check("没有当场起 osascript", wd.omnifocus.calls, [])
+check("记进了 outbox", [op.get("op") for op in wd.omni_outbox], ["complete"])
+check("队列没被占（面板不卡）", wd.jobs.busy, False)
+
+# 水位到了（空闲 90s / refresh）：一次 flush 把攒的账写回去
 wd.omnifocus.hold()
-wd.omni_complete(wd.task_store.get(task["id"]))
-check("乐观：本地先记「写回过完成」（真值，里面是时间戳）",
-      bool(((wd.task_store.get(task["id"]).get("omnifocus") or {}).get("writeback")
-            or {}).get("completed")), True)
-check("队列忙（面板画得出来）", wd.jobs.busy, True)
-check("Focusmate 那份还没落地（osascript 还在后台跑）",
-      (wd.task_store.get(task["id"]).get("focusmate") or {}).get("completed_at"), None)
+wd.flush_omnifocus()
+check("flush 排进队列（面板画得出来）", wd.jobs.busy, True)
 wd.omnifocus.release()
 settle(wd)
-check("落地：真的调了 complete", [c[0] for c in wd.omnifocus.calls],
+check("flush 真的调了 complete", [c[0] for c in wd.omnifocus.calls],
       ["complete"])
+check("写回标记落定",
+      bool(((wd.task_store.get(task["id"]).get("omnifocus") or {}).get("writeback")
+            or {}).get("completed")), True)
+check("outbox 清空", len(wd.omni_outbox), 0)
 check("日志里带 [omnifocus] 标签",
-      any("[omnifocus]" in text for _l, text in wd.jobs.log_lines(6)), True)
+      any("[omnifocus]" in text for _l, text in wd.jobs.log_lines(8)), True)
 check("失败账空着", wd.jobs.failures, [])
 
-# 失败：回滚 writeback 标记 + 记账
+# 失败：留在 outbox 里等下一轮（本地不回滚 —— 用户看到的 ✓ 就是真的）
 if os.path.exists(FAILED_FILE):
     os.unlink(FAILED_FILE)
 wd.jobs.clear_failures()
 task2 = wd.task_store.create(fields={"title": "会失败的写回"})
 wd.task_store.link_omnifocus(task2["id"], "pk-2")
-wd.omnifocus.fail["complete"] = "OmniFocus 自动化被拒（测试）"
 wd.omni_complete(wd.task_store.get(task2["id"]))
+wd.omnifocus.fail["complete"] = "OmniFocus 自动化被拒（测试）"
+wd.flush_omnifocus()
 settle(wd)
-check("回滚：writeback 标记退回去了",
+check("失败了还留在 outbox（下次再写）",
+      [op.get("id") for op in wd.omni_outbox], ["pk-2"])
+check("本地没乱回滚",
       ((wd.task_store.get(task2["id"]).get("omnifocus") or {}).get("writeback")
        or {}).get("completed"), None)
-check("记进失败账（名字是 omnifocus.complete）",
-      [f.action.name for f in wd.jobs.failures], ["omnifocus.complete"])
-check("失败账那条带 omnifocus 标签",
-      wd.jobs.failures[0].action.source, "omnifocus")
+check("说了人话（警告）",
+      any("写回" in m[2] and "失败" in m[2] for m in wd.messages), True)
 wd.jobs.clear_failures()
+wd.omni_outbox.clear()
 
 print("\n== 5.6 一次操作、一个标题、编号步骤（task import -a）==")
 bridge = GateBridge()
