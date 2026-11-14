@@ -3076,6 +3076,281 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-12T20:37:55",
+      "task_id": 192,
+      "fields": {
+        "title": "EnglishPrepare"
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-12T20:37:55",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": null,
+        "title": "EnglishPrepare",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-12T20:38:22",
+      "task_id": 194,
+      "fields": {
+        "title": "historyPrepare"
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-12T20:38:22",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": null,
+        "title": "historyPrepare",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-12T20:38:34",
+      "task_id": 193,
+      "fields": {
+        "title": "csPrepare"
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-12T20:38:34",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": null,
+        "title": "csPrepare",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-12T20:48:37",
+      "task_id": 219,
+      "fields": {
+        "title": "create project for each of them",
+        "project": "exam prepare",
+        "project_id": 8,
+        "project_task": "mc9sI2C2NYi",
+        "duration": 10,
+        "notes": "父任务：exam prepare",
+        "count": 1
+      },
+      "session": null,
+      "notes": "父任务：exam prepare",
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-12T20:48:37",
+      "omnifocus": {
+        "id": "mc9sI2C2NYi",
+        "url": "omnifocus:///task/mc9sI2C2NYi",
+        "title": "create project for each of them",
+        "linked_at": "2026-11-12T20:41:23"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "create project for each of them",
+        "description": "父任务：exam prepare",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-12T21:01:44",
+      "task_id": 218,
+      "fields": {
+        "title": "dpwnload pastpaper for history, CS, physic, lit, math",
+        "project": "exam prepare",
+        "project_id": 8,
+        "project_task": "mI_ezULWD9m",
+        "duration": 25,
+        "notes": "父任务：exam prepare",
+        "count": 1,
+        "count_total": 1,
+        "note": "父任务：exam prepare",
+        "due": "2026-11-12T20:50:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-12",
+        "start": "20:00",
+        "end": "20:50",
+        "duration": 50,
+        "focusmate_session_id": "cf977461-7400-4965-8572-6704bc4eb958"
+      },
+      "notes": "父任务：exam prepare",
+      "tags": [],
+      "manual": true,
+      "reason": "review-count",
+      "actual_minutes": null,
+      "status_at": "2026-11-12T21:01:44",
+      "omnifocus": {
+        "id": "mI_ezULWD9m",
+        "url": "omnifocus:///task/mI_ezULWD9m",
+        "title": "dpwnload pastpaper for history, CS, physic, lit, math",
+        "linked_at": "2026-11-12T20:41:23"
+      },
+      "focusmate": {
+        "task_id": "a8dcbce8-e893-4934-a25d-5e8fe38f2762",
+        "title": "dpwnload pastpaper for history, CS, physic, lit, math",
+        "description": "父任务：exam prepare",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-12T21:01:56",
+      "task_id": 218,
+      "fields": {
+        "title": "dpwnload pastpaper for history, CS, physic, lit, math",
+        "project": "exam prepare",
+        "project_id": 8,
+        "project_task": "mI_ezULWD9m",
+        "duration": 25,
+        "notes": "父任务：exam prepare",
+        "count": 1,
+        "count_total": 1,
+        "note": "父任务：exam prepare",
+        "due": "2026-11-12T20:50:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-12",
+        "start": "20:00",
+        "end": "20:50",
+        "duration": 50,
+        "focusmate_session_id": "cf977461-7400-4965-8572-6704bc4eb958"
+      },
+      "notes": "父任务：exam prepare",
+      "focusmate": {
+        "task_id": "a8dcbce8-e893-4934-a25d-5e8fe38f2762",
+        "title": "dpwnload pastpaper for history, CS, physic, lit, math",
+        "description": "父任务：exam prepare",
+        "completed_at": "2026-11-12T13:01:46.460652+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "cf977461-7400-4965-8572-6704bc4eb958"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-12T23:36:43",
+      "task_id": 221,
+      "fields": {
+        "title": "prepare scenic question for lit",
+        "project": "exam prepare",
+        "project_id": 8,
+        "project_task": "a2pN6hyLcal",
+        "duration": 25,
+        "notes": "父任务：exam prepare",
+        "count": 1
+      },
+      "session": null,
+      "notes": "父任务：exam prepare",
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-12T23:36:43",
+      "omnifocus": {
+        "id": "a2pN6hyLcal",
+        "url": "omnifocus:///task/a2pN6hyLcal",
+        "title": "prepare scenic question for lit",
+        "linked_at": "2026-11-12T20:41:23"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "prepare scenic question for lit",
+        "description": "父任务：exam prepare",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-13T09:12:41",
+      "task_id": 223,
+      "fields": {
+        "title": "prepare mother question for his",
+        "project": "exam prepare",
+        "project_id": 8,
+        "project_task": "gQh5PMUm4qO",
+        "duration": 25,
+        "notes": "父任务：exam prepare",
+        "count": 1,
+        "count_total": 1,
+        "due": "2026-11-12T21:25:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": null,
+      "notes": "父任务：exam prepare",
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-13T09:12:41",
+      "omnifocus": {
+        "id": "gQh5PMUm4qO",
+        "url": "omnifocus:///task/gQh5PMUm4qO",
+        "title": "prepare mother question for his",
+        "linked_at": "2026-11-12T20:41:23"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "prepare mother question for his",
+        "description": "父任务：exam prepare",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-13T10:02:52",
+      "task_id": 224,
+      "fields": {
+        "title": "关联project到具体的项目"
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-13T10:02:52",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": null,
+        "title": "关联project到具体的项目",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

@@ -19,6 +19,7 @@ from .common import (
     fmt_mmss,
     format_compact_timestamp,
     ks,
+    kt,
     note_renderable,
     repl_kit,
     task_dynamic_keys,
@@ -123,6 +124,17 @@ class View(object):
                      + (TASK_CONTENT_COLUMN, "--permanent"))),
                  hint=_hint_actions("时段类型", "id", "状态",
                                     note="close 表头名 = 折叠列；数据视图操作任务表")),
+            _cmd("keytime", w.cmd_keytime,
+                 "Key Time：日历里的硬节点（通勤 / 休息）——报警、确认、Bark 设备",
+                 ("kt", "key-time"),
+                 usage="keytime | keytime ack | keytime refresh | keytime on|off | "
+                       "keytime device [add <名字> <key>|remove <名字>|test|on|off] | "
+                       "keytime set <键> <值>",
+                 options=("ack", "refresh", "on", "off", "device", "set"),
+                 hint=_hint_actions("ack", "device test", "device add iphone <key>",
+                                    "set volume 10",
+                                    note="到点强制置顶 iTerm + 音量 10 + 语音播报；"
+                                         "人不在 Mac 前才推手机（Bark）；确认后停止播报")),
             _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
                  ("stats",), "通用", usage="stat [refresh [full]]",
                  options=("refresh", "full"), hint=_hint_stat),
@@ -215,9 +227,19 @@ class ContractView(View):
         return self.w.render_status_rows()
 
     def render(self):
+        # Key Time 优先占顶部：违约中给整块模板（通勤 / 休息各一套文案 + 挤压
+        # 预测），没违约就只给一行淡红字提示下一个。看板其余部分照常。
+        out = []
+        panel = self.w.render_keytime_panel()
+        if panel is not None:
+            out.append(panel)
+        else:
+            line = self.w.render_keytime_line()
+            if line is not None:
+                out.append(line)
         # 收尾面板不在这儿画：它是 repl_kit 的「打断栏位」（见 render_interrogate），
         # 换视图 / 表格变长都不该把它挤走。
-        out = [self.w.render_table()]
+        out.append(self.w.render_table())
         if self.w.rows_note:
             out.append(Text("  " + self.w.rows_note, style="dim"))
         # 看未来日期时，额外给一张「这一天每个 session 挂什么任务、属于哪个项目」
@@ -1025,17 +1047,70 @@ class DataView(View):
         return text
 
     def render(self):
-        """按当前数据模型分派：task / project / op。"""
+        """按当前数据模型分派：task / project / op / keytime。"""
         model = self.model
         if model == "project":
             return self._render_project_data()
         if model == "op":
             return self._render_op_data()
+        if model == "keytime":
+            return self._render_keytime_data()
         return self._render_task_data()
 
     def _dispatch_hint(self):
-        return Text("open task · open project · open op    ← 切换数据模型（当前：%s）"
-                    "    |    %s" % (self.model, self._filter_caption()), style="dim")
+        return Text("open task · open project · open op · open keytime    ← 切换数据模型"
+                    "（当前：%s）    |    %s" % (self.model, self._filter_caption()),
+                    style="dim")
+
+    def _render_keytime_data(self):
+        """keytime 模型：日历里的硬节点（通勤 / 休息）全表 + 状态。"""
+        w = self.w
+        now = w.keytime_now_dt()
+        w.keytime_reload()
+        rows = w.keytime_upcoming_rows(now, limit=200)
+        t = Table(title="Key Time · 日历硬节点（通勤 / 休息；不占 session，到点强制提醒）",
+                  box=box.SIMPLE_HEAVY, header_style="bold red",
+                  title_justify="left", expand=True)
+        t.add_column("日期", no_wrap=True)
+        t.add_column("时间", no_wrap=True)
+        t.add_column("类型", no_wrap=True)
+        t.add_column("状态", no_wrap=True)
+        t.add_column("标题", overflow="crop")
+        t.add_column("已超时", justify="right", no_wrap=True)
+        for item in rows:
+            acked = kt.acked(item, w._keytime_state)
+            target = w.keytime_target(now)
+            if item is target and not acked:
+                status, style = "🚨 违约中", "bold red"
+            elif acked:
+                status, style = "✓ 已确认", "green"
+            elif item.started(now):
+                status, style = "· 进行中", "yellow"
+            else:
+                status, style = "· 未来", "dim"
+            over = item.overdue_minutes(now) if item.started(now) else 0
+            t.add_row(
+                item.date,
+                "%s-%s" % (item.start, item.end),
+                Text(item.calendar, style="magenta"),
+                Text(status, style=style),
+                Text(item.title or "—", style="bold" if item is target else ""),
+                Text("%d 分钟" % over if over > 0 else "—",
+                     style="bold red" if over > 0 else "dim"),
+            )
+        if not rows:
+            row = [Text("") for _ in range(6)]
+            row[0] = Text("（日历里还没有 %s 的事件；先 sync，或看 keytime 配置）"
+                          % "、".join(w.keytime_events.get("calendars") or []),
+                          style="dim")
+            t.add_row(*row)
+        t.caption = ("%d 条 · 配置的日历：%s · 播报节拍 %ss · 音量 %s · Bark 设备 %d 台"
+                     "（keytime device 管理）"
+                     % (len(rows), "、".join(w.keytime_events.get("calendars") or []),
+                        w.keytime_events.get("announce_sec"),
+                        w.keytime_events.get("volume"),
+                        len(kt.load_devices())))
+        return [t, self._dispatch_hint()]
 
     def _render_project_data(self):
         """project 模型：真正项目 Project（``pro``）的本地数据。"""

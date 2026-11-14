@@ -2335,22 +2335,29 @@ class BoardMixin(object):
         "task": "task", "tasks": "task",
         "project": "project", "projects": "project",
         "op": "op", "ops": "op",
+        # 第四个模型：日历硬节点（通勤/休息），只有只读视图和确认命令。
+        "keytime": "keytime", "keytimes": "keytime", "kt": "keytime",
+        "key-time": "keytime",
     }
 
     def _switch_data_model(self, model):
-        """切到第四视图「数据」并选择展示 task / project / op 模型。"""
-        if model not in ("task", "project", "op"):
-            raise ValueError("数据模型只能是 task / project / op；你给的是 %r" % model)
+        """切到第四视图「数据」并选择展示 task / project / op / keytime 模型。"""
+        if model not in ("task", "project", "op", "keytime"):
+            raise ValueError("数据模型只能是 task / project / op / keytime；你给的是 %r"
+                             % model)
         self.data_view_model = model
         if model == "task":
             # 任务模型重新从第一页开始；project / op 没有分页状态。
             self.task_view_page = None
         if not isinstance(self.view, TaskView):
             self.go_to_view(TaskView)
+        if model == "keytime":
+            self.keytime_reload(force=True)
         label = {"task": "Task 任务", "project": "Project 真正项目 pro",
-                 "op": "Op OmniFocus Project"}[model]
-        self.say("🗂 数据视图 → %s（open task / open project / open op 切换）" % label,
-                 "cmd")
+                 "op": "Op OmniFocus Project",
+                 "keytime": "Key Time 日历硬节点"}[model]
+        self.say("🗂 数据视图 → %s（open task / open project / open op / open keytime 切换）"
+                 % label, "cmd")
         self.invalidate()
         return model
 

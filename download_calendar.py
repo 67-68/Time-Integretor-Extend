@@ -73,7 +73,10 @@ DATA_CSV = os.path.join(HERE, "data.csv")
 BACKUP_CSV = os.path.join(TEMP, "data.csv.bak")
 DEFAULT_DOWNLOAD_JSON = os.path.join(TEMP, "calendar-download.json")
 DEFAULT_PROFILES = ["工作", "空闲"]
-
+#: 这些日历里的**全部事件**不进 session 排期，而是记成 Key Time（见 keytime.py）。
+#: 「休息」本来在 DEFAULT_IGNORE 里 —— 两边不冲突：忽略 = 不拿它排 session，
+#: key time = 到点必须做的事。用户以后加「通勤」日历，只用改这个列表。
+DEFAULT_KEYTIME_CALENDARS = ["通勤", "休息"]
 DEFAULT_URL = "https://caldav.icloud.com"
 DEFAULT_IGNORE = ["上课", "休息"]
 DEFAULT_PIP_SPEC = "caldav==2.2.6"
@@ -296,6 +299,8 @@ def cmd_status(args):
         info("  password : %s" % mask(cfg.get("password")))
         info("  忽略分组 : %s" % ("、".join(cfg.get("ignore_calendars") or []) or "(无)"))
         info("  白名单   : %s" % ("、".join(cfg.get("use_calendars") or []) or "(无)"))
+        info("  Key Time : %s（这些日历的全部事件不排 session，记成 key time）"
+             % ("、".join(cfg.get("keytime_calendars") or DEFAULT_KEYTIME_CALENDARS)))
 
     if args.live and cfg and caldav is not None:
         info("== 实时日历列表 ==")
@@ -653,6 +658,10 @@ def make_download(meta):
     data["source"] = meta.get("source") or ""
     data["all_calendars"] = meta.get("calendars") or []
     data["mode"] = meta.get("download_mode") or "legacy"
+    # Key Time（通勤 / 休息…）：和 session 时段同一份文件，但语义完全独立 ——
+    # 它们**不排 session**，只是「到点必须做」的硬节点（见 keytime.py）。
+    data["keytimes"] = meta.get("keytime_events") or []
+    data["keytime_calendars"] = meta.get("keytime_calendars") or list(DEFAULT_KEYTIME_CALENDARS)
     return data
 
 
@@ -713,6 +722,24 @@ def render_md(plans, meta):
                      % (period.get("date"), period.get("id"), period.get("start"),
                         period.get("end"), period.get("type") or "",
                         period.get("name") or ""))
+        L.append("")
+
+    if meta.get("keytime_events"):
+        L.append("## Key Time（%s：不排 session，到点强制提醒）"
+                 % "、".join(meta.get("keytime_calendars") or DEFAULT_KEYTIME_CALENDARS))
+        L.append("")
+        L.append("| 日期 | 时间 | 日历 | 事件 |")
+        L.append("|------|------|------|------|")
+        for row in meta["keytime_events"]:
+            L.append("| %s | %s–%s | %s | %s |"
+                     % (row.get("date"), row.get("start"), row.get("end"),
+                        row.get("calendar"), row.get("title") or "(无标题)"))
+        L.append("")
+    elif meta.get("keytime_calendars"):
+        L.append("## Key Time")
+        L.append("")
+        L.append("_日历里没有 %s 的事件（还没有这两个日历，或者这几天没有安排）。_"
+                 % "、".join(meta.get("keytime_calendars") or []))
         L.append("")
 
     for p in plans:
@@ -791,6 +818,10 @@ def build(load_fn, args):
     use = args.use if args.use is not None else (cfg.get("use_calendars") or [])
     profiles = (args.profiles if getattr(args, "profiles", None)
                 else cfg.get("download_calendars") or DEFAULT_PROFILES)
+    kt_calendars = (getattr(args, "keytime_calendars", None)
+                    if getattr(args, "keytime_calendars", None) is not None
+                    else cfg.get("keytime_calendars") or DEFAULT_KEYTIME_CALENDARS)
+    kt_calendars = [str(c).strip() for c in kt_calendars if str(c).strip()]
     start_date = (datetime.date.fromisoformat(args.start) if args.start
                   else datetime.datetime.now().date())
     now = datetime.datetime.now(LOCAL_TZ)
@@ -807,6 +838,7 @@ def build(load_fn, args):
     plan_use = [] if mode == "profiles" else use
     plans = plan_week(plan_events, start_date, args.days, plan_ignore, plan_use,
                       args.include_all_day, now)
+    keytime_events = keytime_rows(events, kt_calendars)
 
     if args.ics:
         source = "本地 .ics：%s" % "、".join(args.ics)
@@ -815,8 +847,52 @@ def build(load_fn, args):
     meta = {"stamp": stamp(), "source": source, "ignore": ignore, "use": use,
             "calendars": names, "days": args.days, "start_date": start_date,
             "profiles": list(profiles), "used_profiles": used,
-            "download_mode": mode, "selected_events": selected}
+            "download_mode": mode, "selected_events": selected,
+            "keytime_calendars": kt_calendars, "keytime_events": keytime_events}
     return plans, meta, selected
+
+
+def keytime_rows(events, calendars):
+    """从**全部**拉到的日历事件里挑出 Key Time（按日历名；全天事件跳过）。
+
+    输出形状和中间层 JSON 里其它事件一致（date/start/end/start_iso/end_iso），
+    这样 keytime.py 不用认识 CalEvent。跨天的事件按天拆开（日历里的「休息」
+    可能是 22:00–02:00 这种）。
+    """
+    wanted = set(str(c) for c in (calendars or []))
+    if not wanted:
+        return []
+    out = []
+    for ev in events or []:
+        if (ev.calendar or "").strip() not in wanted:
+            continue
+        if getattr(ev, "all_day", False):
+            continue
+        start, end = ev.start, ev.end
+        if end <= start:
+            continue
+        cursor = start
+        while cursor < end:
+            day = cursor.date()
+            day_end = datetime.datetime.combine(day + datetime.timedelta(days=1),
+                                                datetime.time.min).replace(tzinfo=LOCAL_TZ)
+            seg_end = min(end, day_end)
+            # keytime 的时间是「同一天的 HH:MM」；跨天就切成两段，第一段收在 23:59
+            # （差这一分钟只影响「今天还剩多久」的展示，不影响报警）。
+            row_end = seg_end if seg_end.date() == day else (day_end - datetime.timedelta(minutes=1))
+            out.append({
+                "date": day.isoformat(),
+                "start": cursor.astimezone(LOCAL_TZ).strftime("%H:%M"),
+                "end": row_end.astimezone(LOCAL_TZ).strftime("%H:%M"),
+                "start_iso": cursor.astimezone(LOCAL_TZ).isoformat(timespec="minutes"),
+                "end_iso": row_end.astimezone(LOCAL_TZ).isoformat(timespec="minutes"),
+                "calendar": (ev.calendar or "").strip(),
+                "title": (ev.title or "").strip(),
+                "all_day": False,
+            })
+            cursor = seg_end
+    out.sort(key=lambda row: (row["date"], row["start"]))
+    return out
 
 
 def print_summary(plans, meta, events):
@@ -824,6 +900,12 @@ def print_summary(plans, meta, events):
     info("拉到 %d 个事件（%d 天：%s ~ %s）"
          % (len(events), meta["days"], plans[0].date.isoformat(), plans[-1].date.isoformat()))
     info("忽略分组：%s" % ("、".join(meta["ignore"]) or "（无）"))
+    kts = meta.get("keytime_events") or []
+    info("Key Time（%s）：%d 条%s"
+         % ("、".join(meta.get("keytime_calendars") or DEFAULT_KEYTIME_CALENDARS),
+            len(kts),
+            "（" + "、".join(sorted(set(r["calendar"] for r in kts))) + "）" if kts else
+            "（日历里还没有这两个分组）"))
     info("")
     total_min = 0
     for p in plans:
@@ -853,7 +935,13 @@ def make_loader(args):
     if not cfg:
         die("还没有配置。先跑：python3 download_calendar.py login")
     profiles = getattr(args, "profiles", None) or cfg.get("download_calendars") or DEFAULT_PROFILES
-    return lambda a, b: fetch_caldav(cfg, a, b, profiles=profiles)
+    kt = (getattr(args, "keytime_calendars", None)
+          if getattr(args, "keytime_calendars", None) is not None
+          else cfg.get("keytime_calendars") or DEFAULT_KEYTIME_CALENDARS)
+    # Key Time 的日历（通勤/休息）**也要真拉下来** —— fetch_caldav 只查询
+    # 传进来的这几个日历，不并进去就永远拿不到「休息」的事件。
+    wanted = list(dict.fromkeys(list(profiles) + [str(c) for c in kt if str(c).strip()]))
+    return lambda a, b: fetch_caldav(cfg, a, b, profiles=wanted)
 
 
 def cmd_fetch(args):
@@ -1074,6 +1162,9 @@ def parse_args(argv=None):
         p.add_argument("--start", default=None, help="起始日期 YYYY-MM-DD，默认今天")
         p.add_argument("--profiles", nargs="*", default=None,
                        help="只下载这些日历/profile，默认 工作 空闲")
+        p.add_argument("--keytime-calendars", nargs="*", default=None,
+                       help="这些日历里的全部事件记成 Key Time（默认 通勤 休息；"
+                            "它们照旧不排 session）")
         p.add_argument("--ignore", nargs="*", default=None, help="旧模式：忽略的分组（默认 上课 休息）")
         p.add_argument("--use", nargs="*", default=None, help="旧模式：白名单分组")
         p.add_argument("--include-all-day", action="store_true", help="把全天事件当整天可用")

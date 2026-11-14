@@ -5,6 +5,10 @@ __pycache__/
 data/tasks.json
 data/settings.json
 data/tasks.json.bak
+# Bark 设备 key（等于给手机的推送地址，泄露 = 别人能给你推垃圾）：绝不进 git
+data/keytime-devices.json
+temp/keytime.json
+temp/keytime-state.json
 # 网络失败账：每台机器自己那份（`re-action` 重放的就是它）
 data/failed-actions.json
 data/projects.json

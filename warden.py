@@ -93,6 +93,15 @@ incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一�
 新建整场任务挂回去。`cst` / `conscription` 按剩余时间快速征召一条合适任务。
 见 [`feature_intents/project.md`](feature_intents/project.md)。
 
+**Key Time（日历硬节点）**：日历里「通勤」「休息」两个分组的每个事件都是一个
+硬节点 —— 不排 session、不进 `data.csv`，但到点必须做。`download_calendar.py`
+把它们单独抓进中间层（`keytimes`），`keytime.py` 负责判定与文案，本文件的
+`KeyTimeMixin` 负责看板展示、每帧节拍（`frame_key_hook` → `_keytime_tick`）、
+置顶/播报/推送的线程，以及 `keytime` 命令族（`ack` / `device` / `set` …）。
+违约中看板顶部是整块红色模板（通勤给「挤压未来 session」预测，休息给「生理算力
+坍塌」），平时只在契约视图顶部留一行淡红字。`open keytime` 是数据视图第四种模型。
+见 [`feature_intents/keytime.md`](feature_intents/keytime.md)。
+
 **收尾面板长在哪儿**：不是某个视图的内部件，而是 `repl_kit` 的**打断栏位**
 （`ReplShell(interrogate=...)`）—— 压在整块看板下面、状态栏上面。换视图、表格变长、
 终端太矮被裁屏，都冲不掉它；一问完栏位立刻消失，不占一行。
@@ -246,6 +255,8 @@ from warden_core import (  # noqa: E402,F401
     IMPORT_PENDING,
     OMNIFOCUS_OUTBOX_FILE,
     ImportBatch,
+    KeyTimeMixin,
+    kt,
     OmniOutbox,
     MESSAGE_KEEP,
     MESSAGE_SHOW,
@@ -394,6 +405,7 @@ class Warden(
     NetMixin,
     BoardMixin,
     ChoreMixin,
+    KeyTimeMixin,
     SessionMixin,
     TaskCmdMixin,
     TaskPipelineMixin,
@@ -575,6 +587,7 @@ class Warden(
         self._omni_idle_flush_at = 0.0
         #: 每份数据是什么时候拿到的：{"session": epoch, "task": epoch, "stat": epoch}
         self.read_at = {}
+        self._keytime_init()
         self._register_net_actions()
         # 旧账本里「每日检查」可能攒了几十条（args 带快照，永远不相等）。这类
         # 动作跑一次就够，启动时把旧的合并成一条 —— 否则 re-action 会挨个重放，
@@ -625,12 +638,25 @@ class Warden(
         shell_kwargs["pin_bottom"] = True
         self.shell = WardenShell(**shell_kwargs)
         # 画帧缓存要认识「业务状态变没变」：把签名挂上去（见 frame_signature）。
-        self.shell.frame_key_hook = self.frame_signature
+        self.shell.frame_key_hook = self._frame_key
         # 全屏 Application 运行期间，框架的 print（unknown command / exception /
         # `jobs` 输出）必须接进 Recent，不能绕过渲染器写终端历史。
         self.shell.output_hook = self._inline_shell_output
 
     # -- 画帧缓存 -------------------------------------------------------
+
+    def _frame_key(self):
+        """每帧一次的钩子：先驱动 Key Time 节拍，再算帧键。
+
+        repl_kit 的 ``frame_key_hook`` 是**唯一**保证「每秒一定被调一次」的
+        地方（tick=1.0 会 invalidate 一次），所以报警节拍挂在这里，而不是挂在
+        某个视图的 ``status_box`` 上 —— 那样切到专注/统计视图就不响了。
+        """
+        try:
+            self._keytime_tick()
+        except Exception:                          # noqa: BLE001 - 报警坏了不能没画面
+            pass
+        return self.frame_signature()
 
     def invalidate(self):
         """告诉画帧缓存「刚才那个画面不算数了」。

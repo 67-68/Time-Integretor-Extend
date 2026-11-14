@@ -92,6 +92,7 @@ import task_hooks as th  # noqa: E402  任务的 trigger / formatter 预设函�
 import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + 算数字 + 缓存
 import settings_store as cfg  # noqa: E402  设置项注册表 + data/settings.json
 import omnifocus as of  # noqa: E402  OmniFocus：链接解析 + 读写（osascript 子进程）
+import keytime as kt  # noqa: E402  Key Time：日历硬节点 → 报警 / 播报 / Bark 推送
 import postsession as psv  # noqa: E402  session 结束 15s 后的收尾（纯逻辑）
 import project_store as pj  # noqa: E402  项目库：OmniFocus Project 的存在与进度
 import project_plan as pp  # noqa: E402  plan：空闲容量 → 分资源 → 排任务（纯逻辑）
