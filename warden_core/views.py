@@ -2,6 +2,8 @@
 import dataclasses
 import datetime
 
+import keytime_rules as kr
+
 from .common import (
     Panel,
     SESSION_TABLE_COLUMNS,
@@ -125,12 +127,13 @@ class View(object):
                  hint=_hint_actions("时段类型", "id", "状态",
                                     note="close 表头名 = 折叠列；数据视图操作任务表")),
             _cmd("keytime", w.cmd_keytime,
-                 "Key Time：日历里的硬节点（通勤 / 休息）——报警、确认、Bark 设备",
+                 "Key Time：按规则匹配的日历时间块 —— 报警、确认、规则、Bark 设备",
                  ("kt", "key-time"),
                  usage="keytime | keytime ack | keytime refresh | keytime on|off | "
+                       "keytime rules [reset] | "
                        "keytime device [add <名字> <key>|remove <名字>|test|on|off] | "
                        "keytime set <键> <值>",
-                 options=("ack", "refresh", "on", "off", "device", "set"),
+                 options=("ack", "refresh", "rules", "on", "off", "device", "set"),
                  hint=_hint_actions("ack", "device test", "device add iphone <key>",
                                     "set volume 10",
                                     note="到点强制置顶 iTerm + 音量 10 + 语音播报；"
@@ -227,8 +230,9 @@ class ContractView(View):
         return self.w.render_status_rows()
 
     def render(self):
-        # Key Time 优先占顶部：违约中给整块模板（通勤 / 休息各一套文案 + 挤压
-        # 预测），没违约就只给一行淡红字提示下一个。看板其余部分照常。
+        # Key Time 优先占顶部：违约中给整块规则模板（文字+挤压预测都在
+        # data/keytime-rules.toml 里），没违约就只给一行淡红字提示下一个。
+        # 看板其余部分照常。
         out = []
         panel = self.w.render_keytime_panel()
         if panel is not None:
@@ -1063,19 +1067,22 @@ class DataView(View):
                     style="dim")
 
     def _render_keytime_data(self):
-        """keytime 模型：日历里的硬节点（通勤 / 休息）全表 + 状态。"""
+        """keytime 模型：匹配规则的日历时间块全表 + 状态。"""
         w = self.w
         now = w.keytime_now_dt()
         w.keytime_reload()
         rows = w.keytime_upcoming_rows(now, limit=200)
-        t = Table(title="Key Time · 日历硬节点（通勤 / 休息；不占 session，到点强制提醒）",
+        rules = (w.keytime_rules.rules if w.keytime_rules else [])
+        t = Table(title="Key Time · 日历时间块（规则匹配：data/keytime-rules.toml；"
+                         "不占 session，到点强制提醒）",
                   box=box.SIMPLE_HEAVY, header_style="bold red",
                   title_justify="left", expand=True)
         t.add_column("日期", no_wrap=True)
         t.add_column("时间", no_wrap=True)
         t.add_column("类型", no_wrap=True)
+        t.add_column("规则", no_wrap=True)
         t.add_column("状态", no_wrap=True)
-        t.add_column("标题", overflow="crop")
+        t.add_column("名字", overflow="crop")
         t.add_column("已超时", justify="right", no_wrap=True)
         for item in rows:
             acked = kt.acked(item, w._keytime_state)
@@ -1093,23 +1100,27 @@ class DataView(View):
                 item.date,
                 "%s-%s" % (item.start, item.end),
                 Text(item.calendar, style="magenta"),
+                Text(item.kind, style="cyan"),
                 Text(status, style=style),
                 Text(item.title or "—", style="bold" if item is target else ""),
                 Text("%d 分钟" % over if over > 0 else "—",
                      style="bold red" if over > 0 else "dim"),
             )
         if not rows:
-            row = [Text("") for _ in range(6)]
-            row[0] = Text("（日历里还没有 %s 的事件；先 sync，或看 keytime 配置）"
-                          % "、".join(w.keytime_events.get("calendars") or []),
-                          style="dim")
+            row = [Text("") for _ in range(7)]
+            row[0] = Text("（没有匹配规则的 key time：中间层里没有时间块的话先跑 "
+                          "sync / download_calendar.py download；有块但没匹配，"
+                          "看 data/keytime-rules.toml）", style="dim")
             t.add_row(*row)
-        t.caption = ("%d 条 · 配置的日历：%s · 播报节拍 %ss · 音量 %s · Bark 设备 %d 台"
-                     "（keytime device 管理）"
-                     % (len(rows), "、".join(w.keytime_events.get("calendars") or []),
-                        w.keytime_events.get("announce_sec"),
-                        w.keytime_events.get("volume"),
-                        len(kt.load_devices())))
+        caption = ("%d 条 · 规则 %d 条（%s）· 播报节拍 %ss · 音量 %s · Bark 设备 %d 台"
+                   "（keytime rules / keytime device 管理）"
+                   % (len(rows), len(rules), kr.rules_path(),
+                      w.keytime_events.get("announce_sec"),
+                      w.keytime_events.get("volume"),
+                      len(kt.load_devices())))
+        if w.keytime_rules_error:
+            caption += "  ⚠ 规则文件：%s" % w.keytime_rules_error.replace("\n", "；")
+        t.caption = caption
         return [t, self._dispatch_hint()]
 
     def _render_project_data(self):

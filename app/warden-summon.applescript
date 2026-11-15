@@ -80,7 +80,9 @@ end quit
 on optsDefault()
     -- doRefresh defaults to FALSE: see the header (typing "refresh" into a plain
     -- shell, or into a pending review question, does more harm than good).
-    return {dryRun:false, forceNew:false, doRefresh:false, logOnly:false, ttyPath:""}
+    -- noNew: "focus or do nothing" -- used by the Key Time alarm, which runs
+    -- *inside* warden and must never spawn a second window.
+    return {dryRun:false, forceNew:false, doRefresh:false, logOnly:false, ttyPath:"", noNew:false}
 end optsDefault
 
 on parseArgs(argv)
@@ -93,6 +95,8 @@ on parseArgs(argv)
             set dryRun of opts to true
         else if flag is "--new" then
             set forceNew of opts to true
+        else if flag is "--no-new" then
+            set noNew of opts to true
         else if flag is "--no-refresh" then
             set doRefresh of opts to false
         else if flag is "--refresh" then
@@ -120,6 +124,7 @@ on summon(opts)
     set forceNew to forceNew of opts
     set wantRefresh to doRefresh of opts
     set wantTty to ttyPath of opts
+    set wantNoNew to noNew of opts
 
     set repo to my resolveRepo()
     set markerPath to repo & "/app/" & MARKER_NAME
@@ -147,6 +152,10 @@ on summon(opts)
     my logLine("terminal GUI running = " & guiUp)
 
     if guiUp is false then
+        if wantNoNew then
+            my logLine("terminal not running -> focus-only, not creating a window")
+            return "no window (focus-only)"
+        end if
         if dryRun then
             return "terminal not running -> would create a window running: " & cmd
         end if
@@ -250,6 +259,10 @@ on summon(opts)
         return "focused " & hitId
     end if
 
+    if wantNoNew then
+        my logLine("no hit -> focus-only, not creating a window")
+        return "no hit (focus-only)"
+    end if
     return my spawnWindow(cmd, markerPath)
 end summon
 

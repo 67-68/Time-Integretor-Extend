@@ -411,10 +411,42 @@ check("撤销 1 条", ks.clear_abandoned([KEY]), 1)
 check("撤完就不是 abandoned 了", ks.is_abandoned(KEY), False)
 check("撤销不存在的 key 返回 0", ks.clear_abandoned([KEY]), 0)
 
+print("== 只聚焦不新建窗口（Key Time 报警用）==")
+_calls = []
+_real_run = ks.subprocess.run
+_tui_alive = ks.tui_alive
 
 
+class _Proc(object):
+    returncode = 0
+    stdout = "focused ABC"
+    stderr = ""
+
+
+def _fake_run(cmd, **kw):
+    _calls.append([str(x) for x in cmd])
+    return _Proc()
+
+
+ks.subprocess.run = _fake_run
+ks.tui_alive = lambda state=None: (True, {"tty": "/dev/ttys002"})
+check("focus_only 成功", ks.summon_warden(focus_only=True, quiet=True), True)
+_args = _calls[-1] if _calls else []
+check("带 --no-new", "--no-new" in _args, True)
+check("绝不带 --new", "--new" in _args, False)
+check("带 warden 的 tty", "/dev/ttys002" in _args, True)
+check("不打 refresh", "--no-refresh" in _args, True)
+
+_calls[:] = []
+ks.tui_alive = lambda state=None: (False, {})
+check("TUI 没开时 focus_only 直接放弃", ks.summon_warden(focus_only=True, quiet=True),
+      False)
+check("没开就完全不调 osascript", _calls, [])
+ks.subprocess.run = _real_run
+ks.tui_alive = _tui_alive
 
 print()
+
 if fails:
     print("失败 %d 项 ❌" % len(fails))
     for f in fails:

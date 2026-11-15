@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""keytime.py —— Key Time（日历里的「通勤 / 休息」硬节点）：模型 / 挤压预测 / 播报 / 推送。
+"""keytime.py —— Key Time（日历里的硬节点）：模型 / 挤压预测 / 播报 / 推送。
 
 Key Time 是什么
 ---------------
-日历里某些**不是 session** 的时间块（默认「通勤」「休息」两个日历里的所有事件）
-是硬节点：到点必须做那件事，晚一分钟都是从后面的时间盒里抢。本模块只负责
-「怎么算、怎么喊、怎么推」，不碰 warden 的表格，也不写 data.csv。
+日历里某些**不是 session** 的时间块是硬节点：到点必须做那件事，晚一分钟都是
+从后面的时间盒里抢。哪些块算 Key Time、模板写什么，全在规则文件里
+（``keytime_rules.py`` → ``data/keytime-rules.toml``）：规则按
+「时间块名字 > 时间块类型（日历名）」匹配，用户自己改，不需要碰代码。
+本模块只负责「怎么算、怎么喊、怎么推」，不碰 warden 的表格，也不写 data.csv。
 
-    日历（CalDAV）──download_calendar.py──▶ temp/calendar-download.json["keytimes"]
+    日历（CalDAV）──download_calendar.py──▶ temp/calendar-download.json["time_blocks"]
                                                         │
-                                              keytime.load_keytimes()
+                                          keytime_rules.match()
+                                                        │
+                                     keytime.load_keytimes()
                                                         │
                        ┌────────────────────────────────┼─────────────────────────┐
                        ▼                                ▼                         ▼
@@ -19,7 +23,7 @@ Key Time 是什么
 ------------------------------------
 - :func:`alarm_target`  现在该为哪一个 key time 报警（已确认的不算、太久远的不算）
 - :func:`squeeze`       这次拖延会挤掉今天后面哪几场、几场被挤出排期、要多加班几场
-- :func:`render_lines` / :func:`speech_text`  同一个事实的两种句式（屏幕 / 语音）
+- :func:`render_lines` / :func:`speech_text`  规则模板 + 内联变量（屏幕 / 语音）
 
 两条铁律
 --------
@@ -31,10 +35,11 @@ Key Time 是什么
 
 文件
 ----
-    temp/keytime.json           配置（日历名、节拍、音量、推送档位）
+    temp/keytime.json           配置（节拍、音量、推送档位；**不含日历名**）
+    data/keytime-rules.toml     规则表：哪些时间块报警 + 模板文字（用户自己改）
     temp/keytime-state.json     确认记录（按 keytime 的 key = 日期+开始时间）
     data/keytime-devices.json    Bark 设备（含 key，**不进 git**）
-    temp/calendar-download.json 日历中间层（keytimes 由 download_calendar.py 写入）
+    temp/calendar-download.json 日历中间层（time_blocks 由 download_calendar.py 写入）
 """
 from __future__ import annotations
 
@@ -42,6 +47,7 @@ import datetime
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -49,6 +55,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import keytime_rules as kr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMP = os.path.join(HERE, "temp")
@@ -59,14 +67,7 @@ DEFAULT_STATE_FILE = os.path.join(TEMP, "keytime-state.json")
 DEFAULT_DEVICES_FILE = os.path.join(DATA, "keytime-devices.json")
 DEFAULT_DOWNLOAD_JSON = os.path.join(TEMP, "calendar-download.json")
 
-#: 默认把哪些日历里的**全部事件**当作 Key Time。用户日历里现在就有一个「休息」。
-DEFAULT_CALENDARS = ["通勤", "休息"]
-
-#: key time 的类型 → 模板。认不出来当 "generic"。
-TEMPLATES = ("commute", "rest", "generic")
-
 DEFAULT_CONFIG = {
-    "calendars": list(DEFAULT_CALENDARS),
     # 一天的时间盒到哪儿结束：被推迟到 day_end 之后的 session 算「挤出今日排期」。
     "day_end": "23:30",
     # 播报节拍（秒）。用户要求每分钟一次。
@@ -81,8 +82,6 @@ DEFAULT_CONFIG = {
     "summon": True,
     # 系统空闲超过这个秒数 = 人不在 Mac 前（这时才往手机推）。
     "leave_idle_sec": 120,
-    # 超过这么久还没确认就不再报警（防止半夜补账式轰炸）。
-    "lookback_min": 120,
     # Bark 推送。stack_notifications=True 时每分钟发一条新通知（用户选的）；
     # False 时用同一个 id 原地替换（手机上只留一条「已超时 N 分钟」）。
     "push": {
@@ -153,7 +152,12 @@ def _read_json(path, default):
 
 
 def load_config(path=None):
-    """读配置；缺的键用默认值补齐（不会把默认值写回去）。"""
+    """读配置；缺的键用默认值补齐（不会把默认值写回去）。
+
+    老版本配置里的 ``calendars``（硬编码的日历名列表）现在**不再参与匹配**：
+    哪些时间块报警由 ``data/keytime-rules.toml`` 决定。这里把旧键原样留着，
+    不报错也不生效（用户从旧配置升级上来不会炸）。
+    """
     raw = _read_json(config_path(path), {}) or {}
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))          # deep copy
     for key, value in raw.items():
@@ -161,8 +165,6 @@ def load_config(path=None):
             cfg["push"].update(value)
         else:
             cfg[key] = value
-    cfg["calendars"] = [str(c).strip() for c in (cfg.get("calendars") or [])
-                        if str(c).strip()] or list(DEFAULT_CALENDARS)
     return cfg
 
 
@@ -232,17 +234,23 @@ def _iso(dt):
 
 
 class KeyTime(object):
-    """一个 key time 时间块（日历事件；date/start/end 都是本地时间）。"""
+    """一个 key time 时间块（日历事件；date/start/end 都是本地时间）。
 
-    __slots__ = ("date", "start", "end", "calendar", "title", "kind")
+    ``rule`` 是命中它的那条规则（``keytime_rules.Rule``）；模板文字从规则来。
+    """
 
-    def __init__(self, date, start, end, calendar, title="", kind=None):
+    __slots__ = ("date", "start", "end", "calendar", "title", "kind", "rule")
+
+    def __init__(self, date, start, end, calendar, title="", kind=None, rule=None):
         self.date = str(date)
         self.start = str(start)
         self.end = str(end)
         self.calendar = str(calendar or "")
         self.title = str(title or "")
-        self.kind = kind or classify(self.calendar, self.title)
+        self.rule = rule
+        #: 命中的规则 id（没有规则时按日历名/标题猜一个，只为展示）
+        self.kind = kind or (rule.id if rule is not None else
+                             classify(self.calendar, self.title))
 
     # -- 时间 ---------------------------------------------------------
 
@@ -254,6 +262,10 @@ class KeyTime(object):
 
     def key(self):
         return "%sT%s" % (self.date, self.start)
+
+    def block(self):
+        """时间块名字：事件标题，没标题就用日历名。"""
+        return self.title or self.calendar
 
     def label(self):
         return "%s-%s %s" % (self.start, self.end, self.calendar or self.title)
@@ -287,7 +299,11 @@ def _combine(date, hm):
 
 
 def classify(calendar, title=""):
-    """日历名/标题 → 模板类型。用户日历里现在叫「休息」，以后可能加「通勤」。"""
+    """日历名/标题 → 一个「像什么」的猜测。
+
+    只给**没有规则**的 ``KeyTime``（测试里直接构造 / 旧数据）兜底用；真正
+    决定报警与文案的是 ``data/keytime-rules.toml`` 里的规则。
+    """
     text = "%s %s" % (calendar or "", title or "")
     if "通勤" in text or "路上" in text or " commute" in text.lower():
         return "commute"
@@ -296,23 +312,41 @@ def classify(calendar, title=""):
     return "generic"
 
 
-def parse_keytimes(download, calendars=None):
-    """从日历中间层里取 key time 事件。
+def _as_ruleset(rules):
+    """容忍传 RuleSet / list / None（None → 出厂规则）。"""
+    if isinstance(rules, kr.RuleSet):
+        return rules
+    if isinstance(rules, (list, tuple)):
+        return kr.RuleSet(rules=list(rules))
+    return kr.default_rules()
 
-    优先用 download_download.py 新写的 ``keytimes``；老文件没有这一节时，
-    退回去 ``events`` 里按日历名筛（老文件只存了工作/空闲，通常筛不到）。
+
+def parse_keytimes(download, rules=None):
+    """从日历中间层里取时间块，按规则筛出 key time。
+
+    中间层新版写 ``time_blocks``（**全部日历**）；老文件写 ``keytimes``
+    （已经按日历名筛过）；再老的文件只有 ``events``。三种都认。
+
+    没有规则命中的时间块**不是** key time（工作 / 空闲 / 上课 默认不报警）。
     """
-    calendars = [str(c) for c in (calendars or DEFAULT_CALENDARS)]
-    raw = (download or {}).get("keytimes")
+    rule_set = _as_ruleset(rules)
+    raw = (download or {}).get("time_blocks")
     if raw is None:
+        raw = (download or {}).get("keytimes")
+    if raw is None:                                    # 最老的文件
         raw = [ev for ev in (download or {}).get("events") or []
-               if str(ev.get("calendar") or "") in calendars]
+               if not ev.get("all_day")]
     out = []
     for ev in raw or []:
+        title = ev.get("title") or ""
+        calendar = ev.get("calendar") or ""
+        rule = rule_set.match(calendar, title)
+        if rule is None:
+            continue
         try:
             kt = KeyTime(ev.get("date") or str(ev.get("start_iso") or "")[:10],
                          ev.get("start"), ev.get("end"),
-                         ev.get("calendar"), ev.get("title") or "")
+                         calendar, title, rule=rule)
         except (TypeError, ValueError):
             continue
         if not (kt.start_dt() < kt.end_dt()):
@@ -322,14 +356,18 @@ def parse_keytimes(download, calendars=None):
     return out
 
 
-def load_keytimes(download_path=None, config=None):
+def load_rules(path=None):
+    """读规则文件（同 :func:`keytime_rules.load_rules`，这里再导出一次方便调用）。"""
+    return kr.load_rules(path)
+
+
+def load_keytimes(download_path=None, rules=None):
     """读中间层 → (keytimes, error)。读不到不是异常：只是「今天没有 key time」。"""
-    cfg = config or load_config()
     path = download_json_path(download_path)
     data = _read_json(path, None)
     if not isinstance(data, dict):
         return [], "没有日历中间层（先跑 sync / download_calendar.py download）：%s" % path
-    return parse_keytimes(data, cfg.get("calendars")), ""
+    return parse_keytimes(data, rules), ""
 
 
 def upcoming(now, keytimes, limit=3, include_started=False):
@@ -350,17 +388,19 @@ def alarm_target(now, keytimes, state=None, config=None):
     """现在该为哪一个 key time 报警？没有 → None。
 
     规则（按优先级）：
-    1. 已经开始的（start ≤ now）；2. 还没结束或超过 lookback 不算太久远；
+    1. 已经开始的（start ≤ now）；
+    2. **还在这个时间块里**（now < end）—— 过了 end 就立刻停，不再追账。
+       以前是 end + lookback（默认 120 分钟）才停，结果「休息」块 19:30 结束
+       后到 21:30 还在播「休息超时 126 分钟」，用户明确说不行；
     3. 没有被确认过（state.acked 里有它的 key）。
+
     同时命中多个（重叠的两个日历事件）时取**最早开始的**那个。
+    ``config`` 只是为了兼容旧调用（lookback_min 已经不用了）。
     """
     now = _now(now)
-    cfg = config or load_config()
-    lookback = datetime.timedelta(minutes=int(cfg.get("lookback_min") or 120))
     acked = ((state or {}).get("acked") or {})
     hits = [kt for kt in keytimes
-            if kt.started(now) and kt.key() not in acked
-            and (kt.end_dt() + lookback) > now]
+            if kt.started(now) and not kt.ended(now) and kt.key() not in acked]
     if not hits:
         return None
     hits.sort(key=lambda k: k.start_dt())
@@ -418,27 +458,32 @@ def squeeze(now, keytime, sessions, day_end=None):
         "extra_minutes": dropped_minutes,
         "pushed": pushed,
         "dropped": dropped,
+        "total": len(sessions or []),
         "day_end": end_of_day,
     }
 
 
-# ================================================================ 文案（屏幕 / 语音）
+# ================================================================ 文案（规则模板 + 内联变量）
 
 
-ACTION_BY_KIND = {
-    "commute": "立刻动身（通勤）",
-    "rest": "强制断电休息（离开屏幕）",
-    "generic": "立刻处理这个 key time",
-}
+#: 规则文件被删光 / KeyTime 没有规则（测试直接构造）时的兜底模板。
+FALLBACK_RULE = kr.Rule(
+    id="generic",
+    headline="🚨 [KEY TIME 违约警报] {block}",
+    text="""🚨 [KEY TIME 违约警报] {block}
+-动作：立刻处理这个 key time
+>⏱️ 已超时：{overdue_mins} 分钟（应于 {key_time} 启动，现已 {now_time}）
+⏳ 这个 key time 正在被拖延；后面的时间盒按 1:1 顺延。
+""",
+    speech="key time 超时 {overdue_mins} 分钟：{block}。",
+)
 
+#: 行首前缀 → rich 样式（前缀本身不显示）。
+LINE_PREFIXES = (("!", "bold red"), ("-", "bold magenta"),
+                 (">", "yellow"), ("#", "dim"))
 
-def headline(keytime, now):
-    over = keytime.overdue_minutes(_now(now))
-    return "🚨 [KEY TIME 违约警报] %s" % keytime.calendar
-
-
-def _clock(dt):
-    return dt.strftime("%H:%M") if isinstance(dt, datetime.datetime) else str(dt or "--:--")
+_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 
 
 def _task_names(items, limit=2):
@@ -451,90 +496,262 @@ def _task_names(items, limit=2):
     return names[:limit]
 
 
-def render_lines(keytime, now, ctx=None, acked=False, config=None):
-    """屏幕上的模板：``[(rich style, text), ...]``，一行一段，别再自己拼。"""
+# -- 一整句的合成文案（模板里想省事就用这些，想自己写就用下面的细粒度变量） ----
+
+
+def squeeze_text(sq):
+    """这次拖延对后面排期的后果 —— 一整句（自动在挤出 / 顺延 / 没排期之间换句）。"""
+    sq = sq or {}
+    dropped = sq.get("dropped") or []
+    pushed = sq.get("pushed") or []
+    names = _task_names(dropped) or _task_names(pushed)
+    if dropped:
+        if names:
+            return ("再不行动，今日队列中的%s将被直接挤出今日排期。"
+                    % " 与 ".join("【%s】" % name for name in names))
+        return "再不行动，今天后面 %d 场会被挤出排期。" % len(dropped)
+    if pushed:
+        tail = ("（%s）" % "、".join("【%s】" % name for name in names)) if names else ""
+        return ("再不行动，今天后面 %d 场%s将整体后移 %d 分钟，今晚就晚 %d 分钟收工。"
+                % (len(pushed), tail, sq.get("delay") or 0, sq.get("delay") or 0))
+    if int(sq.get("total") or 0):
+        return ("今天后面还有 %d 场排期 —— 你拖的每一分钟，都从它们身上扣。"
+                % int(sq["total"]))
+    return "今天后面已经没有排期了 —— 这一小时只能从睡眠和明天里扣。"
+
+
+def squeeze_speech(sq):
+    """同 :func:`squeeze_text`，但更短，给语音播报用（没后果时为空）。"""
+    sq = sq or {}
+    dropped = sq.get("dropped") or []
+    pushed = sq.get("pushed") or []
+    if dropped:
+        names = _task_names(dropped)
+        head = ("已经被挤出今日排期的是：%s。" % "、".join(names)) if names else ""
+        if sq.get("extra_sessions"):
+            head += "今晚要额外加班 %d 个 session。" % sq["extra_sessions"]
+        return head
+    if pushed:
+        return "后面 %d 场整体后移 %d 分钟。" % (len(pushed), sq.get("delay") or 0)
+    return ""
+
+
+def extra_text(sq):
+    """今晚要额外补几场（没有挤出时为空 —— 模板里那一行会自动消失）。"""
+    count = int((sq or {}).get("extra_sessions") or 0)
+    return ("你今晚将被迫额外加班 %d 个 Session (25m) 擦屁股！" % count) if count else ""
+
+
+def goal_line(goal):
+    """「总目标将因此失败」一整句；还没设总目标时给占位提示。"""
+    goal = str(goal or "").strip()
+    if goal:
+        return "你的 Project 总目标：%s 将因此失败！" % goal
+    return ("（这个 session 的任务没有 Project 总目标；"
+            "用 keytime goal <文本> 设置后这里会显示）")
+
+
+def goal_speech(goal):
+    goal = str(goal or "").strip()
+    return ("总目标：%s。" % goal) if goal else ""
+
+
+# -- 变量表 ------------------------------------------------------------------
+
+
+def render_values(keytime, now, ctx=None, config=None, acked=False):
+    """把「现在的事实」摊成模板变量表（键名见 keytime-rules.toml 顶部注释）。"""
     now = _now(now)
     ctx = ctx or {}
-    lines = []
-    over = keytime.overdue_minutes(now)
-    lines.append(("bold white on red", headline(keytime, now)))
-    lines.append(("bold", "动作：%s" % ACTION_BY_KIND.get(keytime.kind, ACTION_BY_KIND["generic"])))
-    lines.append(("yellow", "⏱️ 已超时：%d 分钟（应于 %s 启动，现已 %s）"
-                  % (over, keytime.start, _clock(now))))
-    if acked:
-        lines.append(("bold green", "✓ 已确认（%s）—— 不再播报；计时器仍在走"
-                      % (_clock(ctx.get("acked_at")) if ctx.get("acked_at") else "刚刚")))
-        return lines
+    cfg = config if isinstance(config, dict) else load_config(config)
     sq = ctx.get("squeeze") or {}
-    if keytime.kind == "rest":
-        lines.append(("bold magenta", "🧠 生理算力坍塌后果："))
-        lines.append(("", "你正在拒绝清理大脑 L1 缓存！"))
-        goal = ctx.get("goal") or ""
-        if goal:
-            lines.append(("", "你的 Project 总目标：%s 将因此失败！" % goal))
-        else:
-            lines.append(("dim", "（这个 session 的任务没有 Project 总目标；"
-                                 "用 keytime goal <文本> 设置后这里会显示）"))
-        lines.append(("", "原本 1 遍能读懂的东西，你会被迫反复空转 4 遍；"
-                          "冲动控制力归零，下个 session 极高概率半途破防。"))
-        lines.append(("bold yellow", "🛑 别拿垃圾时间骗自己：现在立刻离开屏幕 %d 分钟。"
-                      % (int((keytime.end_dt() - keytime.start_dt()).total_seconds() // 60)
-                         or 10)))
-        return lines
-    if keytime.kind == "commute":
-        lines.append(("bold magenta", "💥 物理排期坍塌后果："))
-        lines.append(("", "你的拖延正在以 1:1 的速度直接吞噬后续时间盒！"))
-        dropped = sq.get("dropped") or []
-        pushed = sq.get("pushed") or []
-        names = _task_names(dropped) or _task_names(pushed)
-        if dropped:
-            if names:
-                lines.append(("", "再不行动，今日队列中的%s将被直接挤出今日排期。"
-                              % " 与 ".join("【%s】" % n for n in names)))
-            else:
-                lines.append(("", "再不行动，今天后面 %d 场会被挤出排期。"
-                              % len(dropped)))
-        elif pushed:
-            tail = ("（%s）" % "、".join("【%s】" % n for n in names)) if names else ""
-            lines.append(("", "再不行动，今天后面 %d 场%s将整体后移 %d 分钟，今晚就晚 "
-                              "%d 分钟收工。" % (len(pushed), tail, sq.get("delay") or 0,
-                                               sq.get("delay") or 0)))
-        else:
-            lines.append(("", "今天后面已经没有排期了 —— 这一小时只能从睡眠和明天里扣。"))
-        if sq.get("extra_sessions"):
-            lines.append(("bold red", "你今晚将被迫额外加班 %d 个 Session (25m) 擦屁股！"
-                          % sq["extra_sessions"]))
-        lines.append(("bold red", "🔴 计时器正在跳动：每多看屏幕 1 秒，今晚就晚睡 1 秒！"))
-        return lines
-    lines.append(("bold magenta", "⏳ 这个 key time 正在被拖延；后面的时间盒按 1:1 顺延。"))
+    over = keytime.overdue_minutes(now)
+    duration = int((keytime.end_dt() - keytime.start_dt()).total_seconds() // 60)
+    remain = int((keytime.end_dt() - now).total_seconds() // 60)
+    next_row = None
+    for row in ctx.get("sessions") or []:
+        start = row.get("start")
+        if isinstance(start, str):
+            try:
+                start = _combine(keytime.date, start)
+            except (TypeError, ValueError):
+                continue
+        if isinstance(start, datetime.datetime) and start > now:
+            next_row = dict(row, start=start)
+            break
+    titles = [str(t).strip() for t in (next_row or {}).get("tasks") or []
+              if str(t).strip()]
+    goal = str(ctx.get("goal") or "").strip()
+    acked_at = ctx.get("acked_at")
+    if isinstance(acked_at, datetime.datetime):
+        acked_at = acked_at.strftime("%H:%M")
+    else:
+        acked_at = str(acked_at or "")[11:16] if acked_at else ""
+    dropped = sq.get("dropped") or []
+    pushed = sq.get("pushed") or []
+    return {
+        "block": keytime.block(),
+        "calendar": keytime.calendar,
+        "kind": keytime.kind,
+        "date": keytime.date,
+        "date_short": keytime.date[5:],
+        "key_time": keytime.start,
+        "start": keytime.start,
+        "key_end": keytime.end,
+        "end": keytime.end,
+        "now_time": now.strftime("%H:%M"),
+        "overdue_mins": over,
+        "duration_mins": duration,
+        "remain_mins": remain,
+        "next_task": titles[0] if titles else "后面的安排",
+        "next_tasks": "、".join(titles[:3]) if titles else "后面的安排",
+        "next_time": next_row["start"].strftime("%H:%M") if next_row else "",
+        "next_in_mins": (int((next_row["start"] - now).total_seconds() // 60)
+                         if next_row else ""),
+        "delay": int(sq.get("delay") or 0),
+        "pushed_count": len(pushed),
+        "dropped_count": len(dropped),
+        "dropped_mins": int(sq.get("extra_minutes") or 0),
+        "dropped_tasks": "、".join(_task_names(dropped, limit=99)),
+        "extra_sessions": int(sq.get("extra_sessions") or 0),
+        "extra_minutes": int(sq.get("extra_minutes") or 0),
+        "squeeze_text": squeeze_text(sq),
+        "squeeze_speech": squeeze_speech(sq),
+        "extra_text": extra_text(sq),
+        "goal": goal,
+        "goal_line": goal_line(goal),
+        "goal_speech": goal_speech(goal),
+        "chore": str(ctx.get("chore") or "").strip(),
+        "acked_at": acked_at,
+        "acked_line": "✓ 已确认（%s）—— 不再播报；计时器仍在走" % (acked_at or "刚刚"),
+        "day_end": str(cfg.get("day_end") or "23:30"),
+        "acked": "1" if acked else "",
+    }
+
+
+def format_vars(text, values):
+    """把 ``{name}`` 换成变量值；不认识的变量**原样留着**（方便发现写错）。
+
+    ``{{`` / ``}}`` 是字面量花括号。
+    """
+    text = str(text or "").replace("{{", "\x00").replace("}}", "\x01")
+
+    def replace(match):
+        name = match.group(1)
+        if name in values:
+            return str(values[name])
+        return match.group(0)
+
+    return _VAR_RE.sub(replace, text).replace("\x00", "{").replace("\x01", "}")
+
+
+def _line_style(line):
+    """行首前缀 → (style, 去掉前缀的正文)。"""
+    for prefix, style in LINE_PREFIXES:
+        if line.startswith(prefix):
+            return style, line[len(prefix):]
+    return "", line
+
+
+def _bold_segments(body, style):
+    """把 ``**重点**`` 切成 rich 片段；没有 ** 时就是一段。"""
+    out, pos = [], 0
+    for match in _BOLD_RE.finditer(body):
+        if match.start() > pos:
+            out.append((style, body[pos:match.start()]))
+        out.append((("bold " + style).strip(), match.group(1)))
+        pos = match.end()
+    if pos < len(body):
+        out.append((style, body[pos:]))
+    return out or [(style, "")]
+
+
+def render_text(text, values):
+    """按模板文本渲染 → ``[[(style, text), ...], ...]``（每行一串片段）。
+
+    空行保留（分段用）；某行模板非空但渲染成空串（比如 ``{extra_text}`` 为空）
+    → 整行删掉。第一行固定红底白字。
+    """
+    lines = []
+    for raw in str(text or "").splitlines():
+        filled = format_vars(raw, values)
+        if raw.strip() and not filled.strip():
+            continue
+        style, body = _line_style(filled)
+        lines.append(_bold_segments(body, style))
+    if not lines:                                      # 模板被删空 → 至少有一行
+        lines = [[("bold white on red", "KEY TIME %s" % values.get("block", ""))]]
+    first = "".join(text for _style, text in lines[0])
+    lines[0] = [("bold white on red", first)]
     return lines
 
 
-def speech_text(keytime, now, ctx=None, config=None):
-    """语音播报稿：短、只讲「超时几分钟 + 结果」。太长时 ``say`` 自己会排队。"""
+def plain_text(lines):
+    """``render_lines`` 的结果 → 纯文本（推送正文 / 日志 / 测试断言用）。"""
+    return "\n".join("".join(text for _style, text in line) for line in lines)
+
+
+def _rule_of(keytime):
+    return keytime.rule if keytime.rule is not None else FALLBACK_RULE
+
+
+def headline(keytime, now, ctx=None, config=None):
+    """报警标题（面板第一行 / 手机推送标题）。"""
+    rule = _rule_of(keytime)
+    values = render_values(keytime, now, ctx, config)
+    if rule.headline:
+        return format_vars(rule.headline, values).strip()
+    for raw in (rule.text or FALLBACK_RULE.text).splitlines():
+        if raw.strip():
+            _style, body = _line_style(format_vars(raw, values))
+            return body.strip()
+    return "🚨 KEY TIME %s" % keytime.block()
+
+
+def render_lines(keytime, now, ctx=None, acked=False, config=None):
+    """屏幕模板 → ``[[(style, text), ...], ...]``（一行一串片段，别再自己拼）。
+
+    确认之后只留「标题 + 已确认」两行：停止播报、但计时器还在走。
+    """
     now = _now(now)
     ctx = ctx or {}
-    sq = ctx.get("squeeze") or {}
-    over = keytime.overdue_minutes(now)
-    if keytime.kind == "rest":
-        head = "休息超时 %d 分钟。立刻离开屏幕。" % over
-        goal = (ctx.get("goal") or "").strip()
-        tail = ("总目标：%s。" % goal) if goal else ""
-        return head + tail + "再不休息，下个 session 会脑雾死锁。"
-    if keytime.kind == "commute":
-        head = "通勤超时 %d 分钟，应于 %s 出发。" % (over, keytime.start)
-        dropped = sq.get("dropped") or []
-        pushed = sq.get("pushed") or []
-        if dropped:
-            names = _task_names(dropped)
-            if names:
-                head += "已经被挤出今日排期的是：%s。" % "、".join(names)
-            if sq.get("extra_sessions"):
-                head += "今晚要额外加班 %d 个 session。" % sq["extra_sessions"]
-        elif pushed:
-            head += "后面 %d 场整体后移 %d 分钟。" % (len(pushed), sq.get("delay") or 0)
-        return head
-    return "key time 超时 %d 分钟：%s。" % (over, keytime.calendar or keytime.title)
+    rule = _rule_of(keytime)
+    values = render_values(keytime, now, ctx, config, acked=acked)
+    if acked:
+        return [[("bold white on red", headline(keytime, now, ctx, config))],
+                [("bold green", values["acked_line"])]]
+    return render_text(rule.text or FALLBACK_RULE.text, values)
+
+
+def speech_text(keytime, now, ctx=None, config=None):
+    """语音播报稿：规则里的 ``speech``（没写就用标题）。太长时 ``say`` 自己排队。"""
+    now = _now(now)
+    ctx = ctx or {}
+    rule = _rule_of(keytime)
+    values = render_values(keytime, now, ctx, config)
+    text = rule.speech or headline(keytime, now, ctx, config)
+    text = format_vars(text, values)
+    text = text.replace("**", "").replace("\n", " ").strip()
+    return re.sub(r"\s{2,}", " ", text)
+
+
+def display_line(keytime, now, ruleset=None, config=None):
+    """还没到点时，契约视图顶部那一行（模板在规则的 ``[display] line``）。"""
+    now = _now(now)
+    values = render_values(keytime, now, {}, config)
+    delta = int((keytime.start_dt() - now).total_seconds() // 60)
+    if delta < 1:
+        when = "现在"
+    elif delta < 60:
+        when = "%d 分钟后" % delta
+    else:
+        when = "%d 小时 %d 分钟后" % (delta // 60, delta % 60)
+    values["in_mins"] = max(0, delta)
+    values["when"] = when
+    values["title"] = keytime.title
+    template = (ruleset.display if isinstance(ruleset, kr.RuleSet) and ruleset.display
+                else kr.DEFAULT_DISPLAY)
+    return format_vars(template, values).replace("**", "").strip()
 
 
 # ================================================================ 播报（音量 + say）
@@ -771,10 +988,16 @@ def push_params(config, mode="alarm", seq=None):
 
 
 def summon(dry_run=False, log=None):
-    """activate iTerm + select 到 warden 那个 tab（复用收尾提醒那条路）。"""
+    """activate iTerm + select 到 warden 那个 tab（复用收尾提醒那条路）。
+
+    **focus-only**：报警本来就发生在 warden 进程里，只需要把已有窗口拉到最前。
+    绝不能让它新建窗口 —— 以前「找不到就新建」，而新起来的 warden 又会
+    再 summon 一次，每隔几秒就多开一个窗口（看起来像 malware）。``quiet``
+    则保证 keep_session 的 log 不 print 到 TUI 的 stdout（会把界面打乱）。
+    """
     log = log or (lambda msg: None)
     if dry_run:
-        log("会执行 keep_session.summon_warden()")
+        log("会执行 keep_session.summon_warden(focus_only=True, quiet=True)")
         return True
     try:
         import keep_session as ks
@@ -782,7 +1005,7 @@ def summon(dry_run=False, log=None):
         log("拿不到 keep_session，跳过置顶：%s" % e)
         return False
     try:
-        return bool(ks.summon_warden())
+        return bool(ks.summon_warden(focus_only=True, quiet=True))
     except Exception as e:                         # noqa: BLE001
         log("置顶失败：%s" % e)
         return False
@@ -808,16 +1031,27 @@ def _main(argv=None):
     ap = argparse.ArgumentParser(prog="keytime.py", description="Key Time 自检工具")
     ap.add_argument("--config", default=None)
     ap.add_argument("--download", default=None)
+    ap.add_argument("--rules", default=None, help="规则文件路径（默认 data/keytime-rules.toml）")
     sub = ap.add_subparsers(dest="cmd")
 
-    sub.add_parser("list", help="列出今天的 key time 和状态")
+    sub.add_parser("list", help="列出接下来的 key time 和状态")
     p_p = sub.add_parser("push-test", help="给所有设备发一条测试推送")
     p_p.add_argument("message", nargs="?", default="这是一条 keytime 测试推送")
     sub.add_parser("devices", help="列出设备")
+    sub.add_parser("rules", help="列出规则文件里的规则")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
-    kts, err = load_keytimes(args.download, cfg)
+    ruleset, rules_error = kr.load_rules(args.rules)
+    if args.cmd == "rules" or rules_error:
+        print("规则文件：%s" % kr.rules_path(args.rules))
+        for rule in ruleset.rules:
+            print("  - %s" % rule.describe())
+        if rules_error:
+            print("[warn] %s" % rules_error, file=sys.stderr)
+        if args.cmd == "rules":
+            return 0
+    kts, err = load_keytimes(args.download, ruleset)
     now = datetime.datetime.now()
     if args.cmd == "push-test":
         results = push_all(load_devices(), "[KEY TIME 测试]",
@@ -832,15 +1066,15 @@ def _main(argv=None):
         return 0
     if err:
         print("[warn] " + err, file=sys.stderr)
-    for kt in kts:
-        if kt.end_dt() <= now:
+    for key_time in kts:
+        if key_time.end_dt() <= now:
             continue
-        print("%s  %-8s %s" % (kt.label(), kt.kind, kt.title))
+        print("%s  %-10s %s" % (key_time.label(), key_time.kind, key_time.title))
     target = alarm_target(now, kts, load_state(), cfg)
     if target:
         print("\n现在该报警：%s（已超时 %d 分钟）"
               % (target.label(), target.overdue_minutes(now)))
-        print("\n".join(text for _style, text in render_lines(target, now)))
+        print(plain_text(render_lines(target, now, config=cfg)))
     return 0
 
 

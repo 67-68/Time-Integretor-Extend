@@ -81,7 +81,7 @@ _CONTEXT_HEADS = {
     "period": "时段排布：按 T1/T2 重排当天 session",
     "help": "帮助：当前视图全部命令与用法",
     "open": "打开：切数据模型 / 看板口径 / 展开列",
-    "keytime": "Key Time：日历硬节点（通勤/休息）到点强制置顶 + 播报 + 手机推送",
+    "keytime": "Key Time：按规则匹配的日历时间块到点强制置顶 + 播报 + 手机推送",
     "close": "折叠：收起当前表的一列",
 }
 
@@ -92,8 +92,8 @@ _CONTEXT_USAGES = {
     "conscription": "conscription / cst [session序号|current]",
     "session": "session <HH:MM> <25|50|75> [--permanent]",
     "period": "period <T1> [25|50|75 ...] | period T1 clear",
-    "keytime": "keytime [ack|refresh|on|off] | keytime device add <名字> <key> | "
-               "keytime set <键> <值>",
+    "keytime": "keytime [ack|refresh|rules|on|off] | keytime rules reset | "
+               "keytime device add <名字> <key> | keytime set <键> <值>",
 }
 
 _VIEW_INTROS = {
@@ -231,8 +231,10 @@ def _context_detail(command, args):
             return "确认这个 key time：停止播报与音量，置顶继续每分钟一次"
         if "device" in words or "设备" in words:
             return "配置 Bark 手机推送（iPhone 装 Bark，key 是它首页 URL 里那串）"
+        if "rules" in words or "规则" in words:
+            return "列出规则文件里的规则（data/keytime-rules.toml 自己改；reset 恢复出厂）"
         if "set" in words or "设置" in words:
-            return "改 keytime 配置（volume / announce_sec / calendars / push.level）"
+            return "改 keytime 配置（volume / announce_sec / day_end / push.level）"
         if "on" in words or "off" in words:
             return "整条 keytime 报警链路的开关"
         return "看今天与之后的 key time；违约中的那个会占满看板顶部"

@@ -58,24 +58,28 @@ check("三个时段", [(p["id"], p["start"], p["end"], p["type"], p["name"])
        ("T3", "19:00", "21:00", "空闲", "自由时间")])
 check("原始事件也保留", len(data["events"]), 3)
 
-print("== Key Time：通勤/休息的全部事件单独记一份 ==")
-kt_rows = dc.keytime_rows(events, ["通勤", "休息"])
-check("只收 keytime 日历的事件", [(r["calendar"], r["start"], r["end"], r["title"])
-                                for r in kt_rows],
-      [("休息", "12:00", "13:00", "午睡")])
-check("keytime 不进 session 候选",
-      [e.title for e in selected if e.calendar == "休息"], [])
+print("== 时间块：所有日历都记（匹配交给 keytime 规则）==")
+rows = dc.block_rows(events)
+check("全部日历都记，按时间排序",
+      [(r["calendar"], r["start"], r["end"], r["title"]) for r in rows],
+      [("上课", "09:00", "10:00", "数学"),
+       ("工作", "11:00", "13:00", "SAT 准备"),
+       ("休息", "12:00", "13:00", "午睡"),
+       ("工作", "15:00", "16:00", "托福 准备"),
+       ("空闲", "19:00", "21:00", "自由时间")])
+check("时间块不进 session 候选",
+      [e.title for e in selected if e.calendar in ("休息", "上课")], [])
+check("旧名字 keytime_rows 仍然可用（= block_rows）",
+      dc.keytime_rows(events), rows)
 # 跨午夜的休息切成两段（第一段收在 23:59）
 night = [dc.CalEvent(T(22, 30), datetime.datetime(2026, 10, 27, 0, 30, tzinfo=TZ),
                      "休息", "睡觉")]
-rows2 = dc.keytime_rows(night, ["休息"])
+rows2 = dc.block_rows(night)
 check("跨午夜切成两条", [(r["date"], r["start"], r["end"]) for r in rows2],
       [(D.isoformat(), "22:30", "23:59"),
        ((D + datetime.timedelta(days=1)).isoformat(), "00:00", "00:30")])
-check("全天事件不算 keytime",
-      dc.keytime_rows([dc.CalEvent(T(0), T(23, 59), "休息", "假", all_day=True)],
-                      ["休息"]), [])
-check("没配置日历 → 空", dc.keytime_rows(events, []), [])
+check("全天事件不算时间块",
+      dc.block_rows([dc.CalEvent(T(0), T(23, 59), "休息", "假", all_day=True)]), [])
 
 print("== 没有目标 profile 时退回旧过滤（不静默清空）==")
 legacy = [dc.CalEvent(T(9), T(10), "自习", "数学")]

@@ -1241,6 +1241,11 @@ class BoardMixin(object):
         self.reload_entries()
         self.maybe_generate_repeat_occurrences()
         self.refresh_warnings()
+        # Key Time 违约中：**整页**强制接管 —— 强制暂停牌不该混在一堆信息里。
+        # 确认（keytime ack）或这一段结束后自动恢复正常看板。
+        takeover = self.render_keytime_takeover()
+        if takeover is not None:
+            return takeover
         # 琐事屏是整屏内容：正常看板、Recent、状态框、视图栏都让位。
         if isinstance(self.view, ChoreView):
             return self.view.render()
@@ -2337,7 +2342,7 @@ class BoardMixin(object):
         "task": "task", "tasks": "task",
         "project": "project", "projects": "project",
         "op": "op", "ops": "op",
-        # 第四个模型：日历硬节点（通勤/休息），只有只读视图和确认命令。
+        # 第四个模型：规则匹配到的日历时间块（Key Time），只读 + 确认命令。
         "keytime": "keytime", "keytimes": "keytime", "kt": "keytime",
         "key-time": "keytime",
     }
@@ -2357,7 +2362,7 @@ class BoardMixin(object):
             self.keytime_reload(force=True)
         label = {"task": "Task 任务", "project": "Project 真正项目 pro",
                  "op": "Op OmniFocus Project",
-                 "keytime": "Key Time 日历硬节点"}[model]
+                 "keytime": "Key Time 时间块"}[model]
         self.say("🗂 数据视图 → %s（open task / open project / open op / open keytime 切换）"
                  % label, "cmd")
         self.invalidate()

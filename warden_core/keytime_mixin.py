@@ -2,8 +2,12 @@
 
 分工
 ----
-``keytime.py`` 里是**纯逻辑**（模型 / 挤压预测 / 文案 / 播报 / Bark 推送）；
-这里只做三件事：把它的结果接到画面上、按节拍驱动它、把命令翻译成状态改动。
+``keytime.py`` 里是**纯逻辑**（模型 / 挤压预测 / 文案 / 播报 / Bark 推送），
+``keytime_rules.py`` 管规则文件（哪些时间块报警、模板文字），这里只做三件事：
+把结果接到画面上、按节拍驱动它、把命令翻译成状态改动。
+
+"哪些时间块算 Key Time" 不再硬编码：``data/keytime-rules.toml`` 里按
+「名字 > 类型（日历名）」匹配；用户改完文件 5 秒内自动生效。
 
 节拍（用户定的）
 ----------------
@@ -25,7 +29,10 @@ import time
 
 import sys
 
+import keytime_rules as kr
+
 from .common import (
+    Group,
     Panel,
     Text,
     kt,
@@ -55,6 +62,8 @@ class KeyTimeMixin(object):
         self._keytime_summon_busy = False
         self._keytime_state = kt.load_state()
         self.keytime_events = kt.load_config()
+        #: 规则表：哪些时间块报警 + 模板文字（data/keytime-rules.toml）
+        self.keytime_rules, self.keytime_rules_error = kt.load_rules()
         #: 报警只该在**真人坐在 TUI 前**时响：`--exec` / `--status` / 测试
         #: 都是非交互进程，抢焦点、拧音量、推手机全是副作用。测试可以手动
         #: 打开（``wd.keytime_tick_enabled = True``）。
@@ -70,13 +79,17 @@ class KeyTimeMixin(object):
         return self.keytime_now or datetime.datetime.now()
 
     def keytime_reload(self, force=False):
-        """每 5 秒最多读一次日历中间层；force=True 立刻读。"""
+        """每 5 秒最多读一次日历中间层 + 规则文件；force=True 立刻读。
+
+        规则文件很小，5 秒读一次足够「改完存盘就生效」；中间层是同步产物。
+        """
         now = time.time()
         if not force and now - self.keytime_loaded_at < 5:
             return self.keytimes
         self.keytime_loaded_at = now
         self.keytime_events = kt.load_config()
-        self.keytimes, self.keytime_error = kt.load_keytimes(config=self.keytime_events)
+        self.keytime_rules, self.keytime_rules_error = kt.load_rules()
+        self.keytimes, self.keytime_error = kt.load_keytimes(rules=self.keytime_rules)
         self._keytime_state = kt.load_state()
         self.invalidate()
         return self.keytimes
@@ -132,6 +145,10 @@ class KeyTimeMixin(object):
 
     def _keytime_chore_line(self):
         """key time 屏下面那行灰色小字：现在还能顺手做掉哪件杂事。"""
+        title = self._keytime_chore_title()
+        return ("或者，如果你想做这件杂事：%s。" % title) if title else ""
+
+    def _keytime_chore_title(self):
         try:
             project, _error = self.chore_binding()
             if not project:
@@ -140,17 +157,20 @@ class KeyTimeMixin(object):
             if not tasks:
                 return ""
             index = int(getattr(self, "chore_index", 0) or 0) % len(tasks)
-            title = tasks[index].get("title") or tasks[index].get("pk") or ""
-            return "或者，如果你想做这件杂事：%s。" % title
+            return tasks[index].get("title") or tasks[index].get("pk") or ""
         except Exception:                          # noqa: BLE001 - 只是行提示
             return ""
 
     def keytime_ctx(self, target, now=None):
         now = now or self.keytime_now_dt()
+        sessions = self._keytime_todays_sessions(now)
         return {
-            "squeeze": kt.squeeze(now, target, self._keytime_todays_sessions(now),
+            "squeeze": kt.squeeze(now, target, sessions,
                                   self.keytime_events.get("day_end")),
+            # 模板里的 {next_task} / {next_tasks} / {next_time}
+            "sessions": sessions,
             "goal": self.keytime_goal_for(target, now),
+            "chore": self._keytime_chore_title(),
             "acked_at": None,
         }
 
@@ -244,10 +264,11 @@ class KeyTimeMixin(object):
         if not devices:
             return
         self._keytime_push_busy = True
-        title = kt.headline(target, now)
-        body = "\n".join(text for _style, text in
-                         kt.render_lines(target, now, self.keytime_ctx(target, now),
-                                         acked=(mode == "acked")))
+        title = kt.headline(target, now, config=self.keytime_events)
+        body = kt.plain_text(kt.render_lines(target, now,
+                                             self.keytime_ctx(target, now),
+                                             acked=(mode == "acked"),
+                                             config=self.keytime_events))
         params = kt.push_params(self.keytime_events, mode=mode, seq=target.key())
         timeout = (self.keytime_events.get("push") or {}).get("timeout")
 
@@ -282,49 +303,67 @@ class KeyTimeMixin(object):
 
     # -- 画面 -----------------------------------------------------------
 
+    def render_keytime_takeover(self):
+        """违约中：**整页**只画这块暂停牌（用户要求：强制暂停不该混在看板里）。
+
+        返回 None = 没在违约，正常看板照常画。``keytime ack`` 之后（或这一段
+        结束）自动恢复正常看板 —— 确认只是停播报，不解除「每分钟置顶」。
+
+        只在**真交互式 TUI**里整页接管（和置顶/播报同一个开关）：
+        ``--status`` / ``--exec`` / 测试进程不该被一块暂停牌顶掉整页。
+        """
+        if not self.keytime_tick_enabled:
+            return None
+        target = self.keytime_target()
+        if target is None:
+            return None
+        panel = self.render_keytime_panel()
+        if panel is None:                      # target 一定是 current，兜底而已
+            return None
+        return Group(panel,
+                     Text("keytime ack 确认（停止播报，置顶继续）· 这一段结束后"
+                          "自动回到看板 · 现在整页只留这块暂停牌", style="dim"))
+
     def render_keytime_panel(self):
-        """正在违约的 key time：整块模板（通勤 / 休息两套文案 + 挤压预测）。"""
+        """正在违约的 key time：整块模板（规则文字 + 挤压预测）。"""
         target = self.keytime_target() or self.keytime_current()
         if target is None:
             return None
         now = self.keytime_now_dt()
         acked = kt.acked(target, self._keytime_state)
         ctx = self.keytime_ctx(target, now)
-        lines = kt.render_lines(target, now, ctx, acked=acked,
-                                config=self.keytime_events)
         if acked:
             ctx["acked_at"] = (self._keytime_state.get("acked") or {}).get(
                 target.key(), {}).get("at")
-            lines = kt.render_lines(target, now, ctx, acked=True,
-                                    config=self.keytime_events)
+        lines = kt.render_lines(target, now, ctx, acked=acked,
+                                config=self.keytime_events)
         body = Text()
-        for index, (style, text) in enumerate(lines):
+        for index, segments in enumerate(lines):
             if index:
                 body.append("\n")
-            body.append(text, style=style)
+            for style, text in segments:
+                body.append(text, style=style)
         chore = self._keytime_chore_line()
         if chore and not acked:
             body.append("\n")
             body.append(chore, style="grey50")
-        return Panel(body, title="KEY TIME", border_style="red", expand=True)
+        return Panel(body, title="KEY TIME · %s" % (target.kind or "keytime"),
+                     border_style="red", expand=True)
 
     def render_keytime_line(self):
-        """契约视图顶部那一行淡红字：下一个 key time 还有多久。"""
+        """契约视图顶部那一行淡红字：下一个 key time 还有多久。
+
+        整行文字是模板（规则文件 ``[display] line``），变量见 ``keytime_rules``。
+        """
         if self.keytime_target() is not None:
             return None                            # 已经在报警了，面板会接管
         now = self.keytime_now_dt()
         nxt = kt.next_keytime(now, self.keytimes)
         if nxt is None:
             return None
-        delta = int((nxt.start_dt() - now).total_seconds() // 60)
-        if delta < 0:
+        if int((nxt.start_dt() - now).total_seconds() // 60) < 0:
             return None
-        when = "现在" if delta < 1 else (
-            "%d 分钟后" % delta if delta < 60 else
-            "%d 小时 %d 分钟后" % (delta // 60, delta % 60))
-        title = ("（%s）" % nxt.title) if nxt.title and nxt.title != nxt.calendar else ""
-        return Text("🔴 KEY TIME %s %s · %s%s · %s-%s"
-                    % (nxt.date[5:], nxt.calendar, when, title, nxt.start, nxt.end),
+        return Text(kt.display_line(nxt, now, self.keytime_rules, self.keytime_events),
                     style="bold #ff8a80")
 
     def keytime_upcoming_rows(self, now=None, limit=40):
@@ -339,17 +378,22 @@ class KeyTimeMixin(object):
     # -- 命令 -----------------------------------------------------------
 
     def cmd_keytime(self, args=None):
-        """``keytime`` 命令族：看 / 确认 / 设备 / 开关 / 刷新。
+        """``keytime`` 命令族：看 / 确认 / 设备 / 规则 / 开关 / 刷新。
 
             keytime                      今天与之后的 key time + 状态
             keytime ack                  确认（停止播报，置顶继续）
-            keytime refresh              立刻重读日历中间层
+            keytime refresh              立刻重读日历中间层 + 规则文件
+            keytime rules                列出规则（哪些时间块报警、模板在哪）
+            keytime rules reset          规则文件恢复出厂内容（会覆盖你的修改）
             keytime on|off               开/关整条报警链路
             keytime device               列出 Bark 设备
             keytime device add <名字> <key> [--server URL]
             keytime device remove <名字>
             keytime device test [<名字>]
-            keytime set <键> <值>        改配置（volume / announce_sec / calendars …）
+            keytime set <键> <值>        改配置（volume / announce_sec / day_end …）
+
+        「哪些时间块算 Key Time」由 ``data/keytime-rules.toml`` 决定，用户直接
+        改那个文件（自带注释和变量表），不是用命令配。这里只给看/重置/刷新。
         """
         toks = [str(a).strip() for a in (args or []) if str(a).strip()]
         cfg = self.keytime_events = kt.load_config()
@@ -373,19 +417,48 @@ class KeyTimeMixin(object):
             return cfg["enabled"]
         if head in ("device", "devices", "设备"):
             return self._keytime_device(toks[1:])
+        if head in ("rules", "规则"):
+            return self._keytime_rules(toks[1:])
         if head in ("set", "设置"):
             return self._keytime_set(toks[1:])
-        raise ValueError("keytime 只认 ack / refresh / on / off / device / set；你给的是 %r"
-                         % toks[0])
+        raise ValueError("keytime 只认 ack / refresh / rules / on / off / device / set；"
+                         "你给的是 %r" % toks[0])
+
+    def _keytime_rules(self, toks):
+        """看规则文件 / 恢复出厂。规则本身在 data/keytime-rules.toml 里改。"""
+        sub = (toks[0].lower() if toks else "")
+        path = kr.rules_path()
+        if sub in ("reset", "重置", "恢复"):
+            kr.save_default_rules()
+            self.keytime_reload(force=True)
+            self.say("已把 %s 恢复成出厂内容（你之前的模板被覆盖了）" % path, "cmd")
+            return path
+        self.keytime_reload(force=True)
+        rules = self.keytime_rules.rules if self.keytime_rules else []
+        self.say("Key Time 规则文件：%s（%d 条规则；直接改它，存盘后 5 秒内生效）"
+                 % (path, len(rules)), "cmd")
+        for rule in rules:
+            self.say("  - %s" % rule.describe(), "cmd")
+        if self.keytime_rules_error:
+            self.say("⚠ 规则文件有问题：%s" % self.keytime_rules_error, "warn")
+        self.say("还没到的 key time 那一行文字在 [display] line；模板变量见文件顶部注释。",
+                 "cmd")
+        return rules
 
     def _keytime_show(self):
         now = self.keytime_now_dt()
         self.keytime_reload(force=True)
         if self.keytime_error:
             self.say(self.keytime_error, "warn")
+        if self.keytime_rules_error:
+            self.say("⚠ 规则文件：%s（keytime rules 看详情）" % self.keytime_rules_error,
+                     "warn")
         if not self.keytimes:
-            self.say("日历里还没有 %s 的事件（先在日历里建这两个分组 / 跑 sync）"
-                     % "、".join(self.keytime_events.get("calendars") or []), "cmd")
+            self.say("没有匹配规则的 key time（规则 %d 条：%s）。"
+                     "时间块来自日历中间层 —— 先 sync / download_calendar.py download；"
+                     "哪些块报警看 data/keytime-rules.toml"
+                     % (len((self.keytime_rules or kr.RuleSet()).rules),
+                        kr.rules_path()), "cmd")
             return []
         lines = []
         target = self.keytime_target(now)
@@ -399,13 +472,14 @@ class KeyTimeMixin(object):
                 mark = "· 进行中"
             else:
                 mark = "· 未来"
-            lines.append("%s %s-%s %s %s%s"
-                         % (item.date[5:], item.start, item.end, item.calendar, mark,
+            lines.append("%s %s-%s %s [%s] %s%s"
+                         % (item.date[5:], item.start, item.end, item.calendar,
+                            item.kind, mark,
                             ("  " + item.title) if item.title and item.title != item.calendar
                             else ""))
         if lines:
-            self.say("Key Time（%s）：%s"
-                     % ("、".join(self.keytime_events.get("calendars") or []),
+            self.say("Key Time（规则 %d 条）：%s"
+                     % (len((self.keytime_rules or kr.RuleSet()).rules),
                         "；".join(lines[:6])), "cmd")
         else:
             self.say("没有接下来的 key time", "cmd")
@@ -503,13 +577,11 @@ class KeyTimeMixin(object):
     def _keytime_set(self, toks):
         if len(toks) < 2:
             raise ValueError("用法：keytime set <键> <值>（volume / announce_sec / "
-                             "calendars / day_end / summon / push.level）")
+                             "day_end / leave_idle_sec / summon / restore_volume / "
+                             "push.level）")
         key, raw = toks[0], " ".join(toks[1:])
         cfg = kt.load_config()
-        if key == "calendars":
-            cfg["calendars"] = [t for t in raw.replace("，", ",").replace("、", ",").split(",")
-                                if t.strip()]
-        elif key in ("volume", "announce_sec", "lookback_min", "leave_idle_sec"):
+        if key in ("volume", "announce_sec", "lookback_min", "leave_idle_sec"):
             cfg[key] = int(raw)
         elif key == "day_end":
             if kt._hm(raw) is None:
@@ -519,6 +591,9 @@ class KeyTimeMixin(object):
             cfg[key] = raw.lower() in ("1", "on", "true", "yes", "开")
         elif key.startswith("push."):
             cfg.setdefault("push", {})[key.split(".", 1)[1]] = raw
+        elif key == "calendars":
+            raise ValueError("calendars 已经不用了：哪些时间块报警由 data/keytime-rules.toml "
+                             "的规则决定（keytime rules 看当前规则）")
         else:
             raise ValueError("不认识的配置项 %r" % key)
         kt.save_config(cfg)

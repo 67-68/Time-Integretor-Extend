@@ -1,17 +1,22 @@
-# keytime —— 日历里的硬节点（通勤 / 休息）：到点强制置顶 + 播报 + 手机推送
+# keytime —— 日历里的硬节点：到点整页接管 + 播报 + 手机推送
 
-`keytime` 管的是**不是 session 的时间块**。日历里「通勤」「休息」两个分组的每一个
-事件都是一个 **Key Time**：它不排 session、不订场、不进 `data.csv`，但到点必须做
-（回家 / 断电休息），晚一分钟都是从后面的时间盒里抢。
+`keytime` 管的是**不是 session 的时间块**。日历里任意一个时间块是不是 Key Time，
+**不再由「日历叫通勤/休息」这种硬编码决定**：`download_calendar.py` 把**所有日历**
+的非全天事件都记进中间层，`data/keytime-rules.toml` 里的规则按
+「时间块名字 > 时间块类型（日历名）」动态匹配。命中规则的块就是硬节点：它不排
+session、不订场、不进 `data.csv`，但到点必须做（回家 / 断电休息 / 出门运动），
+晚一分钟都是从后面的时间盒里抢。
 
 ```
-日历（CalDAV）──download_calendar.py──▶ temp/calendar-download.json["keytimes"]
-                                              │
-                                    keytime.load_keytimes()
-                                              │
-            ┌─────────────────────────────────┼──────────────────────────────┐
-            ▼                                 ▼                              ▼
-   warden 看板（模板 / 淡红一行）      音量 10 + say 播报              Bark → iPhone
+日历（CalDAV，全部日历）──download_calendar.py──▶ temp/calendar-download.json["time_blocks"]
+                                                            │
+                                              keytime_rules.match()
+                                                            │
+                                                  keytime.load_keytimes()
+                                                            │
+              ┌─────────────────────────────────────────────┼──────────────────────────┐
+              ▼                                             ▼                          ▼
+   warden **整页接管**（规则模板）                音量 10 + say 播报              Bark → iPhone
 ```
 
 ## 为什么
@@ -19,31 +24,85 @@
 用户原话：「这个功能的存在是为了提醒我在某个时候做某件事」——重点不是「知道」，
 是**必须立刻动**。所以它不是一条通知，而是三层同时压上来：
 
-1. **屏幕**：warden 每帧把 iTerm 拉到最前（不是发个通知，是抢焦点）；
+1. **屏幕**：warden 违约中**整页只画这块暂停牌**（不是混在契约界面里的一张卡片；
+   用户原话：「强制暂停系统难道会混到一大堆信息里面？」）；
 2. **耳朵**：系统音量拧到 10，中文语音播报「已超时 N 分钟 + 后果」；
 3. **手机**：人不在 Mac 前时，每分钟 Bark 推送一条（堆叠，不覆盖）。
 
-确认（`keytime ack`）之后：停止音量与语音，但**置顶照旧每分钟一次** —— 用户明确
-要求「确认 ≠ 可以继续赖着」。
+确认（`keytime ack`）之后：停止音量与语音，**整页接管解除**、回到正常看板，但
+**置顶照旧每分钟一次** —— 用户明确要求「确认 ≠ 可以继续赖着」。
 
 ## 语义（一份合同）
 
 | 时刻 | 屏幕 | 声音 | 手机 |
 |---|---|---|---|
-| 到点前 | 契约视图顶部一行淡红字：`16:00 通勤 · 还有 23 分钟` | — | — |
-| 到点（`start` 起） | 看板顶部整块红色模板（通勤 / 休息两套文案） | 立刻 + 之后每 60s | 人不在 Mac 前才推，每分钟一条（`stack_notifications`） |
-| 确认后 | 模板变成「✓ 已确认」 | 停 | 一开始就离开过 Mac 的话，每 5 分钟再推一条，直到这一段结束 |
-| 过了 `end` | 模板消失，回到一行提示下一个 | — | — |
+| 到点前 | 契约视图顶部一行淡红字：`🔴 KEY TIME 11-15 运动 · 23 分钟后 · 16:00-17:00` | — | — |
+| 到点（`start ≤ now < end`） | **整页**只画规则模板（标题红底白字 + 后果 + 降级契约） | 立刻 + 之后每 60s | 人不在 Mac 前才推，每分钟一条（`stack_notifications`） |
+| 确认后 | 回到正常看板；契约视图顶部留一块「✓ 已确认」 | 停 | 一开始就离开过 Mac 的话，每 5 分钟再推一条，直到这一段结束 |
+| `now ≥ end` | 全部消失，回到一行提示下一个 | — | — |
 
 - **超时口径**：`overdue = now - start`，**不是**「到点 5 分钟才提醒」。模板里写
   「应于 16:00 启动，现已 16:12」，所以 16:00 一到就是「已超时 0 分钟」。
+- **过了 `end` 立刻停**：用户实测「休息 19:30 就结束了，20:03 还在播『休息超时
+  126 分钟』」—— 旧实现是 `end + lookback(120min)` 才停，等于块结束后还要轰炸
+  两小时。现在报警窗口就是 `[start, end)`，`lookback_min` 已废弃。
 - **人在不在 Mac 前**：`keep_session.hid_idle_seconds()`（Quartz，~0.2ms），超过
   `leave_idle_sec`（默认 120s）算离开。读不到就**当人在**（绝不因为读不到而轰炸手机）。
-- **不再追账**：`lookback_min`（默认 120）之外的 key time 不报警。半夜醒来不会
-  看到八小时前那条通勤还在喊。
-- **重叠**（通勤和休息同时命中）：取**最早开始**的那个报警。
+- **重叠**（两个块同时命中）：取**最早开始**的那个报警。
+- **整页接管只在真交互式 TUI**（`keytime_tick_enabled`，和置顶/播报同一个开关）：
+  `--status` / `--exec` / 测试进程不会被一块暂停牌顶掉整页。
 
-## 挤压预测（通勤模板里那两段「后果」）
+## 规则表（`data/keytime-rules.toml`）
+
+第一次运行自动生成，自带完整注释和变量表。改完存盘，warden 5 秒内生效
+（`keytime refresh` 立刻生效；`keytime rules` 看解析结果）。
+
+```
+[display]
+line = "🔴 KEY TIME {date_short} {block} · {when} · {start}-{end}"
+
+[[rule]]
+id = "exercise"
+name = "运动"              # 匹配时间块名字（事件标题），优先级最高
+calendar = "运动"          # 也匹配类型（日历名），name 命中时不会看它
+headline = "..."           # 手机推送标题（可省 → 模板第一行）
+text = """
+...
+"""
+speech = "..."             # 语音稿（可省 → 模板第一行）
+```
+
+匹配规则：
+
+- `name` 匹配**时间块名字**（事件标题；没标题时用日历名当名字），优先级最高；
+- `calendar` 匹配**时间块类型**（日历名）；只要有一条按 name 命中，就轮不到它；
+- 大小写不敏感「包含」；pattern 带 `*` / `?` 时按通配符（整串匹配）；
+- 多条同级命中：**文件里写在前面的赢**；
+- `name` / `calendar` 都不写 = 兜底规则（默认 `enabled = false`，打开会让所有
+  没命中的块都报警）；
+- 都不命中 → **不是 Key Time**，不报警（工作 / 空闲 / 上课 默认不报）。
+
+模板变量（完整表在规则文件顶部注释里）：
+
+| 变量 | 含义 |
+|---|---|
+| `{block}` `{calendar}` `{kind}` `{date}` `{date_short}` | 时间块名字 / 日历名 / 规则 id / 日期 |
+| `{key_time}` `{key_end}` `{now_time}` `{overdue_mins}` `{duration_mins}` `{remain_mins}` | 计划开始/结束、现在、已超时、块长、剩余 |
+| `{next_task}` `{next_tasks}` `{next_time}` `{next_in_mins}` | 下一个 session 的任务 / 开始时刻 / 还有多久 |
+| `{delay}` `{pushed_count}` `{dropped_count}` `{dropped_mins}` `{dropped_tasks}` `{extra_sessions}` `{extra_minutes}` | 挤压预测的细粒度数字 |
+| `{squeeze_text}` `{squeeze_speech}` `{extra_text}` | 一整句后果（自动换句）/ 语音短句 / 加班句（没挤出时为空，整行消失） |
+| `{goal}` `{goal_line}` `{goal_speech}` | Project 总目标（还没接，通常为空） |
+| `{chore}` `{acked_at}` `{acked_line}` | 顺手杂事 / 确认时刻 / 确认那行绿字 |
+
+排版：模板第一行固定「红底白字」；行首前缀 `!` 红字加粗、`-` 品红加粗（段落标题）、
+`>` 黄字、`#` 灰字（前缀不显示）；行内 `**重点**` 会渲染成加粗。某行渲染成空串
+（比如 `{extra_text}` 为空）→ 整行自动删掉。
+
+默认四套规则：`exercise`（运动，用户给的那套「肉体僵死警报 / 最低降级契约」）、
+`commute`（通勤，挤压后续 session 并点名被挤出的任务）、`rest`（休息，生理算力
+坍塌 + 总目标占位）、`generic`（兜底，默认停用）。
+
+## 挤压预测（commute / 模板里那两段「后果」）
 
 模型故意简单、和用户心智一致：**拖延 1 分钟 = 后面每一场整体后移 1 分钟**。
 
@@ -54,41 +113,42 @@ delay = 已超时分钟数
 extra_sessions = ceil(被挤出分钟数 / 25)   # 今晚要补几场
 ```
 
-模板会点名**最早被挤出的两场**里的任务（`【[Run] 物理 2023 P1】`），并报出补课场次。
-不试图「帮你重排」—— 真到那一步再 plan，那是另一条命令的事。
-
-## 模板（两种类型）
-
-类型由日历名/标题判定（`classify`）：含「通勤/路上」→ `commute`，含「休息/睡觉/
-断电」→ `rest`，其余 → `generic`。
-
-- **commute**：`🚨 [KEY TIME 违约警报]` / 动作 / 已超时 / `💥 物理排期坍塌后果` /
-  被挤出的任务 / `你今晚将被迫额外加班 N 个 Session (25m) 擦屁股！` /
-  `🔴 计时器正在跳动：每多看屏幕 1 秒，今晚就晚睡 1 秒！`
-- **rest**：`🧠 生理算力坍塌后果` / 拒绝清理大脑 L1 缓存 / `你的 Project 总目标：…将
-  因此失败！` / `🛑 别拿垃圾时间骗自己：现在立刻离开屏幕 N 分钟。`
-- **总目标**：计划存在 **OmniFocus 任务的 note** 里（用户指定）。现在**还没有接**
-  （见下面「未完成」）：模板会明确写 `用 keytime goal <文本> 设置`，不假装有。
+`{squeeze_text}` 会在「点名被挤出的任务 / 整体后移 N 分钟 / 没有后续排期」之间
+自动换句；`{extra_text}` 只在真有场次被挤出时出现。不试图帮你重排 —— 真到那一步
+再 plan，那是另一条命令的事。
 
 ## 命令
 
 ```
 keytime                             今天与之后的 key time（状态：未来/进行中/违约中/已确认）
-keytime ack                         确认（停止播报与音量；置顶继续）
-keytime refresh                     立刻重读日历中间层
+keytime ack                         确认（停止播报与音量、解除整页接管；置顶继续）
+keytime refresh                     立刻重读日历中间层 + 规则文件
+keytime rules                       列出规则文件里的规则和解析错误
+keytime rules reset                 规则文件恢复出厂内容（会覆盖你的修改）
 keytime on|off                      整条报警链路开关（写 temp/keytime.json 的 enabled）
-open keytime                        数据视图第四种模型：全表 + 已超时分钟数
+open keytime                        数据视图第四种模型：全表 + 规则 + 已超时分钟数
 keytime device                      列出 Bark 设备
 keytime device add iphone <key> [--server URL]
 keytime device remove iphone | on|off iphone
 keytime device test [iphone]        发一条测试推送（验证 key / 授权 / 网络）
-keytime set <键> <值>               volume / announce_sec / calendars / day_end /
-                                    leave_idle_sec / lookback_min / summon /
-                                    restore_volume / push.level / push.sound
+keytime set <键> <值>               volume / announce_sec / day_end / leave_idle_sec /
+                                    summon / restore_volume / push.level / push.sound
 ```
 
 `keytime` 在**所有视图**都可用（挂在 `View.common_commands`）——报警随时可能响，
 不管当时在契约、专注还是琐事屏，`keytime ack` 都要能敲。
+
+## 置顶（`summon`）
+
+- **只聚焦，绝不新建窗口**：报警发生在 warden 进程里，只需要把已有窗口拉到最前。
+  以前 AppleScript 的语义是「找不到就新建」，而新起来的 warden 又会再 summon 一次
+  —— 每隔几秒多开一个窗口（看起来像 malware）。现在 `focus_only=True`：先按
+  `temp/warden-tui.json` 里的 tty 找，找不到就**什么都不做**（不 `--new`、也不走
+  `open -a` 兜底）；TUI 没开直接放弃。
+- **不往 TUI 的 stdout 打日志**：`quiet=True`（照旧写日志文件）。在 TUI 进程里
+  `print` 会把界面打乱（曾经看到 `[postsession] 已唤起 warden…` 直接糊在屏上）。
+- 只聚焦 iTerm2（AppleScript 假设）。如果你在别的终端里跑 warden，置顶会静默失败，
+  但不会影响播报/推送/整页接管。
 
 ## Bark（手机推送）
 
@@ -104,29 +164,29 @@ keytime set <键> <值>               volume / announce_sec / calendars / day_en
   请求 → 封 24 小时」。`push_one` 只打一枪，失败进 Recent 的警告，等下一分钟。
 - **代理坑**：macOS 的「系统设置 → 代理」会被 `urllib` 自动读进来（curl 不会），
   它的例外列表里通常只有 `localhost`、没有 `127.0.0.1`。所以 `_urlopen` 对回环地址
-  **强制绕过代理**；真机推送仍走系统代理（用户可能就靠它出网）。代理没开时的报错会
-  直接提示「curl 能通、python 不通就是这个原因」。
+  **强制绕过代理**；真机推送仍走系统代理（用户可能就靠它出网）。
 
 ## 文件
 
 ```
-temp/keytime.json           配置（日历名 / 节拍 / 音量 / 推送档位 / enabled）
+temp/keytime.json           配置（节拍 / 音量 / 推送档位 / enabled；**不含日历名**）
+data/keytime-rules.toml     规则表：哪些时间块报警 + 模板文字（用户自己改，不进 git）
 temp/keytime-state.json     确认记录：{"acked": {"2026-11-14T16:00": {"at", "left_mac"}}}
 data/keytime-devices.json   Bark 设备（含 key，**不进 git**）
-temp/calendar-download.json keytimes 由 download_calendar.py 写入
+temp/calendar-download.json time_blocks 由 download_calendar.py 写入
 ```
 
-全部可用环境变量指到临时目录再跑（`TI_KEYTIME_JSON` / `TI_KEYTIME_STATE` /
-`TI_KEYTIME_DEVICES` / `TI_CALENDAR_DOWNLOAD`），测试就是这么做的。
+全部可用环境变量指到临时目录再跑（`TI_KEYTIME_RULES` / `TI_KEYTIME_JSON` /
+`TI_KEYTIME_STATE` / `TI_KEYTIME_DEVICES` / `TI_CALENDAR_DOWNLOAD`），测试就是这么做的。
 
 ## 日历侧（download_calendar.py）
 
-- `keytime_calendars`（默认 `["通勤", "休息"]`，可写在 `temp/calendar.json` 或
-  `--keytime-calendars`）里的日历，**查询时也会拉**（`fetch_caldav` 只查传进去的
-  几个日历，不并进去永远拿不到「休息」的事件）。
-- 它们仍然**不排 session**：`select_profile_events` 只认 工作/空闲；`DEFAULT_IGNORE`
-  里本来就有「休息」。
-- 提取在 `keytime_rows()`：跳过全天事件；跨午夜的块按天切成两段（前一段收在 23:59）。
+- **全部日历都要拉**（`fetch_caldav(..., all_calendars=True)`）：时间块候选来自所有
+  日历，不并进去就永远拿不到「休息」「运动」这些分组的事件。
+- session 排期仍然只认 工作/空闲（`select_profile_events`）；`time_blocks` 是另一份
+  数据，不参与切 session。
+- 提取在 `block_rows()`：跳过全天事件；跨夜的块按天切成两段（前一段收在 23:59）。
+  下载层**不判断**哪些算 Key Time —— 那是规则表的事。
 
 ## 节拍挂在哪
 
@@ -134,8 +194,7 @@ temp/calendar-download.json keytimes 由 download_calendar.py 写入
 「每秒一定被调一次」的地方（`tick=1.0` 会 invalidate）。不挂在某个视图的
 `status_box` 上：那样切到专注/统计视图就不响了。节拍自己再节流 1 秒。
 
-置顶（`keep_session.summon_warden`，收尾提醒同一条路）和推送都在**后台线程**里跑：
-画帧线程等 subprocess 会把整个 TUI 卡住。
+置顶和推送都在**后台线程**里跑：画帧线程等 subprocess 会把整个 TUI 卡住。
 
 ## 未完成 / 已知
 
@@ -145,11 +204,14 @@ temp/calendar-download.json keytimes 由 download_calendar.py 写入
   只保留最新一句」（60s 节拍下几乎不会积压）。
 - **`day_end` 默认 23:30**，挤压预测用它算「挤出今日排期」；改 `keytime set day_end`。
 - 确认后每 5 分钟推送只在「确认那一刻人在 Mac 外」时生效（用户要求）。
+- 规则文件用的是 TOML 的小子集（Python 3.9 没有 tomllib）：`[[rule]]` / `[display]`、
+  `"""多行"""`、`#` 注释、裸值。写错键名会报行号；解析失败不会让 warden 崩。
 
 ## 回归
 
 ```
-python3 test/test_keytime.py            # 模型 / 挤压 / 文案 / 播报 / Bark 负载（60+ 断言）
-python3 test/test_keytime_warden.py     # 看板模板 / 每帧节拍 / ack / 数据模型 / 命令
-python3 test/test_calendar_download_layer.py   # keytime_rows 提取（含跨午夜）
+python3 test/test_keytime.py            # 规则解析 / 匹配优先级 / 模板变量 / 挤压 / 播报 / Bark（90+ 断言）
+python3 test/test_keytime_warden.py     # 整页接管 / 面板 / 每帧节拍 / ack / 规则命令 / summon focus-only
+python3 test/test_calendar_download_layer.py   # 全部日历 → time_blocks（含跨午夜）
+python3 test/test_keep_session.py       # summon(focus_only=True) 绝不新建窗口
 ```

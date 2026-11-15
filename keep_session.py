@@ -1120,7 +1120,7 @@ def tui_alive(state=None):
 
 
 def summon_warden(dry_run=False, extra=(), force_new=False, refresh=False,
-                  state=None):
+                  state=None, focus_only=False, quiet=False):
     """把 warden 拉到前台（app/warden-summon.applescript 是唯一实现）。
 
     「找到就聚焦、找不到就新建窗口」那些语义全在 AppleScript 里，这里补三件
@@ -1136,16 +1136,30 @@ def summon_warden(dry_run=False, extra=(), force_new=False, refresh=False,
     3. **不打 refresh**。默认 ``--no-refresh``：warden 自己每帧看收尾队列，
        不需要谁往它的输入行里塞字。塞字有代价 —— 你正在打命令时会被打断，
        收尾问答时那句话会被当成答案。
+
+    ``focus_only=True`` 是给 **Key Time 报警**用的：报警本来就发生在 warden
+    进程里，只需要把已有窗口拉到最前，**绝对不能**因为「没找到」就新建窗口
+    （以前这里会连锁开窗：每开一个 warden 又 summon 一次）。所以这时既不传
+    ``--new``，也不走 ``open -a`` 兜底。``quiet=True`` 把 log 的 stdout echo
+    关掉（照旧写日志文件）—— 在 TUI 进程里 print 会把界面打乱。
     """
+    def _log(msg):
+        log(msg, echo=not quiet)
+
     if dry_run:
-        log("  [postsession] dry-run：会跑 osascript %s" % SUMMON_SCRIPT)
+        _log("  [postsession] dry-run：会跑 osascript %s" % SUMMON_SCRIPT)
         return True
     if not os.path.exists(SUMMON_SCRIPT):
-        log("  [postsession] 找不到 %s，跳过唤起" % SUMMON_SCRIPT)
+        _log("  [postsession] 找不到 %s，跳过唤起" % SUMMON_SCRIPT)
         return False
     alive, st = tui_alive(state)
+    if focus_only and not alive:
+        _log("  [postsession] focus-only：TUI 没开，不新建窗口")
+        return False
     args = [str(x) for x in extra]
-    if force_new or not alive:
+    if focus_only:
+        args.append("--no-new")
+    elif force_new or not alive:
         args.append("--new")
     if not refresh:
         args.append("--no-refresh")
@@ -1155,7 +1169,7 @@ def summon_warden(dry_run=False, extra=(), force_new=False, refresh=False,
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
-        log("  [postsession] 唤起 warden 失败：%s" % e)
+        _log("  [postsession] 唤起 warden 失败：%s" % e)
         return False
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
@@ -1164,11 +1178,13 @@ def summon_warden(dry_run=False, extra=(), force_new=False, refresh=False,
     broken = ("error " in out.lower() or "权限违例" in out
               or "not granted" in out.lower())
     if proc.returncode != 0 or broken:
-        log("  [postsession] 唤起 warden 失败（osascript 退出 %d）：%s"
-            % (proc.returncode, (err or out) or "无输出"))
-        return summon_via_app(alive=alive, why=(err or out)[:120])
-    log("  [postsession] 已唤起 warden（TUI %s，tty %s）：%s"
-        % ("开着" if alive else "没开", st.get("tty") or "?", out or "ok"))
+        _log("  [postsession] 唤起 warden 失败（osascript 退出 %d）：%s"
+             % (proc.returncode, (err or out) or "无输出"))
+        if focus_only:
+            return False
+        return summon_via_app(alive=alive, why=(err or out)[:120], quiet=quiet)
+    _log("  [postsession] 已唤起 warden（TUI %s，tty %s）：%s"
+         % ("开着" if alive else "没开", st.get("tty") or "?", out or "ok"))
     return True
 
 
@@ -1178,13 +1194,16 @@ def summon_warden(dry_run=False, extra=(), force_new=False, refresh=False,
 SUMMON_APP_NAMES = ("Warden",)
 
 
-def summon_via_app(alive=None, why=""):
+def summon_via_app(alive=None, why="", quiet=False):
     """第二条路：``open -a Warden``（不需要 Apple Events）。
 
     AppleScript 那条路在**孤儿 daemon** 里会被 TCC 挡（实测 `-10004 权限违例`，
     连弹框都不弹）。`open -a` 走 LaunchServices，谁跑都行；Warden.app 起来之后
     用它**自己**的身份去跑同一段 AppleScript（「控制 iTerm」那份授权是给 app 的）。
     """
+    def _log(msg):
+        log(msg, echo=not quiet)
+
     targets = list(SUMMON_APP_NAMES)
     if os.path.isdir(SUMMON_APP):
         targets.append(SUMMON_APP)
@@ -1197,12 +1216,12 @@ def summon_via_app(alive=None, why=""):
             tried.append("%s: %s" % (target, e))
             continue
         if proc.returncode == 0:
-            log("  [postsession] 已用 app（open -a %s）唤起 warden"
-                "（osascript 那条路不行：%s）" % (target, why or "未知"))
+            _log("  [postsession] 已用 app（open -a %s）唤起 warden"
+                 "（osascript 那条路不行：%s）" % (target, why or "未知"))
             return True
         tried.append("%s: %s" % (target, (proc.stderr or "").strip() or
                                  ("退出 %d" % proc.returncode)))
-    log("  [postsession] app 唤起也不行（%s）；一次性修法：cd %s && ./app/build.sh "
+    _log("  [postsession] app 也不行（%s）；一次性修法：cd %s && ./app/build.sh "
         "&& ./app/install-app.sh，或者去 系统设置 → 隐私与安全性 → 自动化 里"
         "允许 Warden/iTerm 控制 iTerm" % ("；".join(tried) or "没有可用的 app", HERE))
     return False

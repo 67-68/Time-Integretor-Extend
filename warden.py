@@ -93,13 +93,15 @@ incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一�
 新建整场任务挂回去。`cst` / `conscription` 按剩余时间快速征召一条合适任务。
 见 [`feature_intents/project.md`](feature_intents/project.md)。
 
-**Key Time（日历硬节点）**：日历里「通勤」「休息」两个分组的每个事件都是一个
-硬节点 —— 不排 session、不进 `data.csv`，但到点必须做。`download_calendar.py`
-把它们单独抓进中间层（`keytimes`），`keytime.py` 负责判定与文案，本文件的
-`KeyTimeMixin` 负责看板展示、每帧节拍（`frame_key_hook` → `_keytime_tick`）、
-置顶/播报/推送的线程，以及 `keytime` 命令族（`ack` / `device` / `set` …）。
-违约中看板顶部是整块红色模板（通勤给「挤压未来 session」预测，休息给「生理算力
-坍塌」），平时只在契约视图顶部留一行淡红字。`open keytime` 是数据视图第四种模型。
+**Key Time（日历硬节点）**：`download_calendar.py` 把**所有日历**的非全天
+事件都记进中间层（`time_blocks`）；哪些块算硬节点、模板写什么，全在用户可改的
+`data/keytime-rules.toml` 里按「时间块名字 > 时间块类型（日历名）」匹配
+（`keytime_rules.py`）。被匹配的块不排 session、不进 `data.csv`，但到点必须做。
+`keytime.py` 负责判定、挤压预测与播报/推送，本文件的 `KeyTimeMixin` 负责看板展示、
+每帧节拍（`frame_key_hook` → `_keytime_tick`）、置顶/播报/推送的线程，以及
+`keytime` 命令族（`ack` / `rules` / `device` / `set` …）。违约中看板顶部是规则里
+那块模板（默认运动/通勤/休息各一套，含挤压未来 session 预测），平时只在契约视图
+顶部留一行淡红字。`open keytime` 是数据视图第四种模型。
 见 [`feature_intents/keytime.md`](feature_intents/keytime.md)。
 
 **标题清单派生任务**：一条「每天重复 + 非 defer 锚」的任务，如果 note 里有
