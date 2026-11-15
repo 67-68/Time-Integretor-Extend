@@ -13,6 +13,7 @@ from .common import (
     Table,
     Text,
     box,
+    dv,
     of,
     parse_relate_markdown,
     parse_relate_task,
@@ -948,12 +949,16 @@ class ProjectMixin(object):
         pk = str(item.get("pk") or "").strip()
         if not pk:
             raise ValueError("项目任务没有 pk，不能挂 session")
-        total_count = ts.parse_count(item.get("count")) or ts.minutes_to_count(
+        derived = item.get("derived") or None
+        total_count = ts.parse_count(item.get("total")
+                                     or item.get("count")) or ts.minutes_to_count(
             item.get("duration"))
         fields = {"title": item.get("title") or pk,
                   pj.PROJECT_FIELD: op.get("title") or "",
                   pj.PROJECT_ID_FIELD: op["id"],
                   pj.PROJECT_TASK_FIELD: pk}
+        if derived:
+            fields.update(pp.derived_fields(derived, pk))
         if total_count and total_count > 0:
             fields["count_total"] = int(total_count)
             fields["count"] = int(total_count)
@@ -968,6 +973,8 @@ class ProjectMixin(object):
                               % (parent_title or parent_pk)).strip()
         source = {"kind": "project", "id": pk,
                   "url": of.task_url(pk), "title": item.get("title")}
+        if derived:
+            source = pp.derived_source(derived)
         if item.get("local_only"):
             source["local_only"] = True
             source["url"] = ""
@@ -980,7 +987,7 @@ class ProjectMixin(object):
                 existing["id"], fields, source=source)
         return self.task_store.create(
             fields,
-            omnifocus=None if item.get("local_only") else {
+            omnifocus=None if (item.get("local_only") or derived) else {
                 "id": pk, "url": of.task_url(pk),
                 "title": item.get("title") or pk},
             source=source)
@@ -3389,7 +3396,8 @@ class ProjectMixin(object):
                 excluded.setdefault(pid, set()).add(str(pk))
         items, notes = pp.distribute(
             allocs, [a["project"] for a in allocs], invested,
-            now=datetime.datetime.now(), exclude_pks=excluded)
+            now=datetime.datetime.now(), exclude_pks=excluded,
+            rotation=self.derived_rotation())
         # period-first：只要这一天的空场里有“自动 layout”的 period，就先把任务
         # 按 period 排好，再根据任务反推 session durations；手动 layout 仍然
         # 作为硬约束，只允许任务往里填。
@@ -3462,10 +3470,12 @@ class ProjectMixin(object):
             item = place["item"]
             slot = place["slot"]
             project = item["project"]
-            url = of.task_url(item["pk"])
+            derived = item.get("derived") or None
+            url = "" if derived else of.task_url(item["pk"])
             parent = place.get("parent") or {}
-            parent_pk = item.get("parent_pk") or parent.get("pk")
-            parent_title = item.get("parent_title") or parent.get("title")
+            parent_pk = "" if derived else (item.get("parent_pk") or parent.get("pk"))
+            parent_title = "" if derived else (item.get("parent_title")
+                                              or parent.get("title"))
             fields = {"title": item.get("title") or item["pk"],
                       pj.PROJECT_FIELD: project.get("title") or "",
                       pj.PROJECT_ID_FIELD: item["project_id"],
@@ -3505,6 +3515,11 @@ class ProjectMixin(object):
                 fields["count"] = int(place["count"])
             source = {"kind": "project", "id": item["pk"], "url": url,
                       "title": item.get("title")}
+            if derived:
+                # 标题清单派生的任务：没有 OmniFocus 关联（完成只勾父任务 note），
+                # pk 是合成 pk，账目按它记，重新 plan 时能找回同一条。
+                fields.update(pp.derived_fields(derived, item["pk"]))
+                source = pp.derived_source(derived)
             if item.get("local_only"):
                 # relate --import 从模板文件 append 的任务在 OmniFocus 里没有
                 # 真 primary key：不能挂 omnifocus，否则完成时会拿假 pk 写回。
@@ -3525,7 +3540,7 @@ class ProjectMixin(object):
                 else:
                     task = self.task_store.create(
                         fields,
-                        omnifocus=None if item.get("local_only") else {
+                        omnifocus=None if (item.get("local_only") or derived) else {
                             "id": item["pk"], "url": url,
                             "title": item.get("title")},
                         source=source)

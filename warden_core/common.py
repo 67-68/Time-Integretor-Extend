@@ -93,6 +93,7 @@ import stats as st  # noqa: E402  生涯统计：只读 API 拉全量历史 + �
 import settings_store as cfg  # noqa: E402  设置项注册表 + data/settings.json
 import omnifocus as of  # noqa: E402  OmniFocus：链接解析 + 读写（osascript 子进程）
 import keytime as kt  # noqa: E402  Key Time：日历硬节点 → 报警 / 播报 / Bark 推送
+import derived as dv  # noqa: E402  note 标题清单 → 每日重复任务的派生任务
 import postsession as psv  # noqa: E402  session 结束 15s 后的收尾（纯逻辑）
 import project_store as pj  # noqa: E402  项目库：OmniFocus Project 的存在与进度
 import project_plan as pp  # noqa: E402  plan：空闲容量 → 分资源 → 排任务（纯逻辑）
@@ -321,7 +322,7 @@ TASK_MUTATING_FLAGS = (
     "-a", "--assign", "-n", "--note", "-m", "--mark", "-c", "--count",
     "-act", "--assign-count", "--assigned-count", "--act",
     "-e", "--exclusive", "-t", "--trigger", "-f", "--formatter",
-    "-s", "--from",
+    "-s", "--from", "-d", "--derived",
 )
 
 #: focusmate 里「乐观预测、还没落地」的标记（任务库里的一个字段）
@@ -378,6 +379,9 @@ TASK_SHORT_FLAGS = (
     repl_kit.ShortFlag("-st", ("--single-task",), note="只导入一次，不建重复任务"),
     # `task 3 -e true` ≡ `--exclusive true`：这条独占一整场 session。
     repl_kit.ShortFlag("-e", ("--exclusive",), note="独占：这一场只能有这一条任务"),
+    # `task 3 -d` ≡ `--derived`：把「note 标题清单」重复任务的下一条标题
+    # 派生成本地任务（不同步回 OmniFocus，除了父任务的 note 勾选）。
+    repl_kit.ShortFlag("-d", ("--derived",), note="按 note 标题派生一条任务"),
     # `task 3 -c +2` ≡ `--count +2`：count 进度（1 count = 25 分钟）。
     # 纯数字 = 设定最高 count（duration 跟着变），`+n` / `-n` = 加减已投入。
     repl_kit.ShortFlag("-c", ("--count",), note="count 进度（5=设定 / +2=加 / -1=减）"),
@@ -641,7 +645,10 @@ TASK_TABLE_COLUMNS = (
     ("exclusive", {"no_wrap": True}),
 )
 TASK_CONTENT_COLUMN = "内容"
-TASK_DYNAMIC_HIDDEN = {"due", "due_source", "count_invested", "count_total", "project_id", "project_task", "notes", "note"}
+TASK_DYNAMIC_HIDDEN = {"due", "due_source", "count_invested", "count_total",
+                       "project_id", "project_task", "notes", "note",
+                       "derived_of", "derived_line", "derived_text",
+                       "derived_parent_pk", "derived_parent_title"}
 
 #: 任务视图下默认折叠的列（汇总进「标记」和「备注」，仍可用 open <表头名> 展开）。
 TASK_AUTO_HIDDEN_COLUMNS = (

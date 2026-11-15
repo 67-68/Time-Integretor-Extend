@@ -102,6 +102,12 @@ incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一�
 坍塌」），平时只在契约视图顶部留一行淡红字。`open keytime` 是数据视图第四种模型。
 见 [`feature_intents/keytime.md`](feature_intents/keytime.md)。
 
+**标题清单派生任务**：一条「每天重复 + 非 defer 锚」的任务，如果 note 里有
+`# titles` 列表，就按「一次做一条」处理 —— `task N -d` 把下一条未勾选标题变成
+本地派生任务（不写回 OmniFocus），做完自动把 note 那行勾成 `- [x]`，整份清单勾完
+自动放弃整个重复任务。plan 也会展开它（parallel 轮转、sequential 依次）。
+见 [`feature_intents/derived.md`](feature_intents/derived.md)。
+
 **收尾面板长在哪儿**：不是某个视图的内部件，而是 `repl_kit` 的**打断栏位**
 （`ReplShell(interrogate=...)`）—— 压在整块看板下面、状态栏上面。换视图、表格变长、
 终端太矮被裁屏，都冲不掉它；一问完栏位立刻消失，不占一行。
@@ -256,6 +262,7 @@ from warden_core import (  # noqa: E402,F401
     OMNIFOCUS_OUTBOX_FILE,
     ImportBatch,
     KeyTimeMixin,
+    DerivedMixin,
     kt,
     OmniOutbox,
     MESSAGE_KEEP,
@@ -354,6 +361,7 @@ from warden_core import (  # noqa: E402,F401
     check_declaration,
     cmd_install_deps,
     diff_note,
+    dv,
     explain_bridge_error,
     first_mismatch,
     fmt_age,
@@ -406,6 +414,7 @@ class Warden(
     BoardMixin,
     ChoreMixin,
     KeyTimeMixin,
+    DerivedMixin,
     SessionMixin,
     TaskCmdMixin,
     TaskPipelineMixin,
@@ -588,6 +597,7 @@ class Warden(
         #: 每份数据是什么时候拿到的：{"session": epoch, "task": epoch, "stat": epoch}
         self.read_at = {}
         self._keytime_init()
+        self._derived_init()
         self._register_net_actions()
         # 旧账本里「每日检查」可能攒了几十条（args 带快照，永远不相等）。这类
         # 动作跑一次就够，启动时把旧的合并成一条 —— 否则 re-action 会挨个重放，
@@ -665,6 +675,7 @@ class Warden(
         能改变画面的动作都得在这儿拍一下。漏拍也不会画错超过一秒 —— 帧键里
         带着 `int(time.time())`，最坏是慢一秒，和 `tick=1.0` 是一个量级。
         """
+        self._derived_span_map_cache = None
         shell = getattr(self, "shell", None)
         hook = getattr(shell, "invalidate_frame", None)
         if hook is not None:

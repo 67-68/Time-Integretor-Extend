@@ -131,6 +131,10 @@ class ChoreMixin(object):
             return []
         out = []
         for item in items:
+            if item.get("derived"):
+                # 派生任务的完成走任务库（勾父任务 note），茬事屏只处理能在
+                # OmniFocus 里直接勾掉的项目任务。
+                continue
             children = item.get("children") or []
             if children:
                 for child in children:

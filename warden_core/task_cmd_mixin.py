@@ -13,6 +13,7 @@ from .common import (
     TASK_MARK_STATES,
     _task_bool_word,
     cfg,
+    dv,
     normalize_task_column,
     of,
     pj,
@@ -99,6 +100,7 @@ class TaskCmdMixin(object):
         assign_count_spec, kept = self._split_assign_count(kept)
         trigger_tokens, kept = self._split_hook(kept, "trigger")
         formatter_tokens, kept = self._split_hook(kept, "formatter")
+        derived_spec, kept = self._split_derived(kept)
 
         # `task -t` / `task -f` 后面什么都没跟 = 列预设，不是「挂一个空函数」。
         bare_hooks = [kind for kind, tokens in
@@ -130,7 +132,8 @@ class TaskCmdMixin(object):
             return self._apply_bulk(source, assign_to)
         if not kept and mark_status is None and trigger_spec is None \
                 and formatter_spec is None and exclusive is None \
-                and count_spec is None and assign_count_spec is None:
+                and count_spec is None and assign_count_spec is None \
+                and derived_spec is None:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
                              "或后缀 -e/--exclusive / -m/--mark / -c/--count"
                              " / -act/--assign-count / -t/--trigger / -f/--formatter")
@@ -145,6 +148,7 @@ class TaskCmdMixin(object):
             "assign_count_spec": assign_count_spec,
             "trigger_spec": trigger_spec,
             "formatter_spec": formatter_spec,
+            "derived_spec": derived_spec,
         }
         if kept:
             action = kept[0].lower()
@@ -191,6 +195,19 @@ class TaskCmdMixin(object):
                     trigger_spec=trigger_spec,
                     formatter_spec=formatter_spec)
             return result.last
+        if derived_spec is not None:
+            # `-d/--derived`：把父任务的下一条标题变成一条本地派生任务；
+            # 后面的后缀（-ac / -act / -n / -c）都落到这条派生任务上。
+            parent = (result if isinstance(result, dict)
+                      and result.get("id") is not None else None)
+            if parent is None:
+                if self.selected_task_id is None:
+                    raise ValueError("`-d/--derived` 要跟一条任务：`task 3 -d`，"
+                                     "或先 `task select 3`。")
+                parent = self.task_store.get(self.selected_task_id)
+            parent = self.task_store.get(parent["id"])
+            result = self.derived_create(parent, derived_spec.get("which"))
+            action = "derived"
         if note_text is not None:
             self._apply_note(result, note_text, action)
         if count_spec is not None:
@@ -593,6 +610,45 @@ class TaskCmdMixin(object):
         return self._complete_task(task, why="count-done")
 
     @staticmethod
+    def _split_derived(toks):
+        """把 ``-d`` / ``--derived``（可带一个数字）从参数里摘出来。
+
+            task 3 -d          下一条未勾选的标题 → 一条派生任务
+            task 3 -d 2        第 2 条未勾选（或 note 第 N 行）
+            task 3 -d -ac      派生完直接挂到当前这一场
+
+        ``-d`` 只对「每天重复 + note 里有 # titles」的任务有意义；不合格时由
+        :meth:`derived_create` 报错说清楚原因。
+        """
+        spec = None
+        kept = []
+        i = 0
+        while i < len(toks):
+            tok = str(toks[i])
+            low = tok.lower()
+            if low in ("--derived", "-d"):
+                if spec is not None:
+                    raise ValueError("`-d/--derived` 一次只能派生一条。")
+                spec = {}
+                i += 1
+                if i < len(toks) and re.match(r"^\d+$", str(toks[i])):
+                    spec["which"] = int(toks[i])
+                    i += 1
+                continue
+            if low.startswith("--derived=") or low.startswith("-d="):
+                if spec is not None:
+                    raise ValueError("`-d/--derived` 一次只能派生一条。")
+                value = tok.split("=", 1)[1].strip()
+                if value and not re.match(r"^\d+$", value):
+                    raise ValueError("`--derived=` 后面只能是数字（第几条未勾选标题）。")
+                spec = {"which": int(value)} if value else {}
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return spec, kept
+
+    @staticmethod
     def _split_hook(toks, kind):
         """把 ``--formatter end [参数...]`` / ``-f end`` 从参数里摘出来。
 
@@ -764,6 +820,12 @@ class TaskCmdMixin(object):
             self.say("`--assign` 只对会产出任务的动作用得上（create/modify/select）；"
                      "%s 没有可挂的任务，忽略。" % action, "warn")
             return None
+        if not dv.is_derived(task) and self.derived_is_parent(task):
+            raise ValueError(
+                "任务 %s 是「note 标题清单」的特殊重复任务，直接 -ac 会被拒绝；"
+                "先用 `task %s -d` 派生一条（比如 `task %s -d -ac`），再挂那条。"
+                % (self.task_label(task), self.task_label(task),
+                   self.task_label(task)))
         self.selected_task_id = task["id"]
         return self._assign_task(task, str(session_token))
 

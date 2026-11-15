@@ -102,7 +102,8 @@ def slots_text(slots, limit=8):
 # ---------------------------------------------------------------- 分资源
 
 
-def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=None):
+def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=None,
+               rotation=None):
     """把「每个项目多少 count」摊成具体的任务（每条还带要几个 count / 分钟）。
 
     ``allocations``：``[{"project_id": 1, "count": 4}, ...]``（**顺序就是排的顺序**）；
@@ -130,7 +131,8 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
         excluded = (exclude_pks.get(pid) or exclude_pks.get(str(pid))
                     if isinstance(exclude_pks, dict) else exclude_pks)
         for item in pj.remaining_tasks(project, invested_map.get(pid) or {},
-                                       now=now, exclude_pks=excluded):
+                                       now=now, exclude_pks=excluded,
+                                       rotation=rotation):
             if budget <= 0:
                 break
             minutes = int(item.get("minutes") or 0)
@@ -142,8 +144,12 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
                    "pk": item["pk"],
                    "title": item.get("title") or item["pk"],
                    "count": int(item.get("count") or 0),
-                   "total": int(item.get("count") or 0),
+                   "total": int(item.get("total") or item.get("count") or 0),
                    "remaining": int(item.get("remaining") or 0)}
+            if item.get("derived"):
+                # 标题清单派生项：pk 是合成 pk，plan 落盘时要按派生任务建。
+                rec["derived"] = dict(item["derived"])
+                rec["minutes"] = int(item.get("minutes") or 0)
             if priority is not None:
                 rec["priority"] = priority
             if item.get("children"):
@@ -221,6 +227,28 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
 
 
 # ---------------------------------------------------------------- 排任务
+
+
+def derived_fields(info, pk):
+    """plan 落盘时派生任务的本地字段（``info`` = 派生项里的 ``derived``）。"""
+    import derived as _dv
+    info = info or {}
+    return {_dv.F_DERIVED_LINE: int(info.get("line")),
+            _dv.F_DERIVED_TEXT: info.get("text") or "",
+            _dv.F_DERIVED_PARENT_PK: info.get("parent_pk") or "",
+            _dv.F_DERIVED_PARENT_TITLE: info.get("parent_title") or "",
+            "project_task": pk}
+
+
+def derived_source(info):
+    """plan 落盘时派生任务的 ``source``（没有 OmniFocus 关联）。"""
+    import derived as _dv
+    info = info or {}
+    return {"kind": _dv.DERIVED_KIND,
+            "line": int(info.get("line")),
+            "text": info.get("text") or "",
+            "pk": info.get("parent_pk") or "",
+            "parent_title": info.get("parent_title") or ""}
 
 
 def _parallel_order_key(item, index):

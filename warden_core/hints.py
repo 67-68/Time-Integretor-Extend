@@ -734,7 +734,8 @@ def _hint_task(parts):
     if not words:
         return repl_kit.Hint("动作", TASK_ACTION_WORDS,
                              note="后缀：-a <编号|none|current> · -s <编号> 批量 · -n 备注"
-                                  " · -e true|false 独占 · -m complete|discard · 字段随便写")
+                                  " · -e true|false 独占 · -m complete|discard"
+                                  " · -d 派生标题清单里的一条 · 字段随便写")
     if any(tok in words for tok in ("--mark", "-m")):
         return repl_kit.Hint("取值", TASK_MARK_WORDS,
                              note="手动改本地状态：complete = 完成并归档（不勾 Focusmate）"

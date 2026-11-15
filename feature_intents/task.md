@@ -314,6 +314,7 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task <序号> -f end` | 按任务 `duration` 在当天最后一段的**尾巴上切一场**（11:30–11:55 那种）、写进排期并自动 assign；排出来的任务自动独占 |
 | `task <序号> -f enlist` | 不切排布，把任务挂进**已有** session：优先孤立且正好同长的块；大块只从开头/结尾塞入 |
 | `task <序号> -e true`（`--exclusive true`） | **独占**：这一场 session 只能有它一条任务（裸写 `-e` = true，`-e false` 取消） |
+| `task <序号> -d [N]`（`--derived`） | **派生一条标题清单任务**：每天重复、note 里有 `# titles` 的任务，把下一条未勾选标题变成一条本地派生任务（默认挂最近一场）；做完自动勾 note、勾完自动放弃整个重复任务。见 [`derived.md`](derived.md) |
 | `task <序号> -act N`（`--assign-count N`） | **本场 count 覆盖**：只改这一场要记几个 count，不动任务总 count / 时长；可写 `task 5 -ac -act 2` 先挂再改 |
 | `task <序号> assign-count N` | 上一条的子命令写法（任务必须已经挂上 session） |
 | `task sync` | `GET /v1/tasks` → 读 `completedAt` → 写归档（顺带把重复任务挂到 session） |

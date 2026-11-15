@@ -1219,6 +1219,30 @@ class Client(object):
             flags.append("--all-occurrences")
         return self.set_task(pk, *flags, yes=yes, timeout=timeout)
 
+    def note_mark(self, pk, match, timeout=None):
+        """把 note 里标题等于 ``match`` 的那一行勾上（``- [x] …``）。
+
+        走 ``batch`` 的 ``note_mark``：一次 osascript，读 → 改 → 写都在
+        OmniFocus 进程里完成，不会拿旧文本把别人的改动覆盖掉。
+        返回 batch 里那一条结果（含 ``note`` 新文本 / ``remaining``）。
+        """
+        payload = {"ops": [{"id": _clean_id(pk), "op": "note_mark",
+                            "match": str(match)}]}
+        with self._lock:
+            rc, out, err = self._run(
+                ["batch"], timeout=timeout or self.timeout,
+                stdin_text=json.dumps(payload, ensure_ascii=False))
+        self._raise_for(rc, out, err, "写 OmniFocus note")
+        data = parse_batch_output(out)
+        results = data.get("results") or []
+        item = results[0] if results else {}
+        if not item.get("ok"):
+            raise OmniFocusError(
+                item.get("message") or item.get("error") or "note 写回失败",
+                kind="error", exit_code=1)
+        self.invalidate()
+        return item
+
     def set_due(self, pk, due, yes=True, timeout=None):
         return self.set_task(pk, "--due", due, yes=yes, timeout=timeout)
 

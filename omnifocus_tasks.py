@@ -944,6 +944,20 @@ BATCH_JS = r"""
     return JSON.stringify(reply({ ok: false, error: "omnijs_unavailable",
       message: "当前 OmniFocus 不支持 Task.byIdentifier" }));
   }
+  const titlesRemaining = note => {
+    // `# titles` 段里还剩几条没勾（0 = 整套清单做完了）
+    let inTitles = false;
+    let remaining = 0;
+    for (const line of String(note || "").split(/\r?\n/)) {
+      if (/^\s*#+\s*titles\s*$/i.test(line)) { inTitles = true; continue; }
+      if (inTitles && /^\s*#{1,6}\s+\S/.test(line)) break;
+      if (!inTitles) continue;
+      const m = line.match(/^\s*[-*+]\s+(.*\S)\s*$/);
+      if (!m) continue;
+      if (!/^\[[xX]\]/.test(m[1])) remaining += 1;
+    }
+    return remaining;
+  };
   const results = [];
   for (const item of (args.ops || [])) {
     const pk = String(item.id || "");
@@ -991,6 +1005,40 @@ BATCH_JS = r"""
         results.push(Object.assign({}, base, { ok: true, before: before, after: after,
                        changed: JSON.stringify(before) === JSON.stringify(after) ? [] : ["dropped"],
                        repeat_clone_id: clone }));
+      } else if (op === "note_mark") {
+        // 派生任务做完 → 把父任务 note 里对应那行勾上（`- [x] …`）。
+        // 按**标题文本**匹配而不是行号：note 可能在两次操作之间被人改过。
+        const match = String(item.match || "").trim();
+        const note = task.note || "";
+        const lines = note.split(/\r?\n/);
+        const plain = l => l.replace(/^\s*[-*+]\s+/, "")
+                             .replace(/^\[[ xX]\]\s*/, "").trim();
+        let hit = -1;
+        for (let i = 0; i < lines.length; i++) {
+          if (plain(lines[i]) === match) { hit = i; break; }
+        }
+        if (hit < 0) {
+          results.push(Object.assign({}, base, { ok: false, error: "line_not_found",
+                         message: "note 里找不到这一行：" + match }));
+          continue;
+        }
+        let raw = lines[hit];
+        if (/^\s*[-*+]\s+\[[xX]\]/.test(raw)) {
+          // 幂等：已经勾过就不重复写。
+          results.push(Object.assign({}, base, { ok: true,
+                         skipped: "already_checked", changed: [],
+                         note: note, remaining: titlesRemaining(note) }));
+          continue;
+        }
+        if (/^\s*[-*+]\s+\[\s\]/.test(raw)) {
+          raw = raw.replace(/^(\s*[-*+]\s+)\[\s\]\s*/, "$1[x] ");
+        } else {
+          raw = raw.replace(/^(\s*[-*+]\s+)/, "$1[x] ");
+        }
+        lines[hit] = raw;
+        task.note = lines.join("\n");
+        results.push(Object.assign({}, base, { ok: true, changed: ["note"],
+                       note: task.note, remaining: titlesRemaining(task.note) }));
       } else {
         results.push({ id: pk, task_id: taskId, ok: false, error: "bad_op" });
       }
@@ -1810,8 +1858,11 @@ def main_changes(argv=None):
 def build_batch_parser():
     parser = argparse.ArgumentParser(
         prog="omnifocus_tasks.py batch",
-        description="一次 osascript 处理多条 complete/drop（读 stdin 的 "
-                    '{"ops":[{"id","op","due","at","all_occurrences","task_id"}]}）。',
+        description="一次 osascript 处理多条 complete / drop / note_mark"
+                    "（读 stdin 的 {\"ops\":[{\"id\",\"op\",\"due\",\"at\","
+                    "\"all_occurrences\",\"match\",\"task_id\"}]}）。"
+                    " note_mark 按 match 文本在 note 里找到那一行并改成 - [x]；"
+                    "返回新 note 和 titles 段里剩下的未勾选条数。",
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help="osascript 超时秒数（默认 %.0f）" % DEFAULT_TIMEOUT)

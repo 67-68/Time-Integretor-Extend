@@ -1528,7 +1528,8 @@ def _item_deferred(item, now=None):
     return ts.task_is_deferred({"fields": {"defer": item.get("defer")}}, now=now)
 
 
-def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None):
+def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
+                    rotation=None):
     """还没做完、而且还有内容可干的**顶层任务**（按清单顺序）。
 
     有子任务的父任务返回成一条派生单元：``duration`` 是剩余子任务分钟数之和，
@@ -1540,6 +1541,14 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None):
     * ``defer`` 还没到点的（父任务 defer 挡住整棵子树；子任务各自也检查）；
     * ``exclude_pks`` 里的任务 —— 已经挂了 formatter 的项目任务由 formatter
       自己占时间，项目 plan 不能再把它当成待分配资源。
+
+    **标题清单派生任务**（``derived.py``）：一条「每天重复 + 非 defer 锚」且
+    note 里有 ``# titles`` 的任务不直接进队列，而是展开成派生项：
+    parallel 只展开**下一条**未勾选标题（一次派一条），并且整组派生项排到
+    普通任务**最后**、按 ``rotation``（``{父 pk: 最近一次完成的时间}``）轮转；
+    sequential 把**全部**未勾选标题按 note 顺序展开在原位（做完第一条的所有
+    副本才轮到后面）。派生项的 ``pk`` 是合成 pk（``<父>#d<行号>``），
+    count 投入照常按它记账。
     """
     invested_map = invested_map or {}
     exclude = {str(pk) for pk in (exclude_pks or ())}
@@ -1547,6 +1556,8 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None):
     kids = child_map(tasks)
     statuses = effective_task_statuses(tasks)
     out = []
+    derived_tail = []
+    sequential = task_type_of(project) == "sequential"
     for item in top_level_tasks(tasks):
         pk = str(item.get("pk") or "")
         if pk in exclude:
@@ -1556,6 +1567,14 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None):
         if _item_deferred(item, now=now):
             continue
         children = kids.get(item.get("pk")) or []
+        if not children and _derived_eligible(item):
+            expanded = _expand_derived(item, invested_map, all_titles=sequential)
+            if expanded:
+                if sequential:
+                    out.extend(expanded)
+                else:
+                    derived_tail.append((item, expanded))
+                continue
         if children:
             open_children = []
             for child in children:
@@ -1591,6 +1610,63 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None):
         out.append(dict(item, remaining=cap - got, invested=got,
                         minutes=minutes,
                         remaining_minutes=max(0, minutes - spent)))
+    if derived_tail:
+        # parallel：整组派生项排到最后，组内按「上一次做它」轮转
+        # （没做过的先上；做过越久越先回来）。
+        def rank(pair):
+            parent_pk = str((pair[0] or {}).get("pk") or "")
+            stamp = str((rotation or {}).get(parent_pk) or "")
+            return (1, stamp, parent_pk) if stamp else (0, "", parent_pk)
+        for _item, expanded in sorted(derived_tail, key=rank):
+            out.extend(expanded)
+    return out
+
+
+def _derived_eligible(item):
+    """项目清单里的这条任务能不能按 note 标题清单展开。"""
+    if not isinstance(item, dict):
+        return False
+    try:
+        import derived as _dv
+    except ImportError:                        # pragma: no cover - 独立跑 project_store
+        return False
+    return bool(_dv.eligible(item.get("repeat"), item.get("note") or ""))
+
+
+def _expand_derived(item, invested_map=None, all_titles=False):
+    """把一条标题清单任务展成派生项（见 :func:`remaining_tasks` 的说明）。"""
+    try:
+        import derived as _dv
+    except ImportError:                        # pragma: no cover
+        return []
+    parsed = _dv.parse(item.get("note") or "")
+    titles = _dv.open_items(parsed)
+    if not titles:
+        return []
+    base = int(item.get("count") or 0)
+    if base <= 0:
+        base = ts.minutes_to_count(item.get("duration")) or 0
+    if base <= 0:
+        return []
+    got_all = invested_map if isinstance(invested_map, dict) else {}
+    out = []
+    for one in titles:
+        spk = _dv.synthetic_pk(item.get("pk"), one["line"])
+        got = min(base, int(got_all.get(spk) or 0))
+        if base - got <= 0:
+            continue
+        out.append(dict(item, pk=spk,
+                        title=_dv.derived_title(item.get("title"), one["text"]),
+                        derived={"parent_pk": str(item.get("pk") or ""),
+                                 "line": one["line"],
+                                 "text": one["text"],
+                                 "parent_title": item.get("title") or item.get("pk")},
+                        count=base, total=base, remaining=base - got, invested=got,
+                        minutes=ts.count_to_minutes(base),
+                        repeat=None, note="", parent="", parent_id="",
+                        children=None, priority=None))
+        if not all_titles:
+            break               # parallel：一次只派一条
     return out
 
 
@@ -2660,6 +2736,22 @@ class ProjectStore(object):
             if op is not None:
                 out.append(op)
         return out
+
+    def set_task_note(self, project_id, pk, note):
+        """只改项目清单里某条任务的 note 文本（派生任务勾完一行后的本地缓存）。"""
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            for item in project.get("tasks") or ():
+                if str(item.get("pk") or "") != str(pk):
+                    continue
+                item["note"] = str(note or "")
+                project["synced_at"] = _now()
+                self.save(store)
+                return project
+            raise ValueError("项目 %s 里没有任务 %s" % (project_id, pk))
+        raise ValueError("没有项目 %s" % project_id)
 
     def set_tasks(self, project_id, tasks):
         store = self.load()

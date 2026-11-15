@@ -242,8 +242,11 @@ def task_session_assigned_count(task):
     return got if got is not None and got > 0 else None
 
 
-def count_text(task, delta=0, cap=None, invested=None):
+def count_text(task, delta=0, cap=None, invested=None, cap_text=None):
     """界面上的 ``(1+2/5)``：已投入 + 这一场会涨的 / 最高；没设 count 就是 ``""``。
+
+    ``cap_text`` 是上限的**字符串**形式（派生重复任务显示成 ``25-125``）；
+    给了它就按字符串拼，不再用 ``cap`` 做整数格式化。
 
     ``delta`` 只在「挂在某一场 session 上」时有意义 = 那一场时长 / 25（往上取整）
     —— 它是**预报**，不是事实：真正记账发生在收尾的时候（见 warden.begin_review）。
@@ -260,6 +263,10 @@ def count_text(task, delta=0, cap=None, invested=None):
         extra = int(delta or 0)
     except (TypeError, ValueError):
         extra = 0
+    if cap_text and (invested or extra or cap_text):
+        if extra > 0:
+            return "(%d+%d/%s)" % (invested, extra, cap_text)
+        return "(%d/%s)" % (invested, cap_text)
     if cap is None:
         if not invested:
             return ""
@@ -1419,11 +1426,20 @@ class TaskStore(object):
         return removed["v"]
 
     def set_status(self, task_id, status, at=None, reason=None):
-        """改状态（active / completed / dropped），顺便记下时间和原因。"""
+        """改状态（active / completed / dropped），顺便记下时间和原因。
+
+        ``after_status`` 是**观察者**钩子（可选）：状态真的变了之后调一次
+        ``hook(task, before)``。派生任务靠它把「这一条做完了」翻译成「把父任务
+        note 里那行勾上」；观察者抛异常一律吞掉，绝不让它把账本操作弄挂。
+        """
         if status not in STATUSES:
             raise ValueError("状态只能是 %s；你给的是 %r"
                              % (" / ".join(STATUSES), status))
         stamp = at or _now()
+        try:
+            before = TaskStore.status_of(self.get(task_id))
+        except (ValueError, TypeError):
+            before = None
 
         def apply(task):
             task["status"] = status
@@ -1433,7 +1449,14 @@ class TaskStore(object):
                 task["status_at"] = stamp
             if reason:
                 task["status_reason"] = str(reason)
-        return self._mutate(task_id, apply)
+        task = self._mutate(task_id, apply)
+        hook = getattr(self, "after_status", None)
+        if hook is not None and before != status:
+            try:
+                hook(task, before)
+            except Exception:                   # noqa: BLE001 - 观察者不挡账本
+                pass
+        return task
 
     def drop(self, task_id, reason=None, tag=None, at=None):
         """放弃这条本地记录（可选打个本地标签）。
@@ -2056,12 +2079,14 @@ class TaskStore(object):
 
     @staticmethod
     def origin_marks(task):
-        """契约表格 / 面板用的来源记号：🔁 重复子任务，🔗 OmniFocus 关联。"""
+        """契约表格 / 面板用的来源记号：🔁 重复子任务，🔗 OmniFocus 关联，🧬 派生任务。"""
         marks = ""
         if (task or {}).get("repeat_parent"):
             marks += "🔁"
         if TaskStore.omnifocus_id(task):
             marks += "🔗"
+        if str(((task or {}).get("source") or {}).get("kind") or "") == "derived":
+            marks += "🧬"
         return marks
 
     @staticmethod

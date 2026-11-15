@@ -876,7 +876,8 @@ class BoardMixin(object):
         assigned = ts.task_session_assigned_count(task)
         if assigned is not None:
             delta = assigned
-        text = ts.count_text(task, delta, cap=cap, invested=invested)
+        text = ts.count_text(task, delta, cap=cap, invested=invested,
+                             cap_text=self.derived_count_span(task))
         return (text + " ") if text else ""
 
     def task_count_label(self, task, delta=None):
@@ -884,7 +885,8 @@ class BoardMixin(object):
         if delta is None:
             delta = self.task_count_delta(task)
         cap, invested = self.task_count_scope(task)
-        text = ts.count_text(task, delta, cap=cap, invested=invested)
+        text = ts.count_text(task, delta, cap=cap, invested=invested,
+                             cap_text=self.derived_count_span(task))
         return (text + " ") if text else ""
 
     def frame_width(self):

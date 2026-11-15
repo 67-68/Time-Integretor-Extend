@@ -578,37 +578,55 @@ class NetMixin(object):
                     results.append({"id": pk, "task_id": op.get("task_id"),
                                     "op": op.get("op"), "ok": False,
                                     "message": str(exc)})
+        # 同一个 pk 可能同时排了 note_mark 和 drop（勾完最后一行时），所以
+        # 结果必须按 (op, pk) 对回请求，不能只按 pk —— 否则两条结果会互相认错。
+        by_key = {("%s:%s" % (op.get("op") or "complete", op.get("id") or "")): op
+                  for op in ops}
         by_id = {str(op.get("id") or ""): op for op in ops}
-        done, dropped, failed = [], [], []
+        done, dropped, marked, failed = [], [], [], []
         for item in results:
             pk = str(item.get("id") or "")
-            src = by_id.get(pk) or {}
-            key = "%s:%s" % (str(src.get("op") or item.get("op") or "complete"), pk)
+            op = str(item.get("op") or "complete")
+            src = by_key.get("%s:%s" % (op, pk)) or by_id.get(pk) or {}
+            op = str(src.get("op") or op)
+            key = "%s:%s" % (op, pk)
             if not item.get("ok"):
                 failed.append([src.get("task_id"),
                                item.get("message") or item.get("error") or "写回失败"])
                 continue
             entry = {"task_id": src.get("task_id"), "pk": pk, "res": item, "key": key}
-            if str(src.get("op") or item.get("op")) == "drop":
+            if op == "drop":
                 dropped.append(entry)
+            elif op == "note_mark":
+                marked.append(entry)
             else:
                 done.append(entry)
         rep.progress(1.0)
-        written = len(done) + len(dropped)
+        written = len(done) + len(dropped) + len(marked)
         rep.log("写回 %d 条%s" % (written,
                                 ("；%d 条失败" % len(failed)) if failed else ""),
                 "ok" if not failed else "warn")
         if failed and not written:
             raise ValueError("全部写回失败：%s" % failed[0][1])
-        return {"done": done, "dropped": dropped, "failed": failed}
+        return {"done": done, "dropped": dropped, "marked": marked,
+                "failed": failed}
 
     def _apply_omnifocus_flush(self, payload, args):
         """flush 的本地那半：落 writeback 标记 + 重复任务改挂 + 清 outbox。"""
         payload = payload or {}
         done = payload.get("done") or []
         dropped = payload.get("dropped") or []
+        marked = payload.get("marked") or []
         failed = payload.get("failed") or []
         notes = []
+        for item in marked:
+            # note_mark：把新 note 写进本地缓存；清单勾完 → 放弃整个重复系列。
+            res = item.get("res") or {}
+            try:
+                self._derived_after_mark(str(item.get("pk") or ""),
+                                         res.get("note"), res.get("remaining"))
+            except Exception as exc:            # noqa: BLE001 - 派生收尾不挡写回
+                notes.append("派生 note 收尾失败：%s" % exc)
         for entries, what in ((done, "completed"), (dropped, "dropped")):
             for item in entries:
                 task_id = item.get("task_id")
@@ -645,8 +663,8 @@ class NetMixin(object):
                             pass
         outbox = getattr(self, "omni_outbox", None)
         if outbox is not None:
-            outbox.remove([item.get("key") for item in (done + dropped)])
-        written = len(done) + len(dropped)
+            outbox.remove([item.get("key") for item in (done + dropped + marked)])
+        written = len(done) + len(dropped) + len(marked)
         if written:
             suffix = "、".join(notes)
             self.say("✅ OmniFocus 写回 %d 条%s%s"
