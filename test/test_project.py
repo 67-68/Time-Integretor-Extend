@@ -2286,9 +2286,9 @@ _auto_layouts = sp.load_layouts()
 _T1_auto = _auto_layouts["layouts"][wd_auto.sel_date.isoformat()]["T1"]
 _T2_auto = _auto_layouts["layouts"][wd_auto.sel_date.isoformat()]["T2"]
 check("75 分钟任务生成一个 75 分钟 session，而不是 50+25",
-      (_T1_auto.get("source"), _T1_auto.get("durations")), ("auto", [75]))
+      (_T1_auto.get("source"), _T1_auto.get("durations")), ("plan", [75]))
 check("没有任务的 period 自动清空 session 内容",
-      (_T2_auto.get("source"), _T2_auto.get("durations")), ("auto", []))
+      (_T2_auto.get("source"), _T2_auto.get("durations")), ("plan", []))
 _auto_task = next(t for t in wd_auto.task_store.list()
                   if (t.get("fields") or {}).get("project_task") == "long-a")
 check("任务挂到新生成的 75 分钟 session 上",

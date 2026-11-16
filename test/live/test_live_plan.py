@@ -138,7 +138,8 @@ def scenario_plan():
     # -- 1) layout / data.csv：容量 5 count 反推出 75 + 50 两场 -----------------
     layouts = json.load(open(PATHS["layouts"], encoding="utf-8"))
     rec = sp.get_layout_record(layouts, DAY, "T1") or {}
-    check("layout 是 auto 自动排的", rec.get("source"), "auto")
+    check("layout 是 plan 自己排的（source=plan，表格打 🗂）",
+          rec.get("source"), "plan")
     check("排布 [75, 50]（75+15 休息+50 = 150 分钟，正好填满时段）",
           rec.get("durations"), [75, 50])
 

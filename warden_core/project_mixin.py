@@ -2631,9 +2631,10 @@ class ProjectMixin(object):
             rec = sp.get_layout_record(layouts, day, pid)
             meta[pid] = {
                 "period": dict(period),
-                # 没有 layout = 交给任务排期自动生成；有 layout（含旧格式）
-                # 但 source != auto = 手动硬约束。
-                "auto": rec is None or rec.get("source") == "auto",
+                # 没有 layout = 交给任务排期自动生成；有 layout 但 source 是
+                # auto / plan（plan 自己切出来的，见 commit_layout 的 source="plan"）
+                # 也允许下一次 plan 重算；manual 才是硬约束。
+                "auto": rec is None or sp.is_auto_source(rec.get("source")),
                 "has_layout": rec is not None,
             }
         return meta
@@ -2809,6 +2810,25 @@ class ProjectMixin(object):
                 stats["unbooked"].append(row.get("startLabel") or "?")
         return slots, blocked_periods, stats
 
+    def _period_session_rows(self, day, period_id):
+        """这个时段里**真实存在**的 session 行 → ``[{"start","duration"}]``。
+
+        给 :func:`session_plan.tail_gap` 用：它要拿完整的场次序列去验「前缀能不
+        能原样接龙」。占位行（``period_only``）不是 session，不算。
+        """
+        out = []
+        for row in self.rows or ():
+            if row.get("period_only"):
+                continue
+            if str(row.get("period_id") or "") != str(period_id):
+                continue
+            start_dt = self._row_start_datetime(row, fallback_day=day)
+            if start_dt is None or start_dt.date() != day:
+                continue
+            out.append({"start": row.get("startLabel"),
+                        "duration": row.get("durationMin")})
+        return out
+
     def _auto_period_slots(self, day, period_meta, blocked_periods, slots, *,
                            include_current=False, now=None):
         """阶段 3：自动排布的 period 整段换成「工作容量」伪 slot。
@@ -2889,6 +2909,74 @@ class ProjectMixin(object):
                 "period_auto": True,
                 "current": bool(include_current and p_start <= now < p_end),
             })
+        # 阶段 3.5：**已经切了一半的时段**，尾巴那截也得算容量。
+        #
+        # 以前只要这个时段里有一场被排除（挂了任务 / 已经订上 / 已经过去），
+        # 整段就被记进 ``blocked_periods``，容量只剩 data.csv 里那些还没挂任务
+        # 的行 —— 19:00(75) 挂了任务、20:15 之后明明还有 75 分钟空着，plan 却
+        # 说「今天只剩 2 count」（用户 2026-11-16 报的「超预算」就是这么来的）。
+        #
+        # 尾巴能安全追加：layout 只存「从时段起点接龙的 duration 列表」，
+        # ``prefix + 新时长`` 不会挪动前面任何一场。中间的空洞不在此列（插一场
+        # 会把后面已订上的场次整体挪位）。
+        for pid in sorted(period_meta):
+            if pid in auto_replace:
+                continue
+            meta = period_meta.get(pid) or {}
+            period = meta.get("period") or {}
+            if mute_window_for(day, period.get("start"), period.get("end")):
+                continue                        # 静音时段整段不排
+            rows = self._period_session_rows(day, pid)
+            if not rows:
+                # 没有任何真实行：自动时段已经在上面整段算过容量了；手动/已订上
+                # 的时段没有行说明 layout 和 data.csv 对不上，别凭空造容量。
+                continue
+            gap = sp.tail_gap(period, rows)
+            if gap is None:
+                continue
+            gap_dt = datetime.datetime.combine(
+                day, datetime.time(*sp.parse_hhmm(gap["start"])))
+            if gap_dt < anchor:
+                # 尾巴已经来不及开始（追加会把它排到过去），不算资源。
+                continue
+            try:
+                reservations = th.collect_reservations(
+                    self.task_store.list(), day.isoformat())
+            except Exception:                    # noqa: BLE001
+                reservations = []
+            e_got = sp.parse_hhmm(period.get("end"))
+            g_got = sp.parse_hhmm(gap["start"])
+            if e_got is None or g_got is None:
+                continue
+            g_min = g_got[0] * 60 + g_got[1]
+            e_min = e_got[0] * 60 + e_got[1]
+            if e_min <= g_min:
+                e_min += 24 * 60
+            if not th.is_free({"start_min": g_min, "end_min": e_min}, reservations):
+                continue
+            slots.append({
+                "index": len(slots) + 1,
+                "date": day.isoformat(),
+                "start": gap["start"],
+                "end": period.get("end"),
+                "duration": int(gap["work_minutes"]),
+                "counts": int(gap["blocks"]),
+                "id": None,
+                "period_id": pid,
+                "period": dict(period),
+                "period_start": period.get("start"),
+                "period_end": period.get("end"),
+                "period_total_minutes": pp._period_total_minutes(period),
+                # 「整段能放几个块」是 period 层的属性，不是这截缺口的 ——
+                # 追加校验拿它比 prefix+新时长，写成缺口的块数会误判超容量。
+                "period_blocks": pp._period_blocks(period),
+                "period_auto": False,
+                # 追加语义：commit 时把 prefix 原样带上，只往尾巴加新 session。
+                "append": True,
+                "append_prefix": list(gap["prefix"]),
+                "window_minutes": int(gap["minutes"]),
+                "current": False,
+            })
         for slot in slots:
             if str(slot.get("period_id") or "") in blocked_periods:
                 slot["period_auto"] = False
@@ -2929,7 +3017,26 @@ class ProjectMixin(object):
         slots, blocked = self._auto_period_slots(
             day, period_meta, blocked, slots,
             include_current=include_current, now=now)
-        return slots, self._plan_notes(stats, slots)
+        # 面板上的「空场 22:15(50) 20:30(50)」也要按时间顺序 —— 尾巴缺口是
+        # 后补的，不排一下会跑到后面那段「整段」的后面。index 是表格行号，
+        # 跟着 slot 走，排序不影响挂任务。
+        def _slot_start(slot):
+            got = sp.parse_hhmm((slot or {}).get("start"))
+            return got[0] * 60 + got[1] if got else 0
+        slots.sort(key=_slot_start)
+        notes = self._plan_notes(stats, slots)
+        tails = []
+        for slot in slots:
+            if not slot.get("append"):
+                continue
+            tails.append("%s %s 起还剩 %d 分钟（%d count）"
+                         % (slot.get("period_id") or "?",
+                            slot.get("start") or "?",
+                            int(slot.get("window_minutes") or 0),
+                            int(slot.get("counts") or 0)))
+        if tails:
+            notes.append("半截时段只追加、不重切：%s。" % "、".join(tails))
+        return slots, notes
 
     def cmd_plan(self, args=None):
         """``plan`` —— 把这一天剩下的空闲切成 count，分给项目，再自动排任务。
@@ -3429,7 +3536,7 @@ class ProjectMixin(object):
         sig = self._auto_plan_signature(day)
         changed = False
         for rec in day_recs.values():
-            if isinstance(rec, dict) and rec.get("source") == "auto":
+            if isinstance(rec, dict) and sp.is_auto_source(rec.get("source")):
                 rec["plan_sig"] = sig
                 changed = True
         if changed:
@@ -3444,7 +3551,7 @@ class ProjectMixin(object):
         except Exception:                          # noqa: BLE001
             return False
         recs = [rec for rec in ((data.get("layouts") or {}).get(iso) or {}).values()
-                if isinstance(rec, dict) and rec.get("source") == "auto"]
+                if isinstance(rec, dict) and sp.is_auto_source(rec.get("source"))]
         if not recs:
             return False
         current = self._auto_plan_signature(day)
@@ -3555,16 +3662,30 @@ class ProjectMixin(object):
                 continue
             key = pp._period_key(period)
             period_by_key[key] = period
+        try:
+            _layouts_now = sp.load_layouts()
+        except Exception:                          # noqa: BLE001
+            _layouts_now = {}
         for key, durations in (auto_layouts or {}).items():
             period = period_by_key.get(key)
             if not period:
                 continue
+            # 原来是手动/ formatter 切的段，追加之后仍然算硬约束（不能因为
+            # plan 往尾巴加了一场，下一次 plan 就把人家原来的切分重排）。
+            try:
+                _rec = sp.get_layout_record(_layouts_now, day, period.get("id"))
+            except Exception:                      # noqa: BLE001
+                _rec = None
+            _keep_manual = bool(_rec and not sp.is_auto_source(_rec.get("source")))
             try:
                 # 走唯一事务：取消旧场 → 写 layout → 清绑定 → 重算 data.csv。
                 # 这里不预约（book=False）：整天重排的预约由 _plan_apply 末尾统一触发；
                 # refresh 的自动重排整轮都在 _suppress_book 里。
                 # write_csv=False：几个时段改完由下面统一重算一次，别每段整表重写。
-                self.commit_layout(day, period, durations, source="auto",
+                # source="plan"：给 plan 自己切出来的 session 留个记号（表格里 🗂），
+                # 下一次 plan 认得它、可以重算；用户手动 `period` 切的是 manual。
+                self.commit_layout(day, period, durations,
+                                   source="manual" if _keep_manual else "plan",
                                    reason="auto-plan", book=False, announce=False,
                                    write_csv=False, lock_timeout=5.0)
             except ValueError as e:

@@ -240,13 +240,16 @@ check_true("列表不显示旧 SOP / 孤立 op",
            "运行 SOP 旧" not in joined and "无 pro 的孤立 op" not in joined)
 
 print("== plan：一次处理所有项目当前阶段 ==")
-book_all(wd)                                  # 明天 T1 50+25、T2 50 = 5 count
+book_all(wd)                                  # 明天 T1 50+25（尾部还空 30min）、T2 50
 check("plan +1 受理", wd.handle("plan +1"), True)
 check("同一次 plan 同时出现 SOP 与 incubator",
       [(p["title"], p.get("op_type")) for p in wd.planning.projects],
       [("运行 SOP 新", "SOP"), ("孵化 Inc", "incubator")])
 check("没有全局阶段切换", wd.planning.stage, "mixed")
-check("容量一次算全 5 count", wd.planning.cap()["counts"], 5)
+# T1 手动 [50,25] = 3 count，占 11:00–12:30（含休息）；尾巴 12:30–13:00 还有
+# 30 分钟 = 1 count；T2 50 分钟 = 2 count —— 一共 6。尾部缺口只追加、不动那两场。
+check("容量一次算全 6 count（T1 3 + 尾巴 1 + T2 2）",
+      wd.planning.cap()["counts"], 6)
 wd.handle("task 1 1")
 wd.handle("task 2 1")
 check("complete 一次收尾", wd.handle("complete"), True)

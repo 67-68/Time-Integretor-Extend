@@ -359,6 +359,86 @@ def _fmt_min(total):
     return "%02d:%02d" % (total // 60, total % 60)
 
 
+#: 自动 layout 的来源标记：``auto`` 是旧口径，``plan`` 是 2026-11-16 之后
+#: plan 自己切出来的。两者都允许下一次 plan 重算；``manual`` 是用户/ formatter
+#: 钉死的切分，只能往里填。
+AUTO_SOURCES = ("auto", "plan")
+
+
+def is_auto_source(source):
+    return source in AUTO_SOURCES
+
+
+def tail_gap(period, sessions):
+    """时段**尾巴**上还没被任何 session 占用的窗口（可以追加新 session 的那截）。
+
+    ``sessions`` 是这个时段里**真实存在的**场次（``[{"start": "HH:MM",
+    "duration": 25/50/75}, ...]``，可以来自 data.csv、API 或计划行）。
+
+    为什么只认尾巴
+    --------------
+    layout 只存「从时段起点接龙的 duration 列表」，起点是重算出来的。在尾巴
+    追加 = ``prefix + 新时长``，前面每场起点一分不变；夹在中间的空洞做不到 ——
+    往里插一场会把后面已经订上的场次整体挪位（= 取消 + 重订）。
+
+    为什么必须验序列
+    ----------------
+    只有「现有场次正好等于 :func:`plan_period` 排出来的序列」时，``prefix``
+    才能原样接上新时长。真实 API 里会有和计划差 15 分钟的行（计划 16:15、
+    实际 16:00），这种时段一旦重排就会挪动已订场次 —— 宁可不算这截容量。
+
+    返回 ``{"start", "start_min", "minutes", "work_minutes", "blocks",
+    "prefix"}``；没有可用尾巴（太短 / 序列对不上 / 跨过时段终点）返回 ``None``。
+    """
+    period = period or {}
+    got_s = parse_hhmm(period.get("start"))
+    got_e = parse_hhmm(period.get("end"))
+    if got_s is None or got_e is None:
+        return None
+    start_min = got_s[0] * 60 + got_s[1]
+    end_min = got_e[0] * 60 + got_e[1]
+    if end_min <= start_min:
+        end_min += 24 * 60
+    real = []
+    for sess in sessions or ():
+        got = parse_hhmm((sess or {}).get("start"))
+        if got is None:
+            return None
+        s_min = got[0] * 60 + got[1]
+        if s_min < start_min or s_min >= end_min:
+            continue
+        try:
+            duration = int((sess or {}).get("duration"))
+        except (TypeError, ValueError):
+            return None
+        if duration not in DURATIONS:
+            return None
+        real.append({"start": _fmt_min(s_min), "start_min": s_min,
+                     "duration": duration})
+    real.sort(key=lambda item: item["start_min"])
+    prefix = [item["duration"] for item in real]
+    try:
+        canonical = plan_period(period, prefix)
+    except ValueError:
+        return None
+    if len(canonical) != len(real):
+        return None
+    for want, got in zip(real, canonical):
+        # ``plan_period`` 会把起点取整到 15 分钟格；序列对不上就不许追加。
+        if want["start_min"] != got["start_min"] or want["duration"] != got["duration"]:
+            return None
+    cursor = (canonical[-1]["start_min"] + session_span(canonical[-1]["duration"])
+              if canonical else start_min)
+    minutes = end_min - cursor
+    block = MINUTES_PER_COUNT + BREAK_MINUTES_PER_COUNT
+    blocks = minutes // block
+    if blocks <= 0:
+        return None
+    return {"start": _fmt_min(cursor), "start_min": cursor,
+            "minutes": minutes, "work_minutes": blocks * MINUTES_PER_COUNT,
+            "blocks": blocks, "prefix": prefix}
+
+
 def default_durations(period):
     """没自定义时的默认排布：优先 50，塞不下退 25，和旧 carve() 同一口味。
 
@@ -427,7 +507,7 @@ def get_layout_record(layouts, day, period_id):
 def layout_is_auto(layouts, day, period_id):
     """这个 period 的 session 排布是不是任务排期自动生成的。"""
     rec = get_layout_record(layouts, day, period_id)
-    return bool(rec and rec.get("source") == "auto")
+    return bool(rec and is_auto_source(rec.get("source")))
 
 
 def get_layout(layouts, day, period_id):

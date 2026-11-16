@@ -538,7 +538,8 @@ check("refresh 立刻返回，队列忙", wd.jobs.busy, True)
 check("读操作没有预测（表格还空着）", len(wd.rows), 0)
 bridge.release()
 settle(wd)
-check("真数据到了表格才有", len(wd.rows), 1)
+check("真数据到了表格才有",
+      len([r for r in wd.rows if not r.get("period_only")]), 1)
 check("拉了之后记下时间", bool(wd.read_at.get("session")), True)
 wd.read_at["task"] = time.time()      # task 那一份也刚拉过（不然它会单独把整行拉红）
 rows = wd.freshness_rows()

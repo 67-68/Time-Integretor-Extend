@@ -574,12 +574,15 @@ class BoardMixin(object):
         if period:
             row["period"] = dict(period)
             row["period_id"] = period.get("id")
+            row["plan_made"] = str(period.get("id") or "") in getattr(
+                self, "_plan_layout_periods", ())
             first = self.period_first_start(period)
             # 需求：同一时段的第一行显示 T1/时段/类型/名称，后续行留空。
             row["period_first"] = bool(first is None or first == row.get("startLabel"))
         else:
             row["period"] = None
             row["period_id"] = None
+            row["plan_made"] = False
             row["period_first"] = False
         # 「这一行在不在静音时段里」——口径只有一个：`period mute T1 [--permanent]`
         # 写下的时间窗。quiet 是**结果**（Focusmate 那边设上了没），period_muted
@@ -1611,6 +1614,20 @@ class BoardMixin(object):
             rows.append(row)
 
         rows.sort(key=lambda r: r["startMs"])
+        # 哪些时段的切分是 plan 自己排出来的（layout source="plan"）：表格里给
+        # 这些 session 打 🗂，用户能一眼分清「plan 排的」和「我手动切的」。
+        try:
+            recs = ((sp.load_layouts().get("layouts") or {})
+                    .get(day.isoformat()) or {})
+            self._plan_layout_periods = {
+                str(pid) for pid, rec in recs.items()
+                if isinstance(rec, dict) and rec.get("source") == "plan"}
+            self._layout_sources = {
+                str(pid): (rec.get("source") if isinstance(rec, dict) else None)
+                for pid, rec in recs.items()}
+        except Exception:                      # noqa: BLE001 - 读不到就只是不打标记
+            self._plan_layout_periods = set()
+            self._layout_sources = {}
         # daemon 的「认账」结论（state.json 里 slots[key] 的 match / actual）：
         # 计划 16:15 没有同一分钟的 session，但实际被 16:00 25 + 16:30 50 覆盖了。
         # 这是**已经付过钱**的事实，表格必须照着它显示，不能再报「缺」。
@@ -1645,6 +1662,12 @@ class BoardMixin(object):
         self.rows = rows
         self.invalidate()          # 表格换了内容 → 画帧缓存作废
 
+    @staticmethod
+    def _row_blocks_period(row):
+        """这一行是否让所在时段不能再「整段重排」（已订上 / 挂任务 / 已过去 / 静音）。"""
+        return bool(row.get("id") or row.get("tasks") or row.get("period_muted")
+                    or row.get("phase") == "已结束")
+
     def _period_shell_rows(self, rows, day, now_ms=None):
         """没有 session 的时段 → 一行占位（``period_only=True``）。
 
@@ -1662,45 +1685,76 @@ class BoardMixin(object):
         """
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         now_dt = datetime.datetime.now()
-        have = set()
+        have = {}
         for row in rows or ():
             pid = str(row.get("period_id") or "")
             if pid:
-                have.add(pid)
+                have.setdefault(pid, []).append(row)
         out = []
         for period in self.periods_for_day(day):
             pid = str(period.get("id") or "")
-            if not pid or pid in have:
+            if not pid:
                 continue
             start = sp.parse_hhmm(period.get("start"))
             end = sp.parse_hhmm(period.get("end"))
             if start is None:
                 continue
-            start_dt = datetime.datetime.combine(day, datetime.time(*start))
-            if end is not None:
-                minutes = (end[0] * 60 + end[1]) - (start[0] * 60 + start[1])
-                if minutes <= 0:
-                    minutes += 24 * 60
+            existing = [r for r in (have.get(pid) or ())
+                        if not r.get("period_only")]
+            s_dt = datetime.datetime.combine(day, datetime.time(*start))
+            if existing and mute_window_for(day, period.get("start"),
+                                            period.get("end")):
+                # 静音时段 plan 整段不排，别画「剩余 Nmin 可以排」的假容量。
+                continue
+            src = (getattr(self, "_layout_sources", {}) or {}).get(pid)
+            if existing and (src is None or sp.is_auto_source(src)) \
+                    and not any(self._row_blocks_period(r) for r in existing):
+                # 自动 layout 且整段都还能重排：plan 会把这一段整体重切，
+                # 尾巴不是独立缺口，不画占位（同一条口径跟 _plan_slots 对齐）。
+                continue
+            if existing:
+                # 时段已经切了一半，但尾巴还空着（19:00(75) 之后到 21:30）——
+                # 那截同样要显示成「未切 session」，否则用户看到的是「20:15 之后
+                # 什么都没有」，plan 也像是把它忽略了。
+                gap = sp.tail_gap(period, [
+                    {"start": r.get("startLabel"),
+                     "duration": r.get("durationMin")} for r in existing])
+                if gap is None:
+                    continue
+                s_dt = datetime.datetime.combine(
+                    day, datetime.time(*sp.parse_hhmm(gap["start"])))
+                window = int(gap["minutes"])
+                plan_counts = int(gap["blocks"])
+                end_dt = s_dt + datetime.timedelta(minutes=window)
             else:
-                minutes = 0
-            end_dt = start_dt + datetime.timedelta(minutes=max(0, minutes))
-            s_ms = int(start_dt.timestamp() * 1000)
+                window = 0
+                if end is not None:
+                    window = (end[0] * 60 + end[1]) - (start[0] * 60 + start[1])
+                    if window <= 0:
+                        window += 24 * 60
+                plan_counts = max(0, window // 30)
+                end_dt = s_dt + datetime.timedelta(minutes=max(0, window))
+            s_ms = int(s_dt.timestamp() * 1000)
             e_ms = int(end_dt.timestamp() * 1000)
             out.append({
                 "startMs": s_ms, "endMs": e_ms,
-                "startLabel": period.get("start"),
+                "startLabel": s_dt.strftime("%H:%M"),
                 "endLabel": end_dt.strftime("%H:%M"),
-                "durationMin": minutes, "id": None, "title": "", "quiet": None,
+                "durationMin": window, "id": None, "title": "", "quiet": None,
                 "matched": None, "phase": self.phase_of(s_ms, e_ms, now_ms),
                 "planned": False, "period_only": True, "lineno": None,
                 "raw": "", "contract": "",
-                "zone": self.effective_zone(sch.zone_name(start_dt, now_dt), day),
-                "zone_raw": sch.zone_name(start_dt, now_dt),
+                "zone": self.effective_zone(sch.zone_name(s_dt, now_dt), day),
+                "zone_raw": sch.zone_name(s_dt, now_dt),
                 "date": day.isoformat(),
                 # 占位行自己就是这一段的「第一行」：时段三列照常显示。
-                "period": dict(period), "period_id": pid, "period_first": True,
+                # 尾巴缺口（partial_gap）不是整段，时段三列交给前面已有的行。
+                "period": dict(period), "period_id": pid,
+                "period_first": not existing,
                 "period_muted": bool(mute_window_for(day, period.get("start"),
                                                      period.get("end"))),
+                "partial_gap": bool(existing),
+                "plan_counts": plan_counts,
                 "task": None, "tasks": [], "task_text": "",
             })
         return out
@@ -2029,14 +2083,29 @@ class BoardMixin(object):
             pname = (period.get("name") or period.get("title") or "") if first else ""
             task_text = r.get("task_text") or ""
             if r.get("period_only"):
-                task_cell = Text("整段还没切 session（plan 会按任务切）",
-                                 style=STYLE_MUTED)
+                task_cell = Text(
+                    ("这一截还没切 session（plan 会按任务切）"
+                     if r.get("partial_gap")
+                     else "整段还没切 session（plan 会按任务切）"),
+                    style=STYLE_MUTED)
             elif task_text:
                 task_cell = Text(task_text, style="bold green")
             else:
                 # 每一行都是一场要执行的 session（计划或实际）；没有任务就明确报警，
                 # 不要留空让用户以为只是「这一格没画东西」。
                 task_cell = Text("没有设定任务🔞", style="bold red")
+            contract_cell = Text(r.get("contract") or "—", style=STYLE_MUTED)
+            if r.get("plan_made"):
+                contract_cell.append("  🗂plan", style="dim cyan")
+            if r.get("period_only"):
+                dur_text = ("整段 %dmin" % dur) if dur else "?"
+            else:
+                dur_text = ("%dmin" % dur) if dur else "?"
+            if r.get("partial_gap") and dur:
+                dur_text = "剩余 %dmin" % dur
+            if (r.get("period_only") and r.get("plan_counts")
+                    and r.get("phase") != "已结束"):
+                dur_text += "（%d count）" % int(r.get("plan_counts"))
             cells = [
                 Text(pid or "", style="bold magenta"),
                 Text(pspan, style="cyan"),
@@ -2044,11 +2113,10 @@ class BoardMixin(object):
                 Text(pname, style="cyan"),
                 str(idx),
                 "%s–%s" % (r["startLabel"], r.get("endLabel") or "?"),
-                ("整段 %dmin" % dur) if (dur and r.get("period_only"))
-                else (("%dmin" % dur) if dur else "?"),
+                dur_text,
                 st,
                 qtxt,
-                Text(r.get("contract") or "—", style=STYLE_MUTED),
+                contract_cell,
                 label,
                 task_cell,
             ]
@@ -2794,6 +2862,8 @@ class BoardMixin(object):
             "排好的子任务。只有子任务能被完成；本体要结束只能手动 task repeat off 或 drop。\n"
             "契约表 task 列来源记号：🔁=重复任务子任务，🔗=有 OmniFocus 关联，"
             "两个都有就是 🔁🔗；⏱=挂了 formatter（不是「重复」的意思）。"
+            "契约列的 🗂plan = 这一段的切分是 plan 自己排的（可被下一次 plan 重算；"
+            "用户 `period` 手动切的不带这个记号）。"
             "本体不进契约面板，只在 task 视图里显示为 id:N、来源记号只有 🔗。\n"
             "OmniFocus 写回：**只要知道一条任务完成了就一定写**（task done / 收尾 D / "
             "task sync / 收尾自动核对 / 任何一次 refresh 同步完成状态），幂等；"

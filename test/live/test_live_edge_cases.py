@@ -225,8 +225,11 @@ def case_1_capacity_and_past():
     check_true("17:30（落在 16:15 的休息里）仍在表里被算出空场", "17:30" in starts)
     check_true("22:15（整段未切）算空场", "22:15" in starts)
     check_true("19:00 不算（已经挂着独占任务）", "19:00" not in starts)
-    check("可分配的 count = 16:15(3) + 17:30(1) + 22:15(2) = 6",
-          pp.capacity(slots).get("counts"), 6)
+    # 19:00(75) + 15 分钟休息之后，到 T3 终点 21:30 还剩 60 分钟（2 count）——
+    # 「一场挂了任务就把整段算没」是 2026-11-16 超预算的直接原因。
+    check_true("19:00 之后剩下的 20:30 也算空场", "20:30" in starts)
+    check("可分配的 count = 16:15(3) + 17:30(1) + 20:30(2) + 22:15(2) = 8",
+          pp.capacity(slots).get("counts"), 8)
     # 特征 8：23:15 开始、次日 00:05 结束的那一行属于今天
     rows = {r.get("startLabel"): r for r in wd.rows
             if (r.get("date") or DAY.isoformat()) == DAY.isoformat()}
@@ -284,6 +287,7 @@ def case_4_defer_and_repeat():
     run(wd, "plan 0")
     run(wd, "task 1 4")
     run(wd, "task 2 2")
+    run(wd, "task 3 2")
     run(wd, "complete")
     titles = [t.get("fields", {}).get("title") or "" for t in tasks_now()
               if (t.get("session") or {}).get("start")]
@@ -299,6 +303,7 @@ def case_5_small_task_and_t4():
     run(wd, "plan 0")
     run(wd, "task 1 4")
     run(wd, "task 2 2")
+    run(wd, "task 3 2")
     run(wd, "complete")
     small = [t for t in tasks_now()
              if "十分钟小活" in str((t.get("fields") or {}).get("title") or "")
@@ -315,12 +320,12 @@ def case_5_small_task_and_t4():
 
 
 def case_6_over_allocation_refused():
-    """容量只有 6：分 7 必须当场拒绝，而不是排一半。"""
+    """容量只有 8：分 9 必须当场拒绝，而不是排一半。"""
     reset_sandbox()
     wd = new_warden()
     run(wd, "plan 0")
     wd.messages = []
-    run(wd, "task 1 7")
+    run(wd, "task 1 9")
     text = say(wd)
     check_true("超预算被拒（说了超预算/不够）",
                "超预算" in text or "不够" in text or "只能" in text)
@@ -344,6 +349,11 @@ def case_7_booked_rows_untouched():
           [r for r in after if r == ("16:00", 75)], [])
     check("跨午夜那行还在（23:15/50）", [r for r in after if r[0] == "23:15"],
           [("23:15", 50)])
+    # 特征 15：19:00 挂了任务，不等于整个 T3 都没了。20:15–21:30 的尾巴
+    # 要能追加一场，而且 19:00 那场一分钟都不许动。
+    check("T3 尾巴切出了 20:30(50)", ("20:30", 50) in after, True)
+    check("T3 的 layout 是 [75, 50]（19:00 原样 + 尾巴追加）",
+          layout("T3"), [75, 50])
 
 
 def main(argv):

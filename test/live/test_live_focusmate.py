@@ -239,8 +239,10 @@ def main(argv):
         if note:
             print("· " + note)
 
+    plumbing = "--plumbing" in argv
     left = cooldown_left()
-    if left and not force:
+    # plumbing 模式不订场、不花配额，不受 3 天冷却限制（冷却只防真跑烧预约）。
+    if left and not force and not plumbing:
         print("✋ 冷却中：%s 之后才能再真跑（上次成功在 %s）。"
               % ((datetime.datetime.now() + left).strftime("%m-%d %H:%M"),
                  load_ledger().get("last_ok_at")))
@@ -250,7 +252,6 @@ def main(argv):
         print("\n没有 --yes，什么都不做。")
         return 0
 
-    plumbing = "--plumbing" in argv
     paths = fixture.make_sandbox(offset=offset)
     # plumbing 模式：执行区还是 24 小时，目标日在区外 → `check` 一场都不订。
     # 用来先把「沙盒 → 子进程 → plan → data.csv → 本地任务」这条线跑通，

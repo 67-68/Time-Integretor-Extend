@@ -262,13 +262,28 @@ def scenario_capacity():
     check_true("22:15 整段算空场（60min → 2 count）", "22:15" in starts)
     # 19:00 已经挂着任务（History 2.1 C 那一条）—— 它不是空场，plan 不许再往里塞
     check_true("19:00 不算空场（已经挂着任务）", "19:00" not in starts)
+    # 19:00(75) 挂着任务不等于整个 T3 都没了：19:00–20:15 + 15 分钟休息之后
+    # 到 21:30 还有 60 分钟空着（= 2 count）。以前这一段被整段忽略，plan 说
+    # 「今天只剩 2 count」，用户想给 English 分 3 就被判超预算。
+    check_true("T3 的尾巴 20:30 也算空场（19:00 之后还空 60min）",
+               "20:30" in starts)
     cap = pp.capacity(slots)
-    check("可分配的 count = 16:15(3) + 22:15(2) = 5", cap.get("counts"), 5)
-    # 面板要说的也是 5；以前会把「上一轮 plan 挂着的任务」当成可重排，
+    check("可分配的 count = 16:15(3) + 20:30(2) + 22:15(2) = 7",
+          cap.get("counts"), 7)
+    # 表格里也要看得见这一截：一行「20:30–21:30 剩余 60min（2 count）未切
+    # session」。以前 T3 有行就整段不再补占位，用户看到的是「20:15 之后什么都没有」。
+    gap_rows = [r for r in wd.rows if r.get("partial_gap")]
+    check("表里给 T3 尾巴补了一行占位",
+          [(r.get("startLabel"), r.get("endLabel"), r.get("durationMin"),
+            r.get("plan_counts")) for r in gap_rows],
+          [("20:30", "21:30", 60, 2)])
+    # 面板要说的也是 7；以前会把「上一轮 plan 挂着的任务」当成可重排，
     # 于是说成 10 / 11 count，把已经排好的场次全掀掉。
     run(wd, "plan 0")
     text = say(wd)
-    check_true("plan 面板说「5 count 可以分」", "5 count" in text)
+    check_true("plan 面板说「7 count 可以分」", "7 count" in text)
+    check_true("面板说明尾巴是「只追加、不重切」",
+               "半截时段只追加" in text and "20:30" in text)
     check_true("面板不再把已经排好的算成空闲",
                "10 count" not in text and "11 count" not in text)
 
@@ -279,7 +294,7 @@ def scenario_plan_keeps_past_and_booked():
     wd = new_warden()
     before = csv_rows()
     run(wd, "plan 0")
-    # 容量只有 5，就分 5（以前分 4+6=10 是用来暴露「整天重排」那条路上的问题）
+    # 容量 7，这里只分 5（3+2）：English 的 2 count 正好落进 T3 尾巴。
     for idx, count in ((2, 3), (5, 2)):
         run(wd, "task %d %d" % (idx, count))
     err = run(wd, "complete")
@@ -293,6 +308,19 @@ def scenario_plan_keeps_past_and_booked():
     check("19:00(75) 还是 75 分钟那一场（没被切成 19:30）",
           ("19:00", 75) in after, True)
     check("没有凭空冒出 19:30", [r for r in after if r[0] == "19:30"], [])
+    # 尾巴追加：19:00 原样保留，20:30 新切一场 —— 不是把整段重切。
+    check("T3 尾巴切出了 20:30(50)", ("20:30", 50) in after, True)
+    layouts = json.load(open(PATHS["layouts"], encoding="utf-8"))["layouts"]
+    t3 = (layouts.get(DAY.isoformat()) or {}).get("T3") or {}
+    check("T3 的 layout 是 [75, 50]（前缀原样 + 尾巴追加）",
+          t3.get("durations"), [75, 50])
+    # plan 自己切出来的段打 source=plan：表格契约列显示 🗂plan，
+    # 下一次 plan 认得它可以重算（手动 `period` 切的是 manual，不带这个标记）。
+    check("T3 的 layout 来源是 plan（不是 manual）", t3.get("source"), "plan")
+    wd.rebuild_rows()
+    made = {r.get("startLabel"): bool(r.get("plan_made")) for r in wd.rows}
+    check("19:00 / 20:30 两行都带 plan 标记",
+          [made.get("19:00"), made.get("20:30")], [True, True])
     check("没有凭空冒出 09:00–12:00（T1 已经过去了）",
           [r for r in after if r[0] < "13:00"], [])
 
@@ -377,8 +405,8 @@ def scenario_long_period_used():
     reset_sandbox()
     wd = new_warden()
     run(wd, "plan 0")
-    # 5 个 count 全分下去（16:15 拿 3、22:15 拿 2），逼它用到 22:15 那段
-    for idx, count in ((2, 3), (5, 2)):
+    # 7 个 count 全分下去（16:15 拿 3、20:30 拿 2、22:15 拿 2），逼它用到 T4
+    for idx, count in ((2, 3), (5, 2), (1, 2)):
         run(wd, "task %d %d" % (idx, count))
     err = run(wd, "complete")
     check("大批量 plan 没报错（%s）" % (err or "ok"), err, "")

@@ -1210,22 +1210,80 @@ def _periods_from_slots(slots):
                                          or _period_total_minutes(period))
             grouped[key] = {"period": period,
                             "auto": bool(slot.get("period_auto")),
-                            "slots": [], "groups": []}
+                            "slots": [], "groups": [],
+                            "append": False, "append_prefix": None}
             order.append(key)
         grouped[key]["slots"].append(slot)
         if slot.get("period_auto"):
             grouped[key]["auto"] = True
+        if slot.get("append"):
+            # 尾巴追加：这一段不是自由重切，而是「前面原样保留 + 往尾巴加」。
+            grouped[key]["append"] = True
+            if grouped[key]["append_prefix"] is None:
+                grouped[key]["append_prefix"] = list(slot.get("append_prefix") or [])
     out = []
     for key in order:
         rec = grouped[key]
         rec["period"]["auto"] = bool(rec["auto"])
+        rec["period"]["append"] = bool(rec.get("append"))
+        rec["period"]["append_prefix"] = list(rec.get("append_prefix") or [])
         if rec["auto"]:
             rec["groups"] = []
         else:
             rec["groups"] = [_new_fixed_group(s) for s in rec["slots"]]
         out.append(rec["period"] | {"_groups": rec["groups"],
                                     "_slots": rec["slots"]})
+    # 按时间顺序排 period：自动容量伪 slot 和尾巴缺口是后补进来的，不排一下
+    # 18:00 的「整段」会排在 16:15 的真实 session 后面，任务就先分到晚的那段。
+    def _start_min(period):
+        got = sp.parse_hhmm((period or {}).get("start"))
+        return got[0] * 60 + got[1] if got else 0
+    out.sort(key=lambda period: (_start_min(period),
+                                 str((period or {}).get("id") or "")))
     return out
+
+
+def _append_pairs(period, groups, auto_layouts, notes):
+    """尾巴追加：``prefix`` 原样保留，只把新 session 接在最后。
+
+    返回 ``[(group, session), ...]``。固定 group（data.csv 里本来就有、只是还没
+    挂任务的场次）按起点找回自己那一场；``append=True`` 的缺口 group 依次对应
+    ``prefix`` 之后新切出来的场次。序列对不上就整段退回「只填现有场次」，不写
+    layout —— 宁可少排，也不许把已经订上的场次挪位置。
+    """
+    prefix = list(period.get("append_prefix") or [])
+    fixed = [g for g in groups if not (g.get("slot") or {}).get("append")]
+    gaps = [g for g in groups if (g.get("slot") or {}).get("append")]
+    new_durations = []
+    for group in gaps:
+        size = _ceil_session_minutes(group.get("work"))
+        if size:
+            new_durations.append(size)
+    if not new_durations:
+        return [(g, g.get("slot")) for g in fixed if g.get("slot")]
+    durations = prefix + new_durations
+    if sum(d // MINUTES_PER_COUNT for d in durations) > int(period.get("blocks") or 0):
+        notes.append("「%s %s」尾巴追加超出 period 容量，已跳过"
+                     % (period.get("id"), period.get("start")))
+        return [(g, g.get("slot")) for g in fixed if g.get("slot")]
+    try:
+        sessions = sp.plan_period(period, durations)
+    except ValueError as e:
+        notes.append(str(e))
+        return [(g, g.get("slot")) for g in fixed if g.get("slot")]
+    by_start = {s["start"]: s for s in sessions}
+    pairs = []
+    for group in fixed:
+        session = by_start.get(str((group.get("slot") or {}).get("start") or ""))
+        if session is None:
+            notes.append("「%s %s」的时间轴和 layout 对不上，这一段没有追加"
+                         % (period.get("id"), period.get("start")))
+            return [(g, g.get("slot")) for g in fixed if g.get("slot")]
+        pairs.append((group, session))
+    for group, session in zip(gaps, sessions[len(prefix):]):
+        pairs.append((group, session))
+    auto_layouts[_period_key(period)] = durations
+    return pairs
 
 
 def schedule_periods(items, slots):
@@ -1278,10 +1336,14 @@ def schedule_periods(items, slots):
             except ValueError as e:
                 notes.append(str(e))
                 sessions = []
+            pairs = list(zip(groups, sessions))
+        elif period.get("append"):
+            pairs = _append_pairs(period, groups, auto_layouts, notes)
         else:
             sessions = [g.get("slot") for g in groups if g.get("slot")]
             # 手动 layout 的 session 与 group 一一对应。
-        for group, session in zip(groups, sessions):
+            pairs = list(zip(groups, sessions))
+        for group, session in pairs:
             places = list(group.get("places") or ())
             n = len(places)
             for unit, minutes in places:
