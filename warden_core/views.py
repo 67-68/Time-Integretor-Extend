@@ -130,14 +130,17 @@ class View(object):
                  "Key Time：按规则匹配的日历时间块 —— 报警、确认、规则、Bark 设备",
                  ("kt", "key-time"),
                  usage="keytime | keytime ack | keytime refresh | keytime on|off | "
+                       "keytime focus [setup|on|off] | keytime notify [文字] | "
                        "keytime rules [reset] | "
                        "keytime device [add <名字> <key>|remove <名字>|test|on|off] | "
                        "keytime set <键> <值>",
-                 options=("ack", "refresh", "rules", "on", "off", "device", "set"),
-                 hint=_hint_actions("ack", "device test", "device add iphone <key>",
-                                    "set volume 10",
-                                    note="到点强制置顶 iTerm + 音量 10 + 语音播报；"
-                                         "人不在 Mac 前才推手机（Bark）；确认后停止播报")),
+                 options=("ack", "refresh", "rules", "on", "off", "focus", "notify",
+                          "device", "set"),
+                 hint=_hint_actions("ack", "focus setup", "focus on|off", "notify",
+                                    "device test", "set volume 10",
+                                    note="到点锁死桌面（Focus.app，除 iTerm 全杀）+ 置顶 iTerm"
+                                         "+ 音量 10 + 语音 + mac 横幅；人不在 Mac 前才推手机"
+                                         "（Bark）；确认后停止播报，桌面锁到这块结束")),
             _cmd("stat", w.cmd_stat_from_args, "生涯统计（stat refresh / full）",
                  ("stats",), "通用", usage="stat [refresh [full]]",
                  options=("refresh", "full"), hint=_hint_stat),

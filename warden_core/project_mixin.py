@@ -355,7 +355,8 @@ class ProjectMixin(object):
                            overflow="crop"),
                       Text(type_txt, style=type_style),
                       Text(task_type, style=task_type_style),
-                      Text(str(row.get("remaining") or 0), style="bold cyan"),
+                      Text(str(row.get("remaining_text")
+                               or row.get("remaining") or 0), style="bold cyan"),
                       Text(row.get("progress_text") or "—", style=STYLE_MUTED),
                       Text(plan_txt, style="green" if row.get("allocated") else STYLE_MUTED),
                       Text(str(row.get("tasks_open") or 0), style=STYLE_MUTED),
@@ -364,10 +365,14 @@ class ProjectMixin(object):
                            else STYLE_MUTED),
                       Text(str(row.get("pk") or "")[:10] or "—"))
         total_remaining = sum(int(r.get("remaining") or 0) for r in rows)
-        t.caption = ("%d 个活跃项目 · 剩余 %d count（%d 分钟）· 只显示当前阶段对应的 "
+        total_high = sum(int(r.get("remaining_high") or r.get("remaining") or 0)
+                         for r in rows)
+        left_txt = ("%d-%d" % (total_remaining, total_high)
+                    if total_high > total_remaining else str(total_remaining))
+        t.caption = ("%d 个活跃项目 · 剩余 %s count（%d 分钟）· 只显示当前阶段对应的 "
                      "op（running=SOP / bottleneck=incubator）· 排序列 = 该项目检测到的 "
                      "OmniFocus 规则（sequential / parallel）· `plan` 也按同一份清单分配"
-                     % (len(rows), total_remaining,
+                     % (len(rows), left_txt,
                         total_remaining * pp.MINUTES_PER_COUNT))
         return t
 
@@ -713,12 +718,13 @@ class ProjectMixin(object):
                                 pr["number"], file_txt), "warn")
                     continue
                 op = row.get("active_op") or {}
-                self.say("📂 Pro #%d %s [阶段:%s → %s op #%s「%s」]：剩余 %d count · "
+                self.say("📂 Pro #%d %s [阶段:%s → %s op #%s「%s」]：剩余 %s count · "
                          "进度 %s · %d 条未完成 · 本周 %d 条%s%s"
                          % (pr["number"], self.pro_display_title(pr), pr["stage"],
                             row.get("active_op_type") or "?",
                             row.get("op_number") or "?", op.get("title") or "?",
-                            row.get("remaining") or 0, row.get("progress_text") or "—",
+                            row.get("remaining_text") or row.get("remaining") or 0,
+                            row.get("progress_text") or "—",
                             row.get("tasks_open") or 0, int(row.get("week_count") or 0),
                             (" · 今天说好 %d count（已排 %d）"
                              % (row.get("allocated"), row.get("scheduled")))
@@ -1824,9 +1830,10 @@ class ProjectMixin(object):
                 pro_bit = (" · pro:%s(%s)" % (row["pro_title"], row.get("pro_stage") or "running")
                            if row.get("pro_title") else "")
                 allow_bit = "" if row.get("allowed", True) else " · ⏸受项目阶段限制"
-                self.say("📁 op #%d %s [%s%s%s]：剩余 %d count · 进度 %s · %d 条未完成 · 本周 %d 条"
+                self.say("📁 op #%d %s [%s%s%s]：剩余 %s count · 进度 %s · %d 条未完成 · 本周 %d 条"
                          % (row["number"], row["title"], op_kind, pro_bit, allow_bit,
-                            row["remaining"], row["progress_text"], row["tasks_open"],
+                            row.get("remaining_text") or row.get("remaining") or 0,
+                            row["progress_text"], row["tasks_open"],
                             int(row.get("week_count") or 0)), "info")
             return rows
         first_low = toks[0].lower()
@@ -2157,11 +2164,13 @@ class ProjectMixin(object):
         invested = pj.invested_by_project(self.task_store).get(project["id"]) or {}
         stat = pj.stats(project, self.task_store, invested)
         num = self.projects.number_of(project["id"]) or project["id"]
-        self.say("📁 #%d「%s」OmniFocus %s · 排序 %s · 剩余 %d count · 进度 %s（%d/%d）"
+        detail_extra = ("" if stat["total_high"] > stat["total"]
+                        else "（%d/%d）" % (stat["done"], stat["total"]))
+        self.say("📁 #%d「%s」OmniFocus %s · 排序 %s · 剩余 %s count · 进度 %s%s"
                  % (num, project.get("title"),
                     ((project.get("omnifocus") or {}).get("id") or "?"),
-                    pj.task_type_of(project), stat["remaining"],
-                    stat["progress_text"], stat["done"], stat["total"]), "cmd")
+                    pj.task_type_of(project), stat["remaining_text"],
+                    stat["progress_text"], detail_extra), "cmd")
         if project.get("file"):
             self.say("   📄 关联文件：%s" % project.get("file"), "info")
         week = pj.weekly_yield(project.get("tasks") or [])
@@ -2243,9 +2252,9 @@ class ProjectMixin(object):
             pass
         stat = pj.stats(updated, self.task_store)
         week = pj.weekly_yield(updated.get("tasks") or [])
-        self.say("🔄 项目 #%s「%s」刷新了：%d 条任务、剩余 %d count（进度 %s）"
+        self.say("🔄 项目 #%s「%s」刷新了：%d 条任务、剩余 %s count（进度 %s）"
                  % (num, updated.get("title"), len(updated.get("tasks") or []),
-                    stat["remaining"], stat["progress_text"]), "ok")
+                    stat["remaining_text"], stat["progress_text"]), "ok")
         if week.get("count"):
             self.say(pj.week_summary(week), "info")
         self.rebuild_rows()

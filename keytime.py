@@ -15,9 +15,10 @@ Key Time 是什么
                                                         │
                                      keytime.load_keytimes()
                                                         │
-                       ┌────────────────────────────────┼─────────────────────────┐
-                       ▼                                ▼                         ▼
-               warden 看板（淡红一行 / 全屏模板）   alert.py（音量 + say）    Bark（手机推送）
+       ┌───────────────┬───────────────┬────────────────┼────────────────┬──────────────┐
+       ▼               ▼               ▼                ▼                ▼              ▼
+ warden 看板     置顶 iTerm    Focus.app 锁桌面    alert.py（音量+say）  mac 横幅    Bark → iPhone
+（淡红一/整页）            （除 iTerm 全杀）
 
 三个纯函数（测试直接断言，不碰系统）
 ------------------------------------
@@ -28,10 +29,12 @@ Key Time 是什么
 两条铁律
 --------
 1. **只读日历、只写自己的状态文件。** keytime 不改变契约、不订场、不动 data.csv；
-   唯一会写的外部状态是：系统音量（播报前后）和手机推送。
+   会动的外部状态只有四样：系统音量（播报前后）、Focus.app 的开关（`focus://`）、
+   mac 横幅、手机推送。Focus.app 的 profile 只在用户敲 `keytime focus setup` 时写
+   （写之前先让 Focus.app 退出，并留 `default.cfg.keytime.bak`）。
 2. **报警强度从状态来，不从时间硬编码。** 到点 60 秒内一次，之后每分钟一次；
-   确认（ack）之后停止播报，但「每分钟把 warden 拉到最前」还会继续 —— 这是用户
-   明确要的行为（见 feature_intents/keytime.md）。
+   确认（ack）之后停止播报/横幅，但「每分钟把 warden 拉到最前」和桌面锁还会继续
+   —— 这是用户明确要的行为（见 feature_intents/keytime.md）。
 
 文件
 ----
@@ -55,6 +58,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 import keytime_rules as kr
 
@@ -82,6 +86,23 @@ DEFAULT_CONFIG = {
     "summon": True,
     # 系统空闲超过这个秒数 = 人不在 Mac 前（这时才往手机推）。
     "leave_idle_sec": 120,
+    # 到点「锁死所有 App，只留 iTerm」：走 Focus.app（Brad Jasper）的 profile。
+    # profile 名必须和 Focus.app 里那条完全一样；`keytime focus setup` 会自动建。
+    "focus": {
+        "enabled": True,
+        "profile": "keytime",
+        # ack 之后是否立刻解锁：默认不解锁 —— 和「置顶照旧每分钟一次」一个道理，
+        # 锁到这块 key time 结束为止。
+        "release_on_ack": False,
+        # 额外要留下的 App（bundle id；iTerm / Focus / Script Editor 永远留下）。
+        # 例：["com.parallels.desktop.appstore"] 让 Parallels 不被杀。
+        "keep": [],
+    },
+    # Mac 横幅通知（和手机 Bark 是两条独立链路；每分钟一条，叠加不覆盖）。
+    "notify": {
+        "enabled": True,
+        "sound": "Sosumi",
+    },
     # Bark 推送。stack_notifications=True 时每分钟发一条新通知（用户选的）；
     # False 时用同一个 id 原地替换（手机上只留一条「已超时 N 分钟」）。
     "push": {
@@ -161,8 +182,8 @@ def load_config(path=None):
     raw = _read_json(config_path(path), {}) or {}
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))          # deep copy
     for key, value in raw.items():
-        if key == "push" and isinstance(value, dict):
-            cfg["push"].update(value)
+        if key in ("push", "focus", "notify") and isinstance(value, dict):
+            cfg[key].update(value)
         else:
             cfg[key] = value
     return cfg
@@ -982,6 +1003,345 @@ def push_params(config, mode="alarm", seq=None):
         params["sound"] = ""
         params["level"] = push.get("acked_level") or "passive"
     return params
+
+
+# ================================================================ 锁死桌面（Focus.app）+ mac 通知
+#
+# 用户要求（2026-11-15）：「使用 focus 2 锁死所有，仅留 iterm」「同时浮现，置顶
+# iterm 无法使用」「在 mac 上发通知」。前两条走 Brad Jasper 的 **Focus.app**
+# （heyfocus 那个）：它的 profile 里放一份「除了 iTerm 全杀」的黑名单，
+# URL scheme（``focus://focus?profile=名字``）开关；第三条用 osascript 的
+# ``display notification``（横幅 + 声音，每分钟一条，堆叠不覆盖）。
+#
+# 为什么读配置文件、不用 AppleScript：Focus.app 的 sdef 只有查询命令
+# （is focusing / active profile name），而且 iTerm → Focus 的自动化授权还要
+# 用户点一次；它的配置就是 ``~/Library/Application Support/Focus/default.cfg``
+# 这个 JSON，读 activeSessions / profiles 不需要任何权限，测试也好隔离。
+
+FOCUS_APP = "/Applications/Focus.app"
+FOCUS_BUNDLE_ID = "BradJasper.focus"
+FOCUS_CFG = os.path.expanduser("~/Library/Application Support/Focus/default.cfg")
+
+#: 建 profile 时永远不杀的 App：iTerm 是唯一要留的终端；Focus 自己杀了就没人
+#: 解锁；Script Editor 是 osascript 横幅的宿主。
+FOCUS_KEEP_BUNDLES = ("com.googlecode.iterm2", FOCUS_BUNDLE_ID,
+                      "com.apple.ScriptEditor2")
+
+#: 发现 App 的目录（和 Focus.app 自己的「加 App」扫描范围一致）
+FOCUS_APP_DIRS = ("/Applications", "/Applications/Utilities",
+                  "/System/Applications", "/System/Applications/Utilities",
+                  os.path.expanduser("~/Applications"))
+
+
+def focus_keep(section=None):
+    """建 profile 时保留的 App：上面三条 + 配置里的 ``focus.keep``（bundle id）。"""
+    extra = [str(x).strip() for x in ((section or {}).get("keep") or [])
+             if str(x).strip()]
+    return tuple(FOCUS_KEEP_BUNDLES) + tuple(extra)
+
+
+def focus_cfg_path(path=None):
+    """Focus.app 配置文件路径。测试用 ``TI_KEYTIME_FOCUS_CFG`` 指到临时目录。"""
+    return (path or os.environ.get("TI_KEYTIME_FOCUS_CFG")
+            or os.path.expanduser(FOCUS_CFG))
+
+
+def focus_available():
+    return os.path.isdir(FOCUS_APP)
+
+
+def load_focus_cfg(path=None):
+    raw = _read_json(focus_cfg_path(path), {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_focus_cfg(cfg, path=None):
+    """写回 Focus.app 配置（先留一份 ``.keytime.bak``，写盘走原子替换）。"""
+    target = focus_cfg_path(path)
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    if os.path.exists(target):
+        try:
+            import shutil
+            shutil.copy2(target, target + ".keytime.bak")
+        except OSError:
+            pass
+    tmp = target + ".keytime.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False)
+    os.replace(tmp, target)
+    return target
+
+
+def focus_profiles(path=None):
+    """Focus.app 里所有 profile 的名字（文件里写着的顺序）。"""
+    return [str(p.get("name") or "")
+            for p in (load_focus_cfg(path).get("profiles") or [])
+            if isinstance(p, dict)]
+
+
+def focus_state(path=None):
+    """读 Focus.app 当前状态：``{"focusing": bool, "profile": 名字, "since": …}``。
+
+    只读配置文件（activeSessions / activeProfileID），不碰 AppleScript —— 沙箱
+    和没授权时都能用，测试也只需要一个 JSON。
+    """
+    cfg = load_focus_cfg(path)
+    sessions = [s for s in (cfg.get("activeSessions") or [])
+                if isinstance(s, dict)]
+    active_id = str(cfg.get("activeProfileID") or "")
+    name = ""
+    for profile in cfg.get("profiles") or []:
+        if isinstance(profile, dict) and str(profile.get("uniqueID") or "") == active_id:
+            name = str(profile.get("name") or "")
+            break
+    since = ""
+    if sessions:
+        first = sessions[0]
+        since = str(first.get("startDate") or first.get("start") or "")
+    else:
+        name = ""                                  # 没在锁 → 当前 profile 就是空
+    return {"focusing": bool(sessions), "profile": name, "since": since,
+            "sessions": len(sessions)}
+
+
+def focus_app_running():
+    """Focus.app 进程在不在（``pgrep`` 不需要 Apple 事件授权）。"""
+    try:
+        proc = subprocess.run(["pgrep", "-x", "Focus"], capture_output=True,
+                              text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+def focus_url(action, profile=None):
+    """``focus://focus?profile=名字`` / ``focus://unfocus?profile=名字``。"""
+    url = "focus://%s" % str(action or "").strip().lstrip("/")
+    name = str(profile or "").strip()
+    if name:
+        url += "?profile=" + urllib.parse.quote(name, safe="")
+    return url
+
+
+def focus_open(action, profile=None, dry_run=False, log=None):
+    """用 URL scheme 开关 Focus.app（``open -g``：后台发事件，不抢 iTerm 前台）。"""
+    log = log or (lambda msg: None)
+    if not focus_available():
+        log("没装 Focus.app（%s），跳过「锁死桌面」" % FOCUS_APP)
+        return False
+    url = focus_url(action, profile)
+    if dry_run:
+        log("会 open -g %s" % url)
+        return True
+    try:
+        proc = subprocess.run(["open", "-g", url], capture_output=True,
+                              text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("Focus.app 开关失败：%s" % e)
+        return False
+    if proc.returncode != 0:
+        log("Focus.app 开关失败：%s"
+            % ((proc.stderr or proc.stdout or "").strip() or "无输出"))
+        return False
+    return True
+
+
+def focus_start(config=None, profile=None, dry_run=False, log=None):
+    cfg = config or load_config()
+    section = cfg.get("focus") or {}
+    return focus_open("focus", profile or section.get("profile") or "keytime",
+                      dry_run=dry_run, log=log)
+
+
+def focus_stop(config=None, profile=None, dry_run=False, log=None):
+    cfg = config or load_config()
+    section = cfg.get("focus") or {}
+    return focus_open("unfocus", profile or section.get("profile") or "keytime",
+                      dry_run=dry_run, log=log)
+
+
+def _plist_bundle(app_path):
+    """``X.app/Contents/Info.plist`` 里的 CFBundleIdentifier（二进制 plist 也行）。"""
+    try:
+        import plistlib
+        with open(os.path.join(app_path, "Contents", "Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+        return str(info.get("CFBundleIdentifier") or "").strip()
+    except Exception:                              # noqa: BLE001 - 坏 App 跳过
+        return ""
+
+
+def discover_apps(dirs=None):
+    """扫出所有 ``.app`` 的 ``{路径: bundleId}``（只扫一层，够全）。"""
+    found = {}
+    for root in dirs or FOCUS_APP_DIRS:
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".app"):
+                continue
+            app_path = os.path.join(root, name)
+            bundle = _plist_bundle(app_path)
+            if bundle:
+                found[app_path] = bundle
+    return found
+
+
+def _blocked_entry(app_path, bundle):
+    """Focus.app 黑名单里一条 App 的字段（和它自己写出来的形状一致）。"""
+    return {"path": app_path, "bundleId": bundle,
+            "shouldReopenWhenUnfocusing": True,
+            "shouldHideInsteadOfQuit": True,
+            "shouldAlwaysForceQuit": False,
+            "performOnlySoftKillThenLeaveOpen": False}
+
+
+def build_focus_profile(name="keytime", base="night purge", keep=None,
+                        path=None, dirs=None):
+    """造一条「除 iTerm 全杀」的 profile（以现有 profile 为模板，字段最全）。
+
+    以 ``base`` 那条为底（保留它的脚本/引语/计时器等字段），把
+    ``blockedApplications`` 换成「现有黑名单 + 扫到的全部 App − keep」。
+    """
+    cfg = load_focus_cfg(path)
+    profiles = [p for p in (cfg.get("profiles") or []) if isinstance(p, dict)]
+    keep = tuple(keep or FOCUS_KEEP_BUNDLES)
+    base_profile = next((p for p in profiles if p.get("name") == base), None)
+    if base_profile is None and profiles:
+        base_profile = profiles[0]
+    new = json.loads(json.dumps(base_profile)) if base_profile else {}
+    apps = {}
+    for entry in new.get("blockedApplications") or []:
+        if isinstance(entry, dict) and entry.get("bundleId"):
+            apps[str(entry["bundleId"])] = dict(entry)
+    for app_path, bundle in discover_apps(dirs).items():
+        apps.setdefault(bundle, _blocked_entry(app_path, bundle))
+    for bundle in keep:
+        apps.pop(bundle, None)
+    new["blockedApplications"] = sorted(
+        apps.values(), key=lambda e: str(e.get("path") or ""))
+    new["name"] = str(name)
+    new["uniqueID"] = uuid.uuid4().hex.upper()     # 每条 profile 自己的 id
+    # **绝不继承模板的定时规则**：night purge 带着一条 23:50→07:00 的自动 session，
+    # 继承下来就会在半夜自己锁死桌面 —— 那时没有 key time，warden 也不会去解锁。
+    new["schedules"] = []
+    new.setdefault("blockedWebsites", [])
+    new.setdefault("defaultBreaks", 0)
+    new.setdefault("defaultIsLocked", False)
+    return new
+
+
+def _quit_focus_app(log=None, wait=10.0):
+    """让 Focus.app 退出（它退出时不会把内存配置写回来，所以之后再写盘才安全）。"""
+    log = log or (lambda msg: None)
+    for cmd in (["osascript", "-e",
+                 'tell application id "%s" to quit' % FOCUS_BUNDLE_ID],
+                ["killall", "Focus"]):
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if not focus_app_running():
+                return True
+            time.sleep(0.2)
+    log("Focus.app 没能退出（keytime 的 profile 没写进去）")
+    return not focus_app_running()
+
+
+def install_focus_profile(name="keytime", base="night purge", keep=None,
+                          path=None, restart=True, log=None, dirs=None):
+    """把「除 iTerm 全杀」的 profile 写进 Focus.app。
+
+    Focus.app 跑着的时候会用内存里的配置盖掉 ``default.cfg``，所以写盘前必须
+    先让它退出（``restart=True`` 就 kill + 重新打开 —— 会重启用户的 Focus.app，
+    但不会动它已经存在的 profile）。返回 ``(ok, 说明文字)``。
+    """
+    log = log or (lambda msg: None)
+    if not focus_available():
+        return False, "没装 Focus.app（%s）" % FOCUS_APP
+    cfg = load_focus_cfg(path)
+    if not cfg:
+        return False, "读不到 Focus.app 配置：%s" % focus_cfg_path(path)
+    active = focus_state(path)
+    if active.get("focusing") and active.get("profile") != name:
+        return False, ("Focus.app 现在正跑着别的 profile（%s），先把它停了再 setup"
+                       % (active.get("profile") or "? "))
+    profile = build_focus_profile(name, base, keep, path, dirs)
+    others = [p for p in (cfg.get("profiles") or [])
+              if isinstance(p, dict) and p.get("name") != name]
+    cfg["profiles"] = others + [profile]
+    was_running = focus_app_running()
+    if restart and was_running:
+        if not _quit_focus_app(log):
+            return False, "Focus.app 没退出，配置没写（先手动退出它再试）"
+    save_focus_cfg(cfg, path)
+    if restart and was_running:
+        try:
+            subprocess.run(["open", "-g", "-a", FOCUS_APP],
+                           capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as e:
+            log("Focus.app 没重新打开：%s" % e)
+    blocked = len(profile.get("blockedApplications") or [])
+    return True, ("profile %r：拦 %d 个 App（保留 iTerm / Focus / Script Editor）%s"
+                  % (name, blocked,
+                     "；Focus.app 已重启" if (restart and was_running) else ""))
+
+
+def verify_focus_profile(name="keytime", path=None):
+    """profile 真的写进去了没有（写盘后立刻读回来确认）。"""
+    cfg = load_focus_cfg(path)
+    for profile in cfg.get("profiles") or []:
+        if isinstance(profile, dict) and profile.get("name") == name:
+            return len(profile.get("blockedApplications") or [])
+    return -1
+
+
+# ---------------------------------------------------------------- mac 通知
+
+
+#: osascript 从 argv 取文字，避免把中文/引号拼进 AppleScript 源码
+#: （拼字符串时一个引号转义错就是静默不弹）。
+_NOTIFY_SCRIPT = ("on run argv\n"
+                  "  display notification (item 2 of argv) with title (item 1 of argv)%s\n"
+                  "end run")
+_NOTIFY_SOUND = " sound name (item 3 of argv)"
+
+
+def notification_body(text, limit=240):
+    """把模板渲染出来的多行文字压成横幅正文（一行流 + 截断）。"""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    body = " · ".join(lines)
+    if len(body) > limit:
+        body = body[:limit - 1].rstrip() + "…"
+    return body
+
+
+def notify(title, body, sound=None, dry_run=False, log=None):
+    """mac 横幅通知（声音默认走配置；没有声音时只弹横幅）。"""
+    log = log or (lambda msg: None)
+    if dry_run:
+        log("会 display notification %r（%r%s）"
+            % (title, body, "，声音 " + str(sound) if sound else ""))
+        return True
+    args = ["osascript", "-e",
+            _NOTIFY_SCRIPT % (_NOTIFY_SOUND if sound else ""),
+            str(title or "Key Time"), str(body or "")]
+    if sound:
+        args.append(str(sound))
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("mac 通知失败：%s" % e)
+        return False
+    if proc.returncode != 0:
+        log("mac 通知失败：%s"
+            % ((proc.stderr or proc.stdout or "").strip() or "无输出"))
+        return False
+    return True
 
 
 # ================================================================ 把 warden 拉到最前

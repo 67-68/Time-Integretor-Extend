@@ -944,14 +944,27 @@ BATCH_JS = r"""
     return JSON.stringify(reply({ ok: false, error: "omnijs_unavailable",
       message: "当前 OmniFocus 不支持 Task.byIdentifier" }));
   }
+  const listStart = lines => {
+    // 清单段从哪一行之后开始：`@list`（第一行非空行）优先，其次旧的 `# titles`。
+    let first = -1;
+    for (let i = 0; i < lines.length; i += 1) {
+      if (lines[i].trim()) { first = i; break; }
+    }
+    if (first >= 0 && /^\s*@list\b/i.test(lines[first])) return first + 1;
+    for (let i = 0; i < lines.length; i += 1) {
+      if (/^\s*#+\s*titles\s*$/i.test(lines[i])) return i + 1;
+    }
+    return -1;
+  };
   const titlesRemaining = note => {
-    // `# titles` 段里还剩几条没勾（0 = 整套清单做完了）
-    let inTitles = false;
+    // 清单里还剩几条没勾（0 = 整套清单做完了）
+    const lines = String(note || "").split(/\r?\n/);
+    const start = listStart(lines);
+    if (start < 0) return 0;
     let remaining = 0;
-    for (const line of String(note || "").split(/\r?\n/)) {
-      if (/^\s*#+\s*titles\s*$/i.test(line)) { inTitles = true; continue; }
-      if (inTitles && /^\s*#{1,6}\s+\S/.test(line)) break;
-      if (!inTitles) continue;
+    for (let i = start; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (/^\s*#{1,6}\s+\S/.test(line)) break;
       const m = line.match(/^\s*[-*+]\s+(.*\S)\s*$/);
       if (!m) continue;
       if (!/^\[[xX]\]/.test(m[1])) remaining += 1;

@@ -104,10 +104,13 @@ incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一�
 顶部留一行淡红字。`open keytime` 是数据视图第四种模型。
 见 [`feature_intents/keytime.md`](feature_intents/keytime.md)。
 
-**标题清单派生任务**：一条「每天重复 + 非 defer 锚」的任务，如果 note 里有
-`# titles` 列表，就按「一次做一条」处理 —— `task N -d` 把下一条未勾选标题变成
-本地派生任务（不写回 OmniFocus），做完自动把 note 那行勾成 `- [x]`，整份清单勾完
-自动放弃整个重复任务。plan 也会展开它（parallel 轮转、sequential 依次）。
+**标题清单派生任务**：任何任务带了 `@list` 记号（note 第一行，或任务标题最前面；
+旧写法 `# titles` 也认），
+就按「一次做一条」处理 —— `task N -d` 把下一条未勾选标题变成本地派生任务
+（不写回 OmniFocus），做完自动把 note 那行勾成 `- [x]`，整份清单勾完自动收掉容器
+（重复任务放弃整套、普通任务标完成）。不需要它是重复任务。plan 也会展开它
+（parallel 轮转、sequential 依次）。没有清单、但本身是重复任务时，`-d` 复制
+一条和本体一样的任务（同标题 / count / 时长），**没有数量上限**。
 见 [`feature_intents/derived.md`](feature_intents/derived.md)。
 
 **收尾面板长在哪儿**：不是某个视图的内部件，而是 `repl_kit` 的**打断栏位**
@@ -1104,6 +1107,12 @@ class Warden(
         try:
             self.shell.run()
         finally:
+            # 退出前解开桌面锁：daemon 线程会被进程退出砍掉，那时必须同步把
+            # focus://unfocus 发出去，否则「锁死除 iTerm 外所有 App」会一直挂着。
+            try:
+                self._keytime_focus_release("warden 退出", blocking=True)
+            except Exception:                      # noqa: BLE001 - 退出不能被它卡住
+                pass
             # 后台线程是 daemon：退出前给它一次机会把手上那件事做完，
             # 别让「刚点了取消」这种操作停在半路（超时就照旧退）。
             self.jobs.wait(5.0)

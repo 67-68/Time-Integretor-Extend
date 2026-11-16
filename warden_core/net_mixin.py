@@ -1134,11 +1134,11 @@ class NetMixin(object):
                      % (head, num, project.get("title"), type_label, pro_label,
                         (project.get("omnifocus") or {}).get("id") or "?"), "ok")
             self.say("   %d 条任务（%d 条未完成、%d 条已完成、%d 条已放弃）"
-                     " · 共 %d count = %d 分钟 · 剩余 %d count（进度 %s）"
+                     " · 共 %d count = %d 分钟 · 剩余 %s count（进度 %s）"
                      % (len(tasks), len(open_tasks), len(done_tasks),
                         len(dropped_tasks), stat["total"],
                         stat["total"] * pp.MINUTES_PER_COUNT,
-                        stat["remaining"], stat["progress_text"]), "info")
+                        stat["remaining_text"], stat["progress_text"]), "info")
             week = pj.weekly_yield(tasks)
             if week.get("count"):
                 self.say("   " + pj.week_summary(week), "info")

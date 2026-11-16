@@ -2085,7 +2085,8 @@ class TaskStore(object):
             marks += "🔁"
         if TaskStore.omnifocus_id(task):
             marks += "🔗"
-        if str(((task or {}).get("source") or {}).get("kind") or "") == "derived":
+        if str(((task or {}).get("source") or {}).get("kind") or "") in (
+                "derived", "derived-copy"):
             marks += "🧬"
         return marks
 

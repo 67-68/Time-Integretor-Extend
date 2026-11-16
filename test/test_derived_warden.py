@@ -84,7 +84,7 @@ def fresh():
     return wd
 
 
-NOTE = """# titles
+NOTE = """@list
 - 2019-亚太-12
 - 2019-亚太-22
 - 2019-亚太-32
@@ -130,19 +130,39 @@ def make(note=NOTE, repeat=DAILY, count=25, task_type="parallel",
 print("== 资格 / count 范围 ==")
 wd, project, parent = make()
 state = wd.derived_state(parent)
-check("识别成标题清单重复任务", state["eligible"], True)
+check("识别成 @list 清单任务", state["eligible"], True)
 check("3 条未勾选", len(dv.open_items(dv.parse(state["note"]))), 3)
 check("count 范围 25-75", wd.derived_count_span(parent), "25-75")
 check_in("任务格子显示范围", "25-75", wd.task_count_label(parent))
 check_in("任务面板格子里也能看到范围", "25-75", wd.task_index_title(parent))
 check("不是父任务就没有范围", wd.derived_count_span(wd.task_store.create(
     {"title": "普通任务"})), None)
-wd2, _, parent2 = make(repeat=DEFER)
-check("defer 锚不合格", wd2.derived_state(parent2)["eligible"], False)
-wd3, _, parent3 = make(repeat=WEEKLY)
-check("每周重复不合格", wd3.derived_state(parent3)["eligible"], False)
+_stat = pj.stats(project)
+check("项目行剩余 count 也是范围", _stat["remaining_text"], "25-75")
+check("项目行进度也是范围", _stat["progress_text"], "0/25-75")
+_row = {"number": 1, "pro_title": "History Papers",
+        "active_op": {"title": "History Papers"}, "effective_stage": "running",
+        "active_op_type": "SOP", "task_type": "parallel", "remaining": 25,
+        "remaining_text": "25-75", "progress_text": "0/25-75",
+        "allocated": 0, "scheduled": 0, "tasks_open": 1, "week_count": 0,
+        "pk": "taskHIST"}
+wd.current_project_rows = lambda day=None: [_row]
+_buf = io.StringIO()
+Console(file=_buf, width=200, force_terminal=False).print(wd.render_projects_table())
+check_in("项目表里能看到范围", "25-75", _buf.getvalue())
+world = [("defer 锚也认（不看重复规则）", make(repeat=DEFER)),
+         ("每周重复也认", make(repeat=WEEKLY)),
+         ("不重复的任务也认", make(repeat=None))]
+for label, (wd2, _project2, parent2) in world:
+    check(label, wd2.derived_state(parent2)["eligible"], True)
 wd4, _, parent4 = make(note="没有清单")
-check("没有 # titles 不合格", wd4.derived_state(parent4)["eligible"], False)
+check("没有 @list 不合格", wd4.derived_state(parent4)["eligible"], False)
+wd5, _, parent5 = make(note="说明在前\n@list\n- a\n")
+check("记号不在第一行不合格", wd5.derived_state(parent5)["eligible"], False)
+wd6, _project6, parent6 = make(note="- a\n- b\n", title="@list 完成历史 Papers")
+check("记号写在标题前面也认", wd6.derived_state(parent6)["eligible"], True)
+check("标题前面的记号不算进派生标题",
+      wd6.derived_create(parent6)["fields"]["title"], "完成历史 Papers：a")
 
 print("== task N -d ==")
 wd, project, parent = make()
@@ -170,6 +190,39 @@ wd, project, parent = make()
 two = wd.derived_create(parent, 2)
 check("-d 2 取第二条", two["fields"][dv.F_DERIVED_TEXT], "2019-亚太-22")
 
+print("== 重复任务 -d → 再来一条副本 ==")
+wd, project, parent = make(note="")
+copy1 = wd.derived_create(parent)
+check("副本标题和本体一样", copy1["fields"]["title"], "完成历史 Papers")
+check("副本 count 一样", copy1["fields"]["count"], 25)
+check("副本时长一样", copy1["fields"]["duration"], 625)
+check("副本没有 OmniFocus 关联", copy1.get("omnifocus"), None)
+check("副本不再重复", copy1.get("repeat"), None)
+check("合成 pk #c1", copy1["fields"][pj.PROJECT_TASK_FIELD], "taskHIST#c1")
+check("source.kind", copy1["source"]["kind"], dv.COPY_KIND)
+copy2 = wd.derived_create(parent)
+check("第二次派生 #c2（没有上限）", copy2["fields"][pj.PROJECT_TASK_FIELD],
+      "taskHIST#c2")
+copy3 = wd.derived_create(parent)
+check("第三次照样行", copy3["fields"][dv.F_DERIVED_COPY], 3)
+check("副本是拷贝不是清单派生",
+      (dv.is_copy(copy1), dv.is_derived(copy1)), (True, False))
+check("派生副本数量不限", len([t for t in wd.task_store.list() if dv.is_copy(t)]), 3)
+wd.task_store.complete(copy1["id"])
+check("完成副本不动本体", wd.task_store.get(parent["id"])["status"], ts.STATUS_ACTIVE)
+check("完成副本不回写 note", dv.derivation(copy1), None)
+check("副本不排 note_mark/drop", wd.omni_outbox.ops, [])
+wd, project, parent = make(note="")
+wd.cmd_task(["id:%d" % parent["id"], "-d"])
+check("命令路径也能复制", len([t for t in wd.task_store.list()
+                              if dv.is_copy(t)]), 1)
+wd7, _p7, plain = make(note="", repeat=None)
+try:
+    wd7.derived_create(plain)
+    check("既没清单也不是重复 → 报错", "没报错", "ValueError")
+except ValueError as exc:
+    check_in("报错提到 @list / 重复任务", "@list", str(exc))
+
 print("== -ac 被拒绝 ==")
 wd, project, parent = make()
 try:
@@ -191,7 +244,7 @@ check_in("本地 note 立刻勾上", "- [x] 2019-亚太-12", note)
 check_in("原来没勾的行还在", "- 2019-亚太-22", note)
 
 print("== 全部勾完 → 放弃整个重复任务 ==")
-wd, project, parent = make(note="# titles\n- a\n- b\n")
+wd, project, parent = make(note="@list\n- a\n- b\n")
 first = wd.derived_create(parent)
 wd.task_store.complete(first["id"])
 second = wd.derived_create(parent)
@@ -206,6 +259,18 @@ left = [t for t in wd.task_store.list()
         if dv.is_derived(t) and t["status"] == ts.STATUS_ACTIVE]
 check("没留活的派生任务", left, [])
 check("本地 note 全勾", dv.parse(wd.derived_note_of("taskHIST"))["open"], 0)
+
+print("== 全部勾完 → 普通任务标完成 ==")
+wd, project, parent = make(note="@list\n- a\n- b\n", repeat=None)
+first = wd.derived_create(parent)
+wd.task_store.complete(first["id"])
+second = wd.derived_create(parent)
+wd.task_store.complete(second["id"])
+ops = wd.omni_outbox.ops
+check("排了完成而不是放弃", [o["op"] for o in ops if o["op"] != "note_mark"],
+      ["complete"])
+check("本地父任务已完成",
+      wd.task_store.get(parent["id"])["status"], ts.STATUS_COMPLETED)
 
 print("== 计划展开（parallel）==")
 wd, project, parent = make()
@@ -286,19 +351,19 @@ check("source.kind", src["kind"], "derived")
 check("source 不带 id（无 OmniFocus 关联）", src.get("id"), None)
 
 print("== flush 回填 note_mark ==")
-wd, project, parent = make(note="# titles\n- a\n- b\n")
+wd, project, parent = make(note="@list\n- a\n- b\n")
 d = wd.derived_create(parent)
 wd.omni_outbox.ops = []
 wd._apply_omnifocus_flush({
     "done": [], "dropped": [], "failed": [],
     "marked": [{"pk": "taskHIST", "task_id": d["id"],
-                "res": {"note": "# titles\n- [x] a\n- b\n", "remaining": 1}}]}, {})
+                "res": {"note": "@list\n- [x] a\n- b\n", "remaining": 1}}]}, {})
 check("还剩一条 → 不放弃", wd.task_store.get(parent["id"])["status"], ts.STATUS_ACTIVE)
 check_in("note 缓存更新", "- [x] a", wd.derived_note_of("taskHIST"))
 wd._apply_omnifocus_flush({
     "done": [], "dropped": [], "failed": [],
     "marked": [{"pk": "taskHIST", "task_id": d["id"],
-                "res": {"note": "# titles\n- [x] a\n- [x] b\n", "remaining": 0}}]}, {})
+                "res": {"note": "@list\n- [x] a\n- [x] b\n", "remaining": 0}}]}, {})
 check("全勾完 → 本地放弃父任务",
       wd.task_store.get(parent["id"])["status"], ts.STATUS_DROPPED)
 check("排了 drop", [o["op"] for o in wd.omni_outbox.ops], ["drop"])
@@ -320,6 +385,7 @@ script = ot.build_batch_script({"ops": [{"id": "pk1", "op": "note_mark",
 check_in("含 note_mark 分支", 'note_mark', script)
 check_in("按标题匹配", "line_not_found", script)
 check_in("统计剩余条数", "titlesRemaining", script)
+check_in("认 @list 记号", "@list", script)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print()

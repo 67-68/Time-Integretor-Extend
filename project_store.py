@@ -1469,6 +1469,25 @@ def completion_guard(task, store, task_store):
                    % (project.get("title"), total, got, total - got))
 
 
+def _derived_open_count(item):
+    """清单容器里还剩几条没勾（不是清单 → 0）。
+
+    项目表的「剩余 count / 进度」也要吃这个数：一条 ``@list`` 容器在
+    OmniFocus 里只是一条任务，但实际工作量是「每条未勾标题 × 它的 count」。
+    """
+    if not isinstance(item, dict):
+        return 0
+    note = item.get("note") or ""
+    title = item.get("title") or ""
+    try:
+        import derived as _dv
+    except ImportError:                        # pragma: no cover - 独立跑 project_store
+        return 0
+    if not _dv.has_marker(note, title):
+        return 0
+    return len(_dv.open_items(_dv.parse(note, title)))
+
+
 def stats(project, task_store=None, invested_map=None):
     """一个项目的账：``total`` / ``done`` / ``remaining`` / ``progress``。
 
@@ -1480,6 +1499,11 @@ def stats(project, task_store=None, invested_map=None):
     短任务按**实际分钟汇总**再向上取整成 count：7 条 10 分钟的任务总共 70
     分钟 = 3 count，而不是 7 条各 1 count 累加成 7。相应地，剩余 count 也是
     ``ceil(剩余分钟 / 25)``，保证 ``done + remaining == total``。
+
+    ``@list`` 清单容器按「还剩几条未勾」放大：一条 count=3、还剩 2 条未勾的
+    清单，工作量是 3–6 count（和任务面板里的 ``(0/3-6)`` 同一个口径），所以
+    另外返回 ``remaining_text`` / ``total_high`` / ``remaining_high``，进度
+    文字写成 ``0/3-6``。
     """
     if invested_map is None:
         invested_map = invested(task_store, project)
@@ -1487,7 +1511,9 @@ def stats(project, task_store=None, invested_map=None):
     kids = child_map(tasks)
     statuses = effective_task_statuses(tasks)
     total_minutes = 0
+    high_minutes = 0
     remaining_minutes = 0
+    remaining_high_minutes = 0
     for item in tasks:
         if kids.get(item.get("pk")):
             continue
@@ -1501,7 +1527,10 @@ def stats(project, task_store=None, invested_map=None):
             minutes = cap * ts.MINUTES_PER_COUNT
         if not minutes:
             continue
+        opened = _derived_open_count(item) if status == STATUS_ACTIVE else 0
+        span_high = minutes * opened if opened > 1 else minutes
         total_minutes += minutes
+        high_minutes += span_high
         if status == STATUS_COMPLETED:
             continue
         # 已投入的 count 来自本地任务账；把 count 折回分钟封顶（短任务投 1 count
@@ -1509,15 +1538,26 @@ def stats(project, task_store=None, invested_map=None):
         got = min(cap or 0, int(invested_map.get(item["pk"], 0) or 0))
         spent = min(minutes, got * ts.MINUTES_PER_COUNT)
         remaining_minutes += max(0, minutes - spent)
+        remaining_high_minutes += max(0, span_high - spent)
     total = ts.minutes_to_count(total_minutes) or 0
+    total_high = ts.minutes_to_count(high_minutes) or 0
     remaining = ts.minutes_to_count(remaining_minutes) or 0
+    remaining_high = ts.minutes_to_count(remaining_high_minutes) or 0
     done = max(0, total - remaining)
+    if total_high > total:
+        progress_text = "%d/%d-%d" % (done, total, total_high)
+    else:
+        progress_text = "%d/%d" % (done, total) if total else "—"
     return {
         "total": total,
+        "total_high": total_high,
         "done": done,
         "remaining": remaining,
+        "remaining_high": remaining_high,
+        "remaining_text": ("%d-%d" % (remaining, remaining_high)
+                           if remaining_high > remaining else str(remaining)),
         "progress": (float(done) / total) if total else 0.0,
-        "progress_text": "%d/%d" % (done, total) if total else "—",
+        "progress_text": progress_text,
     }
 
 
@@ -1542,8 +1582,8 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
     * ``exclude_pks`` 里的任务 —— 已经挂了 formatter 的项目任务由 formatter
       自己占时间，项目 plan 不能再把它当成待分配资源。
 
-    **标题清单派生任务**（``derived.py``）：一条「每天重复 + 非 defer 锚」且
-    note 里有 ``# titles`` 的任务不直接进队列，而是展开成派生项：
+    **标题清单派生任务**（``derived.py``）：note 第一行写了 ``@list``（旧写法
+    ``# titles`` 也认）的任务不直接进队列，而是展开成派生项：
     parallel 只展开**下一条**未勾选标题（一次派一条），并且整组派生项排到
     普通任务**最后**、按 ``rotation``（``{父 pk: 最近一次完成的时间}``）轮转；
     sequential 把**全部**未勾选标题按 note 顺序展开在原位（做完第一条的所有
@@ -1630,7 +1670,7 @@ def _derived_eligible(item):
         import derived as _dv
     except ImportError:                        # pragma: no cover - 独立跑 project_store
         return False
-    return bool(_dv.eligible(item.get("repeat"), item.get("note") or ""))
+    return bool(_dv.eligible(item.get("note") or "", item.get("title") or ""))
 
 
 def _expand_derived(item, invested_map=None, all_titles=False):
@@ -1639,7 +1679,7 @@ def _expand_derived(item, invested_map=None, all_titles=False):
         import derived as _dv
     except ImportError:                        # pragma: no cover
         return []
-    parsed = _dv.parse(item.get("note") or "")
+    parsed = _dv.parse(item.get("note") or "", item.get("title") or "")
     titles = _dv.open_items(parsed)
     if not titles:
         return []
@@ -3007,6 +3047,8 @@ class ProjectStore(object):
                 "total": stat["total"],
                 "done": stat["done"],
                 "remaining": stat["remaining"],
+                "remaining_high": stat["remaining_high"],
+                "remaining_text": stat["remaining_text"],
                 "progress": stat["progress"],
                 "progress_text": stat["progress_text"],
                 "allocated": int((plan or {}).get("count") or 0),

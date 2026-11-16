@@ -617,8 +617,12 @@ class TaskCmdMixin(object):
             task 3 -d 2        第 2 条未勾选（或 note 第 N 行）
             task 3 -d -ac      派生完直接挂到当前这一场
 
-        ``-d`` 只对「每天重复 + note 里有 # titles」的任务有意义；不合格时由
-        :meth:`derived_create` 报错说清楚原因。
+        ``-d`` 对两类任务有意义：
+
+            * ``@list`` 清单任务（旧写法 ``# titles`` 也认）→ 派发下一条标题；
+            * 重复任务（note 里没清单）→ 复制一条和本体一样的任务，可以无限复制。
+
+        其余任务由 :meth:`derived_create` 报错说清楚原因。
         """
         spec = None
         kept = []
@@ -822,7 +826,7 @@ class TaskCmdMixin(object):
             return None
         if not dv.is_derived(task) and self.derived_is_parent(task):
             raise ValueError(
-                "任务 %s 是「note 标题清单」的特殊重复任务，直接 -ac 会被拒绝；"
+                "任务 %s 是「@list 标题清单」容器，直接 -ac 会被拒绝；"
                 "先用 `task %s -d` 派生一条（比如 `task %s -d -ac`），再挂那条。"
                 % (self.task_label(task), self.task_label(task),
                    self.task_label(task)))

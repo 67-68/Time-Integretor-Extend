@@ -379,9 +379,10 @@ TASK_SHORT_FLAGS = (
     repl_kit.ShortFlag("-st", ("--single-task",), note="只导入一次，不建重复任务"),
     # `task 3 -e true` ≡ `--exclusive true`：这条独占一整场 session。
     repl_kit.ShortFlag("-e", ("--exclusive",), note="独占：这一场只能有这一条任务"),
-    # `task 3 -d` ≡ `--derived`：把「note 标题清单」重复任务的下一条标题
-    # 派生成本地任务（不同步回 OmniFocus，除了父任务的 note 勾选）。
-    repl_kit.ShortFlag("-d", ("--derived",), note="按 note 标题派生一条任务"),
+    # `task 3 -d` ≡ `--derived`：把「@list 标题清单」的下一条标题派生成
+    # 本地任务（不同步回 OmniFocus，除了父任务的 note 勾选）。
+    repl_kit.ShortFlag("-d", ("--derived",),
+                       note="按 @list 清单派生一条（重复任务则复制一条一样的）"),
     # `task 3 -c +2` ≡ `--count +2`：count 进度（1 count = 25 分钟）。
     # 纯数字 = 设定最高 count（duration 跟着变），`+n` / `-n` = 加减已投入。
     repl_kit.ShortFlag("-c", ("--count",), note="count 进度（5=设定 / +2=加 / -1=减）"),
