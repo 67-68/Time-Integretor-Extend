@@ -708,6 +708,38 @@ check("但罪还挂着（关窗口不解锁）", len(ks.load_sins()["sins"]), 1)
 ks.clear_sins()
 check("清干净了", ks.load_sins()["sins"], [])
 
+# ---------------------------------------------------------------- 脚本模式 ≠ 空闲屏
+
+# 琐事屏会「整屏接管」并把每条命令都答成「只认 m / c / q」。`--exec` 是脚本在
+# 敲命令，绝不能被它吞掉（否则 `warden.py --exec "day 1; session 09:00 50"`
+# 这种文档里的用法会静默失效）。
+wd = w.Warden(Console(file=io.StringIO(), width=80, force_terminal=False),
+              FakeBridge(), no_clear=True, offline=True)
+wd._chore_active_session = lambda now=None: None
+wd.chore_binding = lambda: ({"id": 1, "title": "琐事"}, None)
+wd.chore_project_tasks = lambda project: [{"pk": "a", "title": "闲活"}]
+check("交互模式：空闲时会被琐事屏接管", wd._maybe_sync_chore_mode(), True)
+check_true("接管后视图就是琐事屏", isinstance(wd.view, w.ChoreView))
+check("琐事屏会把 plan 当按键吞掉（这就是要修的那个坑）",
+      wd._handle_chore_input("plan 7"), True)
+check("吞掉之后命令没被派发（planning 还是空的）", wd.planning, None)
+
+wd = w.Warden(Console(file=io.StringIO(), width=80, force_terminal=False),
+              FakeBridge(), no_clear=True, offline=True)
+wd.script_mode = True
+wd._chore_active_session = lambda now=None: None
+wd.chore_binding = lambda: ({"id": 1, "title": "琐事"}, None)
+wd.chore_project_tasks = lambda project: [{"pk": "a", "title": "闲活"}]
+check("脚本模式：不接管", wd._maybe_sync_chore_mode(), False)
+check("脚本模式：视图还是契约视图", isinstance(wd.view, w.ChoreView), False)
+
+wd2 = w.Warden(Console(file=io.StringIO(), width=80, force_terminal=False),
+               FakeBridge(), no_clear=True, offline=True)
+wd2.run(exec_lines=["quit"])
+check_true("--exec 起跑就打开脚本模式", wd2.script_mode)
+check_true("--exec 把琐事屏压到无限期",
+           wd2.chore_suppressed_until == datetime.datetime.max)
+
 # ---------------------------------------------------------------- stop 要宣言
 
 print("== 停 daemon 也要敲宣言（密码系统已删）==")

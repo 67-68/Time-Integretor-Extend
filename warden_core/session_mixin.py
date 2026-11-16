@@ -1946,6 +1946,14 @@ class SessionMixin(object):
                     return False
                 if announce:
                     self.say("✅ check 跑完。", "ok")
+                # 订完必须回头把表拉一遍：否则界面上那几场还是「未订上 / 没有
+                # session id」，用户以为没订上，就去手动订一遍（2026-11-16 真事：
+                # daemon 15:53 已经订好 19:00，15:58 的屏幕上它还显示着 "?"）。
+                try:
+                    self.refresh(quiet=True)
+                except Exception as e:             # noqa: BLE001 - 拉不动不挡预约结果
+                    self.had_error = True
+                    self.say("✅ check 跑完，但重拉列表失败：%s" % e, "warn")
                 return True
             # 交互模式**默认不等**：一轮 check 要开浏览器下单，几十秒到几分钟。
             # 以前这里默认 wait=True，`plan` 完成就卡在这句 jobs.wait 上 ——

@@ -1,0 +1,440 @@
+{
+ "version": 1,
+ "next_id": 246,
+ "tasks": [
+  {
+   "id": 237,
+   "fields": {
+    "title": "flashcard review & new learn",
+    "duration": 25,
+    "count": 1,
+    "due": "{{DAY}}T17:55:00",
+    "due_source": "session",
+    "exclusive": true
+   },
+   "created_at": "2026-11-15T00:00:00",
+   "updated_at": "{{DAY}}T11:44:34",
+   "session": {
+    "index": null,
+    "date": "{{DAY}}",
+    "start": "17:30",
+    "end": "17:55",
+    "duration": 25,
+    "focusmate_session_id": null,
+    "previous_due": "{{DAY}}T23:40:00"
+   },
+   "focusmate": {},
+   "status": "active",
+   "tags": [],
+   "file": null,
+   "omnifocus": {
+    "id": "bXBKXt03Pgc",
+    "url": "omnifocus:///task/bXBKXt03Pgc",
+    "title": "flashcard review & new learn",
+    "linked_at": "2026-11-02T15:24:32"
+   },
+   "source": {
+    "kind": "repeat",
+    "parent": 75,
+    "date": "{{DAY}}"
+   },
+   "repeat_parent": 75,
+   "repeat_date": "{{DAY}}",
+   "repeat": null,
+   "duplicate_of": null,
+   "actual_minutes": null,
+   "formatter": {
+    "name": "end",
+    "kind": "formatter",
+    "params": [],
+    "args": {},
+    "result": {
+     "name": "end",
+     "reservation": {
+      "date": "{{DAY}}",
+      "period_id": "T2",
+      "start": "17:30",
+      "end": "18:00",
+      "start_min": 1050,
+      "end_min": 1080,
+      "session_start": "17:30",
+      "session_end": "17:55",
+      "session_duration": 25,
+      "duration": 25,
+      "break_minutes": 5,
+      "task_id": 237,
+      "exclusive": true,
+      "carved": true,
+      "existing_session": false,
+      "source_session": {
+       "start": "14:00",
+       "end": "15:15",
+       "duration": 75,
+       "period_id": "T2"
+      },
+      "created_at": "{{DAY}}T11:44:34"
+     },
+     "session": {
+      "date": "{{DAY}}",
+      "start": "17:30",
+      "end": "17:55",
+      "duration": 25,
+      "period_id": "T2",
+      "period_start": "14:00",
+      "period_end": "18:00",
+      "carved": true,
+      "existing": false,
+      "source_start": "14:00",
+      "cut_period_id": "T2",
+      "cut_prefix": [
+       75,
+       50,
+       75
+      ],
+      "cut_prefix_exact": true
+     },
+     "new_session": true,
+     "cut_period_id": "T2",
+     "cut_prefix": [
+      75,
+      50,
+      75
+     ],
+     "carved_from": "14:00",
+     "conflicts": [],
+     "created_at": "{{DAY}}T11:44:34"
+    },
+    "reservation": {
+     "date": "{{DAY}}",
+     "period_id": "T2",
+     "start": "17:30",
+     "end": "18:00",
+     "start_min": 1050,
+     "end_min": 1080,
+     "session_start": "17:30",
+     "session_end": "17:55",
+     "session_duration": 25,
+     "duration": 25,
+     "break_minutes": 5,
+     "task_id": 237,
+     "exclusive": true,
+     "carved": true,
+     "existing_session": false,
+     "source_session": {
+      "start": "14:00",
+      "end": "15:15",
+      "duration": 75,
+      "period_id": "T2"
+     },
+     "created_at": "{{DAY}}T11:44:34"
+    },
+    "applied_at": "{{DAY}}T11:44:34"
+   }
+  },
+  {
+   "id": 241,
+   "fields": {
+    "title": "flashcard review & new learn",
+    "duration": 25,
+    "count": 1,
+    "due": "2026-11-17T23:40:00",
+    "due_source": "session",
+    "exclusive": true
+   },
+   "created_at": "{{DAY}}T00:00:01",
+   "updated_at": "{{DAY}}T00:00:01",
+   "session": {
+    "index": null,
+    "date": "2026-11-17",
+    "start": "23:15",
+    "end": "23:40",
+    "duration": 25,
+    "focusmate_session_id": null,
+    "previous_due": "2026-11-17T17:35:00"
+   },
+   "focusmate": {},
+   "status": "active",
+   "tags": [],
+   "file": null,
+   "omnifocus": {
+    "id": "bXBKXt03Pgc",
+    "url": "omnifocus:///task/bXBKXt03Pgc",
+    "title": "flashcard review & new learn",
+    "linked_at": "2026-11-02T15:24:32"
+   },
+   "source": {
+    "kind": "repeat",
+    "parent": 75,
+    "date": "2026-11-17"
+   },
+   "repeat_parent": 75,
+   "repeat_date": "2026-11-17",
+   "repeat": null,
+   "duplicate_of": null,
+   "actual_minutes": null,
+   "formatter": {
+    "name": "end",
+    "kind": "formatter",
+    "params": [],
+    "args": {},
+    "result": {
+     "name": "end",
+     "reservation": {
+      "date": "2026-11-17",
+      "period_id": "T5",
+      "start": "23:15",
+      "end": "23:45",
+      "start_min": 1395,
+      "end_min": 1425,
+      "session_start": "23:15",
+      "session_end": "23:40",
+      "session_duration": 25,
+      "duration": 25,
+      "break_minutes": 5,
+      "task_id": 241,
+      "exclusive": true,
+      "carved": true,
+      "existing_session": true,
+      "source_session": {
+       "start": "23:15",
+       "end": "23:40",
+       "duration": 25,
+       "period_id": "T5"
+      },
+      "created_at": "{{DAY}}T00:00:01"
+     },
+     "session": {
+      "date": "2026-11-17",
+      "start": "23:15",
+      "end": "23:40",
+      "duration": 25,
+      "period_id": "T5",
+      "period_start": "23:15",
+      "period_end": "23:40",
+      "carved": true,
+      "existing": true,
+      "source_start": "23:15",
+      "cut_period_id": "T5",
+      "cut_prefix": [],
+      "cut_prefix_exact": true
+     },
+     "new_session": false,
+     "cut_period_id": "T5",
+     "cut_prefix": [],
+     "carved_from": "23:15",
+     "conflicts": [],
+     "created_at": "{{DAY}}T00:00:01"
+    },
+    "reservation": {
+     "date": "2026-11-17",
+     "period_id": "T5",
+     "start": "23:15",
+     "end": "23:45",
+     "start_min": 1395,
+     "end_min": 1425,
+     "session_start": "23:15",
+     "session_end": "23:40",
+     "session_duration": 25,
+     "duration": 25,
+     "break_minutes": 5,
+     "task_id": 241,
+     "exclusive": true,
+     "carved": true,
+     "existing_session": true,
+     "source_session": {
+      "start": "23:15",
+      "end": "23:40",
+      "duration": 25,
+      "period_id": "T5"
+     },
+     "created_at": "{{DAY}}T00:00:01"
+    },
+    "applied_at": "{{DAY}}T00:00:01"
+   }
+  },
+  {
+   "id": 242,
+   "fields": {
+    "title": "History: Complete 1 Mother question：2.1 C",
+    "project": "History EOS Review",
+    "project_id": 13,
+    "project_task": "i0kCbdwyabN#d1",
+    "count_total": 3,
+    "count": 3,
+    "derived_line": 1,
+    "derived_text": "2.1 C",
+    "derived_parent_pk": "i0kCbdwyabN",
+    "derived_parent_title": "History: Complete 1 Mother question",
+    "duration": 75,
+    "due": "{{DAY}}T20:15:00",
+    "due_source": "session"
+   },
+   "created_at": "{{DAY}}T00:23:24",
+   "updated_at": "{{DAY}}T15:53:16",
+   "session": {
+    "index": 7,
+    "date": "{{DAY}}",
+    "start": "19:00",
+    "end": "20:15",
+    "duration": 75,
+    "focusmate_session_id": null,
+    "previous_due": "{{DAY}}T17:30:00"
+   },
+   "focusmate": {
+    "previous": [
+     {
+      "task_id": "d67d0210-8d74-47e1-9bcc-e799f211928c",
+      "session": {
+       "index": 5,
+       "date": "{{DAY}}",
+       "start": "16:15",
+       "end": "17:30",
+       "duration": 75,
+       "focusmate_session_id": "a45cdb3c-a6c8-45b9-930f-4c828e10ddb2",
+       "previous_due": "{{DAY}}T16:05:00"
+      },
+      "replaced_at": "{{DAY}}T15:47:52",
+      "reason": "plan-replaced"
+     }
+    ]
+   },
+   "status": "active",
+   "tags": [],
+   "file": null,
+   "omnifocus": null,
+   "source": {
+    "kind": "derived",
+    "line": 1,
+    "text": "2.1 C",
+    "pk": "i0kCbdwyabN",
+    "parent_title": "History: Complete 1 Mother question"
+   },
+   "repeat": null,
+   "duplicate_of": null,
+   "actual_minutes": null
+  },
+  {
+   "id": 243,
+   "fields": {
+    "title": "Lit: Complete 1 Scene：scene 1",
+    "project": "English EOS Review",
+    "project_id": 12,
+    "project_task": "ke3tlcbOu5Z#d1",
+    "count_total": 3,
+    "count": 3,
+    "derived_line": 1,
+    "derived_text": "scene 1",
+    "derived_parent_pk": "ke3tlcbOu5Z",
+    "derived_parent_title": "Lit: Complete 1 Scene",
+    "duration": 75,
+    "due": "{{DAY}}T15:15:00",
+    "due_source": "session",
+    "count_invested": 3
+   },
+   "created_at": "{{DAY}}T11:45:34",
+   "updated_at": "{{DAY}}T15:44:56",
+   "session": {
+    "index": 3,
+    "date": "{{DAY}}",
+    "start": "14:00",
+    "end": "15:15",
+    "duration": 75,
+    "focusmate_session_id": null
+   },
+   "focusmate": {},
+   "status": "dropped",
+   "tags": [],
+   "file": null,
+   "omnifocus": null,
+   "source": {
+    "kind": "derived",
+    "line": 1,
+    "text": "scene 1",
+    "pk": "ke3tlcbOu5Z",
+    "parent_title": "Lit: Complete 1 Scene"
+   },
+   "repeat": null,
+   "duplicate_of": null,
+   "actual_minutes": null,
+   "count_credits": {
+    "{{DAY}}T14:00": 3
+   },
+   "history": [
+    {
+     "day": "{{DAY}}",
+     "start": "14:00",
+     "action": "reconsider",
+     "at": "{{DAY}}T15:23:03"
+    }
+   ],
+   "status_at": "{{DAY}}T15:44:56",
+   "status_reason": "reconsider"
+  },
+  {
+   "id": 244,
+   "fields": {
+    "title": "Lit: Complete 1 Scene：scene 1",
+    "project": "English EOS Review",
+    "project_id": 12,
+    "project_task": "ke3tlcbOu5Z#d1",
+    "count_total": 3,
+    "count": 3,
+    "derived_line": 1,
+    "derived_text": "scene 1",
+    "derived_parent_pk": "ke3tlcbOu5Z",
+    "derived_parent_title": "Lit: Complete 1 Scene",
+    "duration": 75,
+    "due": "{{DAY}}T15:15:00",
+    "due_source": "session",
+    "count_invested": 3
+   },
+   "created_at": "{{DAY}}T15:44:56",
+   "updated_at": "{{DAY}}T15:44:56",
+   "session": null,
+   "focusmate": {},
+   "status": "active",
+   "tags": [],
+   "file": null,
+   "omnifocus": null,
+   "repeat": null,
+   "duplicate_of": 243,
+   "actual_minutes": null
+  },
+  {
+   "id": 245,
+   "fields": {
+    "title": "Lit: Complete 1 Scene：scene 2",
+    "project": "English EOS Review",
+    "project_id": 12,
+    "project_task": "ke3tlcbOu5Z#d2",
+    "count_total": 3,
+    "count": 3,
+    "derived_line": 2,
+    "derived_text": "scene 2",
+    "derived_parent_pk": "ke3tlcbOu5Z",
+    "derived_parent_title": "Lit: Complete 1 Scene",
+    "duration": 75,
+    "due": "{{DAY}}T17:30:00",
+    "due_source": "session"
+   },
+   "created_at": "{{DAY}}T15:47:52",
+   "updated_at": "{{DAY}}T16:01:56",
+   "session": null,
+   "focusmate": {},
+   "status": "active",
+   "tags": [],
+   "file": null,
+   "omnifocus": null,
+   "source": {
+    "kind": "derived",
+    "line": 2,
+    "text": "scene 2",
+    "pk": "ke3tlcbOu5Z",
+    "parent_title": "Lit: Complete 1 Scene"
+   },
+   "repeat": null,
+   "duplicate_of": null,
+   "actual_minutes": null
+  }
+ ]
+}

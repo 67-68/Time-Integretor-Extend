@@ -240,6 +240,9 @@ class ChoreMixin(object):
         没有 session 时整屏接管（从哪个视图来都会接管，q 回原视图）；但收尾、
         plan 问答、项目对账、导入问答、罪案锁死这些打断态优先，不抢输入。
         """
+        if getattr(self, "script_mode", False):
+            # `--exec`：脚本在敲命令，别用空闲屏接管它（否则命令会被当按键吞掉）
+            return False
         now = self._chore_now_dt()
         if isinstance(self.view, ChoreView):
             if self._chore_active_session(now) is not None:

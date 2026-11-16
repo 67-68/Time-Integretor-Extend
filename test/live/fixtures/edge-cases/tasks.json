@@ -1,0 +1,246 @@
+{
+ "version": 1,
+ "next_id": 100,
+ "tasks": [
+  {
+   "id": 1,
+   "fields": {
+    "title": "flashcard review & new learn",
+    "exclusive": true,
+    "count": 1,
+    "duration": 25
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {
+    "index": 6,
+    "date": "{{DAY}}",
+    "start": "19:00",
+    "end": "20:15",
+    "duration": 75,
+    "focusmate_session_id": "fm-1900"
+   },
+   "actual_minutes": null,
+   "file": null
+  },
+  {
+   "id": 2,
+   "fields": {
+    "title": "flashcard review 副本",
+    "exclusive": true,
+    "count": 1,
+    "duration": 25
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {
+    "index": 6,
+    "date": "{{DAY}}",
+    "start": "19:00",
+    "end": "20:15",
+    "duration": 75,
+    "focusmate_session_id": "fm-1900"
+   },
+   "actual_minutes": null,
+   "file": null
+  },
+  {
+   "id": 3,
+   "fields": {
+    "title": "errand 十分钟小活",
+    "count": 1,
+    "duration": 10
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {},
+   "actual_minutes": null,
+   "file": null
+  },
+  {
+   "id": 4,
+   "fields": {
+    "title": "晚上才允许动的任务",
+    "count": 3,
+    "duration": 75,
+    "defer": "{{DAY}}T23:00:00"
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {},
+   "actual_minutes": null,
+   "file": null
+  },
+  {
+   "id": 5,
+   "fields": {
+    "title": "每日闪卡（本体）",
+    "count": 1,
+    "duration": 25
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": {
+    "rule": "FREQ=DAILY",
+    "next": "{{DAY}}T00:00:00"
+   },
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {},
+   "actual_minutes": null,
+   "file": null
+  },
+  {
+   "id": 6,
+   "fields": {
+    "title": "每日闪卡（今天的子任务）",
+    "count": 1,
+    "duration": 25
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {},
+   "actual_minutes": null,
+   "file": null,
+   "repeat_parent": 5
+  },
+  {
+   "id": 7,
+   "fields": {
+    "title": "Lit: Complete 1 Scene：scene 2",
+    "count": 3,
+    "duration": 75,
+    "project_id": 1,
+    "project_task": "edge_list#d2"
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {},
+   "actual_minutes": null,
+   "file": null,
+   "source": {
+    "kind": "derived",
+    "line": 2,
+    "text": "scene 2",
+    "pk": "edge_list",
+    "parent_title": "Lit: Complete 1 Scene"
+   }
+  },
+  {
+   "id": 8,
+   "fields": {
+    "title": "早上已经做完的那条",
+    "count": 1,
+    "duration": 75
+   },
+   "status": "completed",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {
+    "index": 3,
+    "date": "{{DAY}}",
+    "start": "14:00",
+    "end": "15:15",
+    "duration": 75,
+    "focusmate_session_id": "fm-1400"
+   },
+   "actual_minutes": null,
+   "file": null
+  },
+  {
+   "id": 9,
+   "fields": {
+    "title": "跨午夜的那场任务",
+    "count": 2,
+    "duration": 50
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {
+    "index": 7,
+    "date": "{{DAY}}",
+    "start": "23:15",
+    "end": "00:05",
+    "duration": 50,
+    "focusmate_session_id": "fm-2315"
+   },
+   "actual_minutes": null,
+   "file": null
+  },
+  {
+   "id": 10,
+   "fields": {
+    "title": "Lit: Complete 1 Scene：scene 1",
+    "count": 2,
+    "duration": 50,
+    "project_id": 1,
+    "project_task": "edge_list#d1"
+   },
+   "status": "active",
+   "tags": [],
+   "repeat": null,
+   "duplicate_of": null,
+   "history": [],
+   "created_at": "{{DAY}}T00:00:00",
+   "updated_at": "{{DAY}}T00:00:00",
+   "session": {
+    "index": 7,
+    "date": "{{DAY}}",
+    "start": "23:15",
+    "end": "00:05",
+    "duration": 50,
+    "focusmate_session_id": "fm-2315"
+   },
+   "actual_minutes": null,
+   "file": null,
+   "source": {
+    "kind": "derived",
+    "line": 1,
+    "text": "scene 1",
+    "pk": "edge_list",
+    "parent_title": "Lit: Complete 1 Scene"
+   }
+  }
+ ]
+}

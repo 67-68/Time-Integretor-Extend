@@ -1495,6 +1495,32 @@ class BoardMixin(object):
         count = self._apply_snapshot(payload, {})
         if not quiet:
             self.say("拉到 %d 场（%s）" % (count, (payload or {}).get("date") or ""), "info")
+        self._hint_unbooked_rows()
+
+    def _hint_unbooked_rows(self):
+        """表里有「该订却没订上」的执行区场次 → 说一句（同一份名单只说一次）。
+
+        用户 2026-11-16 报「我尝试 r 一次之后约都没有约上」：plain `refresh` 只对账、
+        不新造外部动作（这是刻意的），但屏幕上也从没说过「你要敲 --check 才会订」。
+        这里补一句可执行的提示。
+        """
+        try:
+            missing = [r for r in self.rows
+                       if r.get("planned") and r.get("id") is None
+                       and r.get("zone") == "execute"]
+        except Exception:                          # noqa: BLE001 - 提示不该弄崩刷新
+            return
+        sig = tuple(sorted(str(r.get("startLabel") or "") for r in missing))
+        if sig == getattr(self, "_unbooked_rows_sig", None):
+            return
+        self._unbooked_rows_sig = sig
+        if missing:
+            self.say("⚠ %d 场该订还没订上（%s）—— `refresh --check` 会去订，"
+                     "或者等 daemon 下一轮。"
+                     % (len(missing),
+                        "、".join(str(r.get("startLabel") or "?")
+                                 for r in missing[:4])
+                        + (" 等" if len(missing) > 4 else "")), "warn")
 
     def _snapshot_failed(self, error, quiet=False):
         self.had_error = True

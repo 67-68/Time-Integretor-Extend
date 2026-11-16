@@ -1,0 +1,29 @@
+{
+ "version": 1,
+ "layouts": {
+  "{{DAY}}": {
+   "T1": {
+    "durations": [],
+    "source": "auto",
+    "updated_at": "{{DAY}}T10:00:00"
+   },
+   "T2": {
+    "durations": [
+     75,
+     50,
+     75,
+     25
+    ],
+    "source": "manual",
+    "updated_at": "{{DAY}}T11:44:00"
+   },
+   "T3": {
+    "durations": [
+     75
+    ],
+    "source": "auto",
+    "updated_at": "{{DAY}}T15:53:00"
+   }
+  }
+ }
+}

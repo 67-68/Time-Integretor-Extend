@@ -1601,7 +1601,7 @@ def _item_deferred(item, now=None):
 
 
 def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
-                    rotation=None):
+                    rotation=None, derived_budget=None, skip_pks=None):
     """还没做完、而且还有内容可干的**顶层任务**（按清单顺序）。
 
     有子任务的父任务返回成一条派生单元：``duration`` 是剩余子任务分钟数之和，
@@ -1616,11 +1616,16 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
 
     **标题清单派生任务**（``derived.py``）：note 第一行写了 ``@list``（旧写法
     ``# titles`` 也认）的任务不直接进队列，而是展开成派生项：
-    parallel 只展开**下一条**未勾选标题（一次派一条），并且整组派生项排到
+    parallel 默认只展开**下一条**未勾选标题（一次派一条），并且整组派生项排到
     普通任务**最后**、按 ``rotation``（``{父 pk: 最近一次完成的时间}``）轮转；
     sequential 把**全部**未勾选标题按 note 顺序展开在原位（做完第一条的所有
     副本才轮到后面）。派生项的 ``pk`` 是合成 pk（``<父>#d<行号>``），
     count 投入照常按它记账。
+
+    ``derived_budget``（count）给 ``plan`` 用：这一次这个项目分到多少 count。
+    parallel 的容器会展开**够填满这笔预算**的条数（3 count/条的清单分到 6
+    count 就展开 2 条），否则「说好 6 count」永远只能排出 3 —— 清单明明还有
+    7 条没做，却报「没有更多可干的了」。
     """
     invested_map = invested_map or {}
     exclude = {str(pk) for pk in (exclude_pks or ())}
@@ -1640,7 +1645,8 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
             continue
         children = kids.get(item.get("pk")) or []
         if not children and _derived_eligible(item):
-            expanded = _expand_derived(item, invested_map, all_titles=sequential)
+            expanded = _expand_derived(item, invested_map, all_titles=sequential,
+                                      budget=derived_budget, skip_pks=skip_pks)
             if expanded:
                 if sequential:
                     out.extend(expanded)
@@ -1705,7 +1711,8 @@ def _derived_eligible(item):
     return bool(_dv.eligible(item.get("note") or "", item.get("title") or ""))
 
 
-def _expand_derived(item, invested_map=None, all_titles=False):
+def _expand_derived(item, invested_map=None, all_titles=False, budget=None,
+                    skip_pks=None):
     """把一条标题清单任务展成派生项（见 :func:`remaining_tasks` 的说明）。"""
     try:
         import derived as _dv
@@ -1721,9 +1728,19 @@ def _expand_derived(item, invested_map=None, all_titles=False):
     if base <= 0:
         return []
     got_all = invested_map if isinstance(invested_map, dict) else {}
+    try:
+        want = int(budget) if budget is not None else 0
+    except (TypeError, ValueError):
+        want = 0
     out = []
+    took = 0
+    skip = {str(x) for x in (skip_pks or ())}
     for one in titles:
         spk = _dv.synthetic_pk(item.get("pk"), one["line"])
+        if skip and str(spk) in skip:
+            # 这一条清单行上一轮已经排进 session 了：追加语义下不能再唤起一次，
+            # 否则同一行会出现两条任务（进度永远对不上）。
+            continue
         got = min(base, int(got_all.get(spk) or 0))
         if base - got <= 0:
             continue
@@ -1737,8 +1754,9 @@ def _expand_derived(item, invested_map=None, all_titles=False):
                         minutes=ts.count_to_minutes(base),
                         repeat=None, note="", parent="", parent_id="",
                         children=None, priority=None))
-        if not all_titles:
-            break               # parallel：一次只派一条
+        took += base - got
+        if not all_titles and (want <= 0 or took >= want):
+            break               # parallel：一次派一条，预算不够就只派一条
     return out
 
 

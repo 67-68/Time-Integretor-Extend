@@ -548,6 +548,11 @@ class Warden(
         # 一直压到下一场 session 开始（或明天），下一段空档再自动出现。
         # chore_now 可在测试里钉死；None = 跟墙上时钟。
         self.chore_now = None
+        # 脚本模式（`--exec`）：不许琐事屏接管。空闲屏是给「人闲着」用的，而
+        # `--exec` 是别人（脚本/集成测试）在敲命令 —— 屏幕被接管后
+        # `_handle_chore_input` 会把每一条命令都答成「琐事屏只认 m / c / q」，
+        # 文档里那些 `warden.py --exec "day 1; session 09:00 50"` 就会静默失效。
+        self.script_mode = False
         self.chore_index = 0
         self.chore_last_note = ""
         self.chore_suppressed_until = None
@@ -1061,6 +1066,11 @@ class Warden(
             pass
 
     def run(self, exec_lines=None):
+        if exec_lines:
+            # 脚本模式：固定从契约视图起跑，且锁住琐事屏（见 __init__ 的注释）。
+            self.script_mode = True
+            self.chore_suppressed_until = datetime.datetime.max
+            self.go_to_view(ContractView)
         if not exec_lines:
             self.write_tui_state()
         self.emit("[dim]起 bridge、拉 session…[/]")

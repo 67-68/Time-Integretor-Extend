@@ -55,6 +55,7 @@ from __future__ import annotations
 import datetime
 import re
 
+import session_plan as sp
 import task_store as ts
 
 #: trigger / formatter 的注册表。值是内部的小 dict：name / params / help / func。
@@ -462,8 +463,10 @@ def _cut_prefix_for(period_range, carve_start, reservations):
     if carve_start <= lower:
         return [], True
 
-    # cursor -> path。cursor 是「上一场结束的绝对分钟」；下一场从 ceil15(cursor)
-    # 开始，和 sp.plan_period 完全一致。
+    # ``cursor`` = 「上一场结束 + 这一场强制的休息」= 下一场最早能开始的位置；
+    # 下一场从 ``ceil15(cursor)`` 开始，和 :func:`session_plan.plan_period` 完全
+    # 一致。以前 cursor 直接取上一场的 end（只做 15 分钟取整），于是 14:00 的
+    # 75 分钟场后面被当成能从 15:15 接着排 —— Focusmate 不允许（要留 15 分钟）。
     reachable = {lower: []}
     best_exact = None
     best_partial = (lower, [])
@@ -477,18 +480,19 @@ def _cut_prefix_for(period_range, carve_start, reservations):
                     continue
                 if not is_free({"start_min": start, "end_min": end}, reservations):
                     continue
-                if end in reachable:
+                next_cursor = end + sp.break_minutes(duration)
+                if next_cursor in reachable:
                     continue
                 new_path = path + [duration]
-                reachable[end] = new_path
+                reachable[next_cursor] = new_path
                 changed = True
                 gap = carve_start - end
-                if _ceil_quarter(end) == carve_start:
+                if _ceil_quarter(next_cursor) == carve_start:
                     key = (0 if gap == 0 else 1, gap, len(new_path), tuple(new_path))
                     if best_exact is None or key < best_exact[0]:
                         best_exact = (key, new_path)
-                if end > best_partial[0]:
-                    best_partial = (end, new_path)
+                if next_cursor > best_partial[0]:
+                    best_partial = (next_cursor, new_path)
         if not changed:
             break
     if best_exact is not None:
@@ -617,8 +621,32 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
             # 「旧 session 原样保留 + 后面随便补」——22:15–00:05 这种时段
             # 里旧的 50 分钟场会让 23:30 的切点永远接不上，最后只剩一场
             # 重叠的旧 session + 一场额外 session。
-            cut_prefix, prefix_exact = _cut_prefix_for(
-                period_range[pid], carve_start, reservations)
+            #
+            # 每场之后要留 Focusmate 的强制休息，所以「最晚的切点」不一定接得上：
+            # 22:15–00:05 里 75+15 到 23:45 就过了 23:30，这时往回退一格
+            # （23:30 → 23:15，前缀 50+10）才是真正排得下的方案。
+            cut_prefix = None
+            prefix_exact = False
+            probe = carve_start
+            for _try in range(12):
+                if probe < lower:
+                    break
+                got_prefix, got_exact = _cut_prefix_for(
+                    period_range[pid], probe, reservations)
+                # 前缀为空 = 任务被压到时段起点。那不叫「切最后一块」，还不如
+                # 走「清掉整段 layout + 给任务单独补一场」的兜底（任务更靠后）。
+                if got_exact and got_prefix:
+                    carve_start = probe
+                    cut_prefix = got_prefix
+                    prefix_exact = True
+                    break
+                if probe == carve_start:
+                    # 第一个候选都接不上：先记下最靠后的合法前缀当兜底。
+                    cut_prefix, prefix_exact = got_prefix, False
+                probe -= 15
+            if cut_prefix is None:
+                cut_prefix, prefix_exact = _cut_prefix_for(
+                    period_range[pid], carve_start, reservations)
         else:
             # 同一天更早的场次：占这一场的开头（绝不越过下一场）。
             if int(fit) > sess_duration:

@@ -2114,12 +2114,11 @@ check("同优先级靠前任务先拿靠前 session",
       [(p["slot"]["start"], p["item"]["title"]) for p in _sf_places2],
       [("12:00", "先列出的 25 分钟"), ("12:30", "后列出的 50 分钟")])
 
-print("== 15) 再次 plan 同一天：旧计划先撤掉，不和新计划并存 ==")
+print("== 15) 再次 plan 同一天：**追加**语义，上一轮不动，要清手动 plan clear ==")
 wd_re = fresh([dict(r) for r in rows_ok], repetitions=None)
 wd_re.omnifocus.rows = [dict(r) for r in rows_ok]
 wd_re.handle("task import sop omnifocus:///project/p-lunwen")
 plan_day(wd_re)
-_messages_before = len(texts(wd_re))
 wd_re.handle("plan +1")
 check("第一次 plan 打开", wd_re.planning is not None, True)
 _cap1 = wd_re.planning.cap()["counts"]
@@ -2128,25 +2127,39 @@ wd_re.handle("complete")
 _plan1 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
 check("第一次 plan 记 2 count", int(_plan1["count"]), 2)
 _first_items = list(_plan1["items"])
-# 第二次 plan 应该仍能看见旧计划占掉的 session（重排而不是只捡剩下的空场）。
+_first_starts = {str(i.get("start") or "") for i in _first_items}
+# 2026-11-16 起：plan 是**追加**语义 —— 上一轮排好的场次不算空闲，也不许被
+# 掀掉重排（以前是「先撤旧 plan 再整天空场重排」，会连带重切已经订上的场次）。
 wd_re.handle("plan +1")
 check("第二次 plan 打开", wd_re.planning is not None, True)
-check("旧计划占用的场次重新进入可选容量",
-      wd_re.planning.cap()["counts"], _cap1)
-wd_re.planning.handle("task 1 3")
+_cap2 = wd_re.planning.cap()["counts"]
+check("第二次只看剩下的空场：容量比第一次小", _cap2 < _cap1, True)
+check("上一轮占掉的场次不在第二次的空场里",
+      _first_starts & {str(s.get("start") or "") for s in wd_re.planning.slots}, set())
+_alloc2 = min(3, _cap2)
+wd_re.planning.handle("task 1 %d" % _alloc2)
 wd_re.messages.clear()
 wd_re.handle("complete")
 _plan2 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
-check("第二次 plan 覆盖而不是相加", int(_plan2["count"]), 3)
-check("第二次计划项记录的是新的 3 count 分配",
-      [int(i["count"]) for i in _plan2["items"]], [3])
-check_true("重排时明确说先撤旧 plan",
-           any("先撤掉旧 plan" in t for t in texts(wd_re)))
-_session_tasks = [t for t in wd_re.task_store.list()
-                  if (t.get("session") or {}).get("date") == wd_re.sel_date.isoformat()
-                  and (t.get("fields") or {}).get("project_id") == wd_re.projects.active()[0]["id"]]
-check("同一天只剩第二轮排出来的 session 任务",
-      len(_session_tasks), len(_plan2["items"]))
+check("第二次 plan 是相加（2 + %d）" % _alloc2, int(_plan2["count"]), 2 + _alloc2)
+check_true("上一轮的 plan items 还在（没有被清掉）",
+           {str(i.get("pk")) for i in _first_items}
+           <= {str(i.get("pk")) for i in _plan2["items"]})
+check_true("不再自动撤旧 plan（要清得显式 plan clear）",
+           not any("先撤掉旧 plan" in t for t in texts(wd_re)))
+_bound = [t for t in wd_re.task_store.list()
+          if (t.get("session") or {}).get("date") == wd_re.sel_date.isoformat()
+          and (t.get("fields") or {}).get("project_id") == wd_re.projects.active()[0]["id"]
+          and wd_re.task_store.is_open(t)]
+check("两轮的任务都各自挂着（不会只剩后一轮）", len(_bound) >= 2, True)
+wd_re.handle("plan clear")
+check("plan clear 之后当天计划清空",
+      pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date), None)
+_left = [t for t in wd_re.task_store.list()
+         if (t.get("session") or {}).get("date") == wd_re.sel_date.isoformat()
+         and (t.get("fields") or {}).get("project_id") == wd_re.projects.active()[0]["id"]
+         and wd_re.task_store.is_open(t)]
+check("plan clear 之后那些任务不再占场次", _left, [])
 
 print("== 16) period-first：容量、parallel / sequential 示例 ==")
 
@@ -2260,7 +2273,9 @@ wd_auto.handle("task import sop omnifocus:///project/p-long")
 wd_auto.handle("day 1")
 wd_auto.rewrite_data_csv_from_plan()
 wd_auto.rebuild_rows()
-book_all(wd_auto)
+# 注意：这里**不能**先 book_all —— 2026-11-16 起「已经订上的场次不许重切」，
+# 订上了的 period 会被当成硬约束，不再参与自动 layout。这一段要验的是
+# 「没有任何场次时，plan 按任务反推 session」，所以保持未订状态。
 wd_auto.handle("plan +1")
 check_true("自动 layout 的 plan 能打开", wd_auto.planning is not None)
 check("自动 layout 的容量按整个 period 算：T1 4 + T2 2 = 6 count",

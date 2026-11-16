@@ -333,7 +333,8 @@ class ContractView(View):
                  usage="plan [+1|今天|明天|YYYY-MM-DD] → "
                        "task <序号> <count> | task <序号> clear | complete；"
                        "或 plan -s <session> -p <project> 单场直排",
-                 options=("+1", "+2", "today", "明天", "complete", "task 1 4",
+                 options=("+1", "+2", "today", "明天", "complete", "clear",
+                          "task 1 4",
                           "-s 1 -p 1"),
                  hint=_hint_actions("+1", "明天", "complete", "task 1 4", "task 1 clear",
                                     "-s 1 -p 1",

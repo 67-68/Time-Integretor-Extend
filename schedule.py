@@ -59,8 +59,13 @@ import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEMP = os.path.join(HERE, "temp")
-DATA_CSV = os.path.join(HERE, "data.csv")
+#: 运行时目录 / data.csv 的**可覆盖**路径。
+#: 默认还是仓库里的 temp/ 和 data.csv；设了 TI_TEMP / TI_DATA_CSV 就整体搬走 ——
+#: 集成测试、临时脚本、替用户试跑都必须走这条路，否则会直接读写他的真实契约表。
+#: （session_plan 写 data.csv 时只认 TI_DATA_CSV，读不认 —— 那个半拉子支持是
+#:  2026-11-16 往真实 keep_session-state.json 写进假 missed 的根，这里补齐。）
+TEMP = os.environ.get("TI_TEMP") or os.path.join(HERE, "temp")
+DATA_CSV = os.environ.get("TI_DATA_CSV") or os.path.join(HERE, "data.csv")
 BACKUP_CSV = os.path.join(TEMP, "data.csv.bak")
 RELOCATIONS_FILENAME = "keep_session-relocations.json"
 

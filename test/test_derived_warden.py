@@ -287,6 +287,28 @@ check("父任务本体不进队列",
 items = pj.remaining_tasks(wd.projects.by_id(project["id"]), {"taskHIST#d1": 25})
 check("这一行已投满 → 换下一条", items[0]["derived"]["line"], 2)
 
+# plan 分到多少 count，就展开够填满这笔预算的条数：清单明明还有 3 条没做，
+# 只派一条会让「说好 2 count」永远排不满（用户报的「English 6 Count 仅排了 3 个」）。
+items = pj.remaining_tasks(wd.projects.by_id(project["id"]), {}, derived_budget=60)
+check("分到 60 count → 展开 3 条（每条 25）",
+      [i["derived"]["line"] for i in items], [1, 2, 3])
+items = pj.remaining_tasks(wd.projects.by_id(project["id"]), {}, derived_budget=25)
+check("预算只够一条就只展开一条", [i["derived"]["line"] for i in items], [1])
+items = pj.remaining_tasks(wd.projects.by_id(project["id"]), {})
+check("不传预算仍然是「一次派一条」（其它调用方不变）", len(items), 1)
+
+# 真实事故的形状：一条 3 count 的清单任务（8 个场景），plan 分到 6 count。
+wd2, project2, _parent2 = make(note="@list\n- s1\n- s2\n- s3\n- s4\n- s5\n"
+                                    "- s6\n- s7\n- s8\n", count=3,
+                              repeat=None)
+_proj2 = wd2.projects.by_id(project2["id"])
+_alloc = [{"project_id": _proj2["id"], "project": _proj2, "count": 6}]
+_ditems, _dnotes = w.pp.distribute(_alloc, [_proj2], {})
+check("6 count → 展开两条清单（各 3 count），不再只排 3 个",
+      [(i["pk"], int(i["count"])) for i in _ditems],
+      [("taskHIST#d1", 3), ("taskHIST#d2", 3)])
+check("不该再报「没有更多可干的了」", _dnotes, [])
+
 print("== 计划展开（sequential）==")
 wd, project, parent = make(task_type="sequential")
 items = pj.remaining_tasks(wd.projects.by_id(project["id"]), {})

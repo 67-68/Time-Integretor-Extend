@@ -38,15 +38,35 @@ import re
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEMP = os.path.join(HERE, "temp")
+# 和 schedule.py 同一套覆盖规则（TI_TEMP / TI_DATA_CSV），两边必须一致：
+# 否则「写认环境变量、读不认」，测试会写进临时目录却读用户的真实 data.csv。
+TEMP = os.environ.get("TI_TEMP") or os.path.join(HERE, "temp")
 DOWNLOAD_FILE = os.path.join(TEMP, "calendar-download.json")
 LAYOUTS_FILE = os.path.join(TEMP, "session-layouts.json")
 #: 一次性 session（只属于某一天；session 命令默认写这里）
 EXTRAS_FILE = os.path.join(TEMP, "session-extras.json")
 #: 长期规则（按星期几重复；session --permanent 写这里）
 RULES_FILE = os.path.join(TEMP, "session-rules.json")
-DATA_CSV = os.path.join(HERE, "data.csv")
+DATA_CSV = os.environ.get("TI_DATA_CSV") or os.path.join(HERE, "data.csv")
 DURATIONS = (25, 50, 75)
+#: 1 count = 25 分钟工作；Focusmate 每场结束强制休息 5 分钟/块，所以 25/50/75 的
+#: 场次实占 30/60/90 分钟。**排布必须按占用来推进 cursor**，否则会排出「14:00
+#: 订 75 分钟、下一场 15:15」这种 Focusmate 根本不让订的排法（用户 2026-11-16
+#: 指出：14:00 的 75 分钟场要到 15:30 才结束）。
+MINUTES_PER_COUNT = 25
+BREAK_MINUTES_PER_COUNT = 5
+
+
+def session_span(duration):
+    """这一场从开始到**下一场最早能开始**之间占用的分钟数（含强制的休息）。"""
+    duration = int(duration or 0)
+    return duration + (duration // MINUTES_PER_COUNT) * BREAK_MINUTES_PER_COUNT
+
+
+def break_minutes(duration):
+    """这一场结束后的休息分钟数（25→5 / 50→10 / 75→15）。"""
+    return int(duration or 0) // MINUTES_PER_COUNT * BREAK_MINUTES_PER_COUNT
+
 
 
 def download_path(path=None):
@@ -277,6 +297,12 @@ def _subject(period):
 def plan_period(period, durations):
     """按 duration 序列算出 session 列表；完全不合法就抛 ValueError（无副作用）。
 
+    **场次之间必须留出 Focusmate 的强制休息**（25/50/75 → 5/10/15 分钟），所以
+    推进 cursor 用的是 :func:`session_span` 而不是 session 本身的长短：14:00 的
+    75 分钟场到 15:15 结束，下一场最早 15:30。以前 cursor 直接接在 end 上（再
+    往 :00/:15/:30/:45 取整），50 分钟场后面碰巧空出 10 分钟、75 分钟场后面却是
+    0 分钟 —— 排出来的时间 Focusmate 不让订（点 slot 不出 Book 按钮）。
+
     返回 [{start,end,duration,period_id,date,period_start,period_end,...}, ...]。
     """
     start_got = parse_hhmm(period.get("start"))
@@ -318,10 +344,13 @@ def plan_period(period, durations):
             "end": _fmt_min(e_min),
             "start_min": s_min,
             "end_min": e_min,
+            "break_minutes": break_minutes(dur),
             "duration": dur,
             "index": n,
         })
-        cursor = e_min
+        # 下一场从「这一场结束 + 强制休息」开始；休息落在时段末尾之外没关系
+        # （最后一场之后不需要休息，只是 cursor 越界，循环也就结束了）。
+        cursor = s_min + session_span(dur)
     return out
 
 
@@ -331,7 +360,12 @@ def _fmt_min(total):
 
 
 def default_durations(period):
-    """没自定义时的默认排布：优先 50，塞不下退 25，和旧 carve() 同一口味。"""
+    """没自定义时的默认排布：优先 50，塞不下退 25，和旧 carve() 同一口味。
+
+    和 :func:`plan_period` 一样按**占用**推进（含每场强制的休息），否则 14:00 的
+    50 分钟 + 25 分钟会排出 14:00 和 14:50 两场，而 Focusmate 只允许 14:00 与
+    15:00（14:50 + 10 分钟休息）。
+    """
     start_got = parse_hhmm(period.get("start"))
     end_got = parse_hhmm(period.get("end"))
     if start_got is None or end_got is None:
@@ -348,7 +382,7 @@ def default_durations(period):
         for d in (50, 25):
             if total + d <= end_min:
                 out.append(d)
-                cur = total + d
+                cur = total + session_span(d)
                 break
         else:
             break
@@ -435,11 +469,70 @@ def remove_layout(day, period_id, layouts_path_=None):
     return removed
 
 
+def _plan_period_legacy(period, durations):
+    """**旧口径**（2026-11-16 之前）：场次之间不留强制休息，只把起点取整到 15 分钟。
+
+    只用于读**历史** layout：那些场次已经按这个口径订出去了（例如今天 14:00 的
+    75 分钟后面紧接着 15:15），现在拿新规则重算会把整段排期和已订的场次全打乱。
+    写路径（``period`` / ``commit_layout``）一律走严格版，排不出就报错。
+    """
+    start_got = parse_hhmm(period.get("start"))
+    end_got = parse_hhmm(period.get("end"))
+    if start_got is None or end_got is None:
+        raise ValueError("%s 的时间不是合法 HH:MM" % _subject(period))
+    start_min = _minutes(*start_got)
+    end_min = _minutes(*end_got)
+    if end_min <= start_min:
+        end_min += 24 * 60
+    durations = _norm_durations(durations)
+    cursor = start_min
+    out = []
+    for n, dur in enumerate(durations, 1):
+        hh, mm, total = ceil_quarter(cursor // 60, cursor % 60)
+        s_min = total
+        e_min = s_min + dur
+        if e_min > end_min:
+            raise ValueError(
+                "%s 放不下：第 %d 场 %dmin 会到 %s，超过时段终点 %s。什么都没改。"
+                % (_subject(period), n, dur, _fmt_min(e_min), period.get("end")))
+        base = None
+        try:
+            base = datetime.date.fromisoformat(str(period.get("date")))
+        except ValueError:
+            pass
+        session_date = ((base + datetime.timedelta(days=s_min // (24 * 60))).isoformat()
+                        if base else period.get("date"))
+        out.append({
+            "date": session_date,
+            "period_id": period.get("id"),
+            "period_date": period.get("date"),
+            "period_start": period.get("start"),
+            "period_end": period.get("end"),
+            "period_type": period.get("type") or period.get("calendar") or "",
+            "period_name": period.get("name") or period.get("title") or "",
+            "start": _fmt_min(s_min),
+            "end": _fmt_min(e_min),
+            "start_min": s_min,
+            "end_min": e_min,
+            "break_minutes": 0,
+            "legacy_spacing": True,
+            "duration": dur,
+            "index": n,
+        })
+        cursor = e_min
+    return out
+
+
 def sessions_for_period(period, layouts):
     ds = get_layout(layouts, period.get("date"), period.get("id"))
     if ds is None:
         ds = default_durations(period)
-    return plan_period(period, ds)
+    try:
+        return plan_period(period, ds)
+    except ValueError:
+        # 历史 layout 是在「休息还没算进去」的年代排的：按旧口径原样读回来，
+        # 别让整段时段从表格 / data.csv 里消失，也别把它和已经订上的场次拆散。
+        return _plan_period_legacy(period, ds)
 
 
 # ---------------------------------------------------------------- 一次性 session

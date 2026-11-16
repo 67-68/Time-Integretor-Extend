@@ -124,7 +124,15 @@ INFRA_MESSAGE_MARKERS = (
     "Target page, context or browser has been closed", "MCP server closed stdout",
     "tools/call", "Timeout", "timeout", "profile 锁", "占着 profile",
 )
-WINDOW_HOURS = sch.WINDOW_HOURS  # 执行区长度：滚动 24 小时（改这里就改了命运）
+# 执行区长度：滚动 24 小时（改这里就改了命运）。集成测试用 TI_BOOK_WINDOW_HOURS
+# 把它放宽到几天后，好让 `plan` 排的未来场次真的走一遍「下单」这条真路径；
+# 正常使用不设它，行为和以前一模一样。
+WINDOW_HOURS = float(os.environ.get("TI_BOOK_WINDOW_HOURS") or sch.WINDOW_HOURS)
+if WINDOW_HOURS.is_integer():
+    WINDOW_HOURS = int(WINDOW_HOURS)          # 日志/打印保持「24」而不是「24.0」
+if WINDOW_HOURS <= 0 or WINDOW_HOURS > 24 * 14:
+    raise SystemExit("TI_BOOK_WINDOW_HOURS 只接受 (0, 336] 小时，你给的是 %r"
+                     % (os.environ.get("TI_BOOK_WINDOW_HOURS"),))
 
 
 def is_infra_failure(reason, code=None):
@@ -138,17 +146,21 @@ def is_infra_failure(reason, code=None):
     return any(marker in reason for marker in INFRA_MESSAGE_MARKERS)
 
 
-STATE_FILE = os.path.join(HERE, "temp", "keep_session-state.json")
-PID_FILE = os.path.join(HERE, "temp", "keep_session.pid")
-LOG_FILE = os.path.join(HERE, "temp", "keep_session.log")
-STOP_FILE = os.path.join(HERE, "temp", "keep_session.stop")  # 放这个文件 = 优雅退出
-LOCK_FILE = os.path.join(HERE, "temp", "keep_session.lock")  # 防 daemon 与手动 check 同时下单
-VERDICTS_FILE = os.path.join(HERE, "temp", "keep_session-verdicts.json")  # 认罪判决
-SINS_FILE = os.path.join(HERE, "temp", "warden-sins.json")        # 待认罪的罪
+#: 运行时目录：默认 temp/；设了 TI_TEMP 就整体搬走（集成测试必须隔离到临时目录，
+#: 否则 `check` 会去订用户明天真实的场次、把状态写进他的真账本）。
+TEMP = os.environ.get("TI_TEMP") or os.path.join(HERE, "temp")
+
+STATE_FILE = os.path.join(TEMP, "keep_session-state.json")
+PID_FILE = os.path.join(TEMP, "keep_session.pid")
+LOG_FILE = os.path.join(TEMP, "keep_session.log")
+STOP_FILE = os.path.join(TEMP, "keep_session.stop")  # 放这个文件 = 优雅退出
+LOCK_FILE = os.path.join(TEMP, "keep_session.lock")  # 防 daemon 与手动 check 同时下单
+VERDICTS_FILE = os.path.join(TEMP, "keep_session-verdicts.json")  # 认罪判决
+SINS_FILE = os.path.join(TEMP, "warden-sins.json")        # 待认罪的罪
 # 「这条是 warden 自己取消的」的挂号单：改排布/程序化取消之前先挂上，
 # daemon 发现 booked-but-missing 时先查这里，命中就不记罪（也不锁死 TUI）。
-EXPECTED_FILE = os.path.join(HERE, "temp", "keep_session-expected.json")
-SINS_ARCHIVE = os.path.join(HERE, "temp", "warden-sins.jsonl")    # 认过的罪（只增不删）
+EXPECTED_FILE = os.path.join(TEMP, "keep_session-expected.json")
+SINS_ARCHIVE = os.path.join(TEMP, "warden-sins.jsonl")    # 认过的罪（只增不删）
 
 # daemon 热重载：改了这些源码就自重启（pid 不变），不用手动 daemon restart。
 # 只认语法能编译的文件，避免你存到一半的半成品把 daemon 重启死。
@@ -244,7 +256,7 @@ SUMMON_APP = os.path.join(HERE, "app", "Warden.app")
 #: 只有这份文件能回答：marker 里那个 iTerm session id 可能早就不跑 warden 了
 #: （你 `q` 退出、或 warden 崩了），那时「聚焦 + 打一行 refresh」只会把
 #: refresh 敲进 shell —— 看起来像叫了，其实谁都没来。
-TUI_STATE_FILE = os.path.join(HERE, "temp", "warden-tui.json")
+TUI_STATE_FILE = os.path.join(TEMP, "warden-tui.json")
 IDLE_MAX_STRIKES = 3             # 兜底值；真正惩罚次数用模式里的 max_strikes
 IDLE_ALERT_AUDIO = os.path.join(HERE, "data", "audio", "赵小六嘶吼.mp3")
 IDLE_ALERT_VOLUME = 10           # 「把音量拉到 10%」
@@ -291,11 +303,11 @@ DEFAULT_IDLE_MODE = "normal"
 # 旧常量保留为普通模式阈值，外部/测试还在引用；真正判定用模式里的 threshold_sec。
 IDLE_THRESHOLD_SEC = IDLE_MODES["normal"]["threshold_sec"]
 
-IDLE_STATE_FILE = os.path.join(HERE, "temp", "keep_session-idle.json")  # 违规计数（按 session）
-IDLE_MODE_FILE = os.path.join(HERE, "temp", "keep_session-mode.json")    # 当前专注模式（TUI/daemon 共用）
+IDLE_STATE_FILE = os.path.join(TEMP, "keep_session-idle.json")  # 违规计数（按 session）
+IDLE_MODE_FILE = os.path.join(TEMP, "keep_session-mode.json")    # 当前专注模式（TUI/daemon 共用）
 # 暂停：专注视图里用 `stop` 消耗一次，暂停 PAUSE_MINUTES 分钟、全天最多 3 次。
 # daemon 在暂停期间不念你；次数/到期时间落盘，warden 和 daemon 共用。
-PAUSE_FILE = os.path.join(HERE, "temp", "keep_session-pause.json")
+PAUSE_FILE = os.path.join(TEMP, "keep_session-pause.json")
 PAUSE_MAX_PER_DAY = 3
 PAUSE_MINUTES = 5
 # ioreg 在 /usr/sbin；daemon 脱离终端后 PATH 极简，写死绝对路径

@@ -168,19 +168,22 @@ night = [t for t in wd.task_store.list()
          if (t.get("fields") or {}).get("title") == "夜读"][0]
 fmt = night.get("formatter") or {}
 res = fmt.get("reservation") or {}
-check("任务落在最后一块 23:30–00:00（25+5）",
-      [res.get("start"), res.get("end")], ["23:30", "00:00"])
-check("切分前缀是 75，不是原来的 50",
-      fmt.get("result", {}).get("cut_prefix"), [75])
-check("排布精确变成 [75,25]",
-      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [75, 25])
-check("当前只剩两场：22:15–23:30 + 23:30–23:55",
+# 每场之后必须留 5 分钟/块的强制休息：75 分钟场 22:15–23:30 之后要到 23:45
+# 才能再开一场，而 23:45 的 25 分钟会顶到 00:10（超过时段终点）。所以「最晚能
+# 切」的位置是 23:15，前缀 [50]（22:15–23:05 + 10 分钟休息 = 23:15）。
+check("任务落在最后一块 23:15–23:45（25+5，休息算进去了）",
+      [res.get("start"), res.get("end")], ["23:15", "23:45"])
+check("切分前缀是 50（75 分钟场后面接不到 23:30）",
+      fmt.get("result", {}).get("cut_prefix"), [50])
+check("排布精确变成 [50,25]",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [50, 25])
+check("当前只剩两场：22:15–23:05 + 23:15–23:40",
       [(s["start"], s["end"], s["duration"])
        for s in wd.sessions_for_day_plan()],
-      [("22:15", "23:30", 75), ("23:30", "23:55", 25)])
+      [("22:15", "23:05", 50), ("23:15", "23:40", 25)])
 check("不再额外造一次性 session", sp.load_extras()["dates"].get(ISO, []), [])
 check("任务挂的就是切出来的那场",
-      [night["session"]["start"], night["session"]["duration"]], ["23:30", 25])
+      [night["session"]["start"], night["session"]["duration"]], ["23:15", 25])
 
 print("== refresh：formatter 每轮重查；排布被改坏会自己掰回来 ==")
 sp.set_layout(TODAY, "T1", [50])
@@ -191,10 +194,10 @@ check("人为把排布改回 [50]", sp.get_layout(sp.load_layouts(), TODAY, "T1"
 wd.messages = []
 check("refresh 受理", wd.handle("refresh"), True)
 check("refresh 后 formatter 的精确切割恢复",
-      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [75, 25])
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [50, 25])
 night = wd.task_store.get(night["id"])
-check("任务仍然在 23:30",
-      [night["session"]["start"], night["session"]["duration"]], ["23:30", 25])
+check("任务仍然在 23:15",
+      [night["session"]["start"], night["session"]["duration"]], ["23:15", 25])
 check_true("refresh 明确说了重新剪断",
            any("剪断成" in m[2] for m in wd.messages))
 # 再 refresh 一次必须幂等：排布、绑定都不动，也不取消/新建任何东西。
@@ -202,8 +205,8 @@ wd.bridge.calls = []
 check("第二次 refresh 受理", wd.handle("refresh"), True)
 check("第二次 refresh 没有取消/新建 session",
       [c[0] for c in wd.bridge.calls if c[0] in ("cancel", "add_task")], [])
-check("第二次 refresh 后排布仍然是 [75,25]",
-      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [75, 25])
+check("第二次 refresh 后排布仍然是 [50,25]",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [50, 25])
 
 print("== 项目 plan：formatter 任务不进项目队列，defer 未到也不进 ==")
 _proj = {"id": 1, "title": "P", "tasks": [
@@ -301,6 +304,35 @@ check_true("明确让用户重新 plan",
 check("原计划任务被下架，等待重新安排",
       wd2.task_store.get(_task["id"]).get("session"), None)
 
+print("== 排布必须留 Focusmate 的强制休息（25/50/75 → 5/10/15 分钟）==")
+# 用户原话（2026-11-16）：「如果从 14:00 开始，订 75 分钟 session，是不能在
+# 15:15 结束的，应该在 15:30 结束，focusmate 自动给你 15 分钟休息时间」。
+# 以前 plan_period 只把下一场起点取整到 15 分钟，75 分钟场后面直接接 15:15 ——
+# Focusmate 不让订（点 slot 不出 Book 按钮），17:30 那场就是这么一直订不上的。
+_brk = fresh([{"id": "T1", "date": TOMORROW_ISO, "start": "14:00",
+               "end": "18:00", "type": "工作", "name": "下午",
+               "calendar": "工作", "title": "下午"}])
+_brk.day_offset = 1
+check("手动 layout 75 + 50 + 75 受理",
+      _brk.handle("period T1 75 50 75"), True)
+check("场次之间留休息：14:00(75) → 15:30(50) → 16:30(75)",
+      [(r["startLabel"], int(r["durationMin"])) for r in _brk.rows
+       if (r.get("date") or "") == TOMORROW_ISO],
+      [("14:00", 75), ("15:30", 50), ("16:30", 75)])
+_brk.messages = []
+_brk.handle("period T1 75 50 75 25")     # 9 个 block 塞不进 8 个 block 的时段
+check_true("9 个 block 的 layout 被明确拒绝（说放不下）",
+           any("放不下" in m[2] for m in _brk.messages))
+check("被拒绝后排布原样不动",
+      [(r["startLabel"], int(r["durationMin"])) for r in _brk.rows
+       if (r.get("date") or "") == TOMORROW_ISO],
+      [("14:00", 75), ("15:30", 50), ("16:30", 75)])
+_brk_period = {"id": "T9", "date": TOMORROW_ISO, "start": "09:00", "end": "12:30"}
+check("默认排布也带休息：210 分钟 → 50+50+50+25（09:00/10:00/11:00/12:00）",
+      [(s["start"], int(s["duration"]))
+       for s in sp.plan_period(_brk_period, sp.default_durations(_brk_period))],
+      [("09:00", 50), ("10:00", 50), ("11:00", 50), ("12:00", 25)])
+
 print("== 项目 plan：小任务叠进大场时，plan 记的时长必须等于真挂上的那场 ==")
 # 用户报的现场：手动 layout 14:00(75) / 15:15(50) / 16:15(75)，plan 里
 # 75 分钟任务和小任务差位，refresh 报「绑定和 plan 不一致」把整天计划清空。
@@ -343,8 +375,8 @@ _up_tasks = {t["fields"]["project_task"]: t for t in wd_up.task_store.list()
              if (t.get("fields") or {}).get("project_id") == _up_project["id"]}
 check("大任务落在 14:00（75 分钟场）",
       [i for i in _up_plan["items"] if i["pk"] == "t-big"][0]["start"], "14:00")
-check("十分钟小事落在 15:15（50 分钟场，前一场已经满）",
-      [i for i in _up_plan["items"] if i["pk"] == "t-tiny"][0]["start"], "15:15")
+check("十分钟小事落在 15:30（50 分钟场，75 分钟场之后要留 15 分钟休息）",
+      [i for i in _up_plan["items"] if i["pk"] == "t-tiny"][0]["start"], "15:30")
 check("plan item 记的时长 = 任务真挂上的那场时长（不是小任务自己的 10 分钟）",
       [(i["pk"], i["duration"],
         int((_up_tasks[i["pk"]].get("session") or {}).get("duration") or 0))

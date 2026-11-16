@@ -2561,7 +2561,7 @@ class ProjectMixin(object):
                 out.add(task_id)
         return out
 
-    def _reset_day_plans(self, day):
+    def _reset_day_plans(self, day, announce=True):
         """重新 plan 前撤掉当天旧的 project plan / task 绑定。
 
         普通 ``plan`` 是「这一天整体重排」：旧的 plan items 和它们挂着的
@@ -2604,7 +2604,7 @@ class ProjectMixin(object):
             self.projects.set_allocation(project.get("id"), day, 0)
             cleared_plans += 1
             cleared_items += len(items)
-        if cleared_plans:
+        if cleared_plans and announce:
             self.say("♻️ 重排 %s：先撤掉旧 plan 的 %d 条任务，再从当前空场重新排"
                      % (iso, cleared_items), "info")
         return {"plans": cleared_plans, "items": cleared_items,
@@ -2677,6 +2677,7 @@ class ProjectMixin(object):
         自动排布不会去重切它。
         """
         now = now or self._now_dt()
+        anchor = self._plan_anchor(now)
         is_today = (day == now.date())
         plan_owned = (self._plan_owned_task_ids(day, rescindable_only=True)
                       if replan else set())
@@ -2718,6 +2719,14 @@ class ProjectMixin(object):
                     if pid_of_row:
                         blocked_periods.add(pid_of_row)
                     continue
+            elif is_today and start_dt < anchor:
+                # 已经来不及开始的那一小段（现在 → 下一个十五分钟整点）不是资源：
+                # 15:58 敲 plan，15:59 / 16:00 之前的场次都不该被排东西进去。
+                if is_planned:
+                    stats["past"] += 1
+                if pid_of_row:
+                    blocked_periods.add(pid_of_row)
+                continue
             # 普通 plan 仍只认 data.csv 里排好的场次；-c 的唯一例外是
             # **此刻正在进行**的真实 session（计划外但已经开打，且没挂任务）。
             if not is_planned and not live:
@@ -2775,6 +2784,13 @@ class ProjectMixin(object):
                        remaining_min, counts))
                 if not is_planned:
                     stats["live_unplanned"].append(row.get("startLabel") or "?")
+            if row.get("id"):
+                # **已经订上的场次不许重切**：它是 Focusmate 上真实存在的一场，
+                # 改切分等于「取消 + 重订」（用户报的「plan 完约都没约上」就是这么
+                # 来的 —— 19:00 的 75 分钟被拆成 19:00(25)+19:30(75)）。这一段
+                # 只允许往里塞任务，不再参与「整段重排」。
+                if pid_of_row:
+                    blocked_periods.add(pid_of_row)
             slot = pp.slot_record(index, start_dt.date().isoformat(),
                                   row.get("startLabel"), duration,
                                   row.get("id"), row.get("endLabel"))
@@ -2805,6 +2821,7 @@ class ProjectMixin(object):
         返回 ``(slots, blocked_periods)``（后者可能因为静音/被占而变大）。
         """
         now = now or self._now_dt()
+        anchor = self._plan_anchor(now)
         auto_period_ids = {pid for pid, meta in period_meta.items() if meta["auto"]}
         original_by_pid = {}
         for slot in slots:
@@ -2829,7 +2846,8 @@ class ProjectMixin(object):
             p_end = datetime.datetime.combine(day, datetime.time(*e_got))
             if p_end <= p_start:
                 p_end += datetime.timedelta(days=1)
-            if p_start <= now and not (include_current and now < p_end):
+            if p_start < anchor and not (include_current and now < p_end):
+                # 这一段已经过去了（或者来不及在下一个整点开始），不重切。
                 slots.extend(original_by_pid.get(pid) or [])
                 continue
             if mute_window_for(day, period.get("start"), period.get("end")):
@@ -2849,7 +2867,7 @@ class ProjectMixin(object):
                 continue
             blocks = pp._period_blocks(period)
             if include_current and p_start <= now < p_end:
-                remaining = int((p_end - now).total_seconds() // 60)
+                remaining = int((p_end - max(now, anchor)).total_seconds() // 60)
                 blocks = min(blocks, remaining // pp.MINUTES_PER_COUNT)
             if blocks <= 0:
                 slots.extend(original_by_pid.get(pid) or [])
@@ -2944,6 +2962,8 @@ class ProjectMixin(object):
         if self.planning is not None:
             raise ValueError("已经有一次 plan 在等你的分配（看下面那块面板）："
                              "`task <序号> <count>` 分资源、`complete` 开始排、`q` 放弃。")
+        if toks and str(toks[0]).lower() in ("clear", "--clear", "-x", "清空"):
+            return self.cmd_plan_clear()
         if (self.pending_import is not None or self.nostart is not None
                 or self.pending_interrupt is not None
                 or self.pending_soft_interrupt is not None
@@ -2994,13 +3014,13 @@ class ProjectMixin(object):
             self.rebuild_rows()
         except Exception:                          # noqa: BLE001 - 快照模式也能 plan
             pass
-        old_replanning = getattr(self, "_plan_replanning", False)
-        self._plan_replanning = True
-        try:
-            slots, notes = (self._plan_slots(day, include_current=True)
-                            if include_current else self._plan_slots(day))
-        finally:
-            self._plan_replanning = old_replanning
+        # **不再**把上一轮 plan 挂着的任务当成可重排资源（``_plan_replanning``）。
+        # 那等于「每次 plan 都把今天重排一遍」：已经排好的场次被摘掉、重切，
+        # 甚至把已经订上的 session 拆成两场（取消 + 重订，然后订不上）。
+        # 现在的口径是：plan 只往**接下来还没排的空场**里加东西，上一轮的安排
+        # 原样保留；要清空请显式 `plan clear`。
+        slots, notes = (self._plan_slots(day, include_current=True)
+                        if include_current else self._plan_slots(day))
         for note in notes:
             self.say("· %s" % note, "info")
         if not slots:
@@ -3328,11 +3348,43 @@ class ProjectMixin(object):
         return {"sessions": len(slots), "counts": counts,
                 "starts": [s.get("start") for s in slots]}
 
+    @staticmethod
+    def _plan_anchor(now):
+        """今天 `plan` 的起点：**下一个 15 分钟整点**。
+
+        用户原话（2026-11-16）：「我希望每次安排的时候就按接下来剩余一天有多少
+        时间安排（从下一个十五分钟整点开始）」。已经流走的时间不是资源，
+        连「现在这一分钟」也不算 —— 15:58 敲 plan 就只从 16:00 往后数。
+        """
+        now = now.replace(second=0, microsecond=0)
+        return now + datetime.timedelta(minutes=(-now.minute) % 15)
+
+    def cmd_plan_clear(self, day=None):
+        """``plan clear`` —— 撤掉这一天的计划（未开始的条目 + 绑定 + 分配）。
+
+        `plan` 现在是**追加**语义：只往空场里加，不动上一轮的安排。所以「我不想
+        要今天这些了」必须有显式出口，就是这条命令（以前是每次 plan 自动清）。
+        """
+        day = day or self.sel_date
+        res = self._reset_day_plans(day, announce=False) or {}
+        try:
+            self.rebuild_rows()
+        except Exception:                          # noqa: BLE001 - 清完拉不到表也不算失败
+            pass
+        self.invalidate()
+        self.say("🧹 %s 的计划已清空：%d 个项目、%d 条条目、%d 条任务下架"
+                 "（已经开始的场次一律不动）。"
+                 % (day.isoformat(), int(res.get("plans") or 0),
+                    int(res.get("items") or 0), int(res.get("detached") or 0)), "ok")
+        return res
+
     def plan_hooks(self):
         """`plan` 要碰外面世界的那个口子（其余全在 project_plan.Allocator 里）。"""
         return {
             "say": lambda text, kind="info": self.say(text, kind),
-            "apply": lambda allocator, allocs: self._plan_apply(allocator, allocs),
+            # 追加语义：`plan` 只往空场里加，不清上一轮（`plan clear` 才清）。
+            "apply": lambda allocator, allocs: self._plan_apply(
+                allocator, allocs, append_to_plan=True),
         }
 
     def _auto_plan_signature(self, day):
@@ -3468,16 +3520,23 @@ class ProjectMixin(object):
         # formatter 任务 / 尚未到 defer 点的本地任务都不该被项目 plan 再算一遍。
         # 前者已经有自己的时间占位，后者现在根本还没进入可安排队列。
         excluded = {}
+        skip_pks = {}
         for task in self.task_store.list():
             pid, _title, pk = ts.TaskStore.project_task_fields(task)
             if not pk or pid is None or not ts.TaskStore.is_open(task):
                 continue
             if task.get("formatter") or ts.task_is_deferred(task):
                 excluded.setdefault(pid, set()).add(str(pk))
+            elif append_to_plan and (task.get("session") or {}).get("start"):
+                # 追加语义的必然后果：上一轮**已经排进 session** 的项目任务（含清单
+                # 派生行）这一轮不能再排。以前不查，`plan` 会把同一条清单行再唤起
+                # 一条本地任务，于是同一行出现两份「(0+3/3)」。
+                excluded.setdefault(pid, set()).add(str(pk))
+                skip_pks.setdefault(pid, set()).add(str(pk))
         items, notes = pp.distribute(
             allocs, [a["project"] for a in allocs], invested,
             now=datetime.datetime.now(), exclude_pks=excluded,
-            rotation=self.derived_rotation())
+            rotation=self.derived_rotation(), skip_pks=skip_pks)
         # period-first：只要这一天的空场里有“自动 layout”的 period，就先把任务
         # 按 period 排好，再根据任务反推 session durations；手动 layout 仍然
         # 作为硬约束，只允许任务往里填。

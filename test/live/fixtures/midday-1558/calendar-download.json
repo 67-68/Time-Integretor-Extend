@@ -1,0 +1,102 @@
+{
+ "version": 1,
+ "generated_at": "{{DAY}} 10:28:41",
+ "start_date": "{{DAY}}",
+ "days": 1,
+ "profiles": [
+  "工作",
+  "空闲"
+ ],
+ "events": [
+  {
+   "date": "{{DAY}}",
+   "start": "22:15",
+   "end": "23:15",
+   "start_iso": "{{DAY}}T22:15:00+08:00",
+   "end_iso": "{{DAY}}T23:15:00+08:00",
+   "calendar": "空闲",
+   "title": "空闲",
+   "all_day": false
+  },
+  {
+   "date": "{{DAY}}",
+   "start": "19:00",
+   "end": "21:30",
+   "start_iso": "{{DAY}}T19:00:00+08:00",
+   "end_iso": "{{DAY}}T21:30:00+08:00",
+   "calendar": "空闲",
+   "title": "空闲",
+   "all_day": false
+  },
+  {
+   "date": "{{DAY}}",
+   "start": "09:00",
+   "end": "12:30",
+   "start_iso": "{{DAY}}T09:00:00+08:00",
+   "end_iso": "{{DAY}}T12:30:00+08:00",
+   "calendar": "空闲",
+   "title": "空闲",
+   "all_day": false
+  },
+  {
+   "date": "{{DAY}}",
+   "start": "14:00",
+   "end": "18:00",
+   "start_iso": "{{DAY}}T14:00:00+08:00",
+   "end_iso": "{{DAY}}T18:00:00+08:00",
+   "calendar": "空闲",
+   "title": "空闲",
+   "all_day": false
+  }
+ ],
+ "periods": [
+  {
+   "id": "T1",
+   "date": "{{DAY}}",
+   "start": "09:00",
+   "end": "12:30",
+   "type": "空闲",
+   "name": "空闲",
+   "calendar": "空闲",
+   "title": "空闲",
+   "start_iso": "{{DAY}}T09:00:00+08:00",
+   "end_iso": "{{DAY}}T12:30:00+08:00"
+  },
+  {
+   "id": "T2",
+   "date": "{{DAY}}",
+   "start": "14:00",
+   "end": "18:00",
+   "type": "空闲",
+   "name": "空闲",
+   "calendar": "空闲",
+   "title": "空闲",
+   "start_iso": "{{DAY}}T14:00:00+08:00",
+   "end_iso": "{{DAY}}T18:00:00+08:00"
+  },
+  {
+   "id": "T3",
+   "date": "{{DAY}}",
+   "start": "19:00",
+   "end": "21:30",
+   "type": "空闲",
+   "name": "空闲",
+   "calendar": "空闲",
+   "title": "空闲",
+   "start_iso": "{{DAY}}T19:00:00+08:00",
+   "end_iso": "{{DAY}}T21:30:00+08:00"
+  },
+  {
+   "id": "T4",
+   "date": "{{DAY}}",
+   "start": "22:15",
+   "end": "23:15",
+   "type": "空闲",
+   "name": "空闲",
+   "calendar": "空闲",
+   "title": "空闲",
+   "start_iso": "{{DAY}}T22:15:00+08:00",
+   "end_iso": "{{DAY}}T23:15:00+08:00"
+  }
+ ]
+}

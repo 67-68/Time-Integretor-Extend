@@ -47,7 +47,9 @@ import session_plan as sp
 import task_store as ts
 
 MINUTES_PER_COUNT = ts.MINUTES_PER_COUNT
-BREAK_MINUTES = 5
+#: 每块 25 分钟工作之后的强制休息。**唯一真源在 session_plan**（排布要靠它推进
+#: cursor），这里只是别名，别在别处再写一个字面量 5。
+BREAK_MINUTES = sp.BREAK_MINUTES_PER_COUNT
 
 #: ``complete`` 的几种写法。用户原话是「使用 complete 可以结束资源分配」。
 COMPLETE_TOKENS = ("complete", "done", "ok", "go", "完成", "结束", "下一步")
@@ -103,7 +105,7 @@ def slots_text(slots, limit=8):
 
 
 def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=None,
-               rotation=None):
+               rotation=None, skip_pks=None):
     """把「每个项目多少 count」摊成具体的任务（每条还带要几个 count / 分钟）。
 
     ``allocations``：``[{"project_id": 1, "count": 4}, ...]``（**顺序就是排的顺序**）；
@@ -130,9 +132,15 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
         task_type = pj.task_type_of(project)
         excluded = (exclude_pks.get(pid) or exclude_pks.get(str(pid))
                     if isinstance(exclude_pks, dict) else exclude_pks)
+        # ``derived_budget``：标题清单容器按「这次分到多少 count」展开够填满的
+        # 条数（3 count/条、分到 6 count → 展开 2 条）。不传就还是只展开一条。
+        skipped = ((skip_pks.get(pid) or skip_pks.get(str(pid)))
+                   if isinstance(skip_pks, dict) else None) or ()
         for item in pj.remaining_tasks(project, invested_map.get(pid) or {},
                                        now=now, exclude_pks=excluded,
-                                       rotation=rotation):
+                                       rotation=rotation,
+                                       derived_budget=need,
+                                       skip_pks=skipped):
             if budget <= 0:
                 break
             minutes = int(item.get("minutes") or 0)
