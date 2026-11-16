@@ -301,6 +301,62 @@ check_true("明确让用户重新 plan",
 check("原计划任务被下架，等待重新安排",
       wd2.task_store.get(_task["id"]).get("session"), None)
 
+print("== 项目 plan：小任务叠进大场时，plan 记的时长必须等于真挂上的那场 ==")
+# 用户报的现场：手动 layout 14:00(75) / 15:15(50) / 16:15(75)，plan 里
+# 75 分钟任务和小任务差位，refresh 报「绑定和 plan 不一致」把整天计划清空。
+_Dmis = TOMORROW
+wd_up = fresh([{"id": "T1", "date": TOMORROW_ISO, "start": "14:00",
+                "end": "18:00", "type": "工作", "name": "下午",
+                "calendar": "工作", "title": "下午"}])
+wd_up.day_offset = 1
+check("手动 layout 排成 75 + 50 + 75",
+      wd_up.handle("period T1 75 50 75"), True)
+wd_up.reload_entries()
+sync_up = wd_up
+check("先有一份「已经订上」的快照",
+      (sync_api(wd_up), len(wd_up.rows))[1], 3)
+_up_payload = pj.project_payload(
+    {"id": "p-up", "name": "下午项目", "kind": "project_root",
+     "completed": False, "dropped": False},
+    [{"id": "p-up", "name": "下午项目", "kind": "project_root",
+      "completed": False, "dropped": False},
+     {"id": "t-big", "name": "大任务", "kind": "action", "project": "下午项目",
+      "estimated_minutes": 75, "completed": False, "dropped": False},
+     {"id": "t-tiny", "name": "十分钟小事", "kind": "action", "project": "下午项目",
+      "estimated_minutes": 10, "completed": False, "dropped": False}],
+    now=datetime.datetime.now())
+_up_project, _ = wd_up.projects.upsert(_up_payload)
+wd_up.sync_project_tasks(_up_project)
+_up_project = wd_up.projects.by_id(_up_project["id"])
+_up_slots, _ = wd_up._plan_slots(_Dmis)
+up_allocator = pp.Allocator(_Dmis, [_up_project], _up_slots,
+                            task_store=wd_up.task_store,
+                            hooks=wd_up.plan_hooks())
+_up_summary = wd_up._plan_apply(
+    up_allocator,
+    [{"project_id": _up_project["id"], "project": _up_project, "count": 4}],
+    book=False)
+check("plan 把 75 + 10 分钟都排进去了",
+      (_up_summary["placements"], _up_summary["unscheduled"]), (2, 0))
+_up_plan = pj.plan_of(wd_up.projects.by_id(_up_project["id"]), _Dmis)
+_up_tasks = {t["fields"]["project_task"]: t for t in wd_up.task_store.list()
+             if (t.get("fields") or {}).get("project_id") == _up_project["id"]}
+check("大任务落在 14:00（75 分钟场）",
+      [i for i in _up_plan["items"] if i["pk"] == "t-big"][0]["start"], "14:00")
+check("十分钟小事落在 15:15（50 分钟场，前一场已经满）",
+      [i for i in _up_plan["items"] if i["pk"] == "t-tiny"][0]["start"], "15:15")
+check("plan item 记的时长 = 任务真挂上的那场时长（不是小任务自己的 10 分钟）",
+      [(i["pk"], i["duration"],
+        int((_up_tasks[i["pk"]].get("session") or {}).get("duration") or 0))
+       for i in _up_plan["items"]],
+      [("t-big", 75, 75), ("t-tiny", 50, 50)])
+wd_up.messages = []
+check("refresh 受理", wd_up.handle("refresh"), True)
+check("refresh 之后 plan 还在（不再因为时长口径不同被清空）",
+      bool(pj.plan_of(wd_up.projects.by_id(_up_project["id"]), _Dmis)), True)
+check_true("没有报「绑定和 plan 不一致」",
+           not any("绑定和 plan 不一致" in m[2] for m in wd_up.messages))
+
 print("== end formatter：11:00–12:00 + 25 分钟任务 → 任务场次从 11:30 开始 ==")
 wd_hour = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
                   "type": "工作", "name": "一小时", "calendar": "工作",

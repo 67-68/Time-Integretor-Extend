@@ -1,4 +1,4 @@
-# 由 download_calendar.py / session_plan.py 生成 @ 2026-11-16T11:45:34
+# 由 download_calendar.py / session_plan.py 生成 @ 2026-11-16T13:32:22
 # 来源：temp/calendar-download.json + temp/session-layouts.json + temp/session-extras.json + temp/session-rules.json
 # 格式：YYYY-MM-DD,HH:MM,duration（也兼容旧的 weekday,HH:MM,duration）
 2026-11-16,14:00,75

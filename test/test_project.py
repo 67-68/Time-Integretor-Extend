@@ -2217,6 +2217,41 @@ check("两个 >=25 分钟任务不能塞进同一个 session",
 check("两个 25 分钟任务生成两个 session",
       sorted(_split_layouts.values()), [[25, 25]])
 
+print("== 16b) period-first：小任务叠进中间的空场，placement 必须跟着它真正所在的场 ==")
+# 手动 layout：14:00(75) / 15:15(50) / 16:15(75) / 17:30(25)。两个 75 分钟任务会
+# 落到 14:00 和 16:15，10 分钟的小任务叠进 15:15 —— 放置顺序是 [大1, 大2, 小]，
+# 和 group 顺序 [14:00, 15:15, 16:15] 不一样。以前拿扁平顺序对位，把大2 记到
+# 15:15、小任务记到 16:15，refresh 就报「绑定和 plan 不一致」清空整天的计划。
+
+def _manual_slot(idx, start, duration, pid="T2",
+                 pstart="14:00", pend="18:00"):
+    got = pp.slot_record(idx, TOMORROW, start, duration, None, None)
+    period = {"id": pid, "date": TOMORROW, "start": pstart, "end": pend}
+    got.update({"period_id": pid, "period": period,
+                "period_start": pstart, "period_end": pend,
+                "period_total_minutes": pp._period_total_minutes(period),
+                "period_blocks": pp._period_blocks(period),
+                "period_auto": False})
+    return got
+
+
+_mis_slots = [_manual_slot(1, "14:00", 75), _manual_slot(2, "15:15", 50),
+              _manual_slot(3, "16:15", 75), _manual_slot(4, "17:30", 25)]
+_mis_places, _mis_uns, _mis_notes, _mis_layouts = pp.schedule_periods(
+    [_pitem("大 75", 75), _pitem("大 75 二", 75), _pitem("小 10", 10)], _mis_slots)
+check("大任务各占一个 75 分钟场，小任务叠进 15:15（不按扁平顺序错位）",
+      [(p["item"]["title"], p["slot"]["start"], p["duration"])
+       for p in _mis_places],
+      [("大 75", "14:00", 75), ("小 10", "15:15", 10),
+       ("大 75 二", "16:15", 75)])
+check("没有 placement 的分钟数超过它所在场次",
+      [(p["item"]["title"], p["slot"]["start"], p["duration"],
+        p["slot"]["duration"]) for p in _mis_places
+       if int(p["duration"]) > int(p["slot"]["duration"])], [])
+check("15:15 这场只有小任务自己（不算叠场）",
+      [_p["stacked"] for _p in _mis_places
+       if _p["item"]["title"] == "小 10"], [False])
+
 print("== 17) plan 无手动 layout：按任务反推 session，并写回中间层 ==")
 sp.save_layouts(sp.empty_layouts())
 wd_auto = fresh([dict(r) for r in _long_rows])

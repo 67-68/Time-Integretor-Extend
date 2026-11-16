@@ -714,12 +714,12 @@ class TaskPipelineMixin(object):
             sessions = self.sessions_for_day_plan(day)
         except Exception:                          # noqa: BLE001
             sessions = []
-        by_key = {}
+        by_start = {}
         for sess in sessions:
-            try:
-                by_key[(str(sess.get("start")), int(sess.get("duration") or 0))] = sess
-            except (TypeError, ValueError):
+            start_key = str(sess.get("start") or "")
+            if not start_key:
                 continue
+            by_start.setdefault(start_key, sess)
         rows_by_start = {}
         for row in self.rows or ():
             if row.get("date") != iso or not row.get("planned"):
@@ -758,11 +758,16 @@ class TaskPipelineMixin(object):
                 reasons.append("任务 %s 的 defer 还没到" % title)
                 continue
             sess = task.get("session") or {}
+            # ``item["duration"]`` = 这一场**要装下**多少分钟。session 比它长不算
+            # 错（<25 分钟的小任务本来就和别的任务叠在同一场、甚至单独占一个
+            # 大场）；只有 session 装不下才算排期真的失效。以前要求两者严格相等，
+            # 于是小任务叠场（item 10 / session 75）每轮 refresh 都被判成「绑定
+            # 不一致」，整天的计划连任务绑定一起被清掉。
             if (sess.get("date") != iso or str(sess.get("start")) != start
-                    or int(sess.get("duration") or 0) != duration):
+                    or int(sess.get("duration") or 0) < duration):
                 reasons.append("任务 %s 的绑定和 plan 不一致" % title)
                 continue
-            if not start or (start, duration) not in by_key:
+            if not start or start not in by_start:
                 reasons.append("%s %s 这场已不在当前排布里" % (start or "?", duration))
                 continue
             row = rows_by_start.get(start)

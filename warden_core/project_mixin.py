@@ -3633,12 +3633,6 @@ class ProjectMixin(object):
                 failed += 1
                 self.say("⚠ 「%s」没建成本地任务：%s" % (item.get("title"), e), "error")
                 continue
-            made.setdefault(item["project_id"], []).append({
-                "pk": item["pk"], "task_id": task["id"],
-                "count": int(place["count"]), "start": slot.get("start") or "",
-                "duration": int(place.get("duration")
-                                or int(place["count"]) * pp.MINUTES_PER_COUNT),
-                "parent_pk": parent_pk or ""})
             try:
                 self._assign_task(task, str(slot["index"]), refresh=False,
                                   allow_unbooked=True)
@@ -3646,6 +3640,25 @@ class ProjectMixin(object):
                 failed += 1
                 self.say("⚠ 「%s」建好了但没挂到 session #%s：%s"
                          % (item.get("title"), slot["index"], e), "warn")
+                continue
+            # 记进 plan 的 start/duration 必须**等于任务真正挂上的那一场**：
+            # refresh 就是拿这两项去核对绑定的，记岔了下一轮就会报「绑定和
+            # plan 不一致」并把整天的计划清掉。``place["duration"]`` 是这个
+            # 任务自己占多少分钟，小任务（<25 分钟）可以叠进大场，这时它
+            # （10）和 session 长度（75）不是一个数 —— 所以回读绑定。
+            try:
+                bound = self.task_store.get(task["id"]) or {}
+            except (ValueError, TypeError):
+                bound = {}
+            sess = bound.get("session") or {}
+            made.setdefault(item["project_id"], []).append({
+                "pk": item["pk"], "task_id": task["id"],
+                "count": int(place["count"]),
+                "start": str(sess.get("start") or slot.get("start") or ""),
+                "duration": int(sess.get("duration") or 0) or int(
+                    place.get("duration")
+                    or int(place["count"]) * pp.MINUTES_PER_COUNT),
+                "parent_pk": parent_pk or ""})
         for pid, records in made.items():
             self.projects.record_items(pid, day, records,
                                        append=append_to_plan)

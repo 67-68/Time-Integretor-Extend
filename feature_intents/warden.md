@@ -744,6 +744,30 @@ stdout  每行： {"id":1,"ok":true,"cmd":"snapshot","ms":842,"result":{...}}
   （一条命令失败不该带走整个桥）。用 `inCommand` 标志把命令执行期间的
   `process.exit` 转成异常。
 
+## 项目 plan 的两条口径（2026-11-16 修）
+
+`plan` 排完之后列进 `projects.json` 的每条 item 只有四个字段：`pk` / `task_id` /
+`start` / `duration`。它们是「这一天怎么排的」的唯一凭据，`refresh` 拿它们和
+任务的 `session` 绑定逐条对账。这里有两条口径，错一条就会在下一轮 `refresh`
+被报「绑定和 plan 不一致」，然后整天的计划连任务绑定一起被清掉：
+
+1. **`start`/`duration` 必须等于任务真挂上的那一场**，不是任务自己的工作分钟。
+   `place["duration"]` 是「这个任务在这一场占多少分钟」，而 `_assign_task()` 记的
+   是**整场 session 的长度**。小任务（<25 分钟）可以叠进大场：10 分钟的小事进
+   75 分钟场，item 记 10 而绑定记 75 → 永远对不上。所以 `_plan_apply()` 现在先
+   `_assign_task()`、再回读 `task["session"]` 拿 `start`/`duration` 落 item。
+   对账那边也放宽了：`item.duration` 只表示「这一场至少要装下这么多分钟」，
+   `session` 更长不算错（`<` 才算硬失效），查 session 也从 `(start,duration)`
+   改成按 `start` 查。
+2. **placement 的归属由 `group["places"]` 决定，不再用 period 级扁平顺序对位**。
+   `schedule_periods()` 以前把「哪个任务放了多少分钟」记成一个 period 级的扁平
+   列表，再按 group 顺序去取 —— 而两者顺序根本不同：小任务会塞进前面还有空位的
+   session（15:15，50 分钟），大任务去后面的 75 分钟场（16:15）。扁平顺序是
+   `[大1@14:00, 大2@16:15, 小@15:15]`，对位却按 `[14:00, 15:15, 16:15]` 发，
+   于是大2 被记到 15:15、小任务被记到 16:15，任务真的挂到了错的场次上（75 分钟
+   任务占 50 分钟场，25 分钟白丢）。现在每个 group 自己带 `places`，
+   placement 逐个 group 读自己的记录。
+
 ## 踩过的坑（都有回归测试）
 
 - **`handle()` 不展开紧凑短选项**：`-an` 的展开原本只挂在 repl_kit 的 `dispatch`
