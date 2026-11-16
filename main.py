@@ -31,6 +31,8 @@ import sys
 import urllib.parse
 import urllib.request
 
+import focusmate_lock as fm_lock
+
 SESSION_REGISTRATION_PATH = "data.csv"
 TOKEN = "8e595973b02a43a58c7e3dbbba477777"
 # MCP server 入口：默认读 install.py 装到 temp/ 的副本，可用环境变量覆盖。
@@ -188,10 +190,30 @@ def verify_token(target, start_iso):
         print("   -", s.get("startTime"), s.get("sessionId"))
 
 
-def mcp_call(tool: str, arguments: dict, timeout: int = 180):
-    """最小 MCP stdio client：initialize -> tools/call，全用 stdlib。"""
+#: 每个工具拿 profile 锁最多等多久。bridge 让位通常 1-2 秒，60s 已经很宽松；
+#: 登录虽然要人操作 5 分钟，但只需要先拿到锁，等 30 秒足够。
+_LOCK_WAIT_MS = {"focusmate_auth": 30000, "book_session": 60000}
+
+
+def mcp_call(tool: str, arguments: dict, timeout: int = 180, wait_ms=None):
+    """最小 MCP stdio client：initialize -> tools/call，全用 stdlib。
+
+    整个调用（起 node → 起 Chromium → 操作页面）都在 profile 锁里：同一个
+    user-data-dir 绝不能被两个 Chromium 同时打开 —— 第二个会白屏，并在争抢中
+    把 firebase:authUser 记录踩丢（看起来就像「登录态又过期了」）。见
+    :mod:`focusmate_lock` 的头注释。
+    """
     home = ensure_mcp_home()   # 确保 browser-data 可写，否则 dashboard 会空白
-    print("[mcp] home=%s tool=%s" % (home, tool))
+    if wait_ms is None:
+        wait_ms = _LOCK_WAIT_MS.get(tool, 30000)
+    with fm_lock.profile_lock(home, "mcp:%s" % tool, wait_ms=wait_ms) as held:
+        print("[mcp] home=%s tool=%s lock=%s"
+              % (home, tool, fm_lock.describe_holder(held)))
+        return _mcp_call_locked(tool, arguments, timeout)
+
+
+def _mcp_call_locked(tool: str, arguments: dict, timeout: int = 180):
+    """真正跑 MCP 协议；调用方**必须**已经持有 profile 锁。"""
     proc = subprocess.Popen(
         ["node", MCP_SERVER_JS],
         stdin=subprocess.PIPE,
@@ -273,23 +295,56 @@ def mcp_call(tool: str, arguments: dict, timeout: int = 180):
 def book_once(start_iso, duration):
     """调一次 book_session，返回解析后的 payload。"""
     print(f"[book] book_session startTime={start_iso} duration={duration}")
-    result = mcp_call("book_session", {"startTime": start_iso, "duration": duration})
+    try:
+        result = mcp_call("book_session",
+                          {"startTime": start_iso, "duration": duration})
+    except fm_lock.ProfileBusy as e:
+        # 这一条不算 slot 级失败：另一个浏览器占着 profile，等下一轮环境退避再来。
+        print("[book] 拿不到 profile 锁：%s" % e)
+        return {
+            "success": False,
+            "error": "另一个 Chromium 正占着 profile（%s），本轮没下单：%s"
+                     % ("focusmate profile", e),
+            "errorCode": "PROFILE_BUSY",
+        }
     print(json.dumps(result, indent=2, ensure_ascii=False))
     # book_session 返回 content[0].text 里是 JSON: {success, session / error, errorCode}
     try:
         payload = json.loads(result["content"][0]["text"])
     except Exception:
         payload = {}
+    # 「白屏」这句话原本还说「profile 目录不可写」，实测最常发生的是**另一只
+    # 浏览器正占着 profile**。现在有 focusmate_lock 互斥，正常不该再出现；
+    # 真出现就照这句话查锁和进程。
+    if payload.get("errorCode") == "AUTOMATION_FAILED":
+        err = payload.get("error") or ""
+        if "blank page" in err or "SPA did not mount" in err:
+            payload["error"] = (
+                "dashboard 白屏（SPA 没挂载）：profile 写不进去，或另一只 Chromium 正占着它。"
+                "查 temp/focusmate-home/.profile-lock.json 与 "
+                "`pgrep -f -- '--user-data-dir='`。")
     return payload
 
 
-def do_auth():
+def do_auth(reset=False):
     """触发 focusmate_auth，会弹出 Chromium 让你手动登录，5 分钟内完成即可。
+
+    ``reset=True`` 才会清空整个 profile（``clearAuthData``）。默认**保留**
+    profile：以前 force=True 就把 IndexedDB / localStorage 全删了，每次重登都
+    从空白开始，登录态攒不下来也查不清为什么掉。
 
     返回 True 表示登录成功，False 表示失败/超时。
     """
-    print("[auth] 检测到未登录，自动拉起浏览器，请在弹出的窗口里登录 Focusmate（5分钟有效）...")
-    result = mcp_call("focusmate_auth", {"force": True}, timeout=360)
+    print("[auth] %s请在弹出的窗口里登录 Focusmate（5分钟有效）..."
+          % ("先清空 profile 再" if reset else ""))
+    try:
+        result = mcp_call("focusmate_auth",
+                          {"force": True, "reset": bool(reset)}, timeout=360)
+    except fm_lock.ProfileBusy as e:
+        print("[auth] 拿不到 profile 锁：%s" % e)
+        print("[auth] 说明另一个 Chromium 正在用这个 profile（下单中/桥还开着）。"
+              "等它让位，或先在 warden 里停一轮再重试。")
+        return False
     print(json.dumps(result, indent=2, ensure_ascii=False))
     try:
         payload = json.loads(result["content"][0]["text"])
@@ -332,12 +387,14 @@ def parse_args(argv=None):
     ap.add_argument("--time", default="50", choices=["25", "50", "75"],
                     help="时长（分钟），默认 50")
     ap.add_argument("--auth", action="store_true", help="只登录（弹浏览器），不下单")
+    ap.add_argument("--reset", action="store_true",
+                    help="配 --auth 用：先清空整个浏览器 profile 再登录（登录态彻底坏了才用）")
     return ap.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = parse_args()
     if args.auth:
-        do_auth()
+        do_auth(reset=args.reset)
     else:
         main(args.start, args.time)

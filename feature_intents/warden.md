@@ -92,6 +92,45 @@ TUI 的浏览器活儿全在 `scripts/bridge.mjs` 里干，daemon 在 `keep_sess
 `{"cmd":"where"}`（bridge 协议）不启动浏览器就能问出「现在读哪个、怎么选出来的」。
 报错文案也会补上下一步动作（`python3 main.py --auth`）和桥实际读的 profile 路径。
 
+## 同一个 profile 只许一个进程开浏览器（profile 锁）
+
+「读同一个 profile」还不够，**同一个 user-data-dir 绝不能被两个 Chromium 同时打开**。
+
+2026-11-16 真机诊断（用户原话：「最近的 cookie 腐烂得很快，每天都得要我重新登陆」）：
+
+- `keep_session.py daemon` 每 5 分钟自己起一个 Chromium 下单；
+- TUI 的 `bridge.mjs` 每条命令后把浏览器留 120s（`WARDEN_BRIDGE_IDLE_MS`）；
+- 只有 warden 自己触发 `book()` / `start` 时才 `_release_browser()`，daemon 的定时轮次不让位。
+
+`chrome-headless-shell` **不写 SingletonLock**（浏览器在跑时 profile 里没有任何
+`Singleton*`），所以 Chromium 根本不拦第二个实例。实测复现：同一份 profile 副本
+双开 → 第二个 dashboard `bodyLen=0`（`SPA did not mount`）+ IndexedDB 报
+`Internal error opening backing store`；换两份独立副本同时开则都正常。
+日志里当天 20 次 blank page，00:39–04:34 连 13 次之后 08:10 起变成
+`Session expired` —— LevelDB 在争抢中回放/截断日志，`firebase:authUser` 记录被
+抹掉，profile 本身还在，于是表现成「登录态过期」。
+
+现在两层机制（两边协议完全对齐，改一边必须改另一边）：
+
+| 文件 | 职责 |
+|---|---|
+| `focusmate_lock.py` | python 侧：`<home>/.profile-lock.json`（pid/role/ts/host）+ `.profile-want.json`；`acquire / release / profile_lock()`；拿锁后清掉占着 profile 的孤儿 Chromium |
+| `scripts/profile_lock.mjs` | node 侧同一份协议（文件名、stale 判据、want TTL 20s 全对齐） |
+| `main.py` `mcp_call` | 整个 MCP 调用（起 node → 起 Chromium → 操作页面）都在锁里；`book_session` 等 60s、`focusmate_auth` 等 30s |
+| `scripts/_lib.mjs` `openSession` | 起浏览器前拿锁，`ctx.close()` 自动放锁，`process.once("exit")` 兜底（`die()` 直接退也不留死锁） |
+| `bridge.mjs` | 空闲定时器之外多一个 700ms 的 **want 轮询**：有人在等就 `closeBrowser("yield")` 让位；`ctx.close()` 超过 15s 没返回 → 强杀占着 profile 的 Chromium 并强制放锁 |
+
+约定三句话：**谁开浏览器谁拿锁**；**拿不到就写 want 并等**（正常让位 <2s，不用等满
+120s 空闲）；**持锁进程死了或 15 分钟没动静 = 死锁，直接抢**。
+
+`main.py --auth` 也随之改了：`focusmate_auth` 的 `force` 不再等于 `clearAuthData()`
+（以前每次重登都把整个 user-data-dir 删掉，Firebase 登录态跟着没，等于永远不会
+自愈）。现在只有显式 `python3 main.py --auth --reset` 才清 profile，见
+`patches/focusmate-auth-keep-profile.patch`。
+
+看板状态框多一档 `PROFILE_BUSY`：另一只 Chromium 正占着 profile —— 等下一轮自动
+重试（桥会让位），不再说「去 `--auth`」（那是误导）。
+
 ## 命令
 
 ```

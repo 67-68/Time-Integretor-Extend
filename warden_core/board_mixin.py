@@ -2072,6 +2072,7 @@ class BoardMixin(object):
             "AUTH_EXPIRED": "Focusmate 登录态过期 —— 跑 `python3 main.py --auth` 登录一次",
             "AUTH_REQUIRED": "还没登录 Focusmate —— 跑 `python3 main.py --auth`",
             "AUTOMATION_FAILED": "浏览器没起来/页面空白 —— 看 temp/focusmate-home 能不能写",
+            "PROFILE_BUSY": "另一只 Chromium 正占着 profile —— 等下一轮自动重试（桥会让位）",
             "TIMEOUT": "下单超时 —— daemon 会自己退避重试",
         }
         out = []

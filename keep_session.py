@@ -116,13 +116,13 @@ INFRA_NOTIFY_EVERY = 4         # 环境问题每 N 次失败最多通知一次�
 NON_INFRA_CODES = ("SLOT_UNAVAILABLE", "SESSION_CONFLICT")
 INFRA_CODES = ("AUTH_REQUIRED", "AUTH_EXPIRED", "AUTH_TIMEOUT", "AUTOMATION_FAILED",
                "CONFIG_ERROR", "NETWORK_ERROR", "BROWSER_ERROR", "INTERNAL_ERROR",
-               "EXCEPTION")
+               "PROFILE_BUSY", "EXCEPTION")
 INFRA_MESSAGE_MARKERS = (
     "FOCUSMATE_MCP_HOME", "not writable", "EPERM", "SPA did not mount",
     "blank page", "net::ERR_", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT",
     "ENOTFOUND", "Executable doesn't exist", "browser has been closed",
     "Target page, context or browser has been closed", "MCP server closed stdout",
-    "tools/call", "Timeout", "timeout",
+    "tools/call", "Timeout", "timeout", "profile 锁", "占着 profile",
 )
 WINDOW_HOURS = sch.WINDOW_HOURS  # 执行区长度：滚动 24 小时（改这里就改了命运）
 
@@ -153,7 +153,8 @@ SINS_ARCHIVE = os.path.join(HERE, "temp", "warden-sins.jsonl")    # 认过的罪
 # daemon 热重载：改了这些源码就自重启（pid 不变），不用手动 daemon restart。
 # 只认语法能编译的文件，避免你存到一半的半成品把 daemon 重启死。
 RELOAD_SOURCES = [os.path.join(HERE, name) for name in
-                  ("keep_session.py", "main.py", "schedule.py", "alert.py")]
+                  ("keep_session.py", "main.py", "focusmate_lock.py",
+                   "schedule.py", "alert.py")]
 _SOURCE_MTIMES = {p: os.path.getmtime(p) for p in RELOAD_SOURCES if os.path.exists(p)}
 _BAD_SOURCE_MTIMES = {}
 

@@ -28,6 +28,13 @@ ping / snapshot / title / mute / cancel / tasks / add_task / complete_task / rel
   `/tasks/completed` 复核 `completedAt`；每一步写 `temp/logs/YYYY-MM-DD.jsonl`。
 
 `_lib.mjs` 是共用底座（起浏览器、取 token、调内部 API、按时间找 session、CLI 解析）。
+`profile_lock.mjs` 是 **profile 互斥锁**：`_lib.openSession()` 起浏览器前拿锁、
+`ctx.close()` 自动放锁，和 python 侧 `focusmate_lock.py` 用同一份协议
+（`.profile-lock.json` + `.profile-want.json`）。
+
+> 同一个 user-data-dir 被两个 Chromium 同时打开会白屏、并把 IndexedDB 里的
+> Firebase 登录态打坏（2026-11-16 实测：登录态天天「腐烂」）。所以**任何**起浏览器
+> 的路子都必须经过 `openSession`，不要自己 `chromium.launchPersistentContext`。
 
 > 上面四个 `.mjs` 是「一个脚本干一件事」的 CLI，每次调用冷启动一个 Chromium
 > （~10s）。要**连着**改好几场就用 `bridge.mjs`（常驻，热命令 ~2s），

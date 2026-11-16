@@ -1,0 +1,43 @@
+diff --git a/src/tools/focusmate-auth.ts b/src/tools/focusmate-auth.ts
+index 27db62c..c0d4d24 100644
+--- a/src/tools/focusmate-auth.ts
++++ b/src/tools/focusmate-auth.ts
+@@ -18,9 +18,19 @@ export function registerFocusmateAuthTool(server: McpServer): void {
+     {
+       force: z.boolean()
+         .default(false)
+-        .describe('Force re-authentication even if valid cookies exist')
++        .describe('Force re-authentication even if valid cookies exist'),
++      reset: z.boolean()
++        .default(false)
++        .describe(
++          'Also wipe the browser profile (cookies + IndexedDB) before logging in. ' +
++            'Only for a profile that is beyond repair: it throws away the saved Firebase ' +
++            'session, so the next run must log in again from scratch.'
++        )
+     },
+-    async ({ force }): Promise<{ content: Array<{ type: 'text'; text: string }> }> => {
++    async ({
++      force,
++      reset
++    }): Promise<{ content: Array<{ type: 'text'; text: string }> }> => {
+       // Check if already authenticated
+       if (!force && hasAuthData()) {
+         const output: AuthOutput = {
+@@ -32,8 +42,14 @@ export function registerFocusmateAuthTool(server: McpServer): void {
+         };
+       }
+ 
+-      // Clear existing auth data if forcing
+-      if (force) {
++      // 只有显式 reset 才清 profile。
++      //
++      // 踩过（2026-11-16）：以前 force 就等于 clearAuthData()，于是 `main.py
++      // --auth`（force: true）每次重登都把整个 user-data-dir 删掉 —— IndexedDB
++      // 里的 firebase:authUser 也跟着没，登录态永远攒不下来，排查时连
++      // 「到底哪天掉的」都看不出来。force 只该表示「别信 hasAuthData，重新走
++      // 一次登录」，profile 该留着。
++      if (reset) {
+         clearAuthData();
+       }
+ 

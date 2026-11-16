@@ -13,6 +13,7 @@
 import { createRequire } from "module";
 import path from "path";
 import { REPO_ROOT, resolveProfile } from "./mcp_home.mjs";
+import * as LOCK from "./profile_lock.mjs";
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 
@@ -171,15 +172,108 @@ export function fmtLocal(d) {
 
 // ---------------------------------------------------------------- 浏览器
 
+/** 这一进程当前持有的 profile 锁（同一时刻只有一个浏览器，够用）。 */
+let _heldLock = null;
+
+// die()/process.exit 也要把锁放掉：不然一次登录失败就把 profile 永久锁死。
+process.once("exit", () => {
+  if (_heldLock) {
+    try {
+      LOCK.release(CONFIG_DIR, _heldLock);
+    } catch {
+      /* ignore */
+    }
+    _heldLock = null;
+  }
+});
+
+/** 包一层 ctx.close：关浏览器的同时放锁，调用方不用记得。 */
+function wrapClose(ctx) {
+  const raw = ctx.close.bind(ctx);
+  let closed = false;
+  ctx.close = async (...args) => {
+    if (closed) return;
+    closed = true;
+    try {
+      await raw(...args);
+    } finally {
+      if (_heldLock) {
+        LOCK.release(CONFIG_DIR, _heldLock);
+        _heldLock = null;
+      }
+    }
+  };
+  return ctx;
+}
+
+/** 强制放锁：`ctx.close()` 卡死时由 bridge 兜底调用。 */
+export function releaseProfileLock() {
+  if (!_heldLock) return false;
+  const ok = LOCK.release(CONFIG_DIR, _heldLock);
+  _heldLock = null;
+  return ok;
+}
+
+/** 杀掉占着本 profile 的 Chromium（锁在自己手上时才是安全的）。 */
+export function killProfileBrowsers() {
+  return LOCK.killProfileBrowsers(PROFILE_DIR, { quiet: true });
+}
+
+/** 有没有人在等这个 profile（daemon 下单前会写 want）。 */
+export function wantPending() {
+  return LOCK.wantPending(CONFIG_DIR);
+}
+
+/** 给人看的一行：现在谁持锁（`where` / 看板排查用）。 */
+export function profileLockInfo() {
+  const info = LOCK.readLock(CONFIG_DIR);
+  return info
+    ? { ...info, text: LOCK.describeHolder(info), mine: Number(info.pid) === process.pid }
+    : null;
+}
+
+/** 谁在等着要这个 profile。 */
+export function profileWantInfo() {
+  const info = LOCK.wantPending(CONFIG_DIR);
+  return info ? { ...info, text: `${info.role}（pid ${info.pid}）在等` } : null;
+}
+
 /**
  * 起浏览器、进 dashboard，返回 { ctx, page }。
- * 调用方必须自己 ctx.close()（建议放 finally）。
+ *
+ * **先拿 profile 锁再开浏览器**：同一个 user-data-dir 被两个 Chromium 同时
+ * 打开会白屏，并在争抢中打坏 IndexedDB（见 profile_lock.mjs 头注释）。
+ * 锁在 ctx.close() 时自动放掉（wrapClose），所以调用方照旧只写 ctx.close()。
  */
-export async function openSession({ headless = true, viewport } = {}) {
-  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless,
-    viewport: viewport || { width: 1600, height: 900 },
-  });
+export async function openSession({ headless = true, viewport, role } = {}) {
+  const lockRole = role || process.env.FOCUSMATE_LOCK_ROLE || "cli";
+  const waitMs = Number(process.env.FOCUSMATE_LOCK_WAIT_MS || LOCK.DEFAULT_WAIT_MS);
+  try {
+    _heldLock = LOCK.acquire(CONFIG_DIR, lockRole, { waitMs, quiet: true });
+  } catch (e) {
+    if (e instanceof LOCK.ProfileBusyError) {
+      die(
+        `profile 被 ${LOCK.describeHolder(e.holder)} 占着，等了 ` +
+          `${(e.waitedMs / 1000).toFixed(1)}s 还没让开（这一条先跳过，稍后重试）。` +
+          `${describeProfile()}`
+      );
+    }
+    throw e;
+  }
+
+  let ctx;
+  try {
+    ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+      headless,
+      viewport: viewport || { width: 1600, height: 900 },
+    });
+  } catch (e) {
+    LOCK.release(CONFIG_DIR, _heldLock);
+    _heldLock = null;
+    die(`起不来 Chromium：${e.message}${describeProfile()}`);
+  }
+  wrapClose(ctx);
+
   const page = ctx.pages()[0] || (await ctx.newPage());
   try {
     await page.goto(`${APP_URL}/dashboard`, { waitUntil: "domcontentloaded" });
@@ -195,6 +289,19 @@ export async function openSession({ headless = true, viewport } = {}) {
     die(
       `未登录（页面跳到了 /login）。先跑 \`python3 main.py --auth\` 登录一次；` +
         `要是那边登录过还这样，就是 profile 选错了：${describeProfile()}`
+    );
+  }
+
+  // 白屏 = SPA 没挂载：profile 写不进去，或另一只浏览器正占着它。
+  // 以前这里没检查，下游 locator 要白等 10s 再报一句「找不到 Book 按钮」。
+  const blank = await page
+    .evaluate(() => ((document.body && document.body.innerText) || "").trim().length === 0)
+    .catch(() => false);
+  if (blank) {
+    await ctx.close().catch(() => {});
+    die(
+      `dashboard 白屏（SPA 没挂载，bodyLen=0）——profile 写不进去，或另一只浏览器` +
+        `正在用它。${describeProfile()}`
     );
   }
   return { ctx, page };

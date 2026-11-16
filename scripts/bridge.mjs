@@ -231,13 +231,48 @@ function jwtExpMs(tok) {
   }
 }
 
+//: ctx.close() 卡死的上限。实测见过浏览器被 IndexedDB 锁挂住、close 永不返回，
+//: 于是 profile 被它一直占着，后面每一轮下单都白屏 —— 到点就强杀。
+const CLOSE_TIMEOUT_MS = Number(process.env.WARDEN_BRIDGE_CLOSE_TIMEOUT_MS || 15000);
+
+/**
+ * 关浏览器并放锁。
+ *
+ * `c.close()` 可能永远不返回（挂了），所以这里给它一个上限；超时就杀掉占着
+ * profile 的 Chromium 并**强制放锁**，否则 daemon 会一直被挡在门外。
+ */
 async function closeBrowser(reason) {
   if (!ctx) return;
   const c = ctx;
   ctx = null;
   page = null;
   token = null;
-  await c.close().catch(() => {});
+  let timedOut = false;
+  let timer = null;
+  try {
+    const verdict = await Promise.race([
+      c.close().then(() => "ok").catch(() => "ok"),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), CLOSE_TIMEOUT_MS);
+        if (timer.unref) timer.unref();
+      }),
+    ]);
+    timedOut = verdict === "timeout";
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (timedOut) {
+    const killed = lib.killProfileBrowsers();
+    const freed = lib.releaseProfileLock();
+    send({
+      event: "idle-closed",
+      reason: (reason || "idle") + ":hung",
+      at: Date.now(),
+      killed,
+      lockFreed: freed,
+    });
+    return;
+  }
   send({ event: "idle-closed", reason: reason || "idle", at: Date.now() });
 }
 
@@ -257,11 +292,23 @@ function resetIdle() {
 
 async function ensureBrowser() {
   if (browserUp()) return;
-  const s = await lib.openSession({ headless: HEADLESS });
+  const s = await lib.openSession({ headless: HEADLESS, role: "bridge" });
   ctx = s.ctx;
   page = s.page;
   token = null;
 }
+
+// 有人要这个 profile（daemon 下单前会写 want 标记）就让位。
+// 没有这一条，daemon 得等 bridge 空闲满 IDLE_MS（120s）才抢得到锁；
+// 有了它，正常让位在 1 秒内完成，而 TUI 那边下次命令只是多一次冷启动。
+const WANT_POLL_MS = Number(process.env.WARDEN_BRIDGE_WANT_POLL_MS || 700);
+const wantTimer = setInterval(() => {
+  if (inCommand) return;
+  if (!browserUp()) return;
+  if (!lib.wantPending()) return;
+  closeBrowser("yield").catch(() => {});
+}, WANT_POLL_MS);
+if (wantTimer.unref) wantTimer.unref();
 
 async function getTok() {
   await ensureBrowser();
@@ -594,6 +641,7 @@ const handlers = {
       profileSource: lib.PROFILE_SOURCE,
       headless: HEADLESS,
       idleMs: IDLE_MS,
+      lock: lib.profileLockInfo(),
       uptimeMs: Date.now() - startedAt,
     };
   },
@@ -608,6 +656,8 @@ const handlers = {
       browser: p.browser,
       tokenExp: p.tokenExp,
       tokenLive: !!p.tokenExp && p.tokenExp > Date.now(),
+      lock: p.lock,
+      want: lib.profileWantInfo(),
       lastAuthError: lastAuth ? { at: lastAuth.at, error: lastAuth.error } : null,
       logTail: libLog.slice(-8),
     };
