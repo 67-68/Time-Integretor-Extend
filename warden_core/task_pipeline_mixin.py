@@ -7,6 +7,7 @@ from .common import (
     FM_PENDING,
     TASK_SESSION_CURRENT,
     TASK_SESSION_NONE,
+    ks,
     pj,
     sch,
     sp,
@@ -673,17 +674,42 @@ class TaskPipelineMixin(object):
                 return False
         return True
 
+    @staticmethod
+    def _session_cancel_evidence(iso, start):
+        """daemon 那边有没有「这一场被取消/放弃了」的**事实**（不是猜测）。
+
+        ``state.json`` 里 ``missed`` = 订过、然后 API 里没了、已经来不及补订；
+        ``abandoned`` = 你敲完宣言正式放弃。只有这两种才算 plan 失效的证据。
+        其余（没记录 / failed / 退避中 / 登录态过期）都只是「还没订上」。
+        """
+        key = "%sT%s" % (iso, start)
+        try:
+            if ks.is_abandoned(key):
+                return True
+            rec = (ks.load_state().get("slots") or {}).get(key) or {}
+        except Exception:                          # noqa: BLE001 - 账坏了按没证据算
+            return False
+        return str(rec.get("status") or "") in ("missed", "abandoned")
+
     def _project_plan_invalid_reasons(self, project, day):
-        """项目今天的 plan 为什么和当前资源对不上；空列表 = 对得上。"""
+        """项目今天的 plan 为什么和当前资源对不上 → ``(hard, soft)``；都空 = 对得上。
+
+        ``hard``  = 真的排不下去了（场次不在排布里 / 任务收工了 / 绑定不一致），
+                    必须清空计划让用户重新 ``plan``；
+        ``soft``  = 只是**还没订上**（Focusmate 登录态过期、daemon 在退避、正是
+                    这一秒还没下单）。这不是排期错误：契约行还在、时长也对，
+                    清掉计划只会把任务从场次上踹下来，然后再也挂不回去。
+                    交给 ``check_bookings`` 催一轮就行。
+        """
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         plan = pj.plan_of(project, day)
         if not plan:
-            return []
+            return [], []
         items = list(plan.get("items") or [])
         if not items:
             # 只有“说好的 count”、没有任何落地场次 = 没有真正的安排；
             # 不在这里制造假失败，留给用户重新 plan。
-            return []
+            return [], []
         try:
             sessions = self.sessions_for_day_plan(day)
         except Exception:                          # noqa: BLE001
@@ -703,7 +729,7 @@ class TaskPipelineMixin(object):
             reservations = th.collect_reservations(self.task_store.list(), iso)
         except Exception:                          # noqa: BLE001
             reservations = []
-        reasons = []
+        reasons, soft = [], []
         if not self.projects.is_op_allowed_by_pro(project):
             pro = self.projects.pro_for_op(project)
             op_kind = pj.normalize_op_type(project.get("op_type")) or pj.OP_TYPE_SOP
@@ -744,7 +770,13 @@ class TaskPipelineMixin(object):
                 reasons.append("%s 这场没有对应的契约行" % start)
                 continue
             if self.rows_source == "bridge" and not row.get("id"):
-                reasons.append("%s 这场没有订上/已被取消" % start)
+                if self._session_cancel_evidence(iso, start):
+                    # daemon 已经认定这一场「订过又没了 / 你放弃了」：plan 必须失效。
+                    reasons.append("%s 这场已被取消/作废" % start)
+                else:
+                    # 只是没订上（登录态过期、退避中、刚排完还没轮到）：契约行和
+                    # 时长都对，别把计划清掉 —— 交给 check_bookings 催一轮。
+                    soft.append(start)
                 continue
             start_min = th._clock_minutes(start)
             end_min = start_min + duration if start_min is not None else None
@@ -752,7 +784,7 @@ class TaskPipelineMixin(object):
                     and not th.is_free({"start_min": start_min, "end_min": end_min},
                                        reservations)):
                 reasons.append("%s 这场和 formatter 的硬占位重叠" % start)
-        return reasons
+        return reasons, soft
 
     def _invalidate_project_plan(self, project, day, reasons):
         """清空项目当天的 plan，并把相关非 formatter 任务从失效场次下架。
@@ -816,7 +848,8 @@ class TaskPipelineMixin(object):
 
     def _reconcile_schedule_pipeline(self, day, quiet=False):
         """`reconcile_schedule_pipeline` 的实作（不负责 _suppress_book 守卫）。"""
-        result = {"formatters": 0, "invalidated": 0, "detached": 0, "errors": 0}
+        result = {"formatters": 0, "invalidated": 0, "detached": 0, "errors": 0,
+                  "unbooked": 0}
         # 先清掉过期且从未处理的重复 occurrence：它们绝不能再进入今天/明天的
         # formatter 队列（否则同名任务会越积越多，互相抢同一场 session）。
         try:
@@ -869,7 +902,23 @@ class TaskPipelineMixin(object):
             self.had_error = True
             self.say("排期流水线：项目库读不了，跳过项目 plan 校验：%s" % e, "warn")
         for project in projects:
-            reasons = self._project_plan_invalid_reasons(project, day)
+            reasons, soft = self._project_plan_invalid_reasons(project, day)
+            if soft and not reasons:
+                # 没订上 ≠ 排期错了。契约行在、时长对，只是外部还没下单 ——
+                # 以前这里整份 plan 清空，用户看到的是一句「已清空，请重新 plan」，
+                # 重排一遍还是同样的结果（Focusmate 登录态没过期之外都可能发生）。
+                result["unbooked"] += len(soft)
+                # 「还没订上」值得说一句（用户得知道自己该去 `--auth` 还是该等），
+                # 但也别每次 refresh 都重复同一句：同一份名单只说一次。
+                sig = (project.get("id"), str(day), tuple(sorted(soft)))
+                if sig != getattr(self, "_unbooked_note_sig", None):
+                    self._unbooked_note_sig = sig
+                    self.say("⏳ 项目「%s」%s 有 %d 场还没订上（%s）—— 计划保留，"
+                             "等 daemon 补订；`refresh --check` 可以催一轮。"
+                             % (project.get("title") or project.get("id"), day,
+                                len(soft), "、".join(str(x) for x in soft[:4])
+                                + (" 等" if len(soft) > 4 else "")), "warn")
+                continue
             if not reasons:
                 continue
             cleared, detached = self._invalidate_project_plan(project, day, reasons)

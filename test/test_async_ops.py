@@ -395,6 +395,44 @@ finally:
     w.of.clipboard_links = _real_clip
 
 
+# ---------------------------------------------------------------- 1.6
+print("\n== 1.6 book / plan 完成：预约那一轮也在后台，不在提示符线程等 ==")
+bridge = GateBridge()
+wd = mkwarden(bridge)
+seed_rows(wd)
+gate = threading.Event()
+
+
+def _slow_keep(*args, **kw):
+    gate.wait(5.0)
+    return 0, "check 跑完了", ""
+
+
+w.run_keep_session = _slow_keep
+started = time.time()
+_book_ok = wd.book(wd.sel_date, why="测试：排完要把场次订上")
+_elapsed = time.time() - started
+check("book 立刻返回（以前默认在这里 jobs.wait 到 check 跑完）",
+      (_elapsed < 1.0, _book_ok), (True, True))
+check("check 真的排进了后台队列", wd.jobs.busy, True)
+check("进度面板已经画出来了", wd.shell.progress_value() is not None, True)
+gate.set()
+settle(wd)
+check("跑完之后面板自己消失", (wd.jobs.busy, wd.shell.progress_value()), (False, None))
+check("预约结果进 Recent", any("check 跑完" in m[2] for m in wd.messages), True)
+
+# refresh：命令立刻返回，排期流水线这一半等数据到了再跑（不会冻住画面）
+bridge = GateBridge()
+wd = mkwarden(bridge)
+bridge.hold()
+started = time.time()
+wd.handle("refresh")
+check("refresh 立刻返回（不再 wait_net 死等）", time.time() - started < 1.0, True)
+check("收尾已经排上（等队列空了再跑）", len(getattr(wd, "_after_net", [])), 1)
+bridge.release()
+settle(wd)
+check("收尾跑完就清空", getattr(wd, "_after_net", []), [])
+
 # ---------------------------------------------------------------- 2. 失败回滚
 print("\n== 2. 失败：精确回滚 + 警告 + 记账（落盘）==")
 if os.path.exists(FAILED_FILE):

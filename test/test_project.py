@@ -820,6 +820,82 @@ check("OmniFocus 覆盖后采用远端标题",
       [t["title"] for t in _after_remote["tasks"] if t["pk"] == "old-a"],
       ["旧甲改"])
 
+print("== 每日项目对账：note 不走冲突问答，直接拉（@list 清单不能等一天） ==")
+reset_projects()
+_note_store = w.pj.ProjectStore()
+_note_local = pj.project_payload(
+    {"id": "p-note", "name": "清单项目", "kind": "project_root"},
+    [
+        {"id": "p-note", "name": "清单项目", "kind": "project_root"},
+        {"id": "n-lit", "name": "Lit: Complete 1 Scene", "kind": "action",
+         "project": "清单项目", "estimated_minutes": 75, "completed": False,
+         "note": ""},
+        {"id": "n-keep", "name": "已经手写过的", "kind": "action",
+         "project": "清单项目", "estimated_minutes": 25, "completed": False,
+         "note": "本地自己的备注"},
+    ], now=_fixed_now)
+_note_proj, _ = _note_store.upsert(_note_local)
+_note_remote = pj.project_payload(
+    {"id": "p-note", "name": "清单项目", "kind": "project_root"},
+    [
+        {"id": "p-note", "name": "清单项目", "kind": "project_root"},
+        {"id": "n-lit", "name": "Lit: Complete 1 Scene", "kind": "action",
+         "project": "清单项目", "estimated_minutes": 75, "completed": False,
+         "note": "@list\n- scene 1\n- scene 2"},
+        {"id": "n-keep", "name": "已经手写过的", "kind": "action",
+         "project": "清单项目", "estimated_minutes": 25, "completed": False,
+         "note": "OmniFocus 那边改了"},
+    ], now=_fixed_now)
+check("note 变化不算「任务被修改」（不进冲突问答）",
+      pj.diff_tasks(_note_proj["tasks"], _note_remote["tasks"])["modified"], [])
+_wd_note = mkwarden()
+check("note 变化不触发项目级问答（不打断用户）",
+      _wd_note.handle("task %d" % 1) is not False, True)
+_wd_note._apply_project_sync_result({"projects": [{
+    "project_id": _note_proj["id"], "title": "清单项目",
+    "payload": _note_remote,
+    "diff": pj.diff_tasks(_note_proj["tasks"], _note_remote["tasks"]),
+    "remote_found": True, "invalid": "",
+}]})
+_note_after = _wd_note.projects.by_id(_note_proj["id"])
+check("note 直接拉下来了", pj.task_by_pk(_note_after, "n-lit")["note"],
+      "@list\n- scene 1\n- scene 2")
+check("另一条也拉了", pj.task_by_pk(_note_after, "n-keep")["note"],
+      "OmniFocus 那边改了")
+check("没有开冲突问答", _wd_note.project_sync, None)
+check("立刻就能按清单派生（历史任务判断得出来，这条也判断得出来）",
+      w.dv.eligible(pj.task_by_pk(_note_after, "n-lit").get("note"),
+                    pj.task_by_pk(_note_after, "n-lit").get("title")), True)
+
+# outbox 里还排着 note_mark 的那条：本地比远端新，别拉回来盖掉刚勾的那行。
+_note_pending = dict(pj.task_by_pk(_note_after, "n-lit"),
+                     note="@list\n- [x] scene 1\n- scene 2")
+_wd_note.omni_outbox.put({"id": "n-lit", "op": "note_mark", "task_id": 1})
+_note_remote2 = pj.project_payload(
+    {"id": "p-note", "name": "清单项目", "kind": "project_root"},
+    [
+        {"id": "p-note", "name": "清单项目", "kind": "project_root"},
+        {"id": "n-lit", "name": "Lit: Complete 1 Scene", "kind": "action",
+         "project": "清单项目", "estimated_minutes": 75, "completed": False,
+         "note": "@list\n- scene 1\n- scene 2"},
+        {"id": "n-keep", "name": "已经手写过的", "kind": "action",
+         "project": "清单项目", "estimated_minutes": 25, "completed": False,
+         "note": "OmniFocus 那边改了"},
+    ], now=_fixed_now)
+_wd_note._apply_project_sync_result({"projects": [{
+    "project_id": _note_proj["id"], "title": "清单项目",
+    "payload": _note_remote2,
+    "diff": pj.diff_tasks(_note_after["tasks"], _note_remote2["tasks"]),
+    "remote_found": True, "invalid": "",
+}]})
+check("有 note_mark 在排队时不清掉刚勾的那行",
+      w.dv.eligible(pj.task_by_pk(_wd_note.projects.by_id(_note_proj["id"]),
+                                  "n-lit").get("note"),
+                    "Lit: Complete 1 Scene"), True)
+# 这一段只借 outbox 当「还有一笔记账没写回去」的证据；用完就撤掉，
+# 后面「写回」那几节自己会往同一个 outbox 里放东西。
+_wd_note.omni_outbox.remove(["note_mark:n-lit"])
+
 print("== refresh 会检查 OmniFocus 项目任务变化（60→50 能更新） ==")
 _ref_rows_60 = [
     {"id": "p-refresh", "name": "刷新项目", "kind": "project_root",
@@ -1656,6 +1732,10 @@ check("free_plan_slots 也认跨午夜开始于今天的场次", len(_free_cross
 
 print("== 5d) plan -c：把当前正在进行的空 session 纳入范围 ==")
 wd_live = fresh()
+# 这一段只测「行」的语义（过去 / 挂着任务 / 计划外但正在进行），把它和 period
+# 层隔开：没有 session 行的时段现在也会变成容量（见 5f），
+# 那个规则单独用下面的用例测，不然这里的 len(slots) 会混进 T1/T2 的整段容量。
+wd_live.periods_for_day = lambda day=None: []
 _live_day = TODAY
 _live_start = datetime.datetime.combine(_live_day, datetime.time(10, 0))
 _live_end = _live_start + datetime.timedelta(minutes=50)

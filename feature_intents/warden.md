@@ -166,8 +166,13 @@ plan [天数]         一次分配：每个 pro 只取当前阶段的 SOP/incuba
   `end` → 其它 formatter → `enlist`），再校验今天已有的项目 plan。
   `enlist` 只挂已有 session、不切 layout；它必须排在其它 formatter 之后，
   才能使用前者切完/占完后剩下的资源。formatter 是第一阶段，占好的时间段
-  后面项目阶段绝不能改；项目 plan 和当前资源/绑定对不上就整条清空，提示用户
-  重新 `plan`。
+  后面项目阶段绝不能改。
+- 项目 plan 的校验分两档（2026-11-16 修）：**硬理由**（场次已不在排布里 /
+  任务收工了 / 绑定不一致 / daemon 认定这一场「订过又没了」= `missed` 或
+  `abandoned`）才整条清空并提示重新 `plan`；**只是还没订上**（登录态过期、
+  退避中、刚排完还没轮到）只警告一句，计划保留 —— 清掉计划只会把任务从场次上
+  踹下来，然后再也挂不回去（用户报的就是这条：15:15 没订上 → refresh 之后
+  plan 被清空）。补订仍然只有一条路：`check_bookings()` → `book()`。
 - 这些动作只改本地排期账（layout / extras / data.csv / 任务绑定）和必要时排进
   后台的旧场取消，**不创建新 session 订单、不在 Focusmate 建 task**。
 "缺"那几行刷一万遍也还是"缺"。订场只有一条路径 —— `keep_session.py` 的 daemon
@@ -189,10 +194,14 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 `commit_layout` 的顺序不能变（每一步都有事故背书）：纯计算验证 → 撤「永不重订」
 判决 → 拿 daemon 的 round lock → 写挂号单 → 取消旧场 → 写 layout → 清任务绑定 →
 重算 data.csv → 放锁。**所有入口都拿 round lock**，不再有「只有 `period` 守住」
-的破口。
+的破口。等锁时长可传（`lock_timeout`，默认 30 秒）；自动排布一次要改好几个时段，
+传 5 秒 —— 等不到就走挂号单兜底，不能把提示符冻上几分钟。
 
 `book()` 是唯一预约出口：同步模式（测试 / `--exec`）走 `run_keep_session("check")`
-并等结果，异步模式丢给 `op_keep_session`（daemon 会补，不冻提示符）；
+并等结果；**异步模式默认不等**（`wait` 默认 False，要结果的对账命令显式传
+`wait=True`）—— 一轮 check 要开浏览器下单，几十秒到几分钟，以前默认
+`wait=True`，`plan` 一敲完就卡在 `jobs.wait` 上，提示符冻住、进度条一格不动
+（用户报的「plan complete 卡死」）。
 `_release_browser()` 也只在它里面出现一次。两个守卫：
 
 - `_suppress_book`：refresh 的对账轮整段置位 —— **只对账、不新造外部动作**
@@ -203,6 +212,23 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 才订），`book()` 不替各条路重新定义离线语义。
 
 同理，任务视图里的 `refresh` 只跑 `GET /v1/tasks` 同步完成时间，也不订场。
+
+### 进度条：`jobs.begin()` + `jobs.step()`（refresh / plan complete 共用）
+
+一条命令要碰外部世界就必须看得见它在干什么，而且**提示符线程不能等**：
+
+- `refresh`：`jobs.begin(2~3, title="刷新（refresh）")` 声明这一批几步（session /
+  task / 项目对账），每份数据在后台跑完自己把进度 +1；命令**立刻返回**，
+  收尾（排期流水线、统计、收尾面板、缓存）用 `net_after(_finish_refresh_all)`
+  排队，等 `drain_net()` 发现队列空了再在主线程跑。以前收尾是在提示符线程上
+  `wait_net()` 死等 —— 主线程被占着帧根本不重画，进度条一格都不动，看起来
+  就是「卡死」。
+- `plan complete`：`_plan_apply()` 里 `jobs.begin(0, title="排期（plan complete）")`
+  + 若干 `jobs.step("挑任务…")`，本地那几步（挑任务 / 写排布 / 重算 csv / 挂绑定）
+  和末尾的预约 job 共用同一个面板。`step()` 是 repl_kit `JobRunner` 的公开方法
+  （`begin(0)` = 步数未知，一边走一边长分母）。
+- 同理 `refresh --check` 的对账、`force-check` 的补订都不再在提示符线程里等
+  一轮 check：`check_bookings()` 触发一轮就返回，订完再用 `net_after` 重拉。
 
 ### `refresh`：看板上每块组件都重新对一次账
 

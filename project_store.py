@@ -781,6 +781,38 @@ def diff_text(diff, limit=5):
     return " · ".join(bits) or "没有变化"
 
 
+def note_changes(local_tasks, remote_tasks, skip_pks=()):
+    """远端 note 里改过的内容 → 本地项目清单要更新的 ``{pk: note}``。
+
+    为什么 note **不进** :data:`DIFF_FIELDS` 的冲突问答：note 是用户手写的
+    内容，而且 ``@list`` 清单的资格 / 还剩几行全看它 —— 一条任务今天加了
+    清单，明天 plan 就该按清单派生，不能等用户手动 ``project N refresh``。
+    删除 / 改动任务的**结构**（标题、时长、defer、due）才值得问一句。
+
+    ``skip_pks`` 是本地还有 ``note_mark`` 没写回去的那几条（outbox 里排着队）：
+    它们本地的 note 比远端新，拉回来会把刚勾掉的那一行又变回没勾。
+    """
+    remote = {}
+    for task in remote_tasks or ():
+        if not isinstance(task, dict):
+            continue
+        pk = str(task.get("pk") or task.get("id") or "").strip()
+        if pk:
+            remote[pk] = task
+    skip = {str(pk) for pk in (skip_pks or ())}
+    out = {}
+    for item in local_tasks or ():
+        if not isinstance(item, dict):
+            continue
+        pk = str(item.get("pk") or item.get("id") or "").strip()
+        if not pk or pk in skip or pk not in remote:
+            continue
+        note = str(remote[pk].get("note") or "")
+        if note != str(item.get("note") or ""):
+            out[pk] = note
+    return out
+
+
 def weekly_yield(tasks, now=None):
     """一组项目任务 → 本周会产生的任务清单 + 时长缺口（纯函数）。
 
@@ -2791,6 +2823,31 @@ class ProjectStore(object):
                 self.save(store)
                 return project
             raise ValueError("项目 %s 里没有任务 %s" % (project_id, pk))
+        raise ValueError("没有项目 %s" % project_id)
+
+    def set_task_notes(self, project_id, notes):
+        """批量改几条任务的 note（一次落盘）；``notes`` = ``{pk: 文本}``。
+
+        :meth:`set_task_note` 是「勾完一行」那种单条写，一次一条 save；每日
+        对账可能一次拉回十几条的 note，逐条 save 会把 projects.json 重写十几遍。
+        """
+        wanted = {str(pk): str(text or "") for pk, text in (notes or {}).items()}
+        if not wanted:
+            return None
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            changed = 0
+            for item in project.get("tasks") or ():
+                pk = str(item.get("pk") or "")
+                if pk in wanted and str(item.get("note") or "") != wanted[pk]:
+                    item["note"] = wanted[pk]
+                    changed += 1
+            if changed:
+                project["synced_at"] = _now()
+                self.save(store)
+            return project
         raise ValueError("没有项目 %s" % project_id)
 
     def set_tasks(self, project_id, tasks):

@@ -233,6 +233,14 @@ op「论文写作 SOP」 op_type=SOP   pro_id=1
   - `[l]` 保留本地覆盖（新增照拉，删除/修改不应用）；
   - `[o]` 用 OmniFocus 覆盖本地清单；
   - `[s]` 先不处理。
+- **note 不进冲突问答**：note 是用户手写的内容，而且 `@list` 清单的资格 / 还剩
+  几行全看它（`derived.py`）。远端改过的 note 直接覆盖本地（同时刷本地镜像任务
+  的 note），不排队问人 —— 一条任务今天加了清单，明天 plan 就该按清单派生，
+  不能等用户手动 `project N refresh`。唯一例外：outbox 里还排着 `note_mark` 的
+  那几条（本地比远端新，拉回来会把刚勾掉的那行变回没勾）。
+  2026-11-16 修的就是这个：`Lit: Complete 1 Scene` 的清单在 OmniFocus 里，
+  但 `DIFF_FIELDS` 不含 note，每日对账永远拉不回来 → 历史任务判断得出来、
+  它判断不出来。
 - 同一天只自动检查一次，日期戳在项目库同目录的 `project-sync.json`；检查失败
   也不挡 TUI。
 

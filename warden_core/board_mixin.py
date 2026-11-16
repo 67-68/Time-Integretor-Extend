@@ -1606,8 +1606,78 @@ class BoardMixin(object):
                 row.setdefault("task", None)
                 row.setdefault("tasks", [])
                 row.setdefault("task_text", "")
+        # 一个时段至少一行：没切出 session 的时段（今天 19:00–21:30 那种）以前在
+        # 表里整段消失，看起来像「日历没读到这一段」——用户原话：「每个时段都应该
+        # 有一行，哪怕不对应 session」。放在 attach_period_info 之后，因为「这个
+        # 时段已经有行了」要按**行落在哪个时段**判断（API 行还没有 period_id）。
+        # 这些行只占位，不是 session：没有 id、planned=False，plan / 对账 / 取消
+        # / 挂任务都不认它们。
+        shells = self._period_shell_rows(rows, day, now_ms)
+        if shells:
+            rows.extend(shells)
+            rows.sort(key=lambda r: r["startMs"])
         self.rows = rows
         self.invalidate()          # 表格换了内容 → 画帧缓存作废
+
+    def _period_shell_rows(self, rows, day, now_ms=None):
+        """没有 session 的时段 → 一行占位（``period_only=True``）。
+
+        以前契约表的行**只来自 data.csv / API**：一段时段如果还没被 plan 切出
+        session（或者 plan 把这一段分到 0 count，例如今天 19:00–21:30），它就
+        整段从表里消失 —— 用户看到的是「今天的时段被忽略了」，而不是「这一段
+        还没切」。
+
+        这些行的身份是**时段**，不是 session：
+          * ``id=None``、``planned=False`` → ``check_bookings`` / 取消 / mute /
+            挂任务都不认它们（那几条路都要求 ``planned`` 或 ``id``）；
+          * ``durationMin`` 是**整段长度**，``period_only`` 标记让渲染写「整段」
+            而不是把它当成一场 195 分钟的 session；
+          * 只占位，不改任何账。
+        """
+        now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        now_dt = datetime.datetime.now()
+        have = set()
+        for row in rows or ():
+            pid = str(row.get("period_id") or "")
+            if pid:
+                have.add(pid)
+        out = []
+        for period in self.periods_for_day(day):
+            pid = str(period.get("id") or "")
+            if not pid or pid in have:
+                continue
+            start = sp.parse_hhmm(period.get("start"))
+            end = sp.parse_hhmm(period.get("end"))
+            if start is None:
+                continue
+            start_dt = datetime.datetime.combine(day, datetime.time(*start))
+            if end is not None:
+                minutes = (end[0] * 60 + end[1]) - (start[0] * 60 + start[1])
+                if minutes <= 0:
+                    minutes += 24 * 60
+            else:
+                minutes = 0
+            end_dt = start_dt + datetime.timedelta(minutes=max(0, minutes))
+            s_ms = int(start_dt.timestamp() * 1000)
+            e_ms = int(end_dt.timestamp() * 1000)
+            out.append({
+                "startMs": s_ms, "endMs": e_ms,
+                "startLabel": period.get("start"),
+                "endLabel": end_dt.strftime("%H:%M"),
+                "durationMin": minutes, "id": None, "title": "", "quiet": None,
+                "matched": None, "phase": self.phase_of(s_ms, e_ms, now_ms),
+                "planned": False, "period_only": True, "lineno": None,
+                "raw": "", "contract": "",
+                "zone": self.effective_zone(sch.zone_name(start_dt, now_dt), day),
+                "zone_raw": sch.zone_name(start_dt, now_dt),
+                "date": day.isoformat(),
+                # 占位行自己就是这一段的「第一行」：时段三列照常显示。
+                "period": dict(period), "period_id": pid, "period_first": True,
+                "period_muted": bool(mute_window_for(day, period.get("start"),
+                                                     period.get("end"))),
+                "task": None, "tasks": [], "task_text": "",
+            })
+        return out
 
     def _fallback_rows(self, why):
         """拿不到 bridge 时，用 daemon 写下的 state.json 快照（只有时间，没有标题/静音）。"""
@@ -1886,7 +1956,10 @@ class BoardMixin(object):
             tag, tag_style = zone_tag.get(r.get("zone"), ("", ""))
             if tag:
                 st.append(tag + " ", style=tag_style)
-            if not self.authoritative:
+            if r.get("period_only"):
+                # 这一行是**时段占位**，不是 session（这段还没切出来 / 分到 0 count）。
+                st.append("未切 session", style="bold yellow")
+            elif not self.authoritative:
                 # 快照里没有 session id —— 订没订看不出来，别假装知道
                 st.append(r["phase"], style=STYLE_MUTED)
                 st.append(" 快照", style=STYLE_MUTED)
@@ -1922,14 +1995,17 @@ class BoardMixin(object):
             if r.get("actual_note"):
                 label.append("  · %s" % r["actual_note"], style="yellow")
             period = r.get("period") or {}
-            first = bool(r.get("period_first"))
+            first = bool(r.get("period_first")) or bool(r.get("period_only"))
             pid = period.get("id") if first else ""
             pspan = ("%s–%s" % (period.get("start"), period.get("end"))
                      if first and period else "")
             ptype = (period.get("type") or period.get("calendar") or "") if first else ""
             pname = (period.get("name") or period.get("title") or "") if first else ""
             task_text = r.get("task_text") or ""
-            if task_text:
+            if r.get("period_only"):
+                task_cell = Text("整段还没切 session（plan 会按任务切）",
+                                 style=STYLE_MUTED)
+            elif task_text:
                 task_cell = Text(task_text, style="bold green")
             else:
                 # 每一行都是一场要执行的 session（计划或实际）；没有任务就明确报警，
@@ -1942,7 +2018,8 @@ class BoardMixin(object):
                 Text(pname, style="cyan"),
                 str(idx),
                 "%s–%s" % (r["startLabel"], r.get("endLabel") or "?"),
-                ("%dmin" % dur) if dur else "?",
+                ("整段 %dmin" % dur) if (dur and r.get("period_only"))
+                else (("%dmin" % dur) if dur else "?"),
                 st,
                 qtxt,
                 Text(r.get("contract") or "—", style=STYLE_MUTED),
@@ -1964,6 +2041,48 @@ class BoardMixin(object):
             t.caption = Text("\n".join(captions), style="dim")
             t.caption_justify = "left"
         return t
+
+    def unbooked_reason_rows(self, missing=None):
+        """没订上的场次**为什么**没订上（daemon 记在 state.json 里的最后一条错）。
+
+        用户问过「检查一下这个没有订上什么问题」—— 光说「缺 3 场」答不了这个问题。
+        daemon 每轮把失败原因写进 state（``AUTH_EXPIRED`` / ``AUTOMATION_FAILED`` /
+        ``TIMEOUT``…），这里按错误码归并成人话，并给下一步动作。
+        """
+        rows = [r for r in (missing if missing is not None else self.rows)
+                if r.get("planned") and not r.get("id") and not r.get("period_only")]
+        if not rows:
+            return []
+        try:
+            slots = (ks.load_state() or {}).get("slots") or {}
+        except Exception:                          # noqa: BLE001 - 账读不了就不说
+            return []
+        buckets = {}
+        for row in rows:
+            key = "%sT%s" % (row.get("date") or "", row.get("startLabel") or "")
+            rec = slots.get(key) or {}
+            code = str(rec.get("last_error_code") or "").strip().upper()
+            if not code:
+                code = "" if not rec.get("last_error") else "ERROR"
+            buckets.setdefault(code, {"starts": [], "message": ""})
+            buckets[code]["starts"].append(row.get("startLabel") or "?")
+            if rec.get("last_error"):
+                buckets[code]["message"] = str(rec.get("last_error"))
+        hints = {
+            "AUTH_EXPIRED": "Focusmate 登录态过期 —— 跑 `python3 main.py --auth` 登录一次",
+            "AUTH_REQUIRED": "还没登录 Focusmate —— 跑 `python3 main.py --auth`",
+            "AUTOMATION_FAILED": "浏览器没起来/页面空白 —— 看 temp/focusmate-home 能不能写",
+            "TIMEOUT": "下单超时 —— daemon 会自己退避重试",
+        }
+        out = []
+        for code in sorted(buckets):
+            info = buckets[code]
+            starts = "、".join(sorted(set(info["starts"]))[:4])
+            if len(set(info["starts"])) > 4:
+                starts += " 等"
+            hint = hints.get(code) or (info["message"][:60] or "daemon 正在退避重试")
+            out.append("  ↳ %s 没订上：%s" % (starts, hint))
+        return out
 
     def render_status_rows(self):
         """「状态」框的正文：契约执行情况 + 一次性/长期规则 + 临时挪动 + 文件位置。
@@ -1993,6 +2112,8 @@ class BoardMixin(object):
                                                      r.get("durationMin") or "?")
                                       for r in plan["missing"])),
                          "red"))
+            for text in self.unbooked_reason_rows(plan["missing"]):
+                rows.append((text, "yellow"))
             if self.day_zone() in ("draft", "past"):
                 rows.append(("  （草稿区/过去：还没被吃进去是正常的，daemon 下一轮会补）",
                              "dim"))

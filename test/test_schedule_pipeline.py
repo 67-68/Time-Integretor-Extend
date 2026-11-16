@@ -239,8 +239,12 @@ for t in list(wd.task_store.list()):
     wd.task_store.delete(t["id"])
 
 print("== 项目 plan 对不上当前资源：清空 plan，强制重新安排 ==")
-wd2 = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
+# 用**明天**：今天的 11:00 会随墙上时间滑进过去，那时「到点没开始」那一问会接管
+# 输入（refresh 直接被它吃掉），用例就不再是「refresh 的 plan 校验」了。
+_D = TOMORROW
+wd2 = fresh([{"id": "T1", "date": TOMORROW_ISO, "start": "11:00", "end": "12:00",
               "type": "工作", "name": "项目", "calendar": "工作", "title": "项目"}])
+wd2.day_offset = 1
 check("时段先排 50", wd2.handle("period T1 50"), True)
 wd2.reload_entries()
 sync_api(wd2)
@@ -258,27 +262,40 @@ _project = wd2.projects.by_id(_project["id"])
 _task, _ = wd2.task_store.ensure_project_task(
     _project["id"], _project["title"],
     next(t for t in _project["tasks"] if t["pk"] == "t-1"))
-wd2.task_store.assign(_task["id"], {"date": ISO, "start": "11:00",
+wd2.task_store.assign(_task["id"], {"date": _D.isoformat(), "start": "11:00",
                                     "duration": 50, "end": "11:50"})
-wd2.projects.set_allocation(_project["id"], TODAY, 2)
-wd2.projects.record_items(_project["id"], TODAY, [{
+wd2.projects.set_allocation(_project["id"], _D, 2)
+wd2.projects.record_items(_project["id"], _D, [{
     "pk": "t-1", "task_id": _task["id"], "count": 2,
     "start": "11:00", "duration": 50}])
 sync_api(wd2)
 check("资源对得上时 plan 保留", bool(pj.plan_of(wd2.projects.by_id(_project["id"]),
-                                                TODAY)), True)
+                                                _D)), True)
 check("refresh 后 plan 还在", (wd2.handle("refresh"),
                                 bool(pj.plan_of(wd2.projects.by_id(_project["id"]),
-                                                TODAY)))[1], True)
-# 取消掉这一场：API 快照里没有它，计划就不能继续假装排好了。
+                                                _D)))[1], True)
+# API 里暂时没有这一场（还没订上 / 登录态过期 / daemon 在退避）：
+# **plan 必须留着**。以前这里整份清空 + 让用户重新 plan，重排一遍还是同样的结果
+# （用户报的就是这一条：15:15 没订上，refresh 之后 plan 被清空）。
 wd2.bridge.sessions = []
 wd2.api_rows = []
 wd2.rows_source = "bridge"
 wd2.rebuild_rows()
 wd2.messages = []
-check("取消场次后 refresh 受理", wd2.handle("refresh"), True)
+check("还没订上时 refresh 受理", wd2.handle("refresh"), True)
+check_true("plan 保留（只是没订上，不是排期错了）",
+           bool(pj.plan_of(wd2.projects.by_id(_project["id"]), _D)))
+check_true("说清是「没订上」而不是「排错了」",
+           any("还没订上" in m[2] for m in wd2.messages))
+check("任务仍然挂在原场上（等补订）",
+      (wd2.task_store.get(_task["id"]).get("session") or {}).get("start"), "11:00")
+
+# daemon 认定「订过又没了 / 你放弃了」= 真取消：这一回 plan 必须失效。
+ks.mark_slot("%sT11:00" % _D.isoformat(), "missed", note="booked-but-missing")
+wd2.messages = []
+check("真取消后 refresh 受理", wd2.handle("refresh"), True)
 check("对不上资源的 plan 被清空",
-      pj.plan_of(wd2.projects.by_id(_project["id"]), TODAY), None)
+      pj.plan_of(wd2.projects.by_id(_project["id"]), _D), None)
 check_true("明确让用户重新 plan",
            any("请重新 `plan`" in m[2] for m in wd2.messages))
 check("原计划任务被下架，等待重新安排",
@@ -658,6 +675,45 @@ _m_2100 = sch.match_slot(
     _actual, datetime.datetime.combine(TODAY, datetime.time(21, 0)), 25,
     used=[(s["start"], s["duration"]) for s in _m_2000["sessions"]])
 check("同一场 20:15 不能再去覆盖 21:00 的计划", _m_2100["kind"], "none")
+
+
+print("== period 是排期第一等输入：没切出 session 的时段也算容量 ==")
+# 只有日历里的时段、data.csv 里一行都没有（用户今天 19:00–21:30 这种）：
+# 以前这一段会被整段忽略（`plan` 看不到、契约表也不画）。
+wd_p = fresh([{"id": "T1", "date": TOMORROW_ISO, "start": "19:00",
+               "end": "21:30", "type": "空闲", "name": "空闲",
+               "calendar": "空闲", "title": "空闲"}])
+wd_p.day_offset = 1
+wd_p.api_rows = []
+wd_p.rows_source = "bridge"
+wd_p.rebuild_rows()
+_p_shells = [r for r in wd_p.rows if r.get("period_only")]
+_p_sessions = [r for r in wd_p.rows if not r.get("period_only")]
+check("契约表：没 session 的时段也有一行", len(_p_shells), 1)
+check("占位行标着是哪个时段", _p_shells[0].get("period_id") if _p_shells else None, "T1")
+check("占位行不是 session（没 id / 不算计划）",
+      [(_p_shells[0].get("id"), _p_shells[0].get("planned"))] if _p_shells else [],
+      [(None, False)])
+check("没有别的 session 行", _p_sessions, [])
+check("契约统计里也没有这一行", wd_p.plan_summary(), None)
+_p_slots, _p_notes = wd_p._plan_slots(TOMORROW)
+check("plan 能看到这一段的整段容量（150 分钟 → 5 count = 125 分钟）",
+      [(s["start"], s["duration"], s["counts"]) for s in _p_slots],
+      [("19:00", 125, 5)])
+check("这一段是自动排布", [s.get("period_auto") for s in _p_slots], [True])
+
+# 已经有 session 行的时段不再额外造一行/一个伪 slot：行就是容量。
+sp.set_layout(TOMORROW, "T1", [50, 50], source="auto")
+wd_p.rewrite_data_csv_from_plan()
+wd_p.reload_periods()
+wd_p.reload_entries()
+wd_p.rebuild_rows()
+check("切出 session 之后占位行消失",
+      [r for r in wd_p.rows if r.get("period_only")], [])
+_p_slots2, _p_notes2 = wd_p._plan_slots(TOMORROW)
+check("自动 layout 仍然整段参与排期（不是只捡那两场）",
+      [(s["start"], s["duration"], s["counts"]) for s in _p_slots2],
+      [("19:00", 125, 5)])
 
 
 if fails:

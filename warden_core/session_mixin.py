@@ -1408,7 +1408,7 @@ class SessionMixin(object):
     def commit_layout(self, day, period, durations, *, source=None,
                       mode="set", dropped_tasks=None, reason="layout-changed",
                       book=False, announce=True, write_csv=True,
-                      missing_ok=False):
+                      missing_ok=False, lock_timeout=30.0):
         """**唯一的排布落盘事务**：取消旧场 → 写 layout → 清绑定 → 重算 data.csv。
 
         以前这一串被手抄了 5 份（``period`` / ``plan`` 自动排布 / formatter 切割 /
@@ -1463,9 +1463,13 @@ class SessionMixin(object):
 
         # 取消旧场 → 清 state → 写新排布 这三步必须和 daemon 的一轮互斥（同一把锁），
         # 否则它会在缝隙里把 warden 自己干的活记成「你手动取消」的罪。
+        # 默认等 30 秒（交互式改排布，值得等）；自动排布一次要改好几个时段，
+        # 每段都等 30 秒会把提示符冻住好几分钟 —— 那几条路自己传更短的超时，
+        # 等不到就走挂号单兜底（daemon 不会把这次改动记成罪）。
         lock = self._acquire_round_lock(
-            on_wait=lambda: self.say("daemon 正在跑一轮，等它跑完再改排布（最多等 30 秒）…",
-                                     "cmd"))
+            timeout=lock_timeout,
+            on_wait=lambda: self.say("daemon 正在跑一轮，等它跑完再改排布（最多等 %d 秒）…"
+                                     % int(lock_timeout), "cmd"))
         if lock is None:
             self.say("daemon 正在跑一轮（等不到 round lock），改成挂号单兜底："
                      "会让它别把这次改动记成罪。", "warn")
@@ -1686,8 +1690,10 @@ class SessionMixin(object):
         pulled = self.refresh_all()
         if not want_check:
             return pulled
-        checked = self.check_and_fix()
-        return checked and pulled is not False
+        # --check 必须**等刷新那一批真落地**之后再对账，否则会对着旧表说
+        # 「一场不缺」。所以对账也排进同一个队列的收尾（同步模式就地跑）。
+        self.net_after(self.check_and_fix, label="对账（refresh --check）")
+        return pulled
 
     def refresh_all(self):
         """``refresh`` 实作的**全量**那一半：把屏幕上**每块组件**的状态都对一遍。
@@ -1719,12 +1725,20 @@ class SessionMixin(object):
         if project_sync:
             self._refresh_project_tasks()
         # 三块读互相独立：session / task 走浏览器（bridge 自己串行），项目对账走
-        # osascript —— 队列按 source 分 lane，不同 lane 并行。所以这里**只等一次**：
-        # 老写法按 snapshot → task → project 一等再等，把本来可以重叠的 3–6 秒
-        # 也串起来了（用户反馈「网络拉取太慢」）。
-        self.wait_net()
+        # osascript —— 队列按 source 分 lane，不同 lane 并行。**不在提示符线程上
+        # 等**：命令立刻返回，进度条（repl_kit 的 progress 栏位）照常每帧重画；
+        # 队列空了由 drain_net() 调用 _finish_refresh_all。
+        self.drop_after_net("刷新")           # 连敲两次 refresh：只收尾一次
+        self.net_after(self._finish_refresh_all, label="刷新")
+        return pulled
+
+    def _finish_refresh_all(self):
+        """``refresh_all`` 的后半：**拿到真数据之后**才算的那些（主线程，队列已空）。
+
+        顺序不能反：排期流水线要拿刚拉回来的 session 账去对，先跑就等于拿旧账
+        对账（会把已经取消的场次当成资源）。
+        """
         # refresh 的排期流水线：formatter 先占时间，项目 plan 后校验。
-        # 必须在刚拉回的 session 账上跑，否则会把已取消的场次当成资源。
         try:
             self.reconcile_schedule_pipeline(day=self.sel_date, quiet=True)
         except Exception as e:                     # noqa: BLE001 - 一块坏不挡整次刷新
@@ -1738,7 +1752,7 @@ class SessionMixin(object):
         self.refresh_review_state()
         self.forget_caches()
         self.invalidate()
-        return pulled
+        return True
 
     def forget_caches(self):
         """把所有「上次算出来就先存着」的东西作废（refresh 的前后各来一次）。"""
@@ -1933,8 +1947,15 @@ class SessionMixin(object):
                 if announce:
                     self.say("✅ check 跑完。", "ok")
                 return True
-            do_wait = True if wait is None else bool(wait)
-            job = self.op_keep_session(argv, label, wait=do_wait)
+            # 交互模式**默认不等**：一轮 check 要开浏览器下单，几十秒到几分钟。
+            # 以前这里默认 wait=True，`plan` 完成就卡在这句 jobs.wait 上 ——
+            # 提示符冻住、进度条一格不动（用户报的「plan complete 卡死」）。
+            # 要结果的调用方显式传 wait=True（对账 / 测试）。
+            do_wait = bool(wait)
+            job = self.op_keep_session(
+                argv, label, wait=do_wait,
+                on_ok=(lambda _payload: self.say("✅ check 跑完（契约已落盘）。", "ok"))
+                if announce else None)
             if not do_wait:
                 return True
             outcome = job.outcome
@@ -1958,10 +1979,14 @@ class SessionMixin(object):
                          for r in missing[:5])
         self.say("⚠ %d 场该订却没订上：%s —— 叫 daemon 补一轮（check）…"
                  % (len(missing), names), "warn")
+        # 不在这里等：一轮 check 要开浏览器下单，几十秒起步；这是 refresh 的
+        # 收尾回调（跑在 drain_net 的主线程上），等就意味着画面冻住。
         ok = self.book(self.sel_date, why="对账：补订缺的场次",
-                       wait=True, announce=False)
+                       wait=False, announce=False)
         if ok is False:
             return 0
+        # 订完再拉一次表：让「缺」这件事在界面上自己消失。
+        self.net_after(lambda: self.refresh(quiet=True), label="补订后重拉")
         return len(missing)
 
     def check_task_attachments(self):
@@ -2112,9 +2137,10 @@ class SessionMixin(object):
         下单逻辑不在这里重写：薄封装 `keep_session.py check --force`。
         """
         self.say("force-check：忽略重试上限/退避，对执行区所有没订上的 session 各试一次…", "cmd")
+        # 不等这一轮：下单要开浏览器，几十秒起步；提示符冻住对「催一轮」没有好处。
         self.book(self.sel_date, why="force-check：强制重订", force=True,
-                  wait=True, announce=False)
-        self.refresh()
+                  wait=False, announce=False)
+        self.net_after(lambda: self.refresh(quiet=True), label="force-check 后重拉")
         return True
 
     def cmd_sync(self, args):

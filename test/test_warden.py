@@ -329,12 +329,24 @@ wd.api_rows = [api_row("21:00", 25, "sess-1", "契约那场", True, True, "未�
                api_row("08:00", 50, "sess-2", "计划外的", False, False, "已结束")]
 wd.rows_source = "bridge"
 wd.rebuild_rows()
-check("按时间排序", [r["startLabel"] for r in wd.rows], ["08:00", "21:00"])
-check("契约有 + API 有 → 计划内且有 id", (wd.rows[1]["planned"], wd.rows[1]["id"]), (True, "sess-1"))
-check("API 有 + 契约没有 → 计划外", wd.rows[0]["planned"], False)
-check("计划外的契约列是空的", wd.rows[0]["contract"], "")
-check("契约列写的是 csv 原文", wd.rows[1]["contract"], "%s,21:00,25" % TODAY_WD)
-check("契约行列号指向 data.csv", wd.rows[1]["lineno"], 2)
+# 没有 session 的时段也各占一行（period_only）——它们不是 session，比较时先排掉。
+sess_rows = [r for r in wd.rows if not r.get("period_only")]
+shell_rows = [r for r in wd.rows if r.get("period_only")]
+check("按时间排序", [r["startLabel"] for r in sess_rows], ["08:00", "21:00"])
+check("契约有 + API 有 → 计划内且有 id",
+      (sess_rows[1]["planned"], sess_rows[1]["id"]), (True, "sess-1"))
+check("API 有 + 契约没有 → 计划外", sess_rows[0]["planned"], False)
+check("计划外的契约列是空的", sess_rows[0]["contract"], "")
+check("契约列写的是 csv 原文", sess_rows[1]["contract"], "%s,21:00,25" % TODAY_WD)
+check("契约行列号指向 data.csv", sess_rows[1]["lineno"], 2)
+check_true("没切 session 的时段也有一行（09:00 / 14:00 / 19:00 / 22:15）",
+           [r["startLabel"] for r in shell_rows])
+check("占位行不是 session：planned=False、没有 id",
+      [(r["planned"], r["id"]) for r in shell_rows], [(False, None) for _r in shell_rows])
+check("占位行不进契约统计", wd.plan_summary()["total"], 1)
+check("整张表按起点排序",
+      [r["startLabel"] for r in wd.rows],
+      sorted(r["startLabel"] for r in wd.rows))
 ps = wd.plan_summary()
 check("契约统计：计划 1 场", ps["total"], 1)
 check("契约统计：1 场已落地", ps["booked"], 1)
@@ -349,6 +361,16 @@ wd.api_rows = []
 wd.rebuild_rows()
 check("契约有但 API 没有 → 缺", wd.rows[0]["id"], None)
 check("缺的那场被算进 missing", [r["startLabel"] for r in wd.plan_summary()["missing"]], ["21:00"])
+
+print("== 没订上的场次：说出「为什么」（daemon 记的 last_error_code）==")
+ks.mark_slot("%sT21:00" % TODAY, None,
+             last_error="Session expired. Please run focusmate_auth to log in again.",
+             last_error_code="AUTH_EXPIRED")
+_status_text = "\n".join(t for t, _style in wd.render_status_rows())
+check_true("缺的那一场点名了", "21:00" in _status_text)
+check_true("说清是登录态过期", "登录态过期" in _status_text)
+check_true("给出下一步动作", "main.py --auth" in _status_text)
+ks._save_json(ks.STATE_FILE, {"date": TODAY.isoformat(), "slots": {}})
 
 # ---------------------------------------------------------------- cancel：三层摩擦
 

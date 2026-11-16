@@ -77,12 +77,66 @@ class NetMixin(object):
         return self.jobs.submit(action, on_ok=on_ok)
 
     def drain_net(self):
-        """每帧一次：把后台跑完的网络操作搬回主线程（成功/失败回调都在这里跑）。"""
+        """每帧一次：把后台跑完的网络操作搬回主线程（成功/失败回调都在这里跑）。
+
+        队列空了之后，再把 :meth:`net_after` 排着的收尾跑掉 —— 这是 refresh /
+        plan 这类「先读几份外部数据、再在本地算」的命令唯一该用的收尾入口。
+        """
         outcomes = self.jobs.drain()
-        if outcomes or self._net_dirty:
+        finished = self._run_after_net()
+        if outcomes or finished or self._net_dirty:
             self._net_dirty = False
             self.invalidate()
         return outcomes
+
+    # -- 「这一批跑完之后在主线程收尾」的公共接口 ----------------------
+
+    def net_after(self, fn, label=None):
+        """后台队列空下来之后，在**主线程**跑 ``fn``。返回是否排上了。
+
+        为什么需要它：``refresh`` 一次要拉 session / task / 项目三份数据，每份都
+        在后台线程；以前收尾是在提示符线程上 ``jobs.wait()`` 死等 —— 面板里的
+        进度条一格都动不了（主线程被占着，帧根本不重画），用户看到的就是「卡
+        死」。现在命令立刻返回，``drain_net()``（每帧一次）发现队列空了就跑收尾。
+
+        ``jobs.sync``（--exec / 测试）时立刻就地执行，行为和以前完全一样。
+        """
+        if fn is None:
+            return False
+        pending = self.__dict__.setdefault("_after_net", [])
+        pending.append((str(label or ""), fn))
+        if getattr(self.jobs, "sync", False) and not self.jobs.busy:
+            self._run_after_net()
+        return True
+
+    def drop_after_net(self, label):
+        """撤掉还没跑的同类收尾（连敲两次 `refresh` 只该收尾一次）。"""
+        pending = getattr(self, "_after_net", None)
+        if not pending:
+            return 0
+        keep = [item for item in pending if item[0] != str(label)]
+        dropped = len(pending) - len(keep)
+        if dropped:
+            self._after_net = keep
+        return dropped
+
+    def _run_after_net(self):
+        """跑排着的收尾（只在队列真的空了的时候）。返回跑了几个。"""
+        pending = getattr(self, "_after_net", None)
+        if not pending:
+            return 0
+        ran = 0
+        while pending and not self.jobs.busy and ran < 20:
+            label, fn = pending.pop(0)
+            try:
+                fn()
+            except Exception as e:                 # noqa: BLE001 - 收尾坏了不能没画面
+                self.had_error = True
+                self.say("%s收尾失败：%s: %s"
+                         % (("%s：" % label) if label else "",
+                            type(e).__name__, e), "error")
+            ran += 1
+        return ran
 
     def _register_net_actions(self):
         """给队列登记「名字 → 怎么干 / 本地怎么落」（re-action 靠这两半重放）。"""

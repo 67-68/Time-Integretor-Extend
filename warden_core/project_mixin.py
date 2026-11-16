@@ -2377,7 +2377,7 @@ class ProjectMixin(object):
         return n
 
     def _apply_project_sync_result(self, payload):
-        """主线程：自动拉新增；删除 / 修改按项目排队问用户。"""
+        """主线程：自动拉新增；note 直接拉；删除 / 结构修改按项目排队问用户。"""
         records = (payload or {}).get("projects") or []
         for rec in records:
             title = rec.get("title") or rec.get("project_id") or "?"
@@ -2391,6 +2391,12 @@ class ProjectMixin(object):
                 n = self._merge_project_additions(rec.get("project_id"), added)
                 if n:
                     self.say("📥 项目「%s」自动拉取 %d 条新增任务。" % (title, n), "ok")
+            # note 不参与冲突问答（见 project_store.note_changes）：@list 清单
+            # 就是 note，晚一天拉回来 = 这一天 plan 少派生一条任务。
+            pulled = self._pull_project_notes(rec)
+            if pulled:
+                self.say("📝 项目「%s」的 note 拉了 %d 条（清单/说明以 OmniFocus 为准）。"
+                         % (title, pulled), "ok")
             if diff.get("removed") or diff.get("modified"):
                 self._project_sync_queue.append(rec)
             project = self.projects.by_id(rec.get("project_id"))
@@ -2406,6 +2412,59 @@ class ProjectMixin(object):
         self.rebuild_rows()
         self.invalidate()
         return payload
+
+    def _pull_project_notes(self, rec):
+        """把 OmniFocus 那边的 note 拉回项目清单 + 本地镜像。返回改了几条。
+
+        note 是**用户手写的内容**，并且 ``@list`` 清单的资格 / 还剩几行全看它
+        （见 ``derived.py``）—— 所以它不进 ``DIFF_FIELDS`` 的冲突问答：远端改过
+        就直接覆盖本地。唯一例外是 outbox 里还排着 ``note_mark`` 的那几条：本地
+        比远端新，拉回来会把刚勾掉的那一行变回没勾。
+        """
+        payload = (rec or {}).get("payload") or {}
+        remote = [item for item in (payload.get("tasks") or ())
+                  if isinstance(item, dict)]
+        if not remote:
+            return 0
+        try:
+            project = self.projects.by_id(rec.get("project_id"))
+        except (ValueError, TypeError):
+            project = None
+        if project is None:
+            return 0
+        pending = set()
+        outbox = getattr(self, "omni_outbox", None)
+        for op in (getattr(outbox, "ops", None) or ()):
+            if str((op or {}).get("op") or "") == "note_mark":
+                pending.add(str((op or {}).get("id") or ""))
+        changes = pj.note_changes(project.get("tasks") or [], remote, pending)
+        if not changes:
+            return 0
+        self.projects.set_task_notes(project["id"], changes)
+        # 本地镜像也换掉（``-d`` / 任务面板读的是它）；已挂 session 的任务不动，
+        # 那是当天的真实账，note 留着也碍不着派生（派生优先读项目清单）。
+        by_pk = {str(item.get("pk") or ""): item for item in remote}
+        for task in self.task_store.list():
+            pk = ts.TaskStore.omnifocus_id(task)
+            if not pk or pk not in changes:
+                continue
+            if not ts.TaskStore.is_open(task) or task.get("session"):
+                continue
+            note = changes[pk]
+            parent_pk = str((by_pk.get(pk) or {}).get("parent_id") or "")
+            if parent_pk:
+                parent_title = (str((by_pk.get(pk) or {}).get("parent") or "").strip()
+                                or parent_pk)
+                note = (note + "\n父任务：" + parent_title).strip()
+            fields = task.get("fields") or {}
+            if str(fields.get("notes") or fields.get("note") or "") == note:
+                continue
+            try:
+                self.task_store.set_notes(task["id"], note)
+            except (ValueError, TypeError):
+                continue
+        self._derived_span_map_cache = None
+        return len(changes)
 
     def _maybe_start_project_sync_conflict(self):
         """没有别的问答在占地时，把下一个项目冲突顶上来。"""
@@ -2638,6 +2697,10 @@ class ProjectMixin(object):
             start_dt = self._row_start_datetime(row, fallback_day=day)
             if start_dt is None or start_dt.date() != day:
                 continue
+            if row.get("period_only"):
+                # 时段的占位行（没切出 session）不是资源：既不算空场，也不把
+                # 这一段标成 blocked —— 整段容量交给 _auto_period_slots 决定。
+                continue
             pid_of_row = str(row.get("period_id") or "")
             if row.get("period_muted"):
                 if pid_of_row:
@@ -2743,7 +2806,6 @@ class ProjectMixin(object):
         """
         now = now or self._now_dt()
         auto_period_ids = {pid for pid, meta in period_meta.items() if meta["auto"]}
-        seen_periods = {str(s.get("period_id") or "") for s in slots}
         original_by_pid = {}
         for slot in slots:
             original_by_pid.setdefault(str(slot.get("period_id") or ""), []).append(slot)
@@ -2754,11 +2816,10 @@ class ProjectMixin(object):
         for pid in sorted(auto_replace):
             meta = period_meta.get(pid) or {}
             period = meta.get("period") or {}
-            # 没有真实行、也没有 auto layout 记录：这多半是测试/外部拼出来的
-            # 单行数据，不要凭空替它加一个 period 资源。
-            if pid not in seen_periods and not meta.get("has_layout"):
-                slots.extend(original_by_pid.get(pid) or [])
-                continue
+            # 这一段没有任何 session 行（今天 19:00–21:30 那种：还没切，或者上一轮
+            # plan 把它分到 0 count）**照样算容量** —— period 是排期的第一等输入，
+            # 不能因为 data.csv 里没有它的行就当作日历里不存在这段。切分交给
+            # commit_layout 按任务重算。
             s_got = sp.parse_hhmm(period.get("start"))
             e_got = sp.parse_hhmm(period.get("end"))
             if s_got is None or e_got is None:
@@ -3369,13 +3430,15 @@ class ProjectMixin(object):
         allocator.allocations = [{"project_id": a["project_id"], "count": a["count"]}
                                  for a in allocs]
         allocator.closed = True
-        self._plan_apply(allocator, allocs, append_to_plan=False, book=False)
+        self._plan_apply(allocator, allocs, append_to_plan=False, book=False,
+                         title="按计划重算排布（refresh）")
         self._stamp_auto_plan_signature(day)
         self.say("♻️ 检测到计划变化：已按 period 重算未来 session，当前正在进行的场次没动。",
                  "info")
         return True
 
-    def _plan_apply(self, allocator, allocs, append_to_plan=False, book=True):
+    def _plan_apply(self, allocator, allocs, append_to_plan=False, book=True,
+                    title="排期（plan complete）"):
         """分配完了：先记资源，再挑任务、排进 session。
 
         ``append_to_plan=True`` 给 sessional plan / 手工单场安排用：当天已有
@@ -3384,10 +3447,18 @@ class ProjectMixin(object):
         ``book=True`` 时末尾统一走 :meth:`book` 把执行区的场次订上；
         refresh 的自动重排传 False（对账轮不新造外部动作）。
 
+        **进度条走公共接口**：``jobs.begin(0, title=...)`` + ``jobs.step()``，
+        本地那几步（挑任务 / 写排布 / 重算 csv）和末尾的预约 job 共用一个面板。
+        以前这条命令一个字节的进度都没有，慢的时候看起来像卡死。
+
         「尽量一场一个任务、尽量不拆开」在 :func:`project_plan.schedule` 里：先跑
         二分图匹配求「一对一站位」，配不上才拆、才往同一场里叠。
         """
         day = allocator.day
+        progress = getattr(self, "jobs", None)
+        if progress is not None:
+            progress.begin(0, title=title)
+            progress.step("挑任务：%d 个项目分到的 count" % len(allocs))
         # 普通 plan 是整天重排：先撤旧计划，避免旧任务占着场次、和新算法
         # 排出来的内容并存在同一天。sessional plan / project -a 是追加语义，
         # 保留当天已有计划。
@@ -3412,6 +3483,9 @@ class ProjectMixin(object):
         # 作为硬约束，只允许任务往里填。
         placements, unscheduled, more, auto_layouts = pp.schedule_periods(
             items, allocator.slots)
+        if progress is not None:
+            progress.step("排进 %d 场 session（%d 段要重切）"
+                          % (len(placements), len(auto_layouts or {})))
         notes = list(notes) + list(more)
         # 先把新排布写进中间层并重算 data.csv；旧场次只取消未来、未开始的，
         # _cancel_stale_period_sessions 内部会再保护开始中的场次。
@@ -3433,12 +3507,14 @@ class ProjectMixin(object):
                 # write_csv=False：几个时段改完由下面统一重算一次，别每段整表重写。
                 self.commit_layout(day, period, durations, source="auto",
                                    reason="auto-plan", book=False, announce=False,
-                                   write_csv=False)
+                                   write_csv=False, lock_timeout=5.0)
             except ValueError as e:
                 notes.append("自动排布「%s」没落盘：%s" % (period.get("id"), e))
             except Exception as e:             # noqa: BLE001 - 一段坏了不挡其余
                 notes.append("自动排布「%s」落盘出错：%s" % (period.get("id"), e))
         if auto_layouts:
+            if progress is not None:
+                progress.step("重算 data.csv（%d 段排布已落盘）" % len(auto_layouts))
             try:
                 self.rewrite_data_csv_from_plan()
                 self.rebuild_rows()
@@ -3573,6 +3649,8 @@ class ProjectMixin(object):
         for pid, records in made.items():
             self.projects.record_items(pid, day, records,
                                        append=append_to_plan)
+        if progress is not None:
+            progress.step("把 %d 条任务挂到 session 上" % len(placements))
         self.rebuild_rows()
         total_counts = sum(int(p["count"]) for p in placements)
         self.say("🗂 %s 排好了：%d 条任务 → %d 场 session（共 %d count = %d 分钟）"
