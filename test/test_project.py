@@ -605,90 +605,41 @@ check("全部子任务完成 → 父任务自动完成", _auto2, True)
 check("项目库里父任务 completed",
       pj.task_by_pk(_sub_proj, "parent")["completed"], True)
 
-print("== 子任务排期：父任务为单元，25 分钟场只能放 10+13=23，27 留到以后 ==")
-_sub_items, _sub_notes = pp.distribute(
-    [{"project_id": 1, "project": dict(_sub_payload, id=1), "count": 2}],
-    [dict(_sub_payload, id=1)], {1: {}})
-check("distribute 给出一套父任务单元", len(_sub_items), 1)
-check("单元里带三个原始子任务（能整条放就不拆）",
-      [c["pk"] for c in _sub_items[0]["children"]], ["c10", "c13", "c27"])
-_slot25 = pp.slot_record(1, ISO, "11:00", 25, "s25")
-_places, _uns, _more = pp.schedule(_sub_items, [_slot25])
-check("25 分钟场选中 10+13",
-      sorted(p["duration"] for p in _places), [10, 13])
-check("27 分钟子任务在容量不足时整条留着",
-      [p["item"]["pk"] for p in _places], ["c10", "c13"])
-check("没排下的仍是剩余子任务",
-      [c["pk"] for c in _uns[0]["children"]], ["c27"])
-check_true("说明剩余分钟数", any("还有 27 分钟" in n for n in _more))
-check("父任务信息跟着每个 placement",
-      {(p["parent"]["pk"], p["item"]["parent_pk"]) for p in _places},
-      {("parent", "parent")})
-_slot75 = pp.slot_record(1, ISO, "12:00", 75, "s75")
-_places75, _uns75, _more75 = pp.schedule(_sub_items, [_slot75])
-check("75 分钟场放得下就三个子任务一起排",
-      sorted(p["duration"] for p in _places75), [10, 13, 27])
-check("全部排下就没有 unscheduled", _uns75, [])
-
-print("== 排期：75 分钟 action 在 50+25 两场里放两次（count 2 + 1） ==")
-_long_rows = [
-    {"id": "p-long", "name": "Physic Review", "kind": "project_root",
-     "tags": ["project/Physic Review"], "completed": False, "dropped": False},
-    {"id": "long-parent", "name": "physic review", "kind": "action",
-     "project": "Physic Review", "parent_id": "", "completed": False},
-    {"id": "long-a", "name": "action A", "kind": "action",
-     "project": "Physic Review", "parent_id": "long-parent",
-     "estimated_minutes": 75, "completed": False},
-    {"id": "long-b", "name": "action B", "kind": "action",
-     "project": "Physic Review", "parent_id": "long-parent",
-     "estimated_minutes": 75, "completed": False},
+print("== plan 落地拆分 part：超过一场的任务才拆，每段仍记原任务总 count ==")
+_parts_rows = [
+    {"id": "p-parts", "name": "Parts Review", "kind": "project_root",
+     "tags": ["project/Parts Review"], "completed": False, "dropped": False},
+    {"id": "parts-a", "name": "两小时的活", "kind": "action",
+     "project": "Parts Review", "parent_id": "", "completed": False,
+     "estimated_minutes": 100},
 ]
-_long_payload = pj.project_payload(_long_rows[0], _long_rows, now=_fixed_now)
-_long_items, _long_notes = pp.distribute(
-    [{"project_id": 1, "project": dict(_long_payload, id=1), "count": 3}],
-    [dict(_long_payload, id=1)], {1: {}})
-_long_slots = [pp.slot_record(1, ISO, "11:00", 50, "s50"),
-               pp.slot_record(2, ISO, "12:00", 25, "s25")]
-_long_places, _long_uns, _long_more = pp.schedule(_long_items, _long_slots)
-check("同一个 action 排两次，count 分别 2 和 1",
-      sorted((p["item"]["pk"], p["count"])
-             for p in _long_places if p["item"]["pk"] == "long-a"),
-      [("long-a", 1), ("long-a", 2)])
-check("两段实际时长分别是 50 / 25 分钟",
-      sorted(p["duration"] for p in _long_places), [25, 50])
-check("两段都标成 split", [p["split"] for p in _long_places], [True, True])
-check("第二条 75 分钟 action 没被误报成排不下", _long_uns, [])
-check_true("提示 75 分钟拆成 2 段",
-           any("拆成 2 段" in n and "50 + 25" in n for n in _long_more))
-
-print("== plan 落地拆分 part：每段仍记原 OmniFocus 任务的总 count ==")
-wd_parts = fresh(_long_rows)
-check("导入含两条 75 分钟 action 的项目",
-      wd_parts.handle("task import sop omnifocus:///project/p-long"), True)
+wd_parts = fresh(_parts_rows)
+check("导入含 4 count 任务的项目",
+      wd_parts.handle("task import sop omnifocus:///project/p-parts"), True)
 wd_parts.handle("day 1")
-wd_parts.handle("session T1 50 25")
+wd_parts.handle("session T1 75 25")
 book_all(wd_parts)
 wd_parts.handle("plan +1")
 check_true("plan 打开", wd_parts.planning is not None)
-wd_parts.planning.handle("task 1 3")       # 75 分钟 = 3 count，拆到 50 + 25
+wd_parts.planning.handle("task 1 4")      # 100 分钟 = 4 count，一场装不下 → 75 + 25
 wd_parts.handle("complete")
 _part_locals = [t for t in wd_parts.task_store.list()
-                if (t.get("fields") or {}).get("project_task") == "long-a"]
-check("同一 action 落成两个 session part", len(_part_locals), 2)
-check("两段都记得原任务总 count = 3",
+                if (t.get("fields") or {}).get("project_task") == "parts-a"]
+check("一条 4 count 的任务按 75 + 25 落成两个 session", len(_part_locals), 2)
+check("两段都记得原任务总 count = 4",
       sorted((t["fields"].get("count_total") for t in _part_locals),
-             key=lambda x: x or 0), [3, 3])
-check("两段的本地 count 仍是各自分到的 2 / 1",
-      sorted(t["fields"].get("count") for t in _part_locals), [1, 2])
-check("session 时长仍是 50 / 25",
+             key=lambda x: x or 0), [4, 4])
+check("两段的本地 count 是 3 / 1",
+      sorted(t["fields"].get("count") for t in _part_locals), [1, 3])
+check("session 时长是 75 / 25",
       sorted((t.get("session") or {}).get("duration") for t in _part_locals),
-      [25, 50])
+      [25, 75])
 _part_text = " | ".join(wd_parts.task_cell_text([t], (t.get("session") or {}).get("duration"))
                         for t in _part_locals)
-check_true("界面不再把两段显示成独立任务 (0+1/1)/(0+2/2)",
-           "(0+1/1)" not in _part_text and "(0+2/2)" not in _part_text)
-check_true("两段合计显示原任务的 3 count",
-           "(0+1/3)" in _part_text and "(0+2/3)" in _part_text)
+check_true("界面不再把两段显示成独立任务 (0+1/1)/(0+3/3)",
+           "(0+1/1)" not in _part_text and "(0+3/3)" not in _part_text)
+check_true("两段合计显示原任务的 4 count",
+           "(0+3/4)" in _part_text and "(0+1/4)" in _part_text)
 
 print("== plan 落地子任务：session 里只出现子任务，note 标注父任务 ==")
 wd_sub = fresh(_sub_rows)
@@ -1129,36 +1080,6 @@ wd2.handle("complete")
 check_true("说了「只剩 … count」",
            any("只剩" in t and "少排" in t for t in texts(wd2)),
            )
-
-print("== 排期：尽量一场一个任务、尽量不拆 ==")
-rows_p = [
-    {"id": "p1", "name": "论文", "kind": "project_root"},
-    {"id": "a", "name": "写引言", "kind": "action", "project": "论文",
-     "estimated_minutes": 75},
-    {"id": "b", "name": "跑数据", "kind": "action", "project": "论文",
-     "estimated_minutes": 100},
-]
-proj = pj.project_payload(rows_p[0], rows_p)
-items, notes = pp.distribute([{"project_id": 1, "project": proj, "count": 4}], [proj], {})
-check("按清单顺序切 count", [(i["title"], i["count"]) for i in items],
-      [("写引言", 3), ("跑数据", 1)])
-slots = [pp.slot_record(1, ISO, "11:00", 75, "s1"), pp.slot_record(2, ISO, "12:15", 25, "s2")]
-places, uns, more = pp.schedule(items, slots)
-check("装得下就不拆", [p["split"] for p in places], [False, False])
-check("一场一个任务", [p["split"] or p["stacked"] for p in places], [False, False])
-check("75 分钟的活进了 75 分钟那场",
-      [(p["slot"]["start"], p["item"]["title"]) for p in places],
-      [("11:00", "写引言"), ("12:15", "跑数据")])
-check("没有漏排", uns, [])
-
-# 每场都装不下 → 拆开（如实说）
-slots2 = [pp.slot_record(1, ISO, "11:00", 50, "s1"), pp.slot_record(2, ISO, "12:00", 50, "s2")]
-places2, uns2, more2 = pp.schedule(items, slots2)
-check("3 count 的活进不了 2 count 的场 → 拆开",
-      sorted((p["item"]["title"], p["count"]) for p in places2
-             if p["item"]["title"] == "写引言"),
-      [("写引言", 1), ("写引言", 2)])
-check_true("拆开要说出来", any("拆成" in n for n in more2))
 
 print("== 部分完成不勾 OmniFocus 完成（项目里还有剩） ==")
 wd3 = fresh(rows_ok)
@@ -1838,14 +1759,22 @@ _items_small, _notes_small = pp.distribute(
 check("1 count 实际挑出两条 10 分钟短任务",
       [(i["title"], i.get("minutes")) for i in _items_small],
       [("短任务 0", 10), ("短任务 1", 10)])
-_slots_small = [pp.slot_record(1, ISO, "11:00", 25, "s-small")]
-_places_small, _uns_small, _more_small = pp.schedule(_items_small, _slots_small)
-check("两条短任务进了同一场 25 分钟 session",
-      sorted((p["item"]["title"], p["duration"]) for p in _places_small),
+_sm_slots = [{"index": 1, "date": ISO, "start": "11:00", "end": "11:30",
+              "duration": 25, "counts": 1, "id": None, "period_id": "T-sm",
+              "period": {"id": "T-sm", "date": ISO, "start": "11:00", "end": "11:30"},
+              "period_start": "11:00", "period_end": "11:30",
+              "period_total_minutes": 30, "period_blocks": 1,
+              "period_auto": True}]
+_places_small, _uns_small, _more_small, _sm_layouts = pp.schedule_periods(
+    _items_small, _sm_slots)
+check("两条短任务分到同一个 25 分钟 session（按实际分钟叠）",
+      [(p["item"]["title"], p["duration"]) for p in _places_small],
       [("短任务 0", 10), ("短任务 1", 10)])
-check("没有漏排", [u["title"] for u in _uns_small], [])
-check_true("提示了时间对不齐导致空位，并列出（10、10）",
-           any("剩 5 分钟空位" in n and "10、10" in n for n in _more_small))
+check("短任务不各占一场（session 只有一个 25 分钟块）",
+      sorted(_sm_layouts.values()), [[25]])
+check("两条短任务叠在同一场，session 仍是 25 分钟",
+      [len(g) for g in [[p for p in _places_small
+                         if p["slot"]["start"] == "11:00"]]], [2])
 
 print("== 8) op relate --export/--import：模板 -> 本地项目库 ==")
 _relate_dir = os.path.join(TMP, "relate")
@@ -1960,18 +1889,6 @@ check("缺字段的旧 payload 默认 parallel",
 _seq_project = dict(_seq_payload, id=99)
 _seq_items, _ = pp.distribute(
     [{"project_id": 99, "project": _seq_project, "count": 4}], [_seq_project], {})
-_seq_slots = [pp.slot_record(1, ISO, "10:00", 25, "s1"),
-              pp.slot_record(2, ISO, "10:30", 25, "s2"),
-              pp.slot_record(3, ISO, "11:00", 50, "s3")]
-_seq_places, _seq_uns, _seq_notes = pp.schedule(_seq_items, _seq_slots)
-check("sequential：50 分钟任务先填最早的 25+25，不跳去后面的 50",
-      [(p["slot"]["start"], p["item"]["title"], p["count"])
-       for p in _seq_places],
-      [("10:00", "50 分钟任务", 1), ("10:30", "50 分钟任务", 1),
-       ("11:00", "25 分钟任务", 1)])
-check("sequential 拆段有说明",
-      any("按项目顺序拆成 2 场" in n for n in _seq_notes), True)
-
 print("== 10) plan -s / --session + -p / --project：单场 sessional plan ==")
 wd_ss = fresh([dict(r) for r in rows_ok], repetitions=None)
 wd_ss.omnifocus.rows = [dict(r, task_type="sequential") if r["id"] == "p-lunwen"
@@ -2073,46 +1990,21 @@ _pri_items, _ = pp.distribute(
 check("每个 plan item 带优先级",
       [(i["title"], i.get("priority")) for i in _pri_items],
       [("普通任务", None), ("P2 任务", 2), ("P1 任务", 1)])
-_pri_slots = [pp.slot_record(1, ISO, "10:00", 25, "p1s"),
-              pp.slot_record(2, ISO, "10:30", 25, "p2s"),
-              pp.slot_record(3, ISO, "11:00", 25, "p3s")]
-_pri_places, _pri_uns, _pri_notes = pp.schedule(_pri_items, _pri_slots)
+_pri_periods = [{"index": i + 1, "date": ISO, "start": st, "end": en,
+                 "duration": 25, "counts": 1, "id": None, "period_id": "T-p%d" % i,
+                 "period": {"id": "T-p%d" % i, "date": ISO, "start": st, "end": en},
+                 "period_start": st, "period_end": en,
+                 "period_total_minutes": 30, "period_blocks": 1,
+                 "period_auto": True}
+                for i, (st, en) in enumerate((("10:00", "10:30"),
+                                              ("10:30", "11:00"),
+                                              ("11:00", "11:30")))]
+_pri_places, _pri_uns, _pri_notes, _pri_layouts = pp.schedule_periods(
+    _pri_items, _pri_periods)
 check("parallel 先排 P1，再 P2，最后无优先级；同级内保序",
       [(p["slot"]["start"], p["item"]["title"]) for p in _pri_places],
       [("10:00", "P1 任务"), ("10:30", "P2 任务"), ("11:00", "普通任务")])
-
-print("== 14) parallel 改为 session-first：靠前场次先挑，且仍不做无谓拆分 ==")
-_seq2_rows = [
-    {"id": "p-sf", "name": "session-first", "kind": "project_root",
-     "completed": False, "dropped": False},
-    {"id": "sf-a", "name": "先列出的 25 分钟", "kind": "action",
-     "project": "session-first", "estimated_minutes": 25,
-     "completed": False, "dropped": False},
-    {"id": "sf-b", "name": "后列出的 50 分钟", "kind": "action",
-     "project": "session-first", "estimated_minutes": 50,
-     "completed": False, "dropped": False},
-]
-_sf_payload = pj.project_payload(_seq2_rows[0], _seq2_rows)
-_sf_project = dict(_sf_payload, id=88)
-_sf_items, _ = pp.distribute(
-    [{"project_id": 88, "project": _sf_project, "count": 3}],
-    [_sf_project], {})
-_sf_slots = [pp.slot_record(1, ISO, "10:00", 50, "sf50"),
-             pp.slot_record(2, ISO, "11:00", 25, "sf25")]
-_sf_places, _sf_uns, _sf_notes = pp.schedule(_sf_items, _sf_slots)
-check("先列任务不抢走大场导致后面的任务被无谓拆开",
-      [(p["slot"]["start"], p["item"]["title"], p["split"]) for p in _sf_places],
-      [("10:00", "后列出的 50 分钟", False),
-       ("11:00", "先列出的 25 分钟", False)])
-check("parallel session-first 没有漏排", _sf_uns, [])
-# 两个同容量场：靠前的任务一定先拿靠前的 session。
-_sf_slots2 = [pp.slot_record(1, ISO, "12:00", 25, "sf-a"),
-              pp.slot_record(2, ISO, "12:30", 25, "sf-b")]
-_sf_items2 = [dict(item) for item in _sf_items]
-_sf_places2, _sf_uns2, _ = pp.schedule(_sf_items2, _sf_slots2)
-check("同优先级靠前任务先拿靠前 session",
-      [(p["slot"]["start"], p["item"]["title"]) for p in _sf_places2],
-      [("12:00", "先列出的 25 分钟"), ("12:30", "后列出的 50 分钟")])
+check("priority 段没有漏排", _pri_uns, [])
 
 print("== 15) 再次 plan 同一天：**追加**语义，上一轮不动，要清手动 plan clear ==")
 wd_re = fresh([dict(r) for r in rows_ok], repetitions=None)
@@ -2201,6 +2093,7 @@ _seq_items = [_pitem("B", 50, "sequential"), _pitem("A", 25, "sequential"),
 _s_places, _s_uns, _s_notes, _s_layouts = pp.schedule_periods(
     _seq_items, [_pslot("T1", "09:00", "09:30", 1),
                  _pslot("T2", "10:00", "12:30", 5)])
+# 优先整条放置；整条放不下才拆段填缝（用户的「实在没有就找零碎的地方」）。
 check("sequential：B 拆成 25 + 25，P2 再 A25 + C75",
       [(p["item"]["title"], p["slot"]["start"], p["duration"], p["split"])
        for p in _s_places],
@@ -2264,6 +2157,19 @@ check("没有 placement 的分钟数超过它所在场次",
 check("15:15 这场只有小任务自己（不算叠场）",
       [_p["stacked"] for _p in _mis_places
        if _p["item"]["title"] == "小 10"], [False])
+
+_long_rows = [
+    {"id": "p-long", "name": "Physic Review", "kind": "project_root",
+     "tags": ["project/Physic Review"], "completed": False, "dropped": False},
+    {"id": "long-parent", "name": "physic review", "kind": "action",
+     "project": "Physic Review", "parent_id": "", "completed": False},
+    {"id": "long-a", "name": "action A", "kind": "action",
+     "project": "Physic Review", "parent_id": "long-parent",
+     "estimated_minutes": 75, "completed": False},
+    {"id": "long-b", "name": "action B", "kind": "action",
+     "project": "Physic Review", "parent_id": "long-parent",
+     "estimated_minutes": 75, "completed": False},
+]
 
 print("== 17) plan 无手动 layout：按任务反推 session，并写回中间层 ==")
 sp.save_layouts(sp.empty_layouts())

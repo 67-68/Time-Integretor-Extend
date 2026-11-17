@@ -342,8 +342,9 @@ class TaskPipelineMixin(object):
         durations = (prefix + [fit]) if exact else prefix
 
         current = sp.get_layout(self.layouts, day, period_id)
-        if current is None:
-            current = sp.default_durations(period)
+        # 没有 layout = 这一段还没切过（0 场）。绝不能拿 default_durations 当
+        # 「现状」：那会让切割看起来「没变化」而不落盘，凭空长出来的场次
+        # 还会被 daemon 订掉。
         current = [int(d) for d in (current or [])]
         if [int(d) for d in durations] != current:
             self._apply_cut_layout(day, period, durations)
@@ -460,8 +461,6 @@ class TaskPipelineMixin(object):
             return False
         res = fmt.get("reservation") or {}
         sess = (task or {}).get("session") or {}
-        if name == "enlist":
-            return self._enlist_apply_valid(task, day)
         if name == "repeat":
             return self._repeat_apply_valid(task, day)
         if str(res.get("date") or "") != iso:
@@ -493,7 +492,7 @@ class TaskPipelineMixin(object):
                        if str(p.get("id")) == period_id), None)
         if period is None:
             return False
-        # 非尾巴 placement（end 把任务塞进更早一场，或 enlist/兜底一次性场）：
+        # 非尾巴 placement（end 把任务塞进更早一场，或兜底一次性场）：
         # formatter 没有改写整段 layout，不能拿「prefix + 任务场」当整段预期，
         # 否则同一时段里第二条 formatter 永远被判失效、每轮 refresh 都被搬走。
         if not str(result_session.get("cut_period_id") or "").strip():
@@ -596,82 +595,6 @@ class TaskPipelineMixin(object):
         if block is not None and not th.is_free(
                 {"start_min": block[0], "end_min": block[1]}, reservations):
             return False
-        return True
-
-    def _enlist_apply_valid(self, task, day):
-        """``enlist`` 的幂等校验：目标 session 还在、空着，占位也没漂。
-
-        ``enlist`` 不切 layout，所以不能套 ``end`` 的「cut_prefix + 任务场」
-        校验。这里检查的是：任务绑定的整场 session、formatter 记下的任务块、
-        当前 layout 三者是否还对得上；以及这个块有没有被别的 formatter 抢走。
-        """
-        day = day if hasattr(day, "isoformat") else self.sel_date
-        iso = day.isoformat()
-        fmt = (task or {}).get("formatter") or {}
-        res = fmt.get("reservation") or {}
-        sess = (task or {}).get("session") or {}
-        if str(res.get("date") or "") != iso:
-            return False
-        try:
-            if int(res.get("duration") or 0) != int(ts.task_minutes(task) or 0):
-                return False
-            target_start = str(res.get("session_start") or "")
-            target_duration = int(res.get("session_duration") or 0)
-            if (str(sess.get("date")) != iso
-                    or str(sess.get("start")) != target_start
-                    or int(sess.get("duration") or 0) != target_duration):
-                return False
-        except (TypeError, ValueError):
-            return False
-        try:
-            sessions = self.sessions_for_day_plan(day)
-        except Exception:                          # noqa: BLE001
-            return False
-        target = None
-        for candidate in sessions:
-            try:
-                if (str(candidate.get("start")) == target_start
-                        and int(candidate.get("duration") or 0) == target_duration):
-                    target = candidate
-                    break
-            except (TypeError, ValueError):
-                continue
-        if target is None:
-            return False
-        target_range = th._range_of(target)
-        block = th._range_of(res)
-        if target_range is None or block is None:
-            return False
-        task_minutes = int(res.get("duration") or 0)
-        if block[0] < target_range[0]:
-            return False
-        if block[0] + task_minutes > target_range[1]:
-            return False
-        # 目标场次里除了自己不能再有别的 open 任务；enlist 的语义就是「挂进
-        # 一场空 session」，而且这样项目 plan 也不会看到假空场。
-        try:
-            others = [t for t in self.task_store.tasks_for_session(
-                iso, target_start) if t.get("id") != task.get("id")]
-        except Exception:                          # noqa: BLE001
-            others = []
-        if any(ts.TaskStore.is_open(t) for t in others):
-            return False
-        # 别的 formatter 后来占用了同一块 → 失效重排。
-        try:
-            reservations = [r for r in th.collect_reservations(
-                self.task_store.list(), iso) if r.get("task_id") != task.get("id")]
-        except Exception:                          # noqa: BLE001
-            reservations = []
-        if not th.is_free({"start_min": block[0], "end_min": block[1]},
-                          reservations):
-            return False
-        # 休息尾巴不能压住下一场 session。
-        for other in sessions:
-            if other is target:
-                continue
-            got = th._range_of(other)
-            if got is not None and th.overlaps(block, got):
-                return False
         return True
 
     @staticmethod
@@ -824,6 +747,91 @@ class TaskPipelineMixin(object):
                     + (" 等" if len(reasons) > 3 else "")), "warn")
         return len(items), dropped
 
+    def _prune_dead_auto_slots(self, day, quiet=True):
+        """剪掉 daemon 已经判死的自动场次（已放弃 / 订过又没了）。
+
+        为什么必须剪：这些场次**永远订不上**。留着它们，表格会画一行「未开始」
+        的幽灵场次（真实场次就在它旁边，看起来像两场重叠），`tail_gap` 永远
+        看不到这段尾巴的容量，挂在上面的任务也等于挂在空气里。
+
+        事故现场（2026-11-16）：T3 计划 19:00(75)+20:30(25)+21:00(25)；20:30 那场
+        被 Focusmate 落在 20:45，21:00 就落进了它的休息里，daemon 试了 6 次都
+        订不上，最后判 abandoned —— 但 data.csv 里那句 21:00 还在，表格继续画，
+        任务继续挂。
+
+        只动 ``source`` 是 ``auto`` / ``plan`` 的 layout：用户手写 / formatter 切
+        出来的 layout 是硬约束，替人剪等于替他做决定。
+
+        剪法：从**第一个**死场次起，把这一段后面的时长全部砍掉 —— layout 是从
+        时段起点接龙的 duration 列表，中间挖一个洞会让后面每场的起点都变。
+        如果死场次后面还有已经订上的场次，整段跳过（剪了就和现实脱节）。
+        """
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        layouts = sp.load_layouts()
+        recs = (layouts.get("layouts") or {}).get(iso) or {}
+        if not recs:
+            return 0
+        slots = self.daemon_slots() or {}
+        actual = set()
+        for row in getattr(self, "api_rows", ()) or ():
+            label = str(row.get("startLabel") or "")
+            if label:
+                actual.add(label)
+        pruned = 0
+        for period in self.periods_for_day(day):
+            pid = str(period.get("id") or "")
+            rec = recs.get(pid)
+            if not pid or not isinstance(rec, dict):
+                continue
+            if not sp.is_auto_source(rec.get("source")):
+                continue                       # 手动 / formatter 的切分是硬约束
+            try:
+                sessions = sp.sessions_for_period(period, layouts)
+            except (TypeError, ValueError):
+                continue
+            durations = [int(sess.get("duration") or 0) for sess in sessions]
+            dead_at = None
+            for idx, sess in enumerate(sessions):
+                start = str(sess.get("start") or "")
+                if start in actual:
+                    if dead_at is not None:
+                        dead_at = -1           # 后面还有订上的场次：整段跳过
+                        break
+                    continue
+                state = slots.get("%sT%s" % (iso, start)) or {}
+                if (str(state.get("status") or "") in ("abandoned", "missed")
+                        or self._session_cancel_evidence(iso, start)):
+                    dead_at = idx
+                    break
+            if dead_at is None or dead_at < 0 or dead_at >= len(durations):
+                continue
+            keep = durations[:dead_at]
+            try:
+                result = self.commit_layout(
+                    day, period, keep,
+                    mode="set" if keep else "clear",
+                    reason="prune-dead", book=False, announce=False,
+                    missing_ok=True)
+            except Exception as exc:            # noqa: BLE001 - 一段失败不挡别的
+                if not quiet:
+                    self.say("剪掉 %s %s 的废弃场次失败：%s" % (iso, pid, exc), "warn")
+                continue
+            if not result.get("ok", True):
+                continue
+            pruned += 1
+            if not quiet:
+                names = "、".join(str(sess.get("start")) for sess in sessions[dead_at:])
+                self.say("✂ %s %s：%s 已经被 daemon 判死（放弃 / 订过又没了），"
+                         "从排布里剪掉了；原来挂在上面的任务会重新找位置。"
+                         % (iso, pid, names), "warn")
+        if pruned:
+            try:
+                self.reload_periods()
+                self.reload_entries()
+            except Exception:                   # noqa: BLE001
+                pass
+        return pruned
+
     def reconcile_schedule_pipeline(self, day=None, quiet=False):
         """refresh 的排期流水线：**formatter 先、项目 plan 后**。
 
@@ -854,7 +862,7 @@ class TaskPipelineMixin(object):
     def _reconcile_schedule_pipeline(self, day, quiet=False):
         """`reconcile_schedule_pipeline` 的实作（不负责 _suppress_book 守卫）。"""
         result = {"formatters": 0, "invalidated": 0, "detached": 0, "errors": 0,
-                  "unbooked": 0}
+                  "unbooked": 0, "pruned": 0}
         # 先清掉过期且从未处理的重复 occurrence：它们绝不能再进入今天/明天的
         # formatter 队列（否则同名任务会越积越多，互相抢同一场 session）。
         try:
@@ -868,6 +876,14 @@ class TaskPipelineMixin(object):
             self.rebuild_rows()
         except Exception as e:                     # noqa: BLE001 - 先用上一份账
             self.say("排期流水线：重读本地排布失败（先用上一份）：%s" % e, "warn")
+        # 先剪掉「daemon 已经判死、却还赖在自动 layout 里」的场次：那些场次再也
+        # 订不上，留在 data.csv 里会画出一行幽灵场次、继续占容量、任务也挂在一个
+        # 永远不会存在的场上（事故：2026-11-16 的 21:00）。
+        try:
+            result["pruned"] = self._prune_dead_auto_slots(day, quiet=quiet)
+        except Exception as e:                     # noqa: BLE001 - 剪枝失败不挡刷新
+            result["pruned"] = 0
+            self.say("排期流水线：剪掉废弃场次失败（继续刷新）：%s" % e, "warn")
         for task in self.formatter_tasks_for_day(day):
             spec = dict(task.get("formatter") or {})
             try:
@@ -1093,9 +1109,9 @@ class TaskPipelineMixin(object):
             "periods": self.periods_for_day(day),
             "reservations": th.collect_reservations(self.task_store.list(),
                                                     day.isoformat()),
-            # enlist 要判断哪些 session 已经有任务；把 open 任务一起交给算法，
-            # 但算法仍只读、不写盘。
-            "tasks": self.task_store.list(),
+            # 「现在几点」由 warden 注入，formatter 才能判断某一块是不是已经
+            # 过去了（测试用 clock_now 钉死，不依赖墙上时钟）。
+            "now": self._now_dt(),
         }
         try:
             out = th.call_preset("formatter", spec, ctx)
@@ -1180,9 +1196,10 @@ class TaskPipelineMixin(object):
         spec["reservation"] = reservation
         spec["applied_at"] = ts._now()
         task = self.task_store.set_hook(task["id"], "formatter", spec)
-        # `end` 排出来的任务**自动独占**：一场 Focusmate 里塞两条任务等于两个专注块
-        # 被切成四段。想放开就 `task <序号> -e false`。
-        if spec.get("name") == "end" and not th.is_exclusive(task):
+        # 切块型 formatter（`end` / `enlist`）排出来的任务**自动独占**：这一场是
+        # 为它专门切出来的，里面再塞第二条任务等于两个专注块被切成四段。想放开
+        # 就 `task <序号> -e false`。
+        if spec.get("name") in ("end", "enlist") and not th.is_exclusive(task):
             task = self.task_store.modify(task["id"], "exclusive", True)
         if not quiet:
             notes = ""

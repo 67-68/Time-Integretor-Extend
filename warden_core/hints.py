@@ -767,8 +767,9 @@ def _hint_task(parts):
                         "（当天第 2 场）。挂重复任务本体上时，每周每个子任务都固定这一场；"
                         "可带 date=YYYY-MM-DD / tomorrow / today、break_minutes=0")
             elif chosen == "enlist":
-                note = ("enlist = 只挂进已有空 session，不切 layout；"
-                        "优先孤立且正好同长的场；可带 date=...、break_minutes=5")
+                note = ("enlist = 和 end 同一条流水线，只是挑块顺序相反："
+                        "在**最早**还有空位的时段尾巴上切一场任务大小的 session；"
+                        "可带 date=...、break_minutes=5")
             else:
                 note = ("end = 在当天最后一段的尾巴上切一场任务大小的 session"
                         "（11:30–11:55 那种，时长取 25/50/75）并自动挂上；"

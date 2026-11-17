@@ -312,7 +312,7 @@ TUI（任务视图 / 任意视图都认 `task`）。下表的 `<序号>` = 面�
 | `task <序号> -t <preset> [参数...]` | 给任务挂一个 trigger（只记账；runner 执行） |
 | `task -f` / `task --formatter` | 列出 formatter 预设（现在有 `end` / `enlist` / `repeat`） |
 | `task <序号> -f end` | 按任务 `duration` 在当天最后一段的**尾巴上切一场**（11:30–11:55 那种）、写进排期并自动 assign；排出来的任务自动独占 |
-| `task <序号> -f enlist` | 不切排布，把任务挂进**已有** session：优先孤立且正好同长的块；大块只从开头/结尾塞入 |
+| `task <序号> -f enlist` | 和 `end` 同一条流水线，挑当天**最早**还有空位的时段尾巴切一场任务大小的 session 并挂上 |
 | `task <序号> -e true`（`--exclusive true`） | **独占**：这一场 session 只能有它一条任务（裸写 `-e` = true，`-e false` 取消） |
 | `task <序号> -d [N]`（`--derived`） | **派生一条标题清单任务**：每天重复、note 里有 `# titles` 的任务，把下一条未勾选标题变成一条本地派生任务（默认挂最近一场）；做完自动勾 note、勾完自动放弃整个重复任务。见 [`derived.md`](derived.md) |
 | `task <序号> -act N`（`--assign-count N`） | **本场 count 覆盖**：只改这一场要记几个 count，不动任务总 count / 时长；可写 `task 5 -ac -act 2` 先挂再改 |
@@ -683,7 +683,7 @@ task -t / task -f                      # 只看预设列表，不动任务
 
 ### `task -f end`
 
-`end` 是内置 formatter 之一（另外两个是 `enlist` / `repeat`）。它按任务 `fields.duration`（也认
+`end` 是内置 formatter 之一（另外两个是 `enlist` / `repeat`；`end` 与 `enlist` 只差挑块顺序）。它按任务 `fields.duration`（也认
 `duration_minutes` / `estimated_minutes` / `minutes` / `时长` / `预计时长`）排期：
 
 1. 取**当天最后一个还有空位的时段**（这就是 `end`：每天的结束时间不同，
@@ -755,32 +755,38 @@ task -t / task -f                      # 只看预设列表，不动任务
 
 ### `task -f enlist`
 
-`enlist` 是排在**所有其它 formatter 之后、项目 `plan` 之前**的 formatter。
-它和 `end` 的能力边界故意相反：**只使用已经排好的 session，不切 layout、
-不新造/取消 session**。
+`enlist` 和 `end` **是同一条流水线**，只差挑哪一块：`end` 取当天**最后一个**
+还有空位的时段，`enlist` 取当天**最早**还有空位的时段（早到早得）。它排在
+所有其它 formatter 之后、项目 `plan` 之前。
 
-挂载原则（用户原话：不打断大时间块，找孤立且正好时长适配的时间块；
-如果不得不用大块，就放在它的开始/结尾，保持连贯）：
+两者都遵守同一条铁律：**先切时间块，再创建 session**。formatter 不允许把
+任务塞进别人已经切好的 session —— 那会造出「25 分钟任务挂在 75 分钟场里」
+这种一处时间两种身份的状态，表格、对账、排期三处都得为它写特判（2026-11-16
+用户原话：「我希望你重构代码，让整个 code 就是一个巨大的，可以处理很多复杂
+边缘情况（在框架内）的流水线，而不是使用猴子补丁补起来的内容」）。
 
-1. 两场 session 间隔 ≤ 15 分钟算同一个「大时间块」；单场成块就是 isolated；
-2. 第一优先：**孤立且时长正好等于任务 Focusmate 档位（25/50/75）** 的场次；
-3. 第二优先：孤立的大场次，把任务放在它的开头；
-4. 只剩大块时：只从**整块第一场的开头**或**最后一场的结尾**塞入，尽量不碰中间场；
-5. 前三类都没有才允许动中间场次，仍然只放在那一场的开头/结尾。
+算法：
 
-任务占用 = 任务分钟 + `break_minutes`（默认 5）。已经有任务（手工 / 项目
-`plan` / 另一个 formatter）的场次不碰；别的 formatter 已占的区间是硬约束。
-`formatter.reservation` 里额外记 `session_start` / `session_duration`
-（整场身份）和 `placement`（`start` / `end`）、`exact_fit` / `isolated`。
-每次 `refresh` 都会核对目标场次是否还在、是否仍为空、占位有没有被抢；
-目标 layout 改坏后会自动重挂，已经正确时幂等。
+1. 按时段起点从早到晚遍历当日所有时段；
+2. 每个时段用 `session_plan.tail_gap()` 取**尾巴**：只认「最后一场（含强制
+   休息）到时段终点」这截，并且现有场次必须正好等于 `plan_period` 排出来的
+   序列（对不上就不许追加，否则会把已排好的场次挪位）；
+3. 尾巴放得下任务对应档位（`fit_session_duration`：25/50/75，超过 75 向上
+   取 15 的整数倍）时，`plan_period(prefix + [fit])` 算出这一场的起点，它
+   **必须整场落在时段内**；
+4. 这一段不能被别的 formatter 的 reservation 占掉，也不能和任何已有场次
+   （含休息尾巴）重叠；
+5. 取切点最早的那个候选；前缀原样保留，只在后面接上这一场。
 
-同一天**更早的场次**不受影响：任务从那一场的**起点**开始占「时长 + 休息」，
-绝不越过它去抢下一场的时间 —— 一场一个任务，不是两条挤一场。之后别的
-formatter 通过 `task_hooks.collect_reservations()` 看到这段被占，**不会再用**。
+`formatter.result` 因此和 `end` 同形：`carved=true`、`cut_period_id`、
+`cut_prefix`、`cut_prefix_exact`。warden 用同一个 `_cut_period_for_carve()`
+改写 layout，前缀那几场一分钟不动。任务只挂到**它自己切出来的那一场**，
+并自动独占（`end` / `enlist` 同样规则）。
 
+- 今天已经过去的时段不算容量（`ctx["now"]` 由 warden 注入，测试用 `clock_now`
+  钉死）；`end` 同样遵守；
 - 没有 `duration` → 明确警告，不落 `formatter`；
-- 所有位置都被占 / 装不下 → 明确报错；
+- 所有时段尾巴都排满 / 都放不下这一档 → 明确报错，不做「挤进已有场」的兜底；
 - 可选参数：`break_minutes=5`、`date=YYYY-MM-DD|today|tomorrow`。
 
 ### `task -f repeat <session>`

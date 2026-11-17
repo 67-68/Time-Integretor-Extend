@@ -87,6 +87,11 @@ sp.save_download({"version": 1, "generated_at": "x", "start_date": ISO, "days": 
                       _period("T3", TOMORROW, "09:00", "10:00"),
                       _period("T4", TOMORROW, "10:00", "11:00"),
                   ]})
+# 场次是「切出来的结果」，不是默认铺出来的：没有 layout 的时段现在 0 场。
+# 这个用例要验的是「repeat 固定到某一现有场次」，所以先把目标场切出来。
+for _day, _pid in ((TODAY, "T1"), (TODAY, "T2"),
+                   (TOMORROW, "T3"), (TOMORROW, "T4")):
+    sp.set_layout(_day, _pid, [50], source="manual")
 
 
 class FakeBridge(object):

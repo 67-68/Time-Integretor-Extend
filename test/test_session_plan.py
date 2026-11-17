@@ -70,6 +70,9 @@ check("合法排布落盘", len(sessions), 4)
 check("layout 文件已创建", os.path.exists(LP), True)
 layouts = sp.load_layouts(LP)
 check("layout 里是四个 25", [s["duration"] for s in sessions], [25, 25, 25, 25])
+# 另一个时段也切一场，验证「所有时段的排布都进 data.csv」。
+sp.set_layout("2026-10-26", "T2", [50], layouts_path_=LP, download_path_=DL)
+layouts = sp.load_layouts(LP)
 csv = sp.render_data_csv(sp.load_download(DL), layouts,
                         extras=sp.empty_extras(), rules=sp.empty_rules())
 check("data.csv 写精确日期行",
@@ -107,6 +110,9 @@ DL2 = {
 }
 sp.save_download(DL2, DL)
 sp.save_layouts(sp.empty_layouts(), LP)
+# 场次是切出来的结果：要验「时段排布也进 data.csv」，得先真的切一段。
+sp.set_layout("2026-10-26", "T1", [50, 50], layouts_path_=LP, download_path_=DL)
+sp.set_layout("2026-10-27", "T1", [50, 50], layouts_path_=LP, download_path_=DL)
 iso = "2026-10-26"
 
 sp.add_extra("2026-10-26", "11:15", 50, path=XP)

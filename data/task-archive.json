@@ -3389,6 +3389,91 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-16T23:26:14",
+      "task_id": 206,
+      "fields": {
+        "title": "assignmentbook chap7",
+        "project": "SchoolReview",
+        "project_id": 2,
+        "project_task": "f_rrq-G6Az5",
+        "duration": 25,
+        "notes": "父任务：physic review",
+        "count": 1,
+        "count_total": 3,
+        "note": "父任务：physic review",
+        "due": "2026-11-16T22:55:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": {
+        "date": "2026-11-16",
+        "start": "22:30",
+        "duration": 25,
+        "focusmate_session_id": null,
+        "relocated_from": "22:15",
+        "previous_due": "2026-11-16T22:40:00"
+      },
+      "notes": "父任务：physic review",
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 25,
+      "status_at": "2026-11-16T23:26:14",
+      "omnifocus": {
+        "id": "f_rrq-G6Az5",
+        "url": "omnifocus:///task/f_rrq-G6Az5",
+        "title": "assignmentbook chap7",
+        "linked_at": "2026-11-11T09:51:06"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "assignmentbook chap7",
+        "description": "父任务：physic review",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-16T23:26:39",
+      "task_id": 237,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-16T23:25:00",
+        "due_source": "session",
+        "exclusive": true,
+        "count_invested": 1
+      },
+      "session": {
+        "date": "2026-11-16",
+        "start": "23:00",
+        "duration": 25,
+        "focusmate_session_id": null,
+        "relocated_from": "22:45",
+        "previous_due": "2026-11-16T23:10:00"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 25,
+      "status_at": "2026-11-16T23:26:39",
+      "omnifocus": {
+        "id": "bXBKXt03Pgc",
+        "url": "omnifocus:///task/bXBKXt03Pgc",
+        "title": "flashcard review & new learn",
+        "linked_at": "2026-11-02T15:24:32"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "flashcard review & new learn",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

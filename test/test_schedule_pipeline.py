@@ -393,6 +393,7 @@ print("== end formatter：11:00–12:00 + 25 分钟任务 → 任务场次从 11
 wd_hour = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "12:00",
                   "type": "工作", "name": "一小时", "calendar": "工作",
                   "title": "一小时"}])
+wd_hour.clock_now = datetime.datetime.combine(TODAY, datetime.time(6, 0))
 check("先排一场 50", wd_hour.handle("period T1 50"), True)
 wd_hour.reload_entries()
 sync_api(wd_hour)
@@ -416,6 +417,7 @@ print("== 同一时段的多条 formatter：refresh 不能互相清掉绑定 =="
 wd_multi = fresh([{"id": "T1", "date": ISO, "start": "11:00", "end": "13:00",
                    "type": "工作", "name": "多任务", "calendar": "工作",
                    "title": "多任务"}])
+wd_multi.clock_now = datetime.datetime.combine(TODAY, datetime.time(6, 0))
 check("先排 50+50", wd_multi.handle("period T1 50 50"), True)
 wd_multi.reload_entries()
 sync_api(wd_multi)
@@ -447,14 +449,16 @@ check("refresh 没产生清绑定/剪断消息",
        if "清掉任务" in m[2] or "剪断成" in m[2]], [])
 
 
-print("== enlist formatter：优先孤立且正好同长的 session，不动大时间块 ==")
+print("== enlist 走同一条流水线：在当天最早的时段尾巴上切一场 ==")
 wd_en = fresh([
-    {"id": "T1", "date": ISO, "start": "09:00", "end": "09:25",
-     "type": "工作", "name": "孤立", "calendar": "工作", "title": "孤立"},
-    {"id": "T2", "date": ISO, "start": "11:00", "end": "13:00",
-     "type": "工作", "name": "大块", "calendar": "工作", "title": "大块"},
+    {"id": "T1", "date": ISO, "start": "11:00", "end": "13:00",
+     "type": "工作", "name": "早一点", "calendar": "工作", "title": "早一点"},
+    {"id": "T2", "date": ISO, "start": "15:00", "end": "16:30",
+     "type": "工作", "name": "晚一点", "calendar": "工作", "title": "晚一点"},
 ])
-check("大块先排 50+50", wd_en.handle("period T2 50 50"), True)
+wd_en.clock_now = datetime.datetime.combine(TODAY, datetime.time(6, 0))
+check("两个时段各切一场",
+      (wd_en.handle("period T1 50"), wd_en.handle("period T2 25")), (True, True))
 wd_en.reload_entries()
 sync_api(wd_en)
 check("enlist 任务创建受理",
@@ -462,44 +466,70 @@ check("enlist 任务创建受理",
 _en_task = [t for t in wd_en.task_store.list()
             if (t.get("fields") or {}).get("title") == "收拾"][0]
 _en_res = (_en_task.get("formatter") or {}).get("reservation") or {}
-check("选中孤立且正好 25 分钟的 09:00 场",
+check("挑最早的时段尾巴：T1 11:50 之后 12:00 切一场",
       [_en_res.get("start"), _en_res.get("end"),
-       _en_res.get("session_duration"), _en_res.get("exact_fit"),
-       _en_res.get("isolated")],
-      ["09:00", "09:30", 25, True, True])
-check("enlist 挂的是整场已有 session",
-      [_en_task["session"]["start"], _en_task["session"]["duration"]], ["09:00", 25])
-check("enlist 不改任何 layout",
-      sp.get_layout(sp.load_layouts(), TODAY, "T2"), [50, 50])
+       _en_res.get("session_duration"), _en_res.get("period_id")],
+      ["12:00", "12:30", 25, "T1"])
+check("任务挂在自己切出来的那一场（不是塞进 50 分钟场）",
+      [_en_task["session"]["start"], _en_task["session"]["duration"]],
+      ["12:00", 25])
+check("T1 尾巴追加成 [50,25]，前面那场一分钟没动",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [50, 25])
+check("T2 完全没被碰", sp.get_layout(sp.load_layouts(), TODAY, "T2"), [25])
+check("结果是 carved + cut_period_id（和 end 同形）",
+      [(_en_task["formatter"]["result"]["session"]).get("carved"),
+       (_en_task["formatter"]["result"]["session"]).get("cut_period_id")],
+      [True, "T1"])
 wd_en.bridge.calls = []
 check("enlist 后 refresh 受理", wd_en.handle("refresh"), True)
 _en_after = wd_en.task_store.get(_en_task["id"])
 check("refresh 幂等：reservation 不动",
       ((_en_after.get("formatter") or {}).get("reservation") or {}).get("start"),
-      "09:00")
+      "12:00")
 check("refresh 幂等：没有重挂/取消",
       [c[0] for c in wd_en.bridge.calls if c[0] in ("add_task", "cancel")], [])
 
-print("== enlist formatter：只剩大块时只从块的开头/结尾塞，保整块连贯 ==")
+print("== enlist 排满时明确报错，绝不把任务挤进已有 session ==")
 wd_en2 = fresh([
-    {"id": "T1", "date": ISO, "start": "11:00", "end": "13:00",
-     "type": "工作", "name": "大块", "calendar": "工作", "title": "大块"},
+    {"id": "T1", "date": ISO, "start": "09:00", "end": "09:25",
+     "type": "工作", "name": "刚好一场", "calendar": "工作", "title": "刚好一场"},
+    {"id": "T2", "date": ISO, "start": "11:00", "end": "13:00",
+     "type": "工作", "name": "排满", "calendar": "工作", "title": "排满"},
 ])
-check("大块先排 50+50", wd_en2.handle("period T1 50 50"), True)
+check("大块先排 50+50", wd_en2.handle("period T2 50 50"), True)
 wd_en2.reload_entries()
 sync_api(wd_en2)
-check("enlist 任务创建受理",
-      wd_en2.handle("task create title=大块里的活 duration=25 -f enlist"), True)
+wd_en2.clock_now = datetime.datetime.combine(TODAY, datetime.time(6, 0))
+wd_en2.messages = []
+wd_en2.handle("task create title=没地方放 duration=25 -f enlist")
 _en2 = [t for t in wd_en2.task_store.list()
-        if (t.get("fields") or {}).get("title") == "大块里的活"][0]
-_res2 = (_en2.get("formatter") or {}).get("reservation") or {}
-check("只在整块开头放，不切中间场",
-      [_res2.get("start"), _res2.get("placement"), _res2.get("isolated")],
-      ["11:00", "start", False])
-check("挂的是整场 50 分钟 session，不是凭空切一场",
-      [_en2["session"]["start"], _en2["session"]["duration"]], ["11:00", 50])
-check("layout 仍是 50+50",
-      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [50, 50])
+        if (t.get("fields") or {}).get("title") == "没地方放"][0]
+check("没有把任务塞进任何已有场次", _en2.get("session"), None)
+check("明确报「放不下」", [1 for m in wd_en2.messages if "放得下" in m[2]], [1])
+check("两个时段的 layout 都没被改",
+      (sp.get_layout(sp.load_layouts(), TODAY, "T1"),
+       sp.get_layout(sp.load_layouts(), TODAY, "T2")), (None, [50, 50]))
+
+print("== enlist 不往已经过去的时段里排（今天） ==")
+wd_en3 = fresh([
+    {"id": "T1", "date": ISO, "start": "09:00", "end": "10:00",
+     "type": "工作", "name": "早上", "calendar": "工作", "title": "早上"},
+    {"id": "T2", "date": ISO, "start": "20:00", "end": "21:00",
+     "type": "工作", "name": "晚上", "calendar": "工作", "title": "晚上"},
+])
+check("两段都只切一半", (wd_en3.handle("period T1 25"),
+                        wd_en3.handle("period T2 25")), (True, True))
+wd_en3.reload_entries()
+sync_api(wd_en3)
+wd_en3.clock_now = datetime.datetime.combine(TODAY, datetime.time(19, 0))
+check("19:00 时 enlist 受理",
+      wd_en3.handle("task create title=晚上收拾 duration=25 -f enlist"), True)
+_en3 = [t for t in wd_en3.task_store.list()
+        if (t.get("fields") or {}).get("title") == "晚上收拾"][0]
+check("跳过已经过去的 09:00 那一段，落在 20:30",
+      [_en3["session"]["start"], _en3["session"]["duration"]], ["20:30", 25])
+check("早上那段的 layout 没动",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [25])
 
 print("== enlist 优先级：其它 formatter 先跑，enlist 最后、项目 plan 之前 ==")
 wd_pri = fresh([
@@ -802,6 +832,77 @@ _p_slots2, _p_notes2 = wd_p._plan_slots(TOMORROW)
 check("自动 layout 仍然整段参与排期（不是只捡那两场）",
       [(s["start"], s["duration"], s["counts"]) for s in _p_slots2],
       [("19:00", 125, 5)])
+
+
+print("== 已判死的自动场次要被剪掉（否则画幽灵行、继续占容量） ==")
+wd_dead = fresh([
+    {"id": "T1", "date": ISO, "start": "19:00", "end": "21:30",
+     "type": "工作", "name": "晚上", "calendar": "工作", "title": "晚上"},
+])
+sp.set_layout(TODAY, "T1", [75, 25, 25], source="plan")
+wd_dead.rewrite_data_csv_from_plan()
+wd_dead.reload_periods()
+wd_dead.reload_entries()
+_stray = wd_dead.task_store.create({"title": "挂在死场次上", "duration": 25})
+wd_dead.task_store.assign(_stray["id"], {
+    "date": ISO, "start": "21:00", "end": "21:25", "duration": 25})
+ks.save_state({"date": ISO, "slots": {
+    "%sT19:00" % ISO: {"status": "booked", "duration": "75"},
+    "%sT20:30" % ISO: {"status": "booked", "duration": "25"},
+    "%sT21:00" % ISO: {"status": "abandoned", "duration": "25"},
+}})
+wd_dead.api_rows = [
+    {"startLabel": "19:15", "startMs": 0, "durationMin": 75, "id": "s19"},
+    {"startLabel": "20:45", "startMs": 0, "durationMin": 25, "id": "s20"},
+]
+check("剪掉 1 段", wd_dead._prune_dead_auto_slots(TODAY, quiet=True), 1)
+check("layout 从 [75,25,25] 剪成 [75,25]",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [75, 25])
+check("data.csv 里不再有 21:00",
+      [slot["start"] for slot in sch.day_slots(wd_dead.entries, TODAY)],
+      ["19:00", "20:30"])
+check("挂在死场次上的任务被下架（不会继续假装挂着）",
+      (wd_dead.task_store.get(_stray["id"]) or {}).get("session"), None)
+# 手动 / formatter 的切分是硬约束：同样是死场次，也不能替用户剪。
+sp.set_layout(TODAY, "T1", [75, 25, 25], source="manual")
+wd_dead.rewrite_data_csv_from_plan()
+wd_dead.reload_periods()
+wd_dead.reload_entries()
+check("手动 layout 不剪", wd_dead._prune_dead_auto_slots(TODAY, quiet=True), 0)
+check("手动 layout 原样", sp.get_layout(sp.load_layouts(), TODAY, "T1"), [75, 25, 25])
+
+print("== 认账过的真实场次不再单独画一行「计划外」（看起来像两场重叠） ==")
+wd_dup = fresh([
+    {"id": "T1", "date": ISO, "start": "19:00", "end": "21:30",
+     "type": "工作", "name": "晚上", "calendar": "工作", "title": "晚上"},
+])
+wd_dup.clock_now = datetime.datetime.combine(TODAY, datetime.time(6, 0))
+sp.set_layout(TODAY, "T1", [75, 25], source="manual")
+wd_dup.rewrite_data_csv_from_plan()
+wd_dup.reload_periods()
+wd_dup.reload_entries()
+ks.save_state({"date": ISO, "slots": {
+    "%sT19:00" % ISO: {"status": "booked", "duration": "75", "match": "shifted",
+                       "actual": "实际 19:15 75min（计划 19:00）"},
+    "%sT20:30" % ISO: {"status": "booked", "duration": "25", "match": "shifted",
+                       "actual": "实际 20:45 25min（计划 20:30）"},
+}})
+wd_dup.api_rows = [
+    {"startLabel": "19:15", "startMs": 0, "endMs": 0, "durationMin": 75,
+     "id": "s19", "title": "", "quiet": None, "phase": "已结束"},
+    {"startLabel": "20:45", "startMs": 0, "endMs": 0, "durationMin": 25,
+     "id": "s20", "title": "", "quiet": None, "phase": "已结束"},
+]
+wd_dup._snapshot_cache.clear()
+wd_dup.rebuild_rows()
+_dup_rows = [r for r in wd_dup.rows if not r.get("period_only")]
+check("只画两行 session（19:00 / 20:30），不再额外画 19:15 / 20:45",
+      [r.get("startLabel") for r in _dup_rows], ["19:00", "20:30"])
+check("计划行仍然标成「认账」并带上实际时间",
+      [(r.get("adopted"), r.get("actual_note")) for r in _dup_rows],
+      [(True, "实际 19:15 75min（计划 19:00）"),
+       (True, "实际 20:45 25min（计划 20:30）")])
+
 
 
 if fails:

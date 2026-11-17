@@ -1428,7 +1428,7 @@ class SessionMixin(object):
         ``mode``：
           * ``set``    —— 写 ``durations``（``source`` 默认 manual）；
           * ``clear``  —— 写空排布，保留 period 本身（``period T1 clear``）；
-          * ``remove`` —— 删掉自定义排布，回落到默认。
+          * ``remove`` —— 删掉自定义排布，回到「这一段还没切」的状态（0 场）。
 
         ``book=True`` 时才在末尾统一预约（refresh 的自动重排传 False）。
         ``write_csv=False`` 给「一次改好几个时段」的调用方用：由它最后统一重算
@@ -1441,11 +1441,12 @@ class SessionMixin(object):
         if mode == "clear":
             effective = []
         elif mode == "remove":
-            effective = sp.default_durations(period)
+            # 删掉自定义排布 = 回到「这一段还没切」的状态（0 场），
+            # 不是回到默认 50/25 那几场 —— 场次只能由任务/用户决定。
+            effective = []
         else:
             # 注意 ``[]`` 是「这个时段当天不排了」，不能当成「没给」回落默认排布。
-            effective = (list(durations) if durations is not None
-                         else sp.default_durations(period))
+            effective = (list(durations) if durations is not None else [])
         # 纯计算先验证；这里抛 ValueError = 零副作用。
         new_sessions = sp.plan_period(period, effective)
 
@@ -1499,7 +1500,7 @@ class SessionMixin(object):
                     # 终态，本来就没有 = 已经达成，不该抛。
                     raise ValueError("%s 没有自定义排布（本来就是默认）" % period_id)
                 if announce:
-                    self.say("已撤销 %s 的自定义排布，恢复默认 50/25。" % period_id, "ok")
+                    self.say("已撤销 %s 的自定义排布 —— 这一段回到「未切 session」，容量照样算；下次 plan 会按任务重新切。" % period_id, "ok")
             else:
                 kwargs = {"source": source} if source else {}
                 sp.set_layout(day, period_id, effective, **kwargs)

@@ -283,7 +283,7 @@ check("坏 RRULE 在写库前就被拒", bad_rule_ok, True)
 
 print("== warden：task create --repeat + 表格里自动挂上 ==")
 reset_tasks()
-write_csv(["# test", "%s,22:15,50" % WD])
+sp.set_layout(TODAY, "T1", [50], source="manual")   # 场次由 layout 决定（手写 csv 不再算数）
 refresh_plan(mkwarden())
 wd = mkwarden()
 check("建带 repeat 的任务", wd.handle("task create title=明日时间安排 --repeat %s@22:15" % WD), True)
@@ -314,6 +314,18 @@ check("本体自己不挂 session（契约表看不到它）", parent.get("sessi
 check("契约表格显示的是子任务（状态记号 + 🔁 + 编号 + 标题）",
       wd.rows[0]["task_text"], "·🔁%d: 明日时间安排" % wd.task_no(child))
 check("行上标了这是重复任务", wd.rows[0]["task_repeat"], True)
+# 用户要求（2026-11-16）：「重复任务应该像是 list 任务那样，显示 1/2-∞」。
+# 清单容器的上限是个范围（`0/3-6`），重复任务每做一次就再来一次，上限是无穷。
+_cap_parent = wd.task_store.create({"title": "每周闪卡", "count": 2, "duration": 50})
+_cap_parent = wd.task_store.set_repeat(_cap_parent["id"], 0, "15:00", 50)
+_cap_child = dict(_cap_parent)
+_cap_child["repeat_parent"] = _cap_parent["id"]
+check("重复任务的上限显示成 <count>-∞", wd.repeat_count_span(_cap_child), "2-∞")
+check("任务格子带 ∞ 上限", "/2-∞)" in wd.task_count_label(_cap_child), True)
+check("没有 count 的重复任务不显示 ∞ 上限",
+      wd.repeat_count_span(child), None)
+check("普通任务没有 ∞ 上限",
+      wd.repeat_count_span(wd.task_store.create({"title": "普通任务"})), None)
 check("契约表 row 里只有子任务（本体被过滤）",
       [t["id"] for t in wd.rows[0]["tasks"]], [child["id"]])
 check("来源记号：重复子任务 = 🔁", ts.TaskStore.origin_marks(child), "🔁")
@@ -342,7 +354,7 @@ check_true("挂到了当天某个 session（不是消失）",
 
 print("== task sync：把重复任务挂到 session 上（Focusmate 复核成功才写本地）==")
 reset_tasks()
-write_csv(["# test", "%s,22:15,50" % WD])
+sp.set_layout(TODAY, "T1", [50], source="manual")   # 场次由 layout 决定（手写 csv 不再算数）
 refresh_plan(mkwarden())
 wd = mkwarden(offline=False)
 wd.handle("task create title=明日时间安排 --repeat %s@22:15" % WD)
@@ -385,7 +397,7 @@ check("归档里的完成时间来自 completedAt",
 # ---------------------------------------------------------------- 警告
 
 print("== 警告：今天没有重复任务 → 状态框里说怎么设 ==")
-write_csv(["# test", "%s,22:15,50" % WD])
+sp.set_layout(TODAY, "T1", [50], source="manual")   # 场次由 layout 决定（手写 csv 不再算数）
 refresh_plan(mkwarden())
 reset_tasks()                           # 从「没有任何重复任务」重新开始
 wd = mkwarden()
@@ -412,7 +424,9 @@ sp.save_download({"version": 1, "generated_at": "x", "start_date": ISO, "days": 
                        "end": "23:15", "type": "空闲", "name": "晚间", "calendar": "空闲",
                        "title": "晚间"},
                   ]})
-write_csv(["# test", "%s,22:15,50" % WD, "%s,22:15,50" % WD2])
+# 场次是切出来的结果：手写 data.csv 不再算数，用 layout 表达「22:15 有一场 50」。
+sp.set_layout(TODAY, "T1", [50], source="manual")
+sp.set_layout(TOMORROW, "T2", [50], source="manual")
 refresh_plan(mkwarden())
 reset_tasks()
 wd = mkwarden()

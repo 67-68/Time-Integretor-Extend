@@ -203,9 +203,19 @@ plan [天数]         一次分配：每个 pro 只取当前阶段的 SOP/incuba
 
 - **排期流水线**会先按当前可用场次重跑所有 active formatter（优先级：
   `end` → 其它 formatter → `enlist`），再校验今天已有的项目 plan。
-  `enlist` 只挂已有 session、不切 layout；它必须排在其它 formatter 之后，
-  才能使用前者切完/占完后剩下的资源。formatter 是第一阶段，占好的时间段
-  后面项目阶段绝不能改。
+  `end` / `enlist` 走同一条流水线（先切时段尾巴上的时间块、再建 session），
+  只差挑块顺序（`end` 从晚往早、`enlist` 从早到晚）；`enlist` 必须排在其它
+  formatter 之后，才能使用前者切完/占完后剩下的资源。formatter 是第一阶段，
+  占好的时间段后面项目阶段绝不能改。
+- **剪掉 daemon 已经判死的自动场次**（2026-11-16）：`_prune_dead_auto_slots`
+  在 formatter 之前跑 —— `source` 是 `auto`/`plan` 的 layout 里，凡是 state 记成
+  `abandoned` / `missed`（或者 verdicts 里判过）且 API 里没有对应场次的 session，
+  从第一个死场次起把后面的时长全部砍掉（layout 是接龙，中间挖洞会让后面每场
+  都挪位）；后面还有已订场次时整段跳过。手动 / formatter 的 layout 是硬约束，
+  不剪。事故：2026-11-16 的 21:00 一直订不上被判死，data.csv 里那句还留着，
+  表格画一行幽灵场次，看起来和真实的 20:45 场次重叠。
+- 表格里**认账过的真实场次不再单独画一行**：daemon 的 note（`实际 20:45 25min
+  （计划 20:30）`）说明这场已经被计划行认领，再画一行「计划外」就像两场重叠。
 - 项目 plan 的校验分两档（2026-11-16 修）：**硬理由**（场次已不在排布里 /
   任务收工了 / 绑定不一致 / daemon 认定这一场「订过又没了」= `missed` 或
   `abandoned`）才整条清空并提示重新 `plan`；**只是还没订上**（登录态过期、

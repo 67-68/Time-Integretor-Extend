@@ -872,6 +872,35 @@ class BoardMixin(object):
             return max(0, ts.task_count_invested(task) - (own_credit or 0))
         return baseline
 
+    def repeat_count_span(self, task):
+        """重复任务在界面上该显示的 count 上限：``2-∞``（不是重复任务就 ``None``）。
+
+        用户要求（2026-11-16）：「重复任务应该像是 list 任务那样，显示 1/2-∞」。
+        清单容器显示的是 ``0/3-6``（还剩几条 → 上限是个范围）；重复任务每完成
+        一次就再来一次，上限永远是无穷，所以右边写成 ``<每次 count>-∞``。
+        """
+        parent = None
+        if task.get("repeat_parent"):
+            try:
+                parent = self.task_store.get(task["repeat_parent"])
+            except (KeyError, ValueError, TypeError):
+                parent = None
+        elif ts.TaskStore.is_repeat_template(task):
+            parent = task
+        if not parent:
+            return None
+        cap = ts.task_count(parent) or ts.task_count(task)
+        if not cap or cap <= 0:
+            return None
+        return "%d-∞" % int(cap)
+
+    def count_cap_text(self, task):
+        """count 上限的**展示形态**：清单容器 ``3-6`` / 重复任务 ``2-∞`` / 普通任务 None。"""
+        span = self.derived_count_span(task)
+        if span:
+            return span
+        return self.repeat_count_span(task)
+
     def task_session_count_label(self, task, delta):
         """session 表格里那截 count：``(这一场开始前 + 这一场 / 总 count)``。"""
         cap, _aggregate = self.task_count_scope(task)
@@ -880,7 +909,7 @@ class BoardMixin(object):
         if assigned is not None:
             delta = assigned
         text = ts.count_text(task, delta, cap=cap, invested=invested,
-                             cap_text=self.derived_count_span(task))
+                             cap_text=self.count_cap_text(task))
         return (text + " ") if text else ""
 
     def task_count_label(self, task, delta=None):
@@ -889,7 +918,7 @@ class BoardMixin(object):
             delta = self.task_count_delta(task)
         cap, invested = self.task_count_scope(task)
         text = ts.count_text(task, delta, cap=cap, invested=invested,
-                             cap_text=self.derived_count_span(task))
+                             cap_text=self.count_cap_text(task))
         return (text + " ") if text else ""
 
     def frame_width(self):
@@ -1600,8 +1629,24 @@ class BoardMixin(object):
             row["date"] = day.isoformat()
             rows.append(row)
 
+        # 「认账」过的真实场次已经在计划那一行里说明了（计划 20:30 → 实际 20:45），
+        # 就别再单独画一行「计划外」：用户会以为那是两场重叠的 session。
+        # 证据是 daemon 写下的 note（`实际 20:45 25min（计划 20:30）` / 覆盖式
+        # 的 `实际 16:00(25) + 16:30(50)`），正则只取里面的时刻。
+        adopted_labels = set()
+        prefix_key = day.isoformat() + "T"
+        for key, rec in (self.daemon_slots() or {}).items():
+            if not str(key).startswith(prefix_key):
+                continue
+            note = str((rec or {}).get("actual") or "")
+            if not note:
+                continue
+            for got in re.findall(r"(\d{2}:\d{2})", note):
+                adopted_labels.add(got)
         for r in self.api_rows:
             if r["startLabel"] in plan_labels:
+                continue
+            if r["startLabel"] in adopted_labels:
                 continue
             row = dict(r)
             start = datetime.datetime.fromtimestamp(r["startMs"] / 1000.0)

@@ -29,19 +29,24 @@ trigger
 
 formatter
 ---------
-- ``end``：取**当天最后一个还有空位的时段**，在它的尾巴上**切一场任务大小的
-  session**（时长取 Focusmate 真能订的 25/50/75，起点落 15 分钟整点），把
-  「时长 + 5 分钟休息」标成 reserved，后续 formatter 不会再用它。
-- ``enlist``：**不改 layout、不新造/取消 session**，只把任务挂进已有空 session。
-  优先孤立且时长正好适配的块；只有大块时，从整块第一场的开头或最后一场的
-  结尾塞入，保持剩余时间连贯。它排在所有其它 formatter 之后、项目 plan 之前。
+所有 formatter 走**同一条流水线**：先在时段尾巴上找到能放下的时间块，再切一场
+任务大小的 session（时长取 Focusmate 真能订的 25/50/75，起点落 15 分钟整点），
+把「时长 + 5 分钟休息」标成 reserved，最后由 warden 改写 layout 并把任务挂到
+这一场。formatter 之间**只差挑哪一块**：
 
-这一层**只管算、不写盘**：``end`` 把「那个时段的前半截该长什么样」
+- ``end``：当天**最后一个**还有空位的时段；
+- ``enlist``：当天**最早**还有空位的时段（早到早得），排在所有其它 formatter
+  之后、项目 plan 之前。
+
+没有任何 formatter 允许「把任务塞进别人已经切好的 session」：那会造出「25 分钟
+任务挂在 75 分钟场里」这种一处时间两种身份的状态，表格 / 对账 / 排期都得为它写
+特判。
+
+这一层**只管算、不写盘**：formatter 把「那个时段的前半截该长什么样」
 （``cut_prefix``）和「切出来的这一场」（``session``）一起交出去，由 warden 去
-剪断排布（``_cut_period_for_carve``：取消旧的 50 分钟场 + 改写 layout + 重算
-data.csv）。排布表达不了的边角（中间隔了 5/20 分钟那种）才额外补一场一次性
-session（``warden._ensure_carved_session``）。``enlist`` 只交出一个已有 session
-和其中的 reservation。
+剪断排布（``_cut_period_for_carve``：改写 layout + 重算 data.csv）。排布表达
+不了的边角（中间隔了 5/20 分钟那种）才额外补一场一次性 session
+（``warden._ensure_carved_session``）。
 
 独占（``exclusive``）也在这里落地：:func:`collect_reservations` 会把独占任务的
 占用扩展成**整场** session，所以「一场 session 只能有一条任务」不是靠各处的
@@ -70,10 +75,6 @@ DEFAULT_BREAK_MINUTES = 5
 #: 之后（1000），但整个 formatter 阶段仍然早于项目 ``plan``。以后加新 formatter
 #: 如果不写优先级，默认 100，会自然排在 enlist 前面。
 FORMATTER_PRIORITY = {"enlist": 1000}
-
-#: 两场 session 的间隔不超过这么多分钟，就算同一个「大时间块」。enlist 尽量不动
-#: 这种连续块；一定要用时，只从块的开头或结尾塞进去。
-SESSION_BLOCK_GAP = 15
 
 #: 任务时长的字段别名。第一个是推荐写法，其余是为了兼容手写数据。
 #: **口径只有一份**：``count ↔ duration``（1 count = 25 分钟）的换算是 task_store
@@ -512,6 +513,21 @@ def grid_floor(minutes, step=15):
     return total - (total % step)
 
 
+def _already_past(ctx, start_min):
+    """这一块是不是**已经过去了**（只在排「今天」时才是约束）。
+
+    formatter 是「往未来排」的工具：今天 21:00 的时候不该把任务切到 09:00 那场
+    —— 那一场订不了，也会把已经过去的时间重复算成容量。``ctx["now"]`` 由
+    warden 注入（测试可以钉死时钟），没有就当作「不知道现在几点」，不拦。
+    """
+    now = ctx.get("now")
+    if now is None:
+        return False
+    if str(ctx.get("date") or "") != now.date().isoformat():
+        return False
+    return int(start_min) < now.hour * 60 + now.minute
+
+
 @register_formatter(
     "end",
     params=("break_minutes", "date"),
@@ -654,6 +670,8 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
             window_end = int(sess_end) + int(break_got)
             carve_start = int(sess_start)
         carve_end = carve_start + int(fit) + int(break_got)     # 含休息的整段占用
+        if _already_past(ctx, carve_start):
+            continue                       # 今天已经过去的时段不是容量
         if not is_free({"start_min": carve_start, "end_min": carve_end}, reservations):
             continue
         candidates.append({
@@ -768,59 +786,29 @@ def _session_duration(session):
     return (got[1] - got[0]) if got is not None else None
 
 
-def _session_blocks(records):
-    """把当天的 session 切成「大时间块」。
-
-    ``records`` 是已算好 ``start_min/end_min`` 的 session 包装。相邻两场间隔
-    ``<= SESSION_BLOCK_GAP`` 就归为同一块；单场成块就是 ``isolated``。
-    """
-    blocks = []
-    for rec in sorted(records, key=lambda r: (r["start_min"], r["end_min"])):
-        if not blocks:
-            blocks.append([rec])
-            continue
-        last = blocks[-1][-1]
-        gap = rec["start_min"] - last["end_min"]
-        if gap <= SESSION_BLOCK_GAP:
-            blocks[-1].append(rec)
-        else:
-            blocks.append([rec])
-    for block in blocks:
-        for pos, rec in enumerate(block):
-            rec["block_size"] = len(block)
-            rec["isolated"] = len(block) == 1
-            if rec["isolated"]:
-                rec["edge"] = "isolated"
-            elif pos == 0:
-                rec["edge"] = "start"
-            elif pos == len(block) - 1:
-                rec["edge"] = "end"
-            else:
-                rec["edge"] = "middle"
-    return blocks
-
-
 @register_formatter(
     "enlist",
     params=("break_minutes", "date"),
-    help="把任务挂进**已经存在的** session：优先孤立且正好同长的块；"
-         "大块只从开头/结尾塞入，绝不切碎排布")
+    help="在当天**最早**还有空位的时段尾巴上切一场任务大小的 session（25/50/75）"
+         "并挂上去；和 end 只差挑块顺序：end 从晚往早，enlist 从早到晚")
 def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
     """``task <id> -f enlist`` 的算法。
 
-    和 ``end`` 的区别：``enlist`` **不新造 session、不改 layout、不取消任何场次**。
-    它只在现有 session 里找一个能容纳任务的位置，然后把任务挂上去：
+    **和 ``end`` 走同一条流水线**：先算「这个时段还有没有能放下的时间块」，
+    再在那个时间块上切一场任务大小的 session，最后由 warden 改写 layout 并把
+    任务挂到这一场。区别只有一处 —— 挑哪一块：
 
-    1. 先找**孤立**（前后 15 分钟内没有别的 session）且场次时长正好等于任务
-       Focusmate 档位（25/50/75）的块 —— 这是最干净、不会动到大块的选择；
-    2. 没有完全同长的孤立块，就找孤立的大场次，把任务放在它的开头；
-    3. 如果只剩「大时间块」，只允许从整块的第一场开头或最后一场结尾塞入，
-       中间场次尽量不碰，这样整块剩余的可用时间仍然连贯；
-    4. 实在没有别的选择时，才允许动中间场次（仍然放在该场的开头/结尾）。
+    * ``end``   ：当天**最后一个**还有空位的时段（越晚越好）；
+    * ``enlist``：当天**最早**还有空位的时段（早到早得）。
 
-    任务占用长度 = 任务分钟数 + ``break_minutes``；其它 formatter 已经占掉的
-    区间是硬约束。已有任务（包括项目 plan 出来的）的场次不碰，因此这一阶段
-    始终发生在项目 ``plan`` 之前，只能使用项目还没拿走的场次。
+    以前 ``enlist`` 是「往已经存在的 session 里塞」，那是主干之外的一条旁路：
+    它会产出「25 分钟任务挂在 75 分钟场里」这种一份时间两种身份的状态，
+    表格、对账、排期三处都得为它单独写特判。现在没有这条旁路了 —— 一个任务
+    的落点永远是**它自己切出来的那一场**。
+
+    切块的位置只认时段**尾巴**（:func:`session_plan.tail_gap`）：layout 只存
+    从时段起点接龙的 duration 列表，往中间插一场会把后面已经排/订的场次整体
+    挪位（= 取消 + 重订）。尾巴追加则前面每一场的起点一分不变。
     """
     task = ctx.get("task") or {}
     duration = task_duration(task)
@@ -836,8 +824,10 @@ def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
     break_got = int(break_got)
 
     sessions = [dict(s) for s in (ctx.get("sessions") or ()) if isinstance(s, dict)]
-    if not sessions:
-        raise HookError("formatter enlist：这一天没有任何已排的 session，没法挂。")
+    periods = [p for p in (ctx.get("periods") or ()) if isinstance(p, dict)]
+    day_label = date or ctx.get("date") or "这一天"
+    if not periods:
+        raise HookError("formatter enlist：%s 没有任何时段，没法切时间块。" % day_label)
 
     task_id = ctx.get("task_id", task.get("id"))
     reservations = []
@@ -846,146 +836,114 @@ def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
             continue                       # 自己上一次的 reservation 不算占用
         reservations.append(rec)
 
-    # 去重并按时间排序。两个来源（layout / extra）偶尔会给同一场，别重复当候选。
-    records = []
-    seen = set()
+    # 已有场次按「落在哪个时段」分组；拿不到 period_id 的（手写 csv）只当硬约束。
+    by_period = {}
+    all_ranges = []
     for session in sessions:
         got = _range_of(session)
-        dur = _session_duration(session)
-        if got is None or not dur or int(dur) <= 0:
+        if got is None:
             continue
-        key = (str(session.get("date") or ctx.get("date") or ""),
-               str(session.get("start") or ""), int(dur))
-        if key in seen:
-            continue
-        seen.add(key)
-        rec = dict(session)
-        rec.update({"start_min": int(got[0]), "end_min": int(got[1]),
-                    "duration": int(dur), "date": session.get("date") or ctx.get("date")})
-        records.append(rec)
-    if not records:
-        raise HookError("formatter enlist：这一天没有可解析的 session。")
-    _session_blocks(records)
-
-    # 已经有任务（项目、手工、另一个 formatter）的场次算「不孤立」，也不碰。
-    busy = set()
-    for other in ctx.get("tasks") or ():
-        if not isinstance(other, dict) or other.get("id") == task_id:
-            continue
-        try:
-            if not ts.TaskStore.is_open(other):
-                continue
-        except Exception:                  # noqa: BLE001 - 坏任务当占用
-            pass
-        sess = other.get("session") or {}
-        if sess.get("date") and sess.get("start"):
-            busy.add((str(sess.get("date")), str(sess.get("start"))))
+        pid = session.get("period_id")
+        if pid:
+            by_period.setdefault(str(pid), []).append(session)
+        all_ranges.append(got)
 
     fit = int(fit_session_duration(duration))
     span = fit + break_got
-    all_ranges = [(r["start_min"], r["end_min"]) for r in records]
     candidates = []
-    for rec in records:
-        if (str(rec.get("date") or ctx.get("date") or ""),
-                str(rec.get("start") or "")) in busy:
+    for period in periods:
+        pid = str(period.get("id") or "")
+        period_range = _range_of(period)
+        if not pid or period_range is None:
             continue
-        if int(rec["duration"]) < fit:
+        real = by_period.get(pid) or []
+        gap = sp.tail_gap(period, real)
+        if not gap:
+            continue                       # 序列对不上 / 没有尾巴：这一段不许追加
+        prefix = [int(d) for d in (gap.get("prefix") or [])]
+        try:
+            planned = sp.plan_period(period, prefix + [fit])
+        except ValueError:
+            continue                       # 尾巴放不下这一档
+        if len(planned) != len(prefix) + 1:
             continue
-
-        # 大块只在最外沿放。start = 第一场开头；end = 最后一场结尾；middle 是
-        # 不得已的兜底，评分排在最后。
-        if rec.get("edge") == "end":
-            placements = ("end",)
-        elif rec.get("edge") in ("start", "isolated"):
-            placements = ("start",)
-        else:
-            placements = ("start", "end")
-
-        for placement in placements:
-            if placement == "start":
-                block_start = int(rec["start_min"])
-                block_end = block_start + span
-            else:
-                block_start = int(rec["end_min"]) - fit
-                block_end = int(rec["end_min"]) + break_got
-            if block_start < int(rec["start_min"]):
-                continue
-            if block_start + fit > int(rec["end_min"]):
-                continue
-            block_range = {"start_min": block_start, "end_min": block_end}
-            if not is_free(block_range, reservations):
-                continue
-            # 休息尾巴也不能撞上下一场 session。
-            conflict = False
-            for other_range in all_ranges:
-                if other_range == (int(rec["start_min"]), int(rec["end_min"])):
-                    continue
-                if overlaps((block_start, block_end), other_range):
-                    conflict = True
-                    break
-            if conflict:
-                continue
-            exact = int(rec["duration"]) == fit
-            if rec.get("isolated"):
-                class_rank = 0 if exact else 1
-            elif rec.get("edge") in ("start", "end"):
-                class_rank = 2
-            else:
-                class_rank = 3
-            score = (class_rank, 0 if exact else 1,
-                     int(rec["duration"]) - fit, block_start,
-                     0 if placement == "start" else 1)
-            candidates.append((score, rec, placement, block_start, block_end, exact))
+        new = planned[-1]
+        start_min = int(new.get("start_min") or 0)
+        if _already_past(ctx, start_min):
+            continue                       # 今天已经过去的时段不是容量
+        reserve = (start_min, start_min + span)
+        if not is_free({"start_min": reserve[0], "end_min": reserve[1]},
+                       reservations):
+            continue                       # 别的 formatter 已经占了这一块
+        if any(overlaps(reserve, got) for got in all_ranges):
+            continue                       # 休息尾巴会压住别的场次
+        candidates.append({"period": period, "pid": pid, "prefix": prefix,
+                           "planned": planned, "session": dict(new),
+                           "start_min": start_min, "period_range": period_range})
 
     if not candidates:
         raise HookError(
-            "formatter enlist：%s 没有空着的 session 能容纳 %d 分钟任务 + %d 分钟休息。"
-            % ((date or ctx.get("date") or "这一天"), duration, break_got))
+            "formatter enlist：%s 没有任何时段还放得下 %d 分钟任务（需要一场 %d 分钟"
+            "的 session）。要么各时段的尾巴都排满了，要么现有场次和 layout 的接龙"
+            "对不上 —— 那种时段不能追加，否则会把已经排好的场次挪位。"
+            % (day_label, int(duration), fit))
 
-    candidates.sort(key=lambda row: row[0])
-    _score, source, placement, block_start, block_end, exact = candidates[0]
-    session_duration = int(source["duration"])
-    source_start = int(source["start_min"])
-    source_end = int(source["end_min"])
+    # 早到早得：切点越早越优先，同一切点按时段起点。
+    candidates.sort(key=lambda c: (c["start_min"], c["period_range"][0], c["pid"]))
+    pick = candidates[0]
+    period = pick["period"]
+    prefix = pick["prefix"]
+    start_min = pick["start_min"]
+    planned = pick["planned"]
+    session_end = start_min + fit
+    reserve_end = start_min + span
+    prior = planned[:-1]
+    source_start = prior[-1].get("start") if prior else period.get("start")
+
     reservation = {
-        "date": source.get("date") or ctx.get("date"),
-        "period_id": source.get("period_id"),
-        "start": fmt_minutes(block_start),
-        "end": fmt_minutes(block_end),
-        "start_min": block_start,
-        "end_min": block_end,
-        "session_start": fmt_minutes(source_start),
-        "session_end": fmt_minutes(source_end),
-        "session_duration": session_duration,
+        "date": period.get("date") or ctx.get("date"),
+        "period_id": pick["pid"],
+        "start": fmt_minutes(start_min),
+        "end": fmt_minutes(reserve_end),
+        "start_min": start_min,
+        "end_min": reserve_end,
+        "session_start": fmt_minutes(start_min),
+        "session_end": fmt_minutes(session_end),
+        "session_duration": fit,
         "duration": int(duration),
         "break_minutes": break_got,
         "task_id": task_id,
-        "exclusive": False,
-        "enlisted": True,
-        "placement": placement,
-        "isolated": bool(source.get("isolated")),
-        "exact_fit": bool(exact),
+        "exclusive": True,
+        "carved": True,
+        "existing_session": False,
+        "source_session": {
+            "start": source_start,
+            "end": period.get("end"),
+            "duration": int(prefix[-1]) if prefix else 0,
+            "period_id": pick["pid"],
+        },
         "created_at": _now(),
     }
-    chosen = {
-        "date": source.get("date") or ctx.get("date"),
-        "start": fmt_minutes(source_start),
-        "end": fmt_minutes(source_end),
-        "duration": session_duration,
-        "period_id": source.get("period_id"),
-        "period_start": source.get("period_start"),
-        "period_end": source.get("period_end"),
-        "enlisted": True,
-        "existing": True,
-        "source_start": source.get("start"),
-        "cut_period_id": None,
-        "cut_prefix": [],
+    session = {
+        "date": period.get("date") or ctx.get("date"),
+        "start": fmt_minutes(start_min),
+        "end": fmt_minutes(session_end),
+        "duration": fit,
+        "period_id": pick["pid"],
+        "period_start": period.get("start"),
+        "period_end": period.get("end"),
+        "carved": True,
+        "existing": False,
+        "source_start": source_start,
+        # 尾巴上追加：前缀原样保留，只在后面接上这一场 —— 已排好的场次一分钟不动。
+        "cut_period_id": pick["pid"],
+        "cut_prefix": prefix,
         "cut_prefix_exact": True,
     }
-    return {"name": "enlist", "reservation": reservation, "session": chosen,
-            "new_session": False, "cut_period_id": None, "cut_prefix": [],
-            "placement": placement, "exact_fit": bool(exact),
-            "isolated": bool(source.get("isolated")),
+    return {"name": "enlist", "reservation": reservation, "session": session,
+            "new_session": True, "cut_period_id": pick["pid"],
+            "cut_prefix": prefix,
+            "carved_from": fmt_minutes(int(pick["period_range"][0])),
             "conflicts": [], "created_at": _now()}
 
 

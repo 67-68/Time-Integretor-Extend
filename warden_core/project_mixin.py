@@ -2786,11 +2786,15 @@ class ProjectMixin(object):
                 if not is_planned:
                     stats["live_unplanned"].append(row.get("startLabel") or "?")
             if row.get("id"):
-                # **已经订上的场次不许重切**：它是 Focusmate 上真实存在的一场，
-                # 改切分等于「取消 + 重订」（用户报的「plan 完约都没约上」就是这么
-                # 来的 —— 19:00 的 75 分钟被拆成 19:00(25)+19:30(75)）。这一段
-                # 只允许往里塞任务，不再参与「整段重排」。
-                if pid_of_row:
+                # 用户 2026-11-17：「我希望我手动约的 session 和由于 plan 来的
+                # session 不同，后者可以被 plan 重新安排。」
+                # 所以「已订上」本身不再冻结这一段 —— 冻结只看 layout 的来源：
+                #   * manual（用户 `session`/`period` 切的、formatter 切的）
+                #     → 硬约束，只许往里塞任务；
+                #   * auto / plan（上一轮 plan 自己切的）→ 允许重切，重切时
+                #     commit_layout 负责取消旧场，末尾 book() 补订新场。
+                meta_auto = bool((period_meta.get(pid_of_row) or {}).get("auto"))
+                if pid_of_row and not meta_auto:
                     blocked_periods.add(pid_of_row)
             slot = pp.slot_record(index, start_dt.date().isoformat(),
                                   row.get("startLabel"), duration,
@@ -3121,13 +3125,14 @@ class ProjectMixin(object):
             self.rebuild_rows()
         except Exception:                          # noqa: BLE001 - 快照模式也能 plan
             pass
-        # **不再**把上一轮 plan 挂着的任务当成可重排资源（``_plan_replanning``）。
-        # 那等于「每次 plan 都把今天重排一遍」：已经排好的场次被摘掉、重切，
-        # 甚至把已经订上的 session 拆成两场（取消 + 重订，然后订不上）。
-        # 现在的口径是：plan 只往**接下来还没排的空场**里加东西，上一轮的安排
-        # 原样保留；要清空请显式 `plan clear`。
-        slots, notes = (self._plan_slots(day, include_current=True)
-                        if include_current else self._plan_slots(day))
+        # 用户 2026-11-17（第二次提）：「在 plan 开始之后，之前安排的任务仍然在
+        # 占地方，应该把他们视为没有」。所以普通 plan 一律按**整天重排**算资源：
+        # 上一轮 plan 唤起的本地任务不算占用（``replan=True``），它们的场次回到
+        # 可用容量里；complete 时 ``_plan_apply(append_to_plan=False)`` 会把旧计划
+        # 整体撤掉。用户自己的任务、formatter 的占位、手动 layout 仍然照常排除。
+        slots, notes = (self._plan_slots(day, include_current=True, replan=True)
+                        if include_current else
+                        self._plan_slots(day, replan=True))
         for note in notes:
             self.say("· %s" % note, "info")
         if not slots:
@@ -3469,8 +3474,8 @@ class ProjectMixin(object):
     def cmd_plan_clear(self, day=None):
         """``plan clear`` —— 撤掉这一天的计划（未开始的条目 + 绑定 + 分配）。
 
-        `plan` 现在是**追加**语义：只往空场里加，不动上一轮的安排。所以「我不想
-        要今天这些了」必须有显式出口，就是这条命令（以前是每次 plan 自动清）。
+        `plan` 本身现在是**整天重排**语义（上一轮 plan 的任务不算占用）；这条
+        命令用来「我不想再排了、把这些计划清掉」—— 清完不会自动补排。
         """
         day = day or self.sel_date
         res = self._reset_day_plans(day, announce=False) or {}
@@ -3489,9 +3494,11 @@ class ProjectMixin(object):
         """`plan` 要碰外面世界的那个口子（其余全在 project_plan.Allocator 里）。"""
         return {
             "say": lambda text, kind="info": self.say(text, kind),
-            # 追加语义：`plan` 只往空场里加，不清上一轮（`plan clear` 才清）。
+            # 重排语义：`plan` 算资源时已经把上一轮 plan 的任务当成没占用
+            # （见 cmd_plan 的 replan=True），所以 complete 必须整体替换旧计划，
+            # 否则同一条任务会被排两次、旧的场次也腾不出来。
             "apply": lambda allocator, allocs: self._plan_apply(
-                allocator, allocs, append_to_plan=True),
+                allocator, allocs, append_to_plan=False),
         }
 
     def _auto_plan_signature(self, day):

@@ -95,6 +95,8 @@ data = {"version": 1, "generated_at": "x", "start_date": ISO, "days": 8,
              "type": "工作", "name": "托福 准备", "calendar": "工作", "title": "托福 准备"},
         ]}
 sp.save_download(data)
+# 场次是切出来的结果：T2（15:00–16:00）先切一场 50 分钟，--assign 才有东西可挂。
+sp.set_layout(TODAY, "T2", [50], source="manual")
 
 
 class FakeBridge(object):
@@ -537,6 +539,7 @@ check("没建出这条任务",
       [t for t in wd.task_store.list() if (t.get("fields") or {}).get("title") == "空备注"], [])
 
 print("== --note 和 --assign 能一起用 ==")
+
 row1500b = [r for r in wd.rows if r["startLabel"] == "15:00"][0]
 wd.bridge.calls = []
 wd.handle("task create title=组合 --note 材料在这 https://example.com/combo --assign %d"
@@ -962,6 +965,8 @@ check("3 条都挂到了 #1 那一场（不是只有最后一条）",
 # -f end 也是整批：每条各自找一段，不会两条挤在同一场
 for t in list(wd.task_store.list()):
     wd.handle("task delete %d" % t["id"])
+# formatter 不再往「今天已经过去的时间块」里排，把时钟钉在早上
+wd.clock_now = datetime.datetime.combine(datetime.date.today(), datetime.time(6, 0))
 wd.messages = []
 check("task import -f end（3 条一起）受理", wd.handle("task import -f end"), True)
 made = [t for t in wd.task_store.list() if ts.TaskStore.omnifocus_id(t)]
@@ -971,6 +976,7 @@ check("3 条都跑过 formatter end",
       [(t.get("formatter") or {}).get("name") for t in made], ["end"] * 3)
 check("3 条各占一段（前一条的 reservation 挡住了后一条）",
       len({(r.get("date"), r.get("start")) for r in _res}), 3)
+wd.clock_now = None
 
 # 同一批再来一次：全都导入过 → 全部跳过，一条都不新建
 _before = len(wd.task_store.list())
@@ -1849,6 +1855,7 @@ finally:
 
 print("== task -t / -f end：trigger 框架 + formatter 把任务排到当天最后一段 ==")
 wdh = fresh_warden()
+wdh.clock_now = datetime.datetime.combine(datetime.date.today(), datetime.time(6, 0))
 # 加一个真正排在当天最后的时段 T4（17:00–18:00，25+25），用来验「end 取最后」。
 _data = sp.load_download()
 _data["periods"] = [p for p in (_data.get("periods") or []) if p.get("id") != "T4"]
@@ -2050,6 +2057,8 @@ _data["periods"].append({"id": "T8", "date": _TMR, "start": "11:00", "end": "12:
                          "type": "工作", "name": "剪断", "calendar": "工作",
                          "title": "剪断"})
 sp.save_download(_data)
+# 场次是切出来的结果：明天 T8 先明确切一场 50 分钟（默认铺场次已经取消了）。
+sp.set_layout(_TOMORROW, "T8", [50], source="manual")
 wd_cut = fresh_warden()
 wd_cut.reload_periods()
 check("明天 T8（11:00–12:00）先按默认排成一场 50 分钟",

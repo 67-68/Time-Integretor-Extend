@@ -440,7 +440,16 @@ def tail_gap(period, sessions):
 
 
 def default_durations(period):
-    """没自定义时的默认排布：优先 50，塞不下退 25，和旧 carve() 同一口味。
+    """「整段能装几场 50/25」的**口径函数**，不是渲染时的兜底排布。
+
+    只有两个合法用途：
+      * 用户显式要一份「和容量等长的排布」（测试、`period ... 默认` 之类的
+        举例）；
+      * 诊断/对比「这一段容量有多大」。
+
+    **禁止**在 ``sessions_for_period`` / 渲染 / 开单路径上拿它兜底：那会让
+    没排过的时段凭空长出场次，daemon 会照单全订（见 sessions_for_period 的
+    docstring）。场次只能由任务/formatter/用户显式切出来。
 
     和 :func:`plan_period` 一样按**占用**推进（含每场强制的休息），否则 14:00 的
     50 分钟 + 25 分钟会排出 14:00 和 14:50 两场，而 Focusmate 只允许 14:00 与
@@ -604,9 +613,20 @@ def _plan_period_legacy(period, durations):
 
 
 def sessions_for_period(period, layouts):
+    """时段里**已经切出来的**场次；没有 layout 就是 0 场（不是默认 50/25）。
+
+    这是「任务决定 session」的地基：period 只提供容量，场次是上一轮
+    切分/任务的**结果**。以前这里查不到 layout 就回落 :func:`default_durations`，
+    于是每个没排过的时段都凭空长出 50/50/50/25 四场，daemon 照单全订，
+    下一轮 plan 只能把这些「已订上的假场次」当硬约束往里塞任务 —— 用户报的
+    「plan 之后的任务又直接塞进每个 session」就是这么来的。
+
+    没有 layout 的时段在表格里由 ``_period_shell_rows`` 画一行占位
+    （整段 Nmin / N count / 未切 session），容量仍然算数。
+    """
     ds = get_layout(layouts, period.get("date"), period.get("id"))
     if ds is None:
-        ds = default_durations(period)
+        return []
     try:
         return plan_period(period, ds)
     except ValueError:
