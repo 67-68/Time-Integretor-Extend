@@ -42,6 +42,10 @@ class TaskCmdMixin(object):
           ``--trigger <预设> [参数...]``（``-t`` 同义）= 挂创建触发（框架；默认空）
           ``--formatter <预设> [参数...]``（``-f`` 同义）= 挂排期算法并当场执行
           ``--assign-count <N>``（``-act`` 同义）= 覆盖**这一场**要记的 count
+          ``--project [sop|incubator] <项目序号>``（``-p`` 同义）= 改归属：把这条
+              任务移到那个 pro 的 op 里（**写回 OmniFocus，放目标项目第一行**）；
+              ``-ps <序号>`` ≡ ``--project sop``、``-pi <序号>`` ≡
+              ``--project incubator``（显式走那一侧的 op，可越过阶段门控）
 
         ``-act`` 只能作用于已经挂到 session 上的任务；它可以和 ``-ac`` / ``-a``
         组合，先挂载再改本场 count：
@@ -72,6 +76,9 @@ class TaskCmdMixin(object):
             task 3 -f end              ← 按 duration 排到当天最后一段并自动 assign
             task 3 -f repeat 10:45     ← 固定挂到起点 10:45 的已有 session
             task 3 -e true             ← 这条独占一整场（同一场不能再放第二条任务）
+            task 3 -p 2                ← 把 #3 移到项目 #2 当前阶段的 op（写回 OmniFocus）
+            task 3 -ps 2               ← 同上，但显式走该 pro 的 SOP op
+            task 3 -pi 2               ← 同上，但显式走该 pro 的 incubator op
             task create title=写论文 duration=25 -e true -f end
             task create title=闪卡 duration=25 -f end
             task 32 swap 21             ← 两条任务互换位置
@@ -101,6 +108,7 @@ class TaskCmdMixin(object):
         trigger_tokens, kept = self._split_hook(kept, "trigger")
         formatter_tokens, kept = self._split_hook(kept, "formatter")
         derived_spec, kept = self._split_derived(kept)
+        project_move, kept = self._split_project(kept)
 
         # `task -t` / `task -f` 后面什么都没跟 = 列预设，不是「挂一个空函数」。
         bare_hooks = [kind for kind, tokens in
@@ -133,10 +141,11 @@ class TaskCmdMixin(object):
         if not kept and mark_status is None and trigger_spec is None \
                 and formatter_spec is None and exclusive is None \
                 and count_spec is None and assign_count_spec is None \
-                and derived_spec is None:
+                and derived_spec is None and project_move is None:
             raise ValueError("task 后面要跟动作（create/delete/modify/assign/select/repeat/sync）"
                              "或后缀 -e/--exclusive / -m/--mark / -c/--count"
-                             " / -act/--assign-count / -t/--trigger / -f/--formatter")
+                             " / -act/--assign-count / -t/--trigger / -f/--formatter"
+                             " / -p/--project")
         # 异步 action（import 这类要先读外面世界的）拿走**同一份**后缀，
         # 后台那半件事落地之后自己套 —— 和同步路径完全一样的那套 _apply_suffix_chain。
         self._import_suffix_doc = {
@@ -149,6 +158,7 @@ class TaskCmdMixin(object):
             "trigger_spec": trigger_spec,
             "formatter_spec": formatter_spec,
             "derived_spec": derived_spec,
+            "project_move": project_move,
         }
         if kept:
             action = kept[0].lower()
@@ -181,6 +191,7 @@ class TaskCmdMixin(object):
                 "assign_count_spec": assign_count_spec,
                 "trigger_spec": trigger_spec,
                 "formatter_spec": formatter_spec,
+                "project_move": project_move,
             }
             self.pending_import = pending
             return None
@@ -193,7 +204,8 @@ class TaskCmdMixin(object):
                     exclusive=exclusive, mark_status=mark_status,
                     count_spec=count_spec, assign_count_spec=assign_count_spec,
                     trigger_spec=trigger_spec,
-                    formatter_spec=formatter_spec)
+                    formatter_spec=formatter_spec,
+                    project_move=project_move)
             return result.last
         if derived_spec is not None:
             # `-d/--derived`：把父任务的下一条标题变成一条本地派生任务；
@@ -224,6 +236,8 @@ class TaskCmdMixin(object):
             result = self._apply_formatter(result, formatter_spec, action)
         if assign_count_spec is not None:
             result = self._apply_assign_count(result, assign_count_spec, action) or result
+        if project_move is not None:
+            result = self._apply_project(result, project_move, action) or result
         return result
 
     @staticmethod
@@ -833,6 +847,107 @@ class TaskCmdMixin(object):
         self.selected_task_id = task["id"]
         return self._assign_task(task, str(session_token))
 
+    def _apply_project(self, result, spec, action="project"):
+        """``-p/--project [sop|incubator] <项目序号>``：改归属，写回 OmniFocus。
+
+        ``-ps`` / ``-pi`` 就是 ``--project sop`` / ``--project incubator`` 的缩写：
+        sop / incubator 是 ``--project`` 的**策略模式**（走哪个 op 那一侧），允许
+        越过 running/bottleneck 的阶段门控。默认（不写模式）走该 pro 当前阶段的 op。
+        移动成功后任务在 OmniFocus 里落在**项目第一行**。
+        """
+        spec = spec if isinstance(spec, dict) else {}
+        task = (result if isinstance(result, dict)
+                and result.get("id") is not None
+                and isinstance(result.get("fields"), dict) else None)
+        if task is None and action != "import" and self.selected_task_id is not None:
+            try:
+                task = self.task_store.get(self.selected_task_id)
+            except ValueError:
+                task = None
+        if task is None:
+            raise ValueError("`-p/--project` 要跟一条任务：`task 5 -p 2`，"
+                             "或先 `task select 5` 再 `task -p 2`。")
+        target = str(spec.get("target") or "").strip()
+        if not target:
+            raise ValueError("`-p/--project` 后面要跟项目（pro）序号")
+        pro = self.projects.resolve_pro(target)
+        note = self.omni_move(task, pro, mode=spec.get("mode") or "current")
+        if note:
+            self.say(note, "ok")
+        self.selected_task_id = task["id"]
+        try:
+            return self.task_store.get(task["id"])
+        except ValueError:
+            return task
+
+    @staticmethod
+    def _split_project(toks):
+        """把 ``-p/--project [sop|incubator] <项目序号>`` 从参数里摘出来。
+
+        支持的写法（``-ps`` / ``-pi`` 是后两种的缩写）::
+
+            task 5 -p 2              → {"mode": "current",   "target": "2"}
+            task 5 --project 2       → 同上
+            task 5 -ps 2             → {"mode": "sop",       "target": "2"}
+            task 5 -pi 2             → {"mode": "incubator", "target": "2"}
+            task 5 --project sop 2   → 同上（sop 是 --project 的策略模式）
+            task 5 --project=sop 2   → 同上
+        """
+        spec = None
+        kept = []
+        toks = [str(t) for t in (toks or ())]
+        i = 0
+        while i < len(toks):
+            tok = toks[i]
+            low = tok.lower()
+            if low in ("--project", "-p"):
+                if i + 1 >= len(toks):
+                    raise ValueError("--project 后面要跟项目序号"
+                                     "（或 sop|incubator + 项目序号）")
+                nxt = toks[i + 1].strip()
+                if nxt.lower() in ("sop", "incubator"):
+                    if i + 2 >= len(toks):
+                        raise ValueError("--project %s 后面要跟项目序号" % nxt)
+                    spec = {"mode": nxt.lower(), "target": toks[i + 2].strip()}
+                    i += 3
+                else:
+                    spec = {"mode": "current", "target": nxt}
+                    i += 2
+                continue
+            if low in ("-ps", "--project-sop"):
+                if i + 1 >= len(toks):
+                    raise ValueError("-ps 后面要跟项目序号（-ps 2 ≡ --project sop 2）")
+                spec = {"mode": "sop", "target": toks[i + 1].strip()}
+                i += 2
+                continue
+            if low in ("-pi", "--project-incubator"):
+                if i + 1 >= len(toks):
+                    raise ValueError("-pi 后面要跟项目序号（-pi 2 ≡ --project incubator 2）")
+                spec = {"mode": "incubator", "target": toks[i + 1].strip()}
+                i += 2
+                continue
+            if low.startswith("--project="):
+                value = tok.split("=", 1)[1].strip()
+                head, _, tail = value.partition(" ")
+                head = head.strip()
+                tail = tail.strip()
+                if head.lower() in ("sop", "incubator"):
+                    if not tail:
+                        if i + 1 >= len(toks):
+                            raise ValueError("--project=%s 后面要跟项目序号" % head)
+                        tail = toks[i + 1].strip()
+                        i += 2
+                    else:
+                        i += 1
+                    spec = {"mode": head.lower(), "target": tail}
+                    continue
+                spec = {"mode": "current", "target": value}
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return spec, kept
+
     def _apply_mark(self, result, status, action):
         """``-m/--mark`` 的收尾：只改本地账本，不碰 Focusmate / OmniFocus。
 
@@ -1433,7 +1548,7 @@ class TaskCmdMixin(object):
     def _apply_suffix_chain(self, task, action, note_text=None, assign_to=None,
                             exclusive=None, mark_status=None, count_spec=None,
                             assign_count_spec=None, trigger_spec=None,
-                            formatter_spec=None):
+                            formatter_spec=None, project_move=None):
         """按固定顺序把一条任务的后缀跑完：
         note → count → exclusive → assign → mark → trigger → formatter → assign-count。
 
@@ -1461,6 +1576,8 @@ class TaskCmdMixin(object):
             task = self._apply_formatter(task, formatter_spec, action) or task
         if assign_count_spec is not None:
             task = self._apply_assign_count(task, assign_count_spec, action) or task
+        if project_move is not None:
+            task = self._apply_project(task, project_move, action) or task
         return task
 
     def _apply_import_suffix(self, task, suffix):
@@ -1486,7 +1603,8 @@ class TaskCmdMixin(object):
                     count_spec=suffix.get("count_spec"),
                     assign_count_spec=suffix.get("assign_count_spec"),
                     trigger_spec=suffix.get("trigger_spec"),
-                    formatter_spec=suffix.get("formatter_spec"))
+                    formatter_spec=suffix.get("formatter_spec"),
+                    project_move=suffix.get("project_move"))
             return last if last is not None else task.last
         if not isinstance(task, dict) or task.get("id") is None:
             return task
@@ -1498,7 +1616,8 @@ class TaskCmdMixin(object):
             count_spec=suffix.get("count_spec"),
             assign_count_spec=suffix.get("assign_count_spec"),
             trigger_spec=suffix.get("trigger_spec"),
-            formatter_spec=suffix.get("formatter_spec"))
+            formatter_spec=suffix.get("formatter_spec"),
+            project_move=suffix.get("project_move"))
 
     def _finish_task_import(self, items, copy_repeat=False, repeats=None,
                             warnings=None):

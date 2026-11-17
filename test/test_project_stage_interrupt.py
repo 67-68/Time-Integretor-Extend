@@ -251,8 +251,8 @@ check("没有全局阶段切换", wd.planning.stage, "mixed")
 # 30 分钟 = 1 count；T2 50 分钟 = 2 count —— 一共 6。尾部缺口只追加、不动那两场。
 check("容量一次算全 6 count（T1 3 + 尾巴 1 + T2 2）",
       wd.planning.cap()["counts"], 6)
-wd.handle("task 1 1")
-wd.handle("task 2 1")
+wd.handle("pro 1 1")
+wd.handle("pro 2 1")
 check("complete 一次收尾", wd.handle("complete"), True)
 check("planning 关闭", wd.planning, None)
 check("两个当前 op 都排出了任务",

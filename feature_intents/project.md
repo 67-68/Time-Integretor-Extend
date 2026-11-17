@@ -388,21 +388,45 @@ plan -1         拒绝：过去的日子不用 plan
 
 ### 2) 分资源（问人）
 
-面板在 repl_kit 的打断栏位上（和收尾 / 到点没开始同一个位置），输入：
+面板在 repl_kit 的打断栏位上（和收尾 / 到点没开始同一个位置）。**两种分法**
+（2026-11-17 用户定稿），共用一个 count 预算：
 
 ```
-task 1 4       项目 #1 分 4 个 count（= 100 分钟）
-task 1 2       再敲一次是**覆盖**（变成 2，不是 6）
-task 1 clear   清空 #1 的分配
-task 1         只看 #1 的清单，不动分配
+pro 1 4        项目 #1 分 4 个 count（= 100 分钟）
+pro 1 2        再敲一次是**覆盖**（变成 2，不是 6）
+pro 1 clear    清空 #1 的分配
+pro 1          只看 #1 的清单，不动分配
+
+task 5 2       把**任意一条任务**固定成 2 个 count：当作「只有一个任务的独立
+               项目」来排（序号按当前界面：契约 = 任务面板序号，数据 = 任务库
+               内部 id；`id:N` 永远按内部 id）
+task 5 clear   撤掉这条任务的固定项
+task 5         只看这条任务（标题 / 项目 / 剩余 / 今天固定多少）
+task 5 -p 3    改归属：移到项目 #3（交给外层 `task` 命令，写回 OmniFocus，
+               放在目标项目**第一行**）
+task 5 -ps 3   ≡ task 5 --project sop 3（走该 pro 的 SOP op，可越过阶段门控）
+task 5 -pi 3   ≡ task 5 --project incubator 3
+
 complete       分配完了，开始排任务
 q              放弃这次 plan（一个字节都不落）
 ```
 
-**超预算整条命令都不执行**（用户要求）：已经分了 4、容量 5，再敲 `task 2 3` →
-报错、状态一个字都不动，并说清楚「现在还能给它 1 count」。判据是
-`others + count > capacity`，只算内存里的分配，不落盘 —— 所以「说好的数」只有在
-`complete` 之后才写进项目库，中途放弃什么都没有发生。
+**任务固定项优先**：`task <任务> <count>` 的条目排在最前，项目摊派时这些任务
+被 `excluded/skip_pks` 排除 —— 同一条任务不会因为「项目分到 count 又轮到了它」
+被唤起两份。固定项如果属于某个 op，台账里会记它的项目（面板显示 `· 项目名`），
+但**不写进项目库的 plans**（「今天说好 N count」那栏只算项目自己分到的）。
+
+**固定项单独记台账**（`temp/plan-pins.json`，按日期分）：它们不一定属于任何
+project，但重排 / `plan clear` 必须能把它们解绑 —— 否则任务永远占着场次。
+`_plan_owned_task_ids` 也把它们算成「上一轮 plan 排下去的」，整天重排时那几场
+会回到可用容量里。
+
+**超预算整条命令都不执行**（用户要求）：项目分配 + 任务固定项加起来超过容量
+（已经分了 4、容量 5，再敲 `pro 2 3` 或 `task 7 3`）→ 报错、状态一个字都不动，
+并说清楚「现在还能给它 1 count」。判据是 `others + count > capacity`，只算内存里
+的分配，不落盘 —— 所以「说好的数」只有在 `complete` 之后才写进项目库，中途放弃
+什么都没有发生。任务固定项还会按它自己的剩余 count 收口（`task 5 9` 但只剩 3
+→ 按 3 排，并说明）。
 
 ### 3) 排任务（自动）
 
@@ -541,7 +565,8 @@ project 1 -ac       # 第一条任务挂到当前/最近一场
 
 ```
 今天还没 plan：还有 3 场空闲（6 count）没分给项目（11:00、12:00、15:00）
-   → 敲 plan 分今天的资源（plan +1 = 明天；task 1 4 = 项目 #1 分 4 个 count）
+   → 敲 plan 分今天的资源（plan +1 = 明天；pro 1 4 = 项目 #1 分 4 个 count；
+     task 5 2 = 任务 #5 固定 2 count）
 ```
 
 判据只看 `data.csv` + 本地任务绑定（`pending_plan()` / `free_plan_slots()`），
@@ -590,7 +615,10 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `project refresh` / `project check` | 所有 op 刷一遍 / 每日对账 |
 | `plan` / `plan +1` / `plan -c` | 开始一次分配（走「一次只问一件事」的打断栏位）；不带参数 = 今天；`-c` 把今天正在进行的空 session 也纳入 |
 | `plan -s <session> -p <project>` | sessional plan：把指定项目按自身 sequential/parallel 规则排进指定 session |
-| `task <序号> <count>` / `op <序号> <count>` / `clear` / `complete` / `q` | plan 里的那几句（`op` 与 `task` 同义，只是强调操作对象是 op） |
+| `pro <序号> <count>` / `pro <序号> clear` / `clear` / `complete` / `q` | plan 里的项目分配（`op` 与 `pro` 同义，只是强调操作对象是 op） |
+| `task <任务> <count>` / `task <任务> clear` | plan 里的**任务固定项**：把任意一条任务当成「只有一个任务的独立项目」排；序号按当前界面（契约 = 任务面板序号，数据 = 任务库 id，`id:N` 永远认 id） |
+| `task <任务> -p <项目序号>` | 改归属：移到该 pro 当前阶段的 op（写回 OmniFocus，放目标项目**第一行**） |
+| `task <任务> -ps <项目序号>` / `-pi <项目序号>` | `--project sop` / `--project incubator` 的缩写：走该 pro 的 SOP / incubator op，可越过 running/bottleneck 阶段门控 |
 
 ### `pro <序号> interrupt`：默认软中断
 

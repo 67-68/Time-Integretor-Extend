@@ -354,7 +354,7 @@ def scenario_plan_keeps_past_and_booked():
     run(wd, "plan 0")
     # 容量 10（plan 口径），这里只分 5（3+2）：History 3 count、English 2 count。
     for idx, count in ((2, 3), (5, 2)):
-        run(wd, "task %d %d" % (idx, count))
+        run(wd, "pro %d %d" % (idx, count))
     err = run(wd, "complete")
     check("plan complete 没报错（%s）" % (err or "ok"), err, "")
 
@@ -435,7 +435,7 @@ def scenario_leftovers_reused():
                any(not (t.get("session") or {}).get("start") for t in before))
     run(wd, "plan 0")
     for idx, count in ((2, 3), (5, 2)):
-        run(wd, "task %d %d" % (idx, count))
+        run(wd, "pro %d %d" % (idx, count))
     run(wd, "complete")
     after = [t for t in wd.task_store.list()
              if (t.get("fields") or {}).get("project_id")
@@ -460,7 +460,7 @@ def scenario_preserve_previous():
     wd = new_warden()
     run(wd, "plan 0")
     for idx, count in ((2, 3), (5, 2)):
-        run(wd, "task %d %d" % (idx, count))
+        run(wd, "pro %d %d" % (idx, count))
     run(wd, "complete")
     first = {k: len(v.get("items") or []) for k, v in plan_of_day().items()}
     first_ids = plan_task_ids()
@@ -469,7 +469,7 @@ def scenario_preserve_previous():
 
     # 第二轮：只给一个无关项目 1 count。整天重排 → 第一轮的计划整体换掉。
     run(wd, "plan 0")
-    run(wd, "task 6 1")
+    run(wd, "pro 6 1")
     err = run(wd, "complete")
     check("第二轮 complete 没报错（%s）" % (err or "ok"), err, "")
     text = say(wd)
@@ -510,7 +510,7 @@ def scenario_long_period_used():
     wd = new_warden()
     run(wd, "plan 0")
     for idx, count in ((2, 4), (5, 4), (1, 2)):
-        run(wd, "task %d %d" % (idx, count))
+        run(wd, "pro %d %d" % (idx, count))
     err = run(wd, "complete")
     check("大批量 plan 没报错（%s）" % (err or "ok"), err, "")
     layouts = json.load(open(PATHS["layouts"], encoding="utf-8"))["layouts"]

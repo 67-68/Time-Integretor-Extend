@@ -3474,6 +3474,45 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-17T19:48:56",
+      "task_id": 204,
+      "fields": {
+        "title": "词汇题多 50 个",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "pp1eVCxZvUP.0",
+        "duration": 25,
+        "defer": "2026-11-08T00:00:00",
+        "notes": "父任务：sat review",
+        "count": 1,
+        "count_total": 1,
+        "note": "父任务：sat review",
+        "due": "2026-11-17T17:25:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": null,
+      "notes": "父任务：sat review",
+      "tags": [],
+      "manual": true,
+      "reason": "cmd-mark-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-17T19:48:56",
+      "omnifocus": {
+        "id": "pp1eVCxZvUP.0",
+        "url": "omnifocus:///task/pp1eVCxZvUP.0",
+        "title": "词汇题多 50 个",
+        "linked_at": "2026-11-11T09:51:06"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "词汇题多 50 个",
+        "description": "父任务：sat review",
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

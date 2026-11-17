@@ -6,7 +6,7 @@
 
 ```
 1) 元数据      capacity(slots)        今天还有几场空 session = 几个 count
-2) 分资源      Allocator（问人）       task 1 4 / task 1 clear / complete
+2) 分资源      Allocator（问人）       pro 1 4 / task 5 2 / complete
 3) 排任务      distribute() + schedule()   每个项目按分到的 count 唤起任务、排进 session
 ```
 
@@ -76,6 +76,22 @@ def slot_record(index, date_iso, start, duration, session_id=None, end=None):
     }
 
 
+def task_title(task):
+    """本地任务的标题存在 ``fields.title`` 里（``task["title"]`` 不是权威字段）。"""
+    fields = (task or {}).get("fields") or {}
+    return str(fields.get("title") or (task or {}).get("title") or "")
+
+
+def task_remaining(task):
+    """任务还剩多少 count；没设上限就用 duration 推，两个都推不出来返回 ``None``。"""
+    total = ts.task_count(task)
+    if total is None:
+        total = ts.minutes_to_count(ts.task_minutes(task))
+    if total is None:
+        return None
+    return max(0, int(total) - int(ts.task_count_invested(task)))
+
+
 def capacity(slots):
     """这批空场次能装多少：``counts`` / 分钟 / 含 5 分钟休息的分钟数 / 场次数。"""
     counts = sum(int(s.get("counts") or 0) for s in slots or [])
@@ -105,12 +121,14 @@ def slots_text(slots, limit=8):
 
 
 def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=None,
-               rotation=None, skip_pks=None):
+               rotation=None, skip_pks=None, pins=None):
     """把「每个项目多少 count」摊成具体的任务（每条还带要几个 count / 分钟）。
 
     ``allocations``：``[{"project_id": 1, "count": 4}, ...]``（**顺序就是排的顺序**）；
     ``invested_map``：``{项目序号: {项目任务 pk: 已投入 count}}``
     （就是 ``project_store.invested_by_project(task_store)`` 那份账）。
+    ``pins``：任务级固定项（``task <任务> <count>``），当作「只有一个任务的独立
+    项目」排在最前面 —— 项目摊派时这些任务会被跳过（由调用方放进 skip_pks）。
     返回 ``(items, notes)``：
     ``items`` = ``[{"project_id", "project", "pk", "title", "count", ...}]``。
 
@@ -121,6 +139,30 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
     invested_map = invested_map or {}
     exclude_pks = exclude_pks or {}
     out, notes = [], []
+    for pin in pins or ():
+        task_id = int(pin.get("task_id") or 0)
+        count = int(pin.get("count") or 0)
+        if not task_id or count <= 0:
+            continue
+        minutes = int(pin.get("minutes") or 0)
+        rec = {"project_id": pin.get("project_id"),
+               "project": {"id": pin.get("project_id"),
+                           "title": pin.get("project_title") or "（独立任务）"},
+               "pk": pin.get("pk") or "",
+               "title": pin.get("title") or "",
+               "count": count,
+               "total": count,
+               "remaining": count,
+               "minutes": count * MINUTES_PER_COUNT,
+               "pinned": True,
+               "existing_task_id": task_id}
+        if pin.get("priority") is not None:
+            rec["priority"] = pin["priority"]
+        if 0 < minutes < MINUTES_PER_COUNT:
+            # 短任务：不可拆，一场就能装下；按实际分钟吃预算。
+            rec.update({"count": 1, "minutes": minutes, "small": True,
+                        "budget_minutes": minutes})
+        out.append(rec)
     for alloc in allocations or []:
         project = alloc.get("project") or {}
         pid = project.get("id", alloc.get("project_id"))
@@ -787,20 +829,28 @@ def schedule_periods(items, slots):
 class Allocator(object):
     """``plan`` 的问答状态机：先分资源（count），按到 ``complete`` 再排任务。
 
-    输入（用户原话的语法）::
+    两种分法，共用同一个容量预算（用户 2026-11-17 定的语法）::
 
-        task 1 4      ← 项目 #1 分 4 个 count（4 count = 100 分钟）
-        task 1 2      ← 再敲一次是**覆盖**（变成 2，不是 6）
-        task 1 clear  ← 清空 #1 的分配
-        task 1        ← 只看 #1 的清单，不动分配
+        pro 1 4       ← 项目 #1 分 4 个 count（4 count = 100 分钟；再敲一次是覆盖）
+        pro 1 clear   ← 清空 #1 的分配
+        pro 1         ← 只看 #1 的清单，不动分配
+        task 5 2      ← **任意一条任务**固定分 2 个 count：当作「只有一个任务的
+                        独立项目」来排，场次按需重切
+        task 5 clear  ← 撤掉这条任务的固定项
+        task 5        ← 只看这条任务（标题 / 项目 / 剩余 / 当前固定多少）
+        task 5 -p 3   ← 改归属：把任务移到项目 #3（交给外层 `task` 命令，写回 OmniFocus）
         complete      ← 分配完了，开始排任务
         q             ← 放弃这次 plan（一个字节都不落）
+
+    ``task <序号>`` 的序号由外层钩子 ``resolve_task`` 解析：契约界面 = 任务面板
+    的序号，数据界面 = 任务库内部 id。
 
     超预算（今天分不出这么多 count）**整条命令都不执行**：报错、状态不变。
     """
 
     def __init__(self, day, projects, slots, task_store=None, hooks=None,
-                 stage=None, incubator_projects=None, pro_map=None):
+                 stage=None, incubator_projects=None, pro_map=None,
+                 resolve_task=None):
         self.day = day
         # 现在一次 plan 里可能同时有不同项目阶段对应的 op（一个 running 的 SOP、
         # 一个 bottleneck 的 incubator），所以不再把整场 plan 标成某个全局阶段。
@@ -816,6 +866,12 @@ class Allocator(object):
         self.task_store = task_store
         self.hooks = hooks or {}
         self.allocations = []          # [{"project_id","count"}]，顺序 = 排的顺序
+        #: 任务级固定项：``[{"task_id","pk","title","count","project_id",
+        #: "project_title","priority","minutes"}]``。它们同样吃容量，排在项目摊派
+        #: 之前（用户点名要先满足）。
+        self.pins = []
+        #: ``token -> 本地任务 dict``；契约界面按面板序号，数据界面按内部 id。
+        self.resolve_task = resolve_task
         self.closed = False
         self.notes = []
         # 和 Review / NostartReview 对齐的字段名（画帧缓存通用）
@@ -837,7 +893,9 @@ class Allocator(object):
         return capacity(self.slots)
 
     def allocated(self):
-        return sum(int(a.get("count") or 0) for a in self.allocations)
+        """已经分出去的 count = 项目摊派 + 任务固定项（同一个预算）。"""
+        return (sum(int(a.get("count") or 0) for a in self.allocations)
+                + sum(int(p.get("count") or 0) for p in self.pins))
 
     def free_counts(self):
         return max(0, self.cap()["counts"] - self.allocated())
@@ -847,6 +905,15 @@ class Allocator(object):
             if alloc.get("project_id") == project_id:
                 return int(alloc.get("count") or 0)
         return 0
+
+    def pin_of(self, task_id):
+        for pin in self.pins:
+            if int(pin.get("task_id") or 0) == int(task_id or 0):
+                return pin
+        return None
+
+    def pinned_counts(self):
+        return sum(int(p.get("count") or 0) for p in self.pins)
 
     def titles(self):
         """``{project_id: 名字}``（排任务时给消息用）。"""
@@ -862,12 +929,23 @@ class Allocator(object):
             len(self.projects), self.cap()["sessions"], self.cap()["counts"])
 
     def options(self):
-        return ["task <序号> <count>", "task <序号> clear", "complete", "q"]
+        return ["pro <序号> <count>", "pro <序号> clear",
+                "task <任务> <count>", "task <任务> clear",
+                "task <任务> -p <项目序号>", "complete", "q"]
 
     def stage_hint(self):
-        return ("task 1 4 = 第 1 个当前 op 分 4 count · task 1 clear = 清空 · "
+        return ("pro 1 4 = 项目 #1 分 4 count · pro 1 clear = 清空 · "
+                "task 5 2 = 任务 #5 固定 2 count · task 5 -p 3 = 改归项目 #3 · "
                 "complete = 开始排任务 · q = 放弃（已分配 %d / %d count）"
                 % (self.allocated(), self.cap()["counts"]))
+
+    def pin_line(self, pin):
+        """一条固定项在面板上的那一行。"""
+        proj = pin.get("project_title")
+        tail = (" · %s" % proj) if proj else " · 独立任务"
+        return "  📌 %s → %d count（%s）%s" % (
+            pin.get("title") or pin.get("pk") or "?", int(pin.get("count") or 0),
+            "#%d" % int(pin.get("task_id") or 0), tail)
 
     def lines(self):
         """面板正文：[(文本, 样式)]。"""
@@ -902,6 +980,11 @@ class Allocator(object):
             tail = "→ %d count" % got if got else ""
             out.append(("  %-24s %s %s" % (head, " · ".join(bits), tail),
                         "bold green" if got else ""))
+        if self.pins:
+            out.append(("  固定任务 %d 条 = %d count（优先排，项目摊派会跳过它们）"
+                        % (len(self.pins), self.pinned_counts()), "bold cyan"))
+            for pin in self.pins:
+                out.append((self.pin_line(pin), "green"))
         out.append(("  已分配 %d / %d count（还空 %d）"
                     % (self.allocated(), cap["counts"], self.free_counts()), "cyan"))
         out.append((self.stage_hint(), "cyan"))
@@ -917,10 +1000,15 @@ class Allocator(object):
         parts = raw.split()
         head = parts[0].lower()
         if head in HELP_TOKENS:
-            self.say("task <序号> <count>（或 op <序号> <count>）：给第几个当前 op "
-                     "分几个 count（1 count = 25 分钟）；再敲一次是覆盖。", "info")
-            self.say("task <序号> clear：清空这个项目的分配；"
-                     "task <序号>：只看清单。", "info")
+            self.say("pro <序号> <count>：给第几个当前 op 分几个 count（1 count = 25 "
+                     "分钟）；再敲一次是覆盖。pro <序号> clear：清空；"
+                     "pro <序号>：只看清单。", "info")
+            self.say("task <任务> <count>：把一条任意任务固定分到这么多 count"
+                     "（当作只有一个任务的独立项目来排）；序号按当前界面：契约 = 任务"
+                     "面板序号，数据 = 任务库内部 id。", "info")
+            self.say("task <任务> clear：撤掉这条任务的固定项；"
+                     "task <任务> -p <项目序号>：改归属（写回 OmniFocus，放在项目最前）；"
+                     "`-ps` / `-pi` 分别指项目的 SOP / incubator op。", "info")
             self.say("complete：分配完了，开始挑任务、排进 session；q：放弃这次 plan。",
                      "info")
             return {"action": "handled"}
@@ -928,13 +1016,16 @@ class Allocator(object):
             return self._complete()
         if head in CANCEL_TOKENS:
             return self._cancel()
-        if head in ("task", "op"):
+        if head in ("pro", "project", "op"):
+            return self._pro_command(parts[1:])
+        if head == "task":
             return self._task_command(parts[1:])
         if head == "clear":
-            return self._task_command(["--all", "clear"])
+            self._clear_all()
+            return {"action": "handled"}
         if head in DISPATCH_TOKENS:
             return {"action": "dispatch", "line": raw}
-        self.say("认不出 %r；task 1 4 / task 1 clear / complete / q（? 看全部）" % raw,
+        self.say("认不出 %r；pro 1 4 / task 5 2 / complete / q（? 看全部）" % raw,
                  "warn")
         return {"action": "handled"}
 
@@ -950,17 +1041,22 @@ class Allocator(object):
                                                              if self.projects
                                                              else (raw, 0)))
 
-    def _task_command(self, toks):
+    def _clear_all(self):
+        if self.allocations or self.pins:
+            self.allocations = []
+            self.pins = []
+            self.say("🧹 分配和任务固定项都清空了（0 count）。", "info")
+        else:
+            self.say("本来就没分配。", "info")
+
+    def _pro_command(self, toks):
+        """``pro <序号> [<count>|clear]``：给当前 op 分资源。"""
         toks = [str(t) for t in toks if str(t).strip()]
         if not toks:
-            self.say("要哪个项目？task <序号> <count>；序号 = 上面那张表的 #。", "warn")
+            self.say("要哪个项目？pro <序号> <count>；序号 = 上面那张表的 #。", "warn")
             return {"action": "handled"}
         if toks[0] in ("--all", "all", "全部"):
-            if self.allocations:
-                self.allocations = []
-                self.say("🧹 分配清空了（0 count）。", "info")
-            else:
-                self.say("本来就没分配。", "info")
+            self._clear_all()
             return {"action": "handled"}
         try:
             project = self._find(toks[0])
@@ -981,6 +1077,178 @@ class Allocator(object):
             return {"action": "handled"}
         self._set(project, count)
         return {"action": "handled"}
+
+    # -- 任务级固定项 -------------------------------------------------
+    def _task_command(self, toks):
+        """``task <任务> <count>`` / ``task <任务> clear`` / ``task ... -p ...``。"""
+        toks = [str(t) for t in toks if str(t).strip()]
+        if not toks:
+            self.say("要哪条任务？task <任务> <count>；序号按当前界面（契约 = 任务面板，"
+                     "数据 = 任务库 id）。", "warn")
+            return {"action": "handled"}
+        if toks[0] in ("--all", "all", "全部"):
+            self._clear_all()
+            return {"action": "handled"}
+        # 带短选项的（`-p/--project` 改归属、`-an` 下架、`-c` 改进度…）都不是
+        # 「分资源」：原样交给外层 `task` 命令（它才认这些后缀、才碰外部系统）。
+        if self._is_task_flag(toks):
+            return {"action": "dispatch", "line": "task " + " ".join(toks)}
+        token = toks[0]
+        rest = toks[1:]
+        try:
+            task = self._resolve_task(token)
+        except ValueError as e:
+            self.say(str(e), "warn")
+            return {"action": "handled"}
+        if not rest:
+            return self._show_task(task)
+        word = rest[0].lower()
+        if word in ("clear", "清空", "none", "off", "0"):
+            self._remove_pin(task)
+            return {"action": "handled"}
+        try:
+            count = int(rest[0])
+        except ValueError:
+            self.say("count 得是整数（1 count = 25 分钟）；你给的是 %r" % rest[0], "warn")
+            return {"action": "handled"}
+        self._pin(task, count)
+        return {"action": "handled"}
+
+    @staticmethod
+    def _is_task_flag(toks):
+        """这一行是不是「带后缀的 task 命令」（该交给外层的 cmd_task）。"""
+        for tok in toks:
+            text = str(tok)
+            if text.startswith("-") and text not in ("-", "--"):
+                return True
+        return False
+
+    def _resolve_task(self, token):
+        if self.resolve_task is None:
+            raise ValueError("这一层没有任务解析器：plan 面板里不能用 task 分资源")
+        task = self.resolve_task(str(token).strip())
+        if not isinstance(task, dict) or task.get("id") is None:
+            raise ValueError("找不到任务 %r（契约界面用任务面板序号，数据界面用任务库 id）"
+                             % (token,))
+        return task
+
+    def _task_titles(self, task):
+        """``(项目 id, 项目名)``：任务 fields 里记着它属于哪个 op。"""
+        fields = task.get("fields") or {}
+        pid = fields.get(pj.PROJECT_ID_FIELD) or fields.get("project_id")
+        title = fields.get(pj.PROJECT_FIELD) or fields.get("project") or ""
+        return pid, str(title or "")
+
+    def _show_task(self, task):
+        pin = self.pin_of(task.get("id"))
+        pid, title = self._task_titles(task)
+        remaining = task_remaining(task)
+        bits = ["📌 #%d %s" % (int(task.get("id") or 0), task_title(task) or "?")]
+        if title:
+            bits.append("项目：%s" % title)
+        bits.append("剩余 %s count" % ("?" if remaining is None else remaining))
+        bits.append("今天固定 %d count" % int(pin.get("count") or 0) if pin
+                    else "今天还没固定")
+        self.say("；".join(bits), "info")
+        return {"action": "handled"}
+
+    def _pin(self, task, count):
+        """把一条任务固定成「单任务项目」，吃同样的容量预算。"""
+        count = int(count)
+        if count < 0:
+            self.say("count 不能是负数。", "warn")
+            return False
+        task_id = int(task.get("id") or 0)
+        if not task_id:
+            self.say("这条任务没有本地 id，分不了资源。", "warn")
+            return False
+        if not ts.TaskStore.is_open(task):
+            self.say("✗ 「%s」已经收工（%s），没有可排的 count。"
+                     % (task_title(task),
+                        "完成" if ts.TaskStore.status_of(task) == ts.STATUS_COMPLETED
+                        else "放弃"), "warn")
+            return False
+        if ts.TaskStore.is_repeat_template(task):
+            self.say("✗ 「%s」是重复任务**本体**（模板），不能进 session；"
+                     "固定它生成的那一条子任务。" % task_title(task), "warn")
+            return False
+        if task.get("formatter"):
+            self.say("✗ 「%s」已经挂给 formatter，时间由它自己占（plan 不再碰它）。"
+                     % task_title(task), "warn")
+            return False
+        sess = task.get("session") or {}
+        if str(sess.get("start") or ""):
+            self.say("✗ 「%s」已经挂在 %s %s 了；要把它挪到 plan 里，先 "
+                     "`task %d -an` 下架，再 `task %d <count>`。"
+                     % (task_title(task), sess.get("date") or "?",
+                        sess.get("start"), task_id, task_id), "warn")
+            return False
+        remaining = task_remaining(task)
+        if remaining is not None and remaining <= 0:
+            self.say("✗ 「%s」已经投满了（%s），没有可排的 count。"
+                     % (task_title(task), ts.count_text(task)), "warn")
+            return False
+        asked = count
+        if remaining is not None and count > remaining:
+            count = remaining
+            self.say("· 「%s」只剩 %d count，按 %d 排（不是你要的 %d）。"
+                     % (task_title(task), remaining, count, asked), "info")
+        left = self._budget_left(exclude_task=task_id)
+        if count > left:
+            self.say("✗ 超预算：这一天只有 %d count 的空场，项目摊派 + 其它固定项已经"
+                     "占了 %d，「%s」再要 %d 就成 %d —— 这条命令没执行。"
+                     "现在还能给它 %d count。"
+                     % (self.cap()["counts"],
+                        self.allocated() - int(
+                            (self.pin_of(task_id) or {}).get("count") or 0),
+                        task_title(task), count,
+                        self.allocated() - int(
+                            (self.pin_of(task_id) or {}).get("count") or 0) + count,
+                        max(0, left)), "error")
+            return False
+        pid, title = self._task_titles(task)
+        priority = pj.task_priority_of(task)
+        slot = {"task_id": task_id,
+                "pk": ts.TaskStore.omnifocus_id(task) or "",
+                "title": task_title(task),
+                "count": count,
+                "project_id": pid,
+                "project_title": title,
+                "priority": priority,
+                "minutes": ts.task_minutes(task)}
+        self.pins = [p for p in self.pins if int(p.get("task_id") or 0) != task_id]
+        self.pins.append(slot)
+        self.say("✅ 任务 #%d「%s」→ %d count（%d 分钟）。已分配 %d / %d。"
+                 % (task_id, task_title(task), count, count * MINUTES_PER_COUNT,
+                    self.allocated(), self.cap()["counts"]), "ok")
+        return True
+
+    def _remove_pin(self, task):
+        task_id = int(task.get("id") or 0)
+        before = len(self.pins)
+        self.pins = [p for p in self.pins if int(p.get("task_id") or 0) != task_id]
+        if len(self.pins) == before:
+            self.say("这条任务本来就没固定（不动任何分配）。", "info")
+        else:
+            self.say("✅ 任务 #%d「%s」的固定项撤掉了。已分配 %d / %d。"
+                     % (task_id, task_title(task), self.allocated(),
+                        self.cap()["counts"]), "ok")
+        return {"action": "handled"}
+
+    def _budget_left(self, exclude_project=None, exclude_task=None):
+        """还能分多少 count（可以把某一个项目 / 任务先摘出来重算）。"""
+        used = 0
+        for alloc in self.allocations:
+            if (exclude_project is not None
+                    and alloc.get("project_id") == exclude_project):
+                continue
+            used += int(alloc.get("count") or 0)
+        for pin in self.pins:
+            if (exclude_task is not None
+                    and int(pin.get("task_id") or 0) == int(exclude_task)):
+                continue
+            used += int(pin.get("count") or 0)
+        return self.cap()["counts"] - used
 
     def _queue_exclusions(self, project):
         """这个项目里不该再进 plan 候选队列的 pk。
@@ -1030,14 +1298,16 @@ class Allocator(object):
             return False
         others = sum(int(a.get("count") or 0) for a in self.allocations
                      if a.get("project_id") != project["id"])
-        total = others + count
+        other_pins = self.pinned_counts()
+        total = others + other_pins + count
         cap = self.cap()["counts"]
         if total > cap:
-            self.say("✗ 超预算：这一天只有 %d count 的空场，别的项目已经占了 %d，"
-                     "「%s」再要 %d 就成 %d —— 这条命令没执行（分配一个字都没动）。"
+            self.say("✗ 超预算：这一天只有 %d count 的空场，别的项目/固定任务已经占了 "
+                     "%d，「%s」再要 %d 就成 %d —— 这条命令没执行（分配一个字都没动）。"
                      "现在还能给它是 %d count。"
-                     % (cap, others, project.get("title"), count, total,
-                        max(0, cap - others)), "error")
+                     % (cap, others + other_pins, project.get("title"), count, total,
+                        max(0, self._budget_left(exclude_project=project["id"]))),
+                     "error")
             return False
         self.allocations = [a for a in self.allocations if a.get("project_id") != project["id"]]
         if count:
@@ -1056,8 +1326,9 @@ class Allocator(object):
 
     # -- 收尾 ---------------------------------------------------------
     def _complete(self):
-        if not self.allocations:
-            self.say("还没有任何分配 —— 先 `task 1 4`，或者 `q` 放弃这次 plan。", "warn")
+        if not self.allocations and not self.pins:
+            self.say("还没有任何分配 —— 先 `pro 1 4` / `task 5 2`，或者 `q` 放弃这次 plan。",
+                     "warn")
             return {"action": "handled"}
         allocs = []
         for alloc in self.allocations:

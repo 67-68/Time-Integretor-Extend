@@ -1,14 +1,15 @@
 # test/live —— 集成测试（会碰真实 Focusmate 的那一层）
 
 `test/test_*.py` 是进程内的单元测试：bridge 是假的，`keep_session` 被 stub 掉，
-data.csv 是临时目录。它们验不了「模块之间的接缝」，也验不了「Focusmate 上到底
+data.csv 是临时目录（plan 的任务级固定项与 `task -p/-ps/-pi` 见
+`test/test_plan_pins.py`）。它们验不了「模块之间的接缝」，也验不了「Focusmate 上到底
 有没有那一场」。
 
 这里的测试把**整条线**真的跑一遍：
 
 ```
 fixture（沙盒 + mock 数据）
-  → warden --exec "plan 10; task 1 2; task 2 2; task 3 1; complete"
+  → warden --exec "plan 10; pro 1 2; pro 2 2; pro 3 1; complete"
   → 分配 → 挑任务 → 切 session → 写 layout → 重算 data.csv
   → keep_session check → 真下单 → 真 Focusmate session
   → refresh --check → 把任务挂成 Focusmate task
@@ -117,7 +118,7 @@ fixture（沙盒 + mock 数据）
    `temp/logs/*.jsonl`）。
 
 ```
-python3 -B test/live/test_live_blackbox.py        # 场景：plan → 重新 plan（释放旧场次）
+python3 -B test/live/test_live_blackbox.py        # 4 个场景，见下表
 ```
 
 现有场景：
@@ -126,6 +127,8 @@ python3 -B test/live/test_live_blackbox.py        # 场景：plan → 重新 pla
 |---|---|
 | 1. plan → 重新 plan | 上一轮 plan 的场次被释放、layout 按新分配重切（不是追加）、旧 plan items 整体替换、任务只解绑不复制、被释放的时段能原样再用 |
 | 2. plan → plan clear → 再 plan | `plan clear` 撤计划（items/绑定/分配）但不删排布；重排结果和第一次一致 |
+| 3. 重新 plan 到「曾判死」的时刻 | 撤 verdicts + state 两个账本的 abandoned 判决，refresh 不许把新计划当幽灵剪掉 |
+| 4. plan 里安排单独任务 | `task <任务> <count>` 把不属于任何项目的任务当「单任务项目」排；`temp/plan-pins.json` 记账；重新 plan / `plan clear` 必须解绑，任务不复制 |
 
 不订场、不开浏览器：目标日在 +10 天（执行区 24h 够不到）；PATH 里**故意没有
 node**，所以 bridge / focusmate-mcp 一律瞬间失败 —— 这也是为什么断言只看文件，

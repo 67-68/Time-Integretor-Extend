@@ -622,7 +622,7 @@ wd_parts.handle("session T1 75 25")
 book_all(wd_parts)
 wd_parts.handle("plan +1")
 check_true("plan 打开", wd_parts.planning is not None)
-wd_parts.planning.handle("task 1 4")      # 100 分钟 = 4 count，一场装不下 → 75 + 25
+wd_parts.planning.handle("pro 1 4")      # 100 分钟 = 4 count，一场装不下 → 75 + 25
 wd_parts.handle("complete")
 _part_locals = [t for t in wd_parts.task_store.list()
                 if (t.get("fields") or {}).get("project_task") == "parts-a"]
@@ -657,7 +657,7 @@ check("plan 前镜像都是项目备选（不进契约面板）",
       all(ts.TaskStore.is_project_backlog(t) for t in _backlog), True)
 wd_sub.handle("plan +1")
 check_true("plan 打开", wd_sub.planning is not None)
-wd_sub.planning.handle("task 1 1")       # 只分 1 count = 25 分钟
+wd_sub.planning.handle("pro 1 1")       # 只分 1 count = 25 分钟
 wd_sub.handle("complete")
 _sub_locals = wd_sub.task_store.list()
 _assigned = [t for t in _sub_locals if (t.get("session") or {}).get("start")]
@@ -1019,22 +1019,22 @@ check("count = 时长/25 之和 = 6",
 check_true("元数据里有「1 count = 25 分钟」",
            any("1 count = 25 分钟" in t for t in texts(wd)))
 
-planner.handle("task 1 2")
+planner.handle("pro 1 2")
 check("项目 #1 分到 2 count", planner.allocation_of(1), 2)
-planner.handle("task 1 4")
+planner.handle("pro 1 4")
 check("再敲一次是覆盖（4，不是 6）", planner.allocation_of(1), 4)
-planner.handle("task 1 clear")
+planner.handle("pro 1 clear")
 check("clear 清空", planner.allocation_of(1), 0)
 
 total = cap["counts"]
-planner.handle("task 1 %d" % (total - 1))
-planner.handle("task 2 2")
+planner.handle("pro 1 %d" % (total - 1))
+planner.handle("pro 2 2")
 check("加起来超预算 → 项目 #2 一个字都没动", planner.allocation_of(2), 0)
 check("项目 #1 也没被动", planner.allocation_of(1), total - 1)
 check_true("报错说「超预算」", any("超预算" in t for t in texts(wd)))
 check_true("报错说了「这条命令没执行」",
            any("这条命令没执行" in t or "一个字都没动" in t for t in texts(wd)))
-planner.handle("task 2 1")
+planner.handle("pro 2 1")
 check("放得下就收", planner.allocation_of(2), 1)
 
 print("== plan：complete 之后自动排任务 ==")
@@ -1075,7 +1075,7 @@ wd2.handle("task import sop omnifocus:///project/p-dushu")
 plan_day(wd2)
 wd2.handle("plan +1")
 cap2 = wd2.planning.cap()
-wd2.planning.handle("task 1 %d" % cap2["counts"])
+wd2.planning.handle("pro 1 %d" % cap2["counts"])
 wd2.bridge.calls = []
 wd2.handle("complete")
 check_true("说了「只剩 … count」",
@@ -1288,7 +1288,7 @@ check_true("提示里教怎么敲",
 wd9.handle("session T1 75 25")
 book_all(wd9)
 wd9.handle("plan")
-wd9.handle("task 1 1")
+wd9.handle("pro 1 1")
 wd9.handle("complete")
 check("plan 过之后不再提醒", wd9.pending_plan(), None)
 check_true("警告板里也没了",
@@ -1571,8 +1571,8 @@ check("一次 plan 同时列出 running 的 SOP 与 bottleneck 的 incubator",
       [("常规开发 SOP", "SOP"), ("算法破局孵化", "incubator")])
 check("不再有全局 SOP/incubator 阶段切换", wd_plan2.planning.stage, "mixed")
 check("容量是全部空场 6 count", wd_plan2.planning.cap()["counts"], 6)
-wd_plan2.handle("task 1 2")  # 常规开发 SOP：2 count
-wd_plan2.handle("task 2 1")  # 算法破局孵化：1 count
+wd_plan2.handle("pro 1 2")  # 常规开发 SOP：2 count
+wd_plan2.handle("pro 2 1")  # 算法破局孵化：1 count
 check("complete 一次就收尾", wd_plan2.handle("complete"), True)
 check("planning 已关闭", wd_plan2.planning, None)
 _assigned_titles = sorted(
@@ -2015,7 +2015,7 @@ plan_day(wd_re)
 wd_re.handle("plan +1")
 check("第一次 plan 打开", wd_re.planning is not None, True)
 _cap1 = wd_re.planning.cap()["counts"]
-wd_re.planning.handle("task 1 2")
+wd_re.planning.handle("pro 1 2")
 wd_re.handle("complete")
 _plan1 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
 check("第一次 plan 记 2 count", int(_plan1["count"]), 2)
@@ -2032,7 +2032,7 @@ check("上一轮 plan 占掉的场次重新出现在第二次的空场里",
       _first_starts & {str(s.get("start") or "") for s in wd_re.planning.slots},
       _first_starts)
 _alloc2 = min(3, _cap2)
-wd_re.planning.handle("task 1 %d" % _alloc2)
+wd_re.planning.handle("pro 1 %d" % _alloc2)
 wd_re.messages.clear()
 wd_re.handle("complete")
 _plan2 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
@@ -2190,7 +2190,7 @@ wd_auto.handle("plan +1")
 check_true("自动 layout 的 plan 能打开", wd_auto.planning is not None)
 check("自动 layout 的容量按整个 period 算：T1 4 + T2 2 = 6 count",
       wd_auto.planning.cap()["counts"], 6)
-wd_auto.planning.handle("task 1 3")
+wd_auto.planning.handle("pro 1 3")
 wd_auto.handle("complete")
 _auto_layouts = sp.load_layouts()
 _T1_auto = _auto_layouts["layouts"][wd_auto.sel_date.isoformat()]["T1"]
@@ -2229,7 +2229,7 @@ wd_manual.handle("day 1")
 wd_manual.handle("session T1 50 25")
 book_all(wd_manual)
 wd_manual.handle("plan +1")
-wd_manual.planning.handle("task 1 3")
+wd_manual.planning.handle("pro 1 3")
 wd_manual.handle("complete")
 _manual_layout = sp.load_layouts()["layouts"][wd_manual.sel_date.isoformat()]["T1"]
 check("plan 不修改手动 layout",

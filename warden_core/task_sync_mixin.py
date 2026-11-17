@@ -351,6 +351,95 @@ class TaskSyncMixin(object):
             return "OmniFocus %s 已放弃%s" % (pk, ("（%s）" % changed) if changed else "")
         return "OmniFocus 放弃丢后台了（%s）" % pk[:8]
 
+    def omni_move(self, task, pro, mode="current", position="first"):
+        """把一条任务移到某个 pro 的 op 里，**写回 OmniFocus**（默认项目第一行）。
+
+        ``mode``：``current``（当前阶段那个 op）/ ``sop`` / ``incubator``。
+        后两种是 ``task <任务> -ps/-pi <项目序号>`` 的展开：用户显式点名走那一侧，
+        **允许越过 running/bottleneck 的阶段门控**（门控只管自动 ``plan`` 的候选）。
+
+        远端先成功、再改本地（任务字段 + 两个项目的清单）：没有回滚的中间态 ——
+        如果只改了本地，下一次 ``refresh`` 读 OmniFocus 会把归属又翻回去。
+        """
+        title = (task.get("fields") or {}).get("title") or ""
+        pk = ts.TaskStore.omnifocus_id(task)
+        if not pk:
+            raise ValueError("「%s」没有 OmniFocus 关联（本地任务），改不了归属。" % title)
+        want = pj.normalize_op_type(mode) if mode not in (None, "", "current") else None
+        dest = (self.projects.op_for_pro_type(pro, want) if want
+                else self.projects.current_op_for_pro(pro))
+        if dest is None:
+            raise ValueError("项目「%s」没有%s op，移不进去（先 `op <序号> sop|incubator` "
+                             "给它设类型，或用 `pro <序号> -a` 推进阶段）。"
+                             % ((pro or {}).get("title") or "?",
+                                (" %s" % want) if want else "当前阶段对应的"))
+        dest_pk = (dest.get("omnifocus") or {}).get("id")
+        if not dest_pk:
+            raise ValueError("项目「%s」没有 OmniFocus 关联，移不进去。"
+                             % (dest.get("title") or "?"))
+        fields = task.get("fields") or {}
+        old_id = fields.get(pj.PROJECT_ID_FIELD)
+        old_title = str(fields.get(pj.PROJECT_FIELD) or "")
+        if str(old_id) == str(dest.get("id")):
+            return ("「%s」已经在项目「%s」里了（不动任何东西）。"
+                    % (title, dest.get("title")))
+        enabled = self.omnifocus_enabled()
+        rl.log_event("omnifocus", "move_start", enabled=enabled,
+                     task_id=task.get("id"), pk=pk,
+                     from_project=old_title or None,
+                     to_project=dest.get("title"), mode=mode,
+                     position=position)
+        if not enabled:
+            rl.log_event("omnifocus", "move_skipped", reason="disabled_or_unavailable",
+                         task_id=task.get("id"), pk=pk)
+            raise ValueError("OmniFocus 关着（`set omnifocus on` 打开）→ 归属没改 "
+                             "（只改本地会被下一次 refresh 翻回去）。")
+        try:
+            res = self.omnifocus.move_task(pk, dest_pk, position=position, yes=True)
+        except of.OmniFocusError as exc:
+            rl.log_event("omnifocus", "move_failed", level="error",
+                         task_id=task.get("id"), pk=pk, error=str(exc))
+            raise ValueError("OmniFocus 移动失败：%s" % exc) from None
+        # 远端成了才动本地：任务字段 + 两个项目的清单（源项目摘掉、目标项目放最前）。
+        old_op = None
+        try:
+            old_op = (self.projects.by_id(old_id) if old_id is not None else None)
+        except (ValueError, TypeError):
+            old_op = None
+        src_rec = pj.task_by_pk(old_op, pk) if old_op else None
+        try:
+            self.task_store.modify(task["id"], pj.PROJECT_FIELD,
+                                   dest.get("title") or "")
+            self.task_store.modify(task["id"], pj.PROJECT_ID_FIELD, dest.get("id"))
+        except ValueError:
+            pass
+        if old_op is not None:
+            try:
+                self.projects.remove_task(old_op["id"], pk)
+            except ValueError:
+                pass
+        rec = dict(src_rec or {})
+        rec.setdefault("title", title)
+        rec.setdefault("count", ts.task_count(task) or 0)
+        rec.setdefault("duration", ts.task_minutes(task))
+        try:
+            self.projects.prepend_task(dest["id"], rec)
+        except ValueError as exc:                  # noqa: BLE001 - 远端已经成，清单慢慢对
+            rl.log_event("omnifocus", "move_local_list_failed", level="warning",
+                         task_id=task.get("id"), pk=pk, error=str(exc))
+        rl.log_event("omnifocus", "move_done", task_id=task.get("id"), pk=pk,
+                     from_project=old_title or None,
+                     to_project=dest.get("title"), position=position,
+                     changed=(res or {}).get("changed") or [])
+        try:
+            self.rebuild_rows()
+        except Exception:                          # noqa: BLE001
+            pass
+        self.invalidate()
+        return ("↪ OmniFocus %s：「%s」从「%s」移到「%s」%s（项目第一行）。"
+                % (pk[:8], title, old_title or "（无项目）",
+                   dest.get("title"), ("（%s）" % want) if want else ""))
+
     def fm_complete(self, task):
         """Focusmate：把这条 task 勾完成（走 bridge 的内部 API，GET 复核 completedAt）。"""
         fm = task.get("focusmate") or {}

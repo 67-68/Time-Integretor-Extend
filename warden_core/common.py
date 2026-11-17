@@ -201,6 +201,12 @@ FAILED_ACTIONS_FILE = (os.environ.get("TI_FAILED_ACTIONS")
 OMNIFOCUS_OUTBOX_FILE = (os.environ.get("TI_OMNIFOCUS_OUTBOX")
                          or os.path.join(TEMP, "omnifocus-outbox.json"))
 
+#: plan 里「按任务分资源」的固定项台账（``task <任务> <count>`` 排掉的场次）。
+#: 这些任务不一定属于任何 project，所以不能记进项目库的 plans —— 但重排 / plan clear
+#: 必须能把它们解绑，否则它们永远占着场次。``{"<iso>": [item...]}``。
+PLAN_PINS_FILE = (os.environ.get("TI_PLAN_PINS")
+                  or os.path.join(TEMP, "plan-pins.json"))
+
 
 class OmniOutbox(object):
     """OmniFocus 写回的「待发队列」：``{"ops": [{id, op, task_id, due, at, ...}]}``。

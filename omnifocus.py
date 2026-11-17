@@ -1180,6 +1180,31 @@ class Client(object):
         # _cache_repetition 不动：快照里的行还带着重复字段，别让它下次白读一遍。
 
     # -- 写 -----------------------------------------------------------
+    def move_task(self, pk, project_pk, position="first", yes=True, timeout=None):
+        """把一条任务移到另一个 OmniFocus 项目里。
+
+        ``position="first"``（默认）放进项目第一行；"end" 放最后。走 batch 的
+        ``move`` op（osascript 里调 OmniJS 的 ``moveTasks``），一次进程一条。
+        返回 batch 里那一条结果（含 ``before`` / ``after``）。
+        """
+        payload = {"ops": [{"id": _clean_id(pk), "op": "move",
+                            "project": _clean_id(project_pk),
+                            "position": str(position or "first")}]}
+        with self._lock:
+            rc, out, err = self._run(
+                ["batch"], timeout=timeout or self.timeout,
+                stdin_text=json.dumps(payload, ensure_ascii=False))
+        self._raise_for(rc, out, err, "移动 OmniFocus 任务")
+        data = parse_batch_output(out)
+        results = data.get("results") or []
+        item = results[0] if results else {}
+        if not item.get("ok"):
+            raise OmniFocusError(
+                item.get("message") or item.get("error") or "移动任务失败",
+                kind="error", exit_code=1)
+        self.invalidate()
+        return item
+
     def set_task(self, pk, *flags, yes=True, timeout=None, allow_project_root=False):
         """跑 ``set`` 子命令；返回解析后的结果 dict。
 

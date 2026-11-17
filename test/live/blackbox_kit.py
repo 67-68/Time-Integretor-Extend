@@ -147,7 +147,7 @@ PATHS_KEYS = ("root", "day", "temp", "data", "csv", "tasks", "projects", "archiv
               "settings", "project_sync", "calendar", "layouts", "extras", "rules",
               "mutes", "keytime_json", "keytime_state", "keytime_devices",
               "keytime_rules", "nostart", "postsession", "failed_actions",
-              "of_outbox", "logs")
+              "of_outbox", "plan_pins", "logs")
 
 
 def _paths_for(root, day):
@@ -174,6 +174,7 @@ def _paths_for(root, day):
         "postsession": os.path.join(temp, "keep_session-postsession.json"),
         "failed_actions": os.path.join(temp, "failed-actions.json"),
         "of_outbox": os.path.join(temp, "omnifocus-outbox.json"),
+        "plan_pins": os.path.join(temp, "plan-pins.json"),
         "logs": os.path.join(temp, "logs"),
     }
 
@@ -217,6 +218,7 @@ SNAPSHOT_FILES = (
     "temp/keep_session-state.json", "temp/keep_session-verdicts.json",
     "temp/keep_session-expected.json", "temp/keep_session-nostart.json",
     "temp/keep_session-postsession.json", "temp/keep_session-relocations.json",
+    "temp/plan-pins.json",
 )
 
 
@@ -304,6 +306,7 @@ def env_for(paths, offset=DEFAULT_OFFSET, with_node=False, extra_env=None):
         "TI_POSTSESSION_FILE": paths["postsession"],
         "TI_FAILED_ACTIONS": paths["failed_actions"],
         "TI_OMNIFOCUS_OUTBOX": paths["of_outbox"],
+        "TI_PLAN_PINS": paths["plan_pins"],
         "TI_LOG_DIR": paths["logs"],
         "TI_LOG_LEVEL": "debug",
         "TI_KEYTIME_JSON": paths["keytime_json"],
@@ -382,6 +385,13 @@ def plan_items(paths, day=None):
             out.append((op.get("title"), item.get("pk"), item.get("start"),
                         item.get("duration"), item.get("task_id")))
     return out
+
+
+def plan_pins(paths, day=None):
+    """任务级固定项台账（``temp/plan-pins.json``）里某一天的条目。"""
+    day = day or paths["day"]
+    store = _read_json(paths["plan_pins"], {}) or {}
+    return list(store.get(day.isoformat()) or [])
 
 
 def tasks(paths):

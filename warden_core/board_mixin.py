@@ -2375,7 +2375,7 @@ class BoardMixin(object):
                    "、".join(str(s) for s in pending["starts"][:3])
                    + ("…" if len(pending["starts"]) > 3 else "")),
                 level="warn", source="项目",
-                hint="敲 plan 分今天的资源（plan +1 = 明天；task 1 4 = 项目 #1 分 4 个 count）"))
+                hint="敲 plan 分今天的资源（plan +1 = 明天；pro 1 4 = 项目 #1 分 4 个 count；task 5 2 = 任务 #5 固定 2 count）"))
         # 4) 重复任务：今天该不该有 occurrence（日期对上就算；挂不挂得上 session
         # 是另一回事，不再用「同起点同时长」否定整条规则）
         today = datetime.date.today()
@@ -2857,7 +2857,7 @@ class BoardMixin(object):
             ("relocate N ±MM", "临时把 #N 提前/推后：不写 data.csv；推后一天一次，且不能跨天"),
             ("relocate T1 ±MM", "把整个时段里的每场一起挪：相对位置不变、任务跟着走；"
                                 "推后每时段一天一次，和别的场次重叠就拒绝"),
-            ("plan 里那几句", "task 1 4 = 项目 #1 分 4 count（100 分钟）· task 1 clear = 清空 · "
+            ("plan 里那几句", "pro 1 4 = 项目 #1 分 4 count（100 分钟）· task 5 2 = 任务 #5 固定 2 count · task 5 -p 3 = 改归项目 #3 · pro 1 clear = 清空 · "
                               "再敲一次是覆盖（不是相加）· 超预算时整条命令都不执行 · "
                               "q 放弃这次 plan（不建任何任务）"),
             ("🚪 到点没开始（p/x/s）",

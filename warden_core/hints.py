@@ -414,14 +414,16 @@ def _task_command(w):
         usage="task <create|import|delete|modify|note|assign|select|swap|repeat|sync|archive>"
               " ... [-a <编号|none|current>] [-s <编号>] [-n 备注] [-e true|false]"
               " [-m complete|discard] [-c 5|+2|-1] [-act N]"
-              " [-t <trigger> [参数...]] [-f <formatter> [参数...]]",
+              " [-t <trigger> [参数...]] [-f <formatter> [参数...]]"
+              " [-p <项目序号> | -ps <项目序号> | -pi <项目序号>]",
         # 把 flag 放在 action 词前面：补全列表有 20 项上限，flag 被挤到后面
         # 就等于「有这个选项但 Tab 永远看不到」。
         # 紧凑短选项（-an/-ac/-m/-t/-f）由 task_completer 的 short 表补，不要
         # 在 options 里再写一遍 —— 否则 Tab 菜单里会出现两个一模一样的候选。
         options=("--assign", "-a", "--note", "-n", "--from", "-s", "--exclusive", "-e",
                  "--mark", "--count", "--assign-count", "--trigger",
-                 "--formatter", "--repeat", "--single-task",
+                 "--formatter", "--project", "-p", "-ps", "-pi",
+                 "--repeat", "--single-task",
                  "create", "import", "delete", "modify", "note", "assign", "select",
                  "swap", "repeat", "sync", "archive", "inspect-due"),
         values=_TaskCompletionValues({"--mark": TASK_MARK_WORDS,
@@ -744,6 +746,7 @@ def _hint_task(parts):
                              note="后缀：-a <编号|none|current> · -s <编号> 批量 · -n 备注"
                                   " · -e true|false 独占 · -m complete|discard"
                                   " · -d 派生 @list 清单里的一条（重复任务是复制）"
+                                  " · -p <项目序号> 改归属（-ps SOP / -pi incubator）"
                                   " · 字段随便写")
     if any(tok in words for tok in ("--mark", "-m")):
         return repl_kit.Hint("取值", TASK_MARK_WORDS,

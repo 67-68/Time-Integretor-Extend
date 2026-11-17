@@ -130,7 +130,7 @@ def scenario_plan():
     check_true("plan 打开了分资源问答（没有当场报错）", not err)
     check_true("planning 状态已建立", wd.planning is not None)
     for pro_idx, count in fixture.ALLOCATION:
-        _, err = run(wd, "task %d %d" % (pro_idx, count))
+        _, err = run(wd, "pro %d %d" % (pro_idx, count))
         check_true("分配 项目 %d ← %d count 没报错" % (pro_idx, count), not err)
     _, err = run(wd, "complete")
     check_true("complete 没报错（%s）" % (err or "ok"), not err)
@@ -213,7 +213,7 @@ def scenario_rerun_idempotent():
     run(wd, "day %d" % OFFSET)
     run(wd, "plan %d" % OFFSET)
     for pro_idx, count in fixture.ALLOCATION:
-        run(wd, "task %d %d" % (pro_idx, count))
+        run(wd, "pro %d %d" % (pro_idx, count))
     _, err = run(wd, "complete")
     check_true("第二次 plan 也没报错（%s）" % (err or "ok"), not err)
     slots = w.sch.day_slots(wd.entries, DAY)

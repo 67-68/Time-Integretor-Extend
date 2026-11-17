@@ -7,6 +7,7 @@ import time
 
 from .common import (
     HERE,
+    PLAN_PINS_FILE,
     Panel,
     SRC_OMNIFOCUS,
     STYLE_MUTED,
@@ -28,6 +29,7 @@ from .common import (
     ts,
 )
 from .hints import mute_window_for
+from .views import DataView
 
 
 class ProjectMixin(object):
@@ -2578,7 +2580,70 @@ class ProjectMixin(object):
                     if not ts.TaskStore.is_open(task):
                         continue
                 out.add(task_id)
+        # 任务级固定项也算「上一轮 plan 排下去的」：重排时它们的场次要回到可用容量里。
+        for item in self._plan_pins(day):
+            try:
+                task_id = int(item.get("task_id"))
+            except (TypeError, ValueError):
+                continue
+            if rescindable_only:
+                try:
+                    task = self.task_store.get(task_id)
+                except (ValueError, TypeError):
+                    continue
+                if not ts.TaskStore.is_open(task):
+                    continue
+            out.add(task_id)
         return out
+
+    def _plan_pins(self, day):
+        """当天 ``task <任务> <count>`` 排下去的固定项。
+
+        固定项**不一定属于任何 project**，所以不能记进项目库的 plans；但重排 /
+        ``plan clear`` 必须能把它们解绑 —— 否则那些任务永远占着场次。台账就落
+        在这里（``temp/plan-pins.json``，按日期分）。
+        """
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        try:
+            with open(PLAN_PINS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return []
+        items = (data or {}).get(iso) or []
+        return [dict(item) for item in items if isinstance(item, dict)]
+
+    def _save_plan_pins(self, day, items=(), append=False):
+        """写当天的固定项台账；``append=True`` 时按 ``task_id`` 合并（后写覆盖）。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        try:
+            with open(PLAN_PINS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        merged = {}
+        if append:
+            for item in data.get(iso) or ():
+                if isinstance(item, dict) and item.get("task_id") is not None:
+                    merged[str(item.get("task_id"))] = item
+        for item in items or ():
+            if isinstance(item, dict) and item.get("task_id") is not None:
+                merged[str(item.get("task_id"))] = item
+        if merged:
+            data[iso] = list(merged.values())
+        else:
+            data.pop(iso, None)
+        try:
+            tmp = PLAN_PINS_FILE + ".tmp"
+            os.makedirs(os.path.dirname(PLAN_PINS_FILE), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, PLAN_PINS_FILE)
+        except OSError as e:                       # noqa: BLE001 - 台账坏了不挡排期
+            rl.log_event("plan", "pins_save_failed", level="warning",
+                         day=iso, error=str(e))
+        return list(merged.values())
 
     def _reset_day_plans(self, day, announce=True):
         """重新 plan 前撤掉当天旧的 project plan / task 绑定。
@@ -2623,11 +2688,35 @@ class ProjectMixin(object):
             self.projects.set_allocation(project.get("id"), day, 0)
             cleared_plans += 1
             cleared_items += len(items)
-        if cleared_plans and announce:
+        # 任务级固定项（`task <任务> <count>`）不记在项目库里：它们可能压根不属于
+        # 任何 project。单独一份台账，重排时同样要解绑，否则那些任务永远占着场次。
+        pinned = self._plan_pins(day)
+        for item in pinned:
+            try:
+                task = self.task_store.get(item.get("task_id"))
+            except (ValueError, TypeError):
+                continue
+            if task is None or task.get("formatter") or not ts.TaskStore.is_open(task):
+                continue
+            sess = task.get("session") or {}
+            if (str(sess.get("date") or "") != iso
+                    or str(sess.get("start") or "") != str(item.get("start") or "")):
+                continue
+            if self._session_already_started(sess, now=self._now_dt()):
+                continue
+            try:
+                self.task_store.unassign(task["id"], reason="plan-replaced")
+                detached += 1
+            except ValueError:
+                pass
+        if pinned:
+            self._save_plan_pins(day, ())
+            cleared_items += len(pinned)
+        if (cleared_plans or pinned) and announce:
             self.say("♻️ 重排 %s：先撤掉旧 plan 的 %d 条任务，再从当前空场重新排"
                      % (iso, cleared_items), "info")
         return {"plans": cleared_plans, "items": cleared_items,
-                "detached": detached}
+                "detached": detached, "pins": len(pinned)}
 
     # -- 排期流水线的「阶段 1：period 层」 -------------------------------
     def available_periods(self, day):
@@ -3076,9 +3165,16 @@ class ProjectMixin(object):
                                     （session 容量就是这次分配的 count）
             plan +1                 明天（plan 1 / plan 明天 / plan 2026-11-07 同义）
             plan -c 今天            同 plan -c（--current 只能用于今天）
-            task 1 4                项目 #1 分 4 个 count（= 100 分钟）
-            task 1 2                再敲一次是**覆盖**（变成 2，不是 6）
-            task 1 clear            清空 #1
+            pro 1 4                 项目 #1 分 4 个 count（= 100 分钟）
+            pro 1 2                 再敲一次是**覆盖**（变成 2，不是 6）
+            pro 1 clear             清空 #1
+            task 5 2                **任意一条任务**固定 2 个 count：当作「只有一个
+                                    任务的独立项目」排（序号按当前界面：契约 = 任务
+                                    面板序号，数据 = 任务库内部 id；`id:N` 永远认 id）
+            task 5 clear            撤掉这条任务的固定项
+            task 5 -p 3             改归属：移到项目 #3（写回 OmniFocus，放项目最前）
+            task 5 -ps 3            ≡ task 5 --project sop 3（走该 pro 的 SOP op）
+            task 5 -pi 3            ≡ task 5 --project incubator 3
             complete                分配完了，开始排任务
 
         分配**超预算**（加起来超过今天剩下的 count）时整条命令都不执行。
@@ -3094,7 +3190,7 @@ class ProjectMixin(object):
                      args=" ".join(toks) or "(默认今天)")
         if self.planning is not None:
             raise ValueError("已经有一次 plan 在等你的分配（看下面那块面板）："
-                             "`task <序号> <count>` 分资源、`complete` 开始排、`q` 放弃。")
+                             "`pro <序号> <count>` 分给项目、`task <任务> <count>` 固定单独任务、`complete` 开始排、`q` 放弃。")
         if toks and str(toks[0]).lower() in ("clear", "--clear", "-x", "清空"):
             return self.cmd_plan_clear()
         if (self.pending_import is not None or self.nostart is not None
@@ -3119,13 +3215,15 @@ class ProjectMixin(object):
         plan_ops = self.projects.plan_ops()
         if not plan_ops:
             if not self.projects.active_pros():
-                raise ValueError("项目库是空的：在 OmniFocus 里 ⌘C 一个**项目**，"
-                                 "再敲 `task import sop` 或 `task import incubator`"
-                                 "（或者先 `pro create <名称>` 再把 op 关联给它）。")
-            raise ValueError("当前没有可排期的 OmniFocus 项目（op）：只有关联了真正项目 pro、"
-                             "且类型与项目阶段匹配的 op 才会进 plan（running 需要 SOP，"
-                             "bottleneck 需要 incubator）。先用 `op <序号> pro <N>` 关联项目、"
-                             "`pro <序号> -a` 切阶段，或用 `op <序号> sop|incubator` 设类型。")
+                # 没有项目 ≠ 不能 plan：`task <任务> <count>` 能把任意一条任务当成
+                # 「只有一个任务的独立项目」排掉。只提示一句，不挡路。
+                self.say("· 项目库是空的：这次 plan 只能 `task <任务> <count>` 固定单独"
+                         "任务（项目分配那半张表是空的）。", "info")
+            else:
+                raise ValueError("当前没有可排期的 OmniFocus 项目（op）：只有关联了真正项目 pro、"
+                                 "且类型与项目阶段匹配的 op 才会进 plan（running 需要 SOP，"
+                                 "bottleneck 需要 incubator）。先用 `op <序号> pro <N>` 关联项目、"
+                                 "`pro <序号> -a` 切阶段，或用 `op <序号> sop|incubator` 设类型。")
         if offset != self.day_offset:
             # 空场、`-a <编号>` 都按**看板那一天**的表格算，所以先把看板搬过去。
             # 搬过去之后必须**等到**那天的真数据：空场判据要看「订没订上」，
@@ -3168,7 +3266,8 @@ class ProjectMixin(object):
         pro_map = self._pro_display_map(plan_ops)
         self.planning = pp.Allocator(
             day, plan_ops, slots, task_store=self.task_store,
-            hooks=self.plan_hooks(), pro_map=pro_map)
+            hooks=self.plan_hooks(), pro_map=pro_map,
+            resolve_task=self._plan_task_ref)
         by_type = {}
         for op in plan_ops:
             kind = pj.normalize_op_type(op.get("op_type")) or "?"
@@ -3180,8 +3279,11 @@ class ProjectMixin(object):
                  % (day.isoformat(), len(plan_ops), kind_txt,
                     cap["sessions"], cap["counts"], cap["minutes"],
                     pp.MINUTES_PER_COUNT), "cmd")
-        self.say("   `task <序号> <count>` 分给项目（序号 = 面板上的 #）、"
-                 "`task <序号> clear` 清空、`complete` 开始排任务、`q` 放弃。", "info")
+        self.say("   `pro <序号> <count>` 给项目分资源（序号 = 面板上的 #）、"
+                 "`pro <序号> clear` 清空；`task <任务> <count>` 固定某条任务"
+                 "（契约界面用任务面板序号，数据界面用任务库 id）、"
+                 "`task <任务> -p <项目序号>` 改归属；`complete` 开始排任务、`q` 放弃。",
+                 "info")
         self.invalidate()
         return self.planning
 
@@ -3527,6 +3629,20 @@ class ProjectMixin(object):
                 allocator, allocs, append_to_plan=False),
         }
 
+    def _plan_task_ref(self, token, day=None):
+        """``plan`` 面板里 ``task <序号>`` 的序号解析。
+
+        用户 2026-11-17 定的口径：当前在**契约**界面 → 用任务面板上显示的序号；
+        在**数据**界面 → 用任务库里实际的 id（数据表第一列）。``id:N`` 永远按
+        内部 id 认 —— 面板上找不到的任务只能这样点名。
+        """
+        text = str(token or "").strip()
+        if text.lower().startswith("id:"):
+            return self.task_store.get(text[3:])
+        if isinstance(self.view, DataView):
+            return self.task_store.get(text)
+        return self.resolve_task(text, day=day or self.sel_date)
+
     def _auto_plan_signature(self, day):
         """自动 layout 的“计划指纹”：只有任务/分配真的变了才重排。"""
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
@@ -3675,10 +3791,19 @@ class ProjectMixin(object):
                 # 上一轮绑在 23:15，这一轮又建了一条同 pk 的任务）。
                 excluded.setdefault(pid, set()).add(str(pk))
                 skip_pks.setdefault(pid, set()).add(str(pk))
+        pins = [dict(pin) for pin in (getattr(allocator, "pins", None) or ())]
+        for pin in pins:
+            # 用户点名的任务优先：项目摊派必须跳过它，否则同一条任务会被唤起两份。
+            pid = pin.get("project_id")
+            pk = str(pin.get("pk") or "")
+            if pid is None or not pk:
+                continue
+            excluded.setdefault(pid, set()).add(pk)
+            skip_pks.setdefault(pid, set()).add(pk)
         items, notes = pp.distribute(
             allocs, [a["project"] for a in allocs], invested,
             now=datetime.datetime.now(), exclude_pks=excluded,
-            rotation=self.derived_rotation(), skip_pks=skip_pks)
+            rotation=self.derived_rotation(), skip_pks=skip_pks, pins=pins)
         # period-first：只要这一天的空场里有“自动 layout”的 period，就先把任务
         # 按 period 排好，再根据任务反推 session durations；手动 layout 仍然
         # 作为硬约束，只允许任务往里填。
@@ -3790,10 +3915,49 @@ class ProjectMixin(object):
 
         made, failed = {}, 0
         used_ids = set()
+        pin_records = []
         for place in placements:
             item = place["item"]
             slot = place["slot"]
             project = item["project"]
+            if item.get("pinned"):
+                # 用户点名的任务（`task <任务> <count>`）：**复用那一条本地任务**，
+                # 不新建镜像 —— 它就是它自己的「单任务项目」。场次照样走同一条
+                # 排期/挂号流水线，所以这里只补一次挂载。
+                try:
+                    pin_task = self.task_store.get(item.get("existing_task_id"))
+                except (ValueError, TypeError):
+                    failed += 1
+                    self.say("⚠ 固定任务 #%s 已经不在任务库里了，跳过。"
+                             % item.get("existing_task_id"), "warn")
+                    continue
+                try:
+                    self._assign_task(pin_task, str(slot["index"]), refresh=False,
+                                      allow_unbooked=True)
+                except ValueError as e:
+                    failed += 1
+                    self.say("⚠ 固定任务「%s」没挂到 session #%s：%s"
+                             % (item.get("title"), slot["index"], e), "warn")
+                    continue
+                used_ids.add(pin_task.get("id"))
+                try:
+                    bound = self.task_store.get(pin_task["id"]) or {}
+                except (ValueError, TypeError):
+                    bound = {}
+                sess = bound.get("session") or {}
+                pin_records.append({
+                    "task_id": pin_task["id"],
+                    "pk": item.get("pk") or "",
+                    "title": item.get("title") or "",
+                    "count": int(place["count"]),
+                    "project_id": item.get("project_id"),
+                    "start": str(sess.get("start") or slot.get("start") or ""),
+                    "date": str(sess.get("date") or day.isoformat()),
+                    "duration": int(sess.get("duration") or 0) or int(
+                        place.get("duration")
+                        or int(place["count"]) * pp.MINUTES_PER_COUNT),
+                })
+                continue
             derived = item.get("derived") or None
             url = "" if derived else of.task_url(item["pk"])
             parent = place.get("parent") or {}
@@ -3901,6 +4065,10 @@ class ProjectMixin(object):
         for pid, records in made.items():
             self.projects.record_items(pid, day, records,
                                        append=append_to_plan)
+        # 固定项单独记台账：它们不一定属于任何 project（记不进项目库的 plans），
+        # 但重排 / `plan clear` 必须能把它们解绑。
+        if pin_records or pins:
+            self._save_plan_pins(day, pin_records, append=bool(append_to_plan))
         if progress is not None:
             progress.step("把 %d 条任务挂到 session 上" % len(placements))
         self.rebuild_rows()

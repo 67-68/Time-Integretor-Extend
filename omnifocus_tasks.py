@@ -938,7 +938,11 @@ BATCH_JS = r"""
     dropped: !!(t.dropDate),
     completion_date: iso(t.completionDate),
     drop_date: iso(t.dropDate),
-    due: iso(t.dueDate)
+    due: iso(t.dueDate),
+    project_id: (function () {
+      try { return t.containingProject ? idOf(t.containingProject) : null; }
+      catch (e) { return null; }
+    })()
   });
   if (typeof Task === "undefined" || typeof Task.byIdentifier !== "function") {
     return JSON.stringify(reply({ ok: false, error: "omnijs_unavailable",
@@ -1052,6 +1056,51 @@ BATCH_JS = r"""
         task.note = lines.join("\n");
         results.push(Object.assign({}, base, { ok: true, changed: ["note"],
                        note: task.note, remaining: titlesRemaining(task.note) }));
+      } else if (op === "move") {
+        // 把任务移到另一个项目：默认放到项目**最前面**（`task <任务> -p <项目>`）。
+        // OmniJS 的全局 moveTasks(tasks, position) 的 position 可以是
+        // Project / Task / Task.ChildInsertionLocation，`project.beginning`
+        // 就是「项目第一行」。
+        const destId = String(item.project || "");
+        let isRoot = false;
+        try { isRoot = !!task.project; } catch (e) { isRoot = false; }
+        if (isRoot) {
+          results.push(Object.assign({}, base, { ok: false, error: "project_root_refused",
+                         message: "这是 project_root 任务（等于整个项目），不能移动" }));
+          continue;
+        }
+        let dest = null;
+        try {
+          dest = (typeof Project !== "undefined" && Project.byIdentifier)
+            ? Project.byIdentifier(destId) : null;
+        } catch (e) { dest = null; }
+        if (!dest) {
+          results.push(Object.assign({}, base, { ok: false, error: "project_not_found",
+                         message: "找不到目标项目：" + destId }));
+          continue;
+        }
+        const mover = (typeof moveTasks === "function") ? moveTasks
+          : ((typeof database !== "undefined"
+              && database && typeof database.moveTasks === "function")
+             ? database.moveTasks.bind(database) : null);
+        if (!mover) {
+          results.push(Object.assign({}, base, { ok: false, error: "move_unavailable",
+                         message: "当前 OmniFocus 不支持 moveTasks" }));
+          continue;
+        }
+        if (before.project_id === idOf(dest)) {
+          results.push(Object.assign({}, base, { ok: true,
+                         skipped: "already_in_project",
+                         before: before, after: before, changed: [] }));
+          continue;
+        }
+        const position = (String(item.position || "first") === "end")
+          ? dest.ending : dest.beginning;
+        mover([task], position);
+        const afterTask = Task.byIdentifier(pk) || task;
+        const after = snapshot(afterTask);
+        results.push(Object.assign({}, base, { ok: true, before: before,
+                       after: after, changed: ["project"] }));
       } else {
         results.push({ id: pk, task_id: taskId, ok: false, error: "bad_op" });
       }

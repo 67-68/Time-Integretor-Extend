@@ -331,12 +331,13 @@ class ContractView(View):
                  "一次分配：按每个项目的阶段取其当前 SOP/incubator op，再排任务",
                  ("排期", "分配"),
                  usage="plan [+1|今天|明天|YYYY-MM-DD] → "
-                       "task <序号> <count> | task <序号> clear | complete；"
+                       "pro <序号> <count> | task <任务> <count> | complete；"
                        "或 plan -s <session> -p <project> 单场直排",
                  options=("+1", "+2", "today", "明天", "complete", "clear",
-                          "task 1 4",
+                          "pro 1 4", "task 5 2",
                           "-s 1 -p 1"),
-                 hint=_hint_actions("+1", "明天", "complete", "task 1 4", "task 1 clear",
+                 hint=_hint_actions("+1", "明天", "complete", "pro 1 4", "task 5 2",
+                                    "task 5 -p 3", "pro 1 clear",
                                     "-s 1 -p 1",
                                     note="不带参数 = 今天；plan +1 = 明天；"
                                          "plan -s <session> -p <project> = 把这个项目的"
@@ -882,11 +883,13 @@ class DataView(View):
                  "一次分配：按每个项目的阶段取其当前 SOP/incubator op，再排任务",
                  ("排期", "分配"),
                  usage="plan [+1|今天|明天|YYYY-MM-DD] → "
-                       "task <序号> <count> | task <序号> clear | complete；"
+                       "pro <序号> <count> | task <任务> <count> | complete；"
                        "或 plan -s <session> -p <project> 单场直排",
-                 options=("+1", "+2", "today", "明天", "complete", "task 1 4",
+                 options=("+1", "+2", "today", "明天", "complete", "pro 1 4",
+                          "task 5 2", "task 5 -p 3",
                           "-s 1 -p 1"),
-                 hint=_hint_actions("+1", "明天", "complete", "task 1 4", "task 1 clear",
+                 hint=_hint_actions("+1", "明天", "complete", "pro 1 4", "task 5 2",
+                                    "task 5 -p 3", "pro 1 clear",
                                     "-s 1 -p 1",
                                     note="不带参数 = 今天；plan +1 = 明天；"
                                          "plan -s <session> -p <project> = 把这个项目的"

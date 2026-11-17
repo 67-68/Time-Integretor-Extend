@@ -2776,6 +2776,35 @@ class ProjectStore(object):
         linked.sort(key=lambda op: (_as_int(op.get("id")) or 0))
         return linked[-1]
 
+    def op_for_pro_type(self, pro_or_id, op_type, store=None):
+        """一个 ``pro`` 指定类型（SOP / incubator）的那个 op，**不看阶段**。
+
+        ``task <任务> -ps/-pi <项目序号>`` 用的就是它：用户显式点名要走哪一侧，
+        允许越过 running/bottleneck 的阶段门控（那门控只管自动 ``plan`` 的候选）。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.pro_by_id(pro_or_id, store=data))
+        if not pro or pro.get("status") != STATUS_ACTIVE:
+            return None
+        want = normalize_op_type(op_type)
+        if want is None:
+            return None
+        field = ("incubator_op_id" if want == OP_TYPE_INCUBATOR else "sop_op_id")
+        oid = _as_int(pro.get(field))
+        if oid is not None:
+            op = next((p for p in (data.get("projects") or ())
+                       if p.get("id") == oid and p.get("status") == STATUS_ACTIVE),
+                      None)
+            if op is not None and normalize_op_type(op.get("op_type")) == want:
+                return op
+        linked = [op for op in self.ops_for_pro(pro, store=data)
+                  if normalize_op_type(op.get("op_type")) == want]
+        if not linked:
+            return None
+        linked.sort(key=lambda op: (_as_int(op.get("id")) or 0))
+        return linked[-1]
+
     def display_op_for_pro(self, pro_or_id, store=None):
         """项目表展示用的当前 op：阶段匹配优先；没有则唯一 active op 兜底。
 
@@ -2939,6 +2968,23 @@ class ProjectStore(object):
             project["synced_at"] = _now()
             self.save(store)
             return project
+        raise ValueError("没有项目 %s" % project_id)
+
+    def remove_task(self, project_id, task_pk):
+        """把一条任务从项目清单里摘掉（改归属时用；不动本地任务库）。"""
+        store = self.load()
+        pk = str(task_pk or "").strip()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            before = len(project.get("tasks") or [])
+            project["tasks"] = [x for x in (project.get("tasks") or [])
+                                if str(x.get("pk") or "") != pk]
+            removed = before - len(project["tasks"])
+            if removed:
+                project["synced_at"] = _now()
+                self.save(store)
+            return removed
         raise ValueError("没有项目 %s" % project_id)
 
     def remove(self, project_id):

@@ -258,7 +258,7 @@ def case_3_derived_expansion():
     reset_sandbox()
     wd = new_warden()
     run(wd, "plan 0")
-    err = run(wd, "task 1 3")            # 清单容器分 3 count（一条清单行正好 3 count）
+    err = run(wd, "pro 1 3")            # 清单容器分 3 count（一条清单行正好 3 count）
     check("分配 3 count 没报错（%s）" % (err or "ok"), err, "")
     cap = wd.planning.cap()["counts"]
     wd.messages = []
@@ -285,9 +285,9 @@ def case_4_defer_and_repeat():
     reset_sandbox()
     wd = new_warden()
     run(wd, "plan 0")
-    run(wd, "task 1 4")
-    run(wd, "task 2 2")
-    run(wd, "task 3 2")
+    run(wd, "pro 1 4")
+    run(wd, "pro 2 2")
+    run(wd, "pro 3 2")
     run(wd, "complete")
     titles = [t.get("fields", {}).get("title") or "" for t in tasks_now()
               if (t.get("session") or {}).get("start")]
@@ -301,9 +301,9 @@ def case_5_small_task_and_t4():
     reset_sandbox()
     wd = new_warden()
     run(wd, "plan 0")
-    run(wd, "task 1 4")
-    run(wd, "task 2 2")
-    run(wd, "task 3 2")
+    run(wd, "pro 1 4")
+    run(wd, "pro 2 2")
+    run(wd, "pro 3 2")
     run(wd, "complete")
     small = [t for t in tasks_now()
              if "十分钟小活" in str((t.get("fields") or {}).get("title") or "")
@@ -325,7 +325,7 @@ def case_6_over_allocation_refused():
     wd = new_warden()
     run(wd, "plan 0")
     wd.messages = []
-    run(wd, "task 1 9")
+    run(wd, "pro 1 9")
     text = say(wd)
     check_true("超预算被拒（说了超预算/不够）",
                "超预算" in text or "不够" in text or "只能" in text)
@@ -338,8 +338,8 @@ def case_7_booked_rows_untouched():
     wd = new_warden()
     before = csv_rows()
     run(wd, "plan 0")
-    run(wd, "task 1 3")
-    run(wd, "task 2 2")
+    run(wd, "pro 1 3")
+    run(wd, "pro 2 2")
     run(wd, "complete")
     after = csv_rows()
     for pair in (("14:00", 75), ("15:15", 50), ("19:00", 75)):
@@ -367,7 +367,7 @@ def case_8_revived_session_not_pruned():
     reset_sandbox()
     wd = new_warden()
     run(wd, "plan 0")
-    run(wd, "task 1 3")
+    run(wd, "pro 1 3")
     check("第一轮 complete 没报错", run(wd, "complete"), "")
     items = plan_items()
     check_true("第一轮排出了一条计划", bool(items))
@@ -383,7 +383,7 @@ def case_8_revived_session_not_pruned():
 
     # 重新 plan 同一批 = 又一次「我要这几场」→ 两个账本都要撤
     run(wd, "plan 0")
-    run(wd, "task 1 3")
+    run(wd, "pro 1 3")
     check("第二轮 complete 没报错", run(wd, "complete"), "")
     wd.refresh(quiet=True)
 

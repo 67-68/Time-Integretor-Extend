@@ -57,7 +57,7 @@ def case_1_replan_releases_previous_sessions():
 
     # ---- 第 1 轮：3 个项目共 5 个 count → 75 + 50 两场 -------------------
     first = bb.run(sb, ["plan %d" % bb.DEFAULT_OFFSET,
-                        "task 1 2", "task 2 2", "task 3 1", "complete"])
+                        "pro 1 2", "pro 2 2", "pro 3 1", "complete"])
     check("第 1 轮 plan+complete 退出码 0", first["rc"], 0)
     check("第 1 轮排出的场次", bb.csv_rows(sb), [("13:00", 75), ("14:30", 50)])
     lay = bb.layouts(sb).get("T1") or {}
@@ -68,7 +68,7 @@ def case_1_replan_releases_previous_sessions():
     check("第 1 轮挂上本地任务 3 条", len(bb.bound_tasks(sb)), 3)
 
     # ---- 第 2 轮：只给 A 2 count（**新进程**，只能靠落盘状态） ----------
-    second = bb.run(sb, ["plan %d" % bb.DEFAULT_OFFSET, "task 1 2", "complete"])
+    second = bb.run(sb, ["plan %d" % bb.DEFAULT_OFFSET, "pro 1 2", "complete"])
     check("第 2 轮 plan+complete 退出码 0", second["rc"], 0)
     check("上一轮的 14:30 场被释放（csv 只剩这一轮要的）",
           bb.csv_rows(sb), [("13:00", 50)])
@@ -91,7 +91,7 @@ def case_1_replan_releases_previous_sessions():
 
     # ---- 第 3 轮：把 5 个 count 再分回去 → 时段必须**原样可用** ---------
     third = bb.run(sb, ["plan %d" % bb.DEFAULT_OFFSET,
-                        "task 1 2", "task 2 2", "task 3 1", "complete"])
+                        "pro 1 2", "pro 2 2", "pro 3 1", "complete"])
     check("第 3 轮 plan+complete 退出码 0", third["rc"], 0)
     check("被释放的两个时段重新可用（回到 75 + 50）",
           bb.csv_rows(sb), [("13:00", 75), ("14:30", 50)])
@@ -112,7 +112,7 @@ def case_2_plan_after_clear_is_idempotent():
     """
     paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
     bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
-                   "task 1 2", "task 2 2", "task 3 1", "complete"])
+                   "pro 1 2", "pro 2 2", "pro 3 1", "complete"])
     base = bb.csv_rows(paths)
     cleared = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "plan clear"])
     check("plan clear 退出码 0", cleared["rc"], 0)
@@ -122,7 +122,7 @@ def case_2_plan_after_clear_is_idempotent():
     check("plan clear 不删排布（layout 还在）",
           (bb.layouts(paths).get("T1") or {}).get("durations"), [75, 50])
     bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
-                   "task 1 2", "task 2 2", "task 3 1", "complete"])
+                   "pro 1 2", "pro 2 2", "pro 3 1", "complete"])
     check("清空后再 plan 和第一次 plan 一致", bb.csv_rows(paths), base)
     check("plan items 也回到 3 条", len(bb.plan_items(paths)), 3)
 
@@ -151,7 +151,7 @@ def case_3_revived_session_is_not_pruned():
                                     "horizon": "%sT23:59:00" % iso,
                                     "sessions": [], "details": []}}, f)
 
-    first = bb.run(paths, ["plan 1", "task 1 2", "task 2 2", "task 3 1", "complete"])
+    first = bb.run(paths, ["plan 1", "pro 1 2", "pro 2 2", "pro 3 1", "complete"])
     check("重新 plan 到被放弃过的时刻，退出码 0", first["rc"], 0)
     check("场次按 plan 写出来了", bb.csv_rows(paths), [("13:00", 75), ("14:30", 50)])
     check("plan items 3 条", len(bb.plan_items(paths)), 3)
@@ -169,6 +169,66 @@ def case_3_revived_session_is_not_pruned():
     check("refresh 之后场次还在", bb.csv_rows(paths), [("13:00", 75), ("14:30", 50)])
     check("refresh 之后 plan items 还在", len(bb.plan_items(paths)), 3)
     check_true("refresh 没有把计划冲掉", "和当前时间资源对不上" not in second["out"])
+    return paths
+
+
+def case_4_pin_standalone_task():
+    """plan 里安排**单独任务**：一条不属于任何项目的任务也能固定 count 排进 session。
+
+    用户 2026-11-17 定的新语法：``task <任务> <count>`` = 把任意任务当作
+    「只有一个任务的独立项目」排；固定项记在 ``temp/plan-pins.json``，重排 /
+    ``plan clear`` 必须把它解绑（否则那条任务永远占着场次）。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+
+    # ---- 造一条独立任务（进程 1）------------------------------------
+    made = bb.run(paths, ["task create title=独立任务 duration=50"])
+    check("建独立任务退出码 0", made["rc"], 0)
+    solo = [t for t in bb.tasks(paths) if bb.task_title(t) == "独立任务"]
+    check("任务库里只有这一条任务", len(solo), 1)
+    tid = solo[0]["id"]
+    check("它是独立任务（不属于任何项目）",
+          (solo[0].get("fields") or {}).get("project_id"), None)
+
+    # ---- 进程 2：plan + 按内部 id 固定 2 count -------------------------
+    first = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
+                           "task id:%d 2" % tid, "complete"])
+    check("plan + 固定单独任务 退出码 0", first["rc"], 0)
+    check("按 2 count 切出一场 50 分钟", bb.csv_rows(paths), [("13:00", 50)])
+    lay = bb.layouts(paths).get("T1") or {}
+    check("layout 是 [50]、来源 plan",
+          (lay.get("durations"), lay.get("source")), ([50], "plan"))
+    check("独立任务真的挂上了",
+          [(t[0], t[1]) for t in bb.bound_tasks(paths)], [("独立任务", "13:00")])
+    check("没有复制出第二条同名任务",
+          len([t for t in bb.tasks(paths) if bb.task_title(t) == "独立任务"]), 1)
+    led = bb.plan_pins(paths)
+    check("固定项台账记了 1 条", len(led), 1)
+    check("台账里的任务 id 对得上", led[0].get("task_id"), tid)
+    check("台账里的起点对得上", led[0].get("start"), "13:00")
+    check("项目库没有被写进固定项", bb.plan_items(paths), [])
+
+    # ---- 进程 3：重新 plan（项目分资源）→ 固定项释放、场次可重新用 -----
+    second = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET, "pro 1 2", "complete"])
+    check("重新 plan 退出码 0", second["rc"], 0)
+    check("固定项被解绑（只剩项目那条）",
+          [t[0] for t in bb.bound_tasks(paths)], ["A · 写方案骨架"])
+    check("台账里当天没有固定项了", bb.plan_pins(paths), [])
+    check("独立任务还在库里（解绑 ≠ 丢任务）",
+          len([t for t in bb.tasks(paths) if bb.task_title(t) == "独立任务"]), 1)
+
+    # ---- 进程 4：再固定一次，然后 plan clear ---------------------------
+    third = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
+                           "task id:%d 2" % tid, "complete"])
+    check("固定项可以重新用", third["rc"], 0)
+    check("重新用上的是同一场",
+          [(t[0], t[1]) for t in bb.bound_tasks(paths) if t[0] == "独立任务"],
+          [("独立任务", "13:00")])
+    cleared = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "plan clear"])
+    check("plan clear 退出码 0", cleared["rc"], 0)
+    check("plan clear 之后任务全部解绑", bb.bound_tasks(paths), [])
+    check("plan clear 之后台账清空", bb.plan_pins(paths), [])
     return paths
 
 
@@ -190,6 +250,15 @@ def main(argv):
         fails.append("场景 3 异常：%s: %s" % (type(e).__name__, e))
         traceback.print_exc()
 
+    pin_paths = None
+    print("\n== 场景 4：plan 里安排单独任务（task <任务> <count>）==")
+    try:
+        pin_paths = case_4_pin_standalone_task()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 4 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
     print("\n== 场景 2：plan → plan clear → 再 plan（幂等）==")
     try:
         case_2_plan_after_clear_is_idempotent()
@@ -198,13 +267,15 @@ def main(argv):
         fails.append("场景 2 异常：%s: %s" % (type(e).__name__, e))
         traceback.print_exc()
 
-    # 现场：只保留场景 1 的沙盒（出红时人要看它）
-    for paths in (sb,):
-        if paths and not keep:
-            if fails:
-                print("\n场景 1 沙盒留在 %s（data.csv / layouts / 日志都在）" % paths["root"])
-            else:
-                shutil.rmtree(paths["root"], ignore_errors=True)
+    # 现场：只保留场景 1 / 4 的沙盒（出红时人要看它）
+    for paths, label in ((sb, "场景 1"), (pin_paths, "场景 4")):
+        if not paths or keep:
+            continue
+        if fails:
+            print("\n%s 沙盒留在 %s（data.csv / layouts / 日志都在）"
+                  % (label, paths["root"]))
+        else:
+            shutil.rmtree(paths["root"], ignore_errors=True)
     print()
     if fails:
         print("FAILED %d 项：" % len(fails))
