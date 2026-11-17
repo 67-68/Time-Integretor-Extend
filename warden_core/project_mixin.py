@@ -20,6 +20,7 @@ from .common import (
     pj,
     pp,
     repl_kit,
+    rl,
     sch,
     sp,
     th,
@@ -3070,6 +3071,9 @@ class ProjectMixin(object):
         其实排了后天」。
         """
         toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        rl.log_event("plan", "start", level="debug",
+                     day=self.sel_date.isoformat(),
+                     args=" ".join(toks) or "(默认今天)")
         if self.planning is not None:
             raise ValueError("已经有一次 plan 在等你的分配（看下面那块面板）："
                              "`task <序号> <count>` 分资源、`complete` 开始排、`q` 放弃。")
@@ -3136,9 +3140,13 @@ class ProjectMixin(object):
         for note in notes:
             self.say("· %s" % note, "info")
         if not slots:
+            rl.log_event("plan", "no_slots", level="warning", day=day.isoformat())
             raise ValueError("%s 一场空着的 session 都没有 —— 换个日子，或者先 "
                              "`session <HH:MM> <25|50|75>` 把排布加上。" % day.isoformat())
         cap = pp.capacity(slots)
+        rl.log_event("plan", "open", day=day.isoformat(), ops=len(plan_ops),
+                     sessions=cap["sessions"], counts=cap["counts"],
+                     minutes=cap["minutes"])
         pro_map = self._pro_display_map(plan_ops)
         self.planning = pp.Allocator(
             day, plan_ops, slots, task_store=self.task_store,
@@ -3656,6 +3664,10 @@ class ProjectMixin(object):
         # 作为硬约束，只允许任务往里填。
         placements, unscheduled, more, auto_layouts = pp.schedule_periods(
             items, allocator.slots)
+        rl.log_event("plan", "scheduled", level="debug", day=day.isoformat(),
+                     items=len(items), placements=len(placements),
+                     unscheduled=len(unscheduled),
+                     auto_layouts=len(auto_layouts or {}))
         if progress is not None:
             progress.step("排进 %d 场 session（%d 段要重切）"
                           % (len(placements), len(auto_layouts or {})))
@@ -3696,8 +3708,14 @@ class ProjectMixin(object):
                                    reason="auto-plan", book=False, announce=False,
                                    write_csv=False, lock_timeout=5.0)
             except ValueError as e:
+                rl.log_event("plan", "layout_failed", level="warning",
+                             day=day.isoformat(), period=period.get("id"),
+                             error=str(e))
                 notes.append("自动排布「%s」没落盘：%s" % (period.get("id"), e))
             except Exception as e:             # noqa: BLE001 - 一段坏了不挡其余
+                rl.log_event("plan", "layout_error", level="error",
+                             day=day.isoformat(), period=period.get("id"),
+                             error="%s: %s" % (type(e).__name__, e))
                 notes.append("自动排布「%s」落盘出错：%s" % (period.get("id"), e))
         if auto_layouts:
             if progress is not None:
@@ -3887,9 +3905,16 @@ class ProjectMixin(object):
         if book:
             self.book(day, why="plan 排完了，要把执行区的场次订上")
         self.invalidate()
-        return {"placements": len(placements), "counts": total_counts,
-                "unscheduled": len(unscheduled), "notes": notes, "failed": failed,
-                "used_slot_indices": {p["slot"]["index"] for p in placements}}
+        result = {"placements": len(placements), "counts": total_counts,
+                  "unscheduled": len(unscheduled), "notes": notes, "failed": failed,
+                  "used_slot_indices": {p["slot"]["index"] for p in placements}}
+        rl.log_event("plan", "apply_done",
+                     level="warning" if (failed or unscheduled) else "info",
+                     day=day.isoformat(), placements=result["placements"],
+                     counts=result["counts"], unscheduled=result["unscheduled"],
+                     failed=failed, auto_layouts=len(auto_layouts or {}),
+                     append=bool(append_to_plan), book=bool(book))
+        return result
 
     def plan_panel(self):
         """`plan` 的分资源问答面板（挂在 repl_kit 的打断栏位里）。"""

@@ -48,6 +48,7 @@ def check_raises(label, fn):
 
 
 TMP = tempfile.mkdtemp(prefix="postsession-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
 os.environ["TI_PROJECTS_FILE"] = os.path.join(TMP, "projects.json")
 os.environ["TI_PROJECT_SYNC_FILE"] = os.path.join(TMP, "project-sync.json")

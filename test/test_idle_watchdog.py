@@ -40,6 +40,7 @@ sch = ks.sch
 # ---------------------------------------------------------------- 沙箱
 
 TMP = tempfile.mkdtemp(prefix="idle-watchdog-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 CSV = os.path.join(TMP, "data.csv")
 sch.DATA_CSV = CSV
 ks.IDLE_STATE_FILE = os.path.join(TMP, "idle-state.json")

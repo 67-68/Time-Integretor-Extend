@@ -49,6 +49,7 @@ except ValueError as e:
 
 print("== 落盘：验证失败 = 零副作用 ==")
 TMP = tempfile.mkdtemp(prefix="session-plan-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 DL = os.path.join(TMP, "download.json")
 LP = os.path.join(TMP, "layouts.json")
 XP = os.path.join(TMP, "extras.json")

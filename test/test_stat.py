@@ -37,6 +37,7 @@ def check_true(label, got):
 
 st = load("stats", "stats.py")
 TMP = tempfile.mkdtemp(prefix="stat-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 CACHE = os.path.join(TMP, "stat-history.json")
 
 TODAY = datetime.date(2026, 1, 11)

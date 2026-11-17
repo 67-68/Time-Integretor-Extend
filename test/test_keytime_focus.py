@@ -19,6 +19,7 @@ from rich.console import Console
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="keytime-focus-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 for _name, _file in (
     ("TI_CALENDAR_DOWNLOAD", "download.json"),
     ("TI_SESSION_LAYOUTS", "layouts.json"),
@@ -233,6 +234,22 @@ def fresh(now):
     return wd
 
 
+def tick(wd, timeout=3.0):
+    """跑一次 tick，并等它开出来的后台线程收工。
+
+    ``_keytime_tick`` 的锁屏 / 推送 / 拉窗口都是后台线程。以前测试靠「线程刚好
+    跑完」的运气：现在日志要落盘，线程晚一步进 finally，busy 还是 True，下一次
+    tick 就直接跳过 —— 断言测到的其实是调度。等到 busy 清零再断言，测的才是逻辑。
+    """
+    wd._keytime_tick()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not (wd._keytime_focus_busy or wd._keytime_push_busy
+                or wd._keytime_summon_busy):
+            return
+        time.sleep(0.01)
+
+
 # 假装：Focus.app 装好了，状态/开关都在测试里记录。
 fake_state = {"focusing": False, "profile": ""}
 calls = {"start": [], "stop": [], "notify": []}
@@ -251,7 +268,7 @@ kt.save_devices([])
 
 print("== 到点：自动上锁 + 发 mac 横幅 ==")
 wd = fresh(at(1))
-wd._keytime_tick()
+tick(wd)
 check("开了一次 Focus 锁", calls["start"], ["keytime"])
 check("warden 记着自己上的锁", wd.keytime_focus_on, True)
 check("mac 横幅也发了", len(calls["notify"]) >= 1, True)
@@ -261,12 +278,12 @@ check_in("横幅标题来自规则", "KEY TIME", calls["notify"][0][0])
 print("== 用户手动解锁：下一分钟又被锁回去 ==")
 wd.keytime_next_tick = 0
 fake_state.update({"focusing": True, "profile": "keytime"})
-wd._keytime_tick()
+tick(wd)
 check("已经在锁就不重复开", len(calls["start"]), 1)
 fake_state.update({"focusing": False, "profile": ""})
 wd.keytime_next_tick = 0
 wd.keytime_next_focus_check = 0.0
-wd._keytime_tick()
+tick(wd)
 check("被手动关掉后重新锁", calls["start"], ["keytime", "keytime"])
 
 print("== 用户自己的 Focus session：不接管 ==")
@@ -274,7 +291,7 @@ fake_state.update({"focusing": True, "profile": "night purge"})
 calls["start"].clear()
 wd.keytime_next_tick = 0
 wd.keytime_next_focus_check = 0.0
-wd._keytime_tick()
+tick(wd)
 check("别人的锁不抢", calls["start"], [])
 check("也不认为锁是我们上的", wd.keytime_focus_on, False)
 
@@ -310,12 +327,12 @@ print("== 这一块结束：自动解锁 ==")
 calls["stop"].clear()
 fake_state.update({"focusing": True, "profile": "keytime"})
 wd = fresh(at(1))
-wd._keytime_tick()
+tick(wd)
 check("先锁上", wd.keytime_focus_on, True)
 wd.keytime_now = at(70)                    # 17:10，块已经结束
 wd.keytime_next_tick = 0
 fake_state.update({"focusing": True, "profile": "keytime"})
-wd._keytime_tick()
+tick(wd)
 check("结束后解锁", wait_for(lambda: calls["stop"]), True)
 check("解完就不记账了", wd.keytime_focus_on, False)
 
@@ -328,7 +345,7 @@ calls["start"].clear()
 calls["notify"].clear()
 fake_state.update({"focusing": False, "profile": ""})
 wd = fresh(at(1))
-wd._keytime_tick()
+tick(wd)
 check("focus 关掉就不锁", wd.keytime_focus_on, False)
 check("focus 关掉就不开 Focus.app", calls["start"], [])
 check("notify 关掉就不弹横幅", calls["notify"], [])

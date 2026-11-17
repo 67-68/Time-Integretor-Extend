@@ -25,6 +25,7 @@ def check_true(label, got):
 
 
 TMP = tempfile.mkdtemp(prefix="project-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 os.environ["TI_CALENDAR_DOWNLOAD"] = os.path.join(TMP, "download.json")
 os.environ["TI_SESSION_LAYOUTS"] = os.path.join(TMP, "layouts.json")
 os.environ["TI_SESSION_EXTRAS"] = os.path.join(TMP, "extras.json")
@@ -1250,7 +1251,7 @@ book_all(wd8)                              # 今天的都订上了
 check("看板在今天是哪一天", wd8.sel_date, datetime.date.today())
 # 真实时钟跑到晚上时今天已经没有未来的场次；这条用例只关心「默认目标今天」，
 # 所以用一个固定的未来 slot 替掉时钟依赖，别让 23:00 跑测试时假红。
-wd8._plan_slots = lambda day: (
+wd8._plan_slots = lambda day, **_kw: (
     [pp.slot_record(1, day.isoformat(), "12:15", 25, "s99")], [])
 wd8.handle("plan")
 check("今天有空场才开得了问答", wd8.planning is not None, True)
@@ -1271,7 +1272,7 @@ check("没项目时不该提这件事", wd9.pending_plan(), None)
 wd9.handle("task import sop omnifocus:///project/p-lunwen")
 # 这条用例验证「提醒/plan 一次就消失」，不依赖测试跑在一天里的哪个时刻。
 wd9.free_plan_slots = lambda day: [{"start": "12:15", "duration": 25}]
-wd9._plan_slots = lambda day: (
+wd9._plan_slots = lambda day, **_kw: (
     [pp.slot_record(1, day.isoformat(), "12:15", 25, "s99")], [])
 wd9._assign_task = lambda *args, **kwargs: None
 pend = wd9.pending_plan()
@@ -1715,7 +1716,7 @@ wd_flag = fresh(rows_ok)
 wd_flag.omnifocus.rows = [dict(r) for r in rows_ok]
 wd_flag.handle("task import sop omnifocus:///project/p-lunwen")
 _seen_flag = {}
-def _fake_plan_slots(day, include_current=False):
+def _fake_plan_slots(day, include_current=False, **_kw):
     _seen_flag["include_current"] = include_current
     return [pp.slot_record(1, day.isoformat(), "12:15", 25, "s99")], []
 wd_flag._plan_slots = _fake_plan_slots
@@ -2020,30 +2021,33 @@ _plan1 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
 check("第一次 plan 记 2 count", int(_plan1["count"]), 2)
 _first_items = list(_plan1["items"])
 _first_starts = {str(i.get("start") or "") for i in _first_items}
-# 2026-11-16 起：plan 是**追加**语义 —— 上一轮排好的场次不算空闲，也不许被
-# 掀掉重排（以前是「先撤旧 plan 再整天空场重排」，会连带重切已经订上的场次）。
+# 2026-11-17 起：普通 plan 是**整天重排**（`_plan_slots(day, replan=True)`）——
+# 上一轮 plan 自己切的场次不算占用、会被重新切回来；只有用户手动切的 layout
+# 才是硬约束。追加语义只留给 `plan -s` / `project -a`。
 wd_re.handle("plan +1")
 check("第二次 plan 打开", wd_re.planning is not None, True)
 _cap2 = wd_re.planning.cap()["counts"]
-check("第二次只看剩下的空场：容量比第一次小", _cap2 < _cap1, True)
-check("上一轮占掉的场次不在第二次的空场里",
-      _first_starts & {str(s.get("start") or "") for s in wd_re.planning.slots}, set())
+check("整天重排：第二次容量和第一次一样（上一轮 plan 的场次还回来）", _cap2, _cap1)
+check("上一轮 plan 占掉的场次重新出现在第二次的空场里",
+      _first_starts & {str(s.get("start") or "") for s in wd_re.planning.slots},
+      _first_starts)
 _alloc2 = min(3, _cap2)
 wd_re.planning.handle("task 1 %d" % _alloc2)
 wd_re.messages.clear()
 wd_re.handle("complete")
 _plan2 = pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date)
-check("第二次 plan 是相加（2 + %d）" % _alloc2, int(_plan2["count"]), 2 + _alloc2)
-check_true("上一轮的 plan items 还在（没有被清掉）",
-           {str(i.get("pk")) for i in _first_items}
-           <= {str(i.get("pk")) for i in _plan2["items"]})
-check_true("不再自动撤旧 plan（要清得显式 plan clear）",
-           not any("先撤掉旧 plan" in t for t in texts(wd_re)))
+check("第二次 plan 是覆盖（%d，不是 2 + %d）" % (_alloc2, _alloc2),
+      int(_plan2["count"]), _alloc2)
+check_true("重排前会先撤掉旧 plan（消息里说清）",
+           any("先撤掉旧 plan" in t for t in texts(wd_re)))
 _bound = [t for t in wd_re.task_store.list()
           if (t.get("session") or {}).get("date") == wd_re.sel_date.isoformat()
           and (t.get("fields") or {}).get("project_id") == wd_re.projects.active()[0]["id"]
           and wd_re.task_store.is_open(t)]
-check("两轮的任务都各自挂着（不会只剩后一轮）", len(_bound) >= 2, True)
+check("只按这一轮的 plan items 挂任务（旧一轮已解绑、不重复）",
+      len(_bound), len(_plan2["items"]))
+check("同一条任务没有同时挂两场",
+      len({t["id"] for t in _bound}), len(_bound))
 wd_re.handle("plan clear")
 check("plan clear 之后当天计划清空",
       pj.plan_of(wd_re.projects.active()[0], wd_re.sel_date), None)

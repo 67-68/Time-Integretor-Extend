@@ -208,7 +208,8 @@ class ReviewMixin(object):
         """
         if not self.offline:
             started = time.monotonic()
-            rl.log_event("focusmate", "task_pull_start", source="sync_completion_state")
+            rl.log_event("focusmate", "task_pull_start", level="debug",
+                         source="sync_completion_state")
             try:
                 res = self.bridge.call("tasks", timeout=180)
                 remote = res.get("tasks") if isinstance(res, dict) else res
@@ -222,11 +223,14 @@ class ReviewMixin(object):
                     "archived": n,
                     "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
                 })
-                rl.log_event("focusmate", "task_pull_result", **summary)
+                rl.log_change("focusmate", "task_pull_result",
+                             key=summary.get("source"), volatile=("elapsed_ms",),
+                             **summary)
                 if n:
                     self.announce_completions(before)
             except (BridgeError, ValueError) as e:
-                rl.log_event("focusmate", "task_pull_error", source="sync_completion_state",
+                rl.log_event("focusmate", "task_pull_error", level="error",
+                             source="sync_completion_state",
                              elapsed_ms=round((time.monotonic() - started) * 1000, 1),
                              error="%s: %s" % (type(e).__name__, e))
                 self.say("核对 Focusmate 完成状态失败：%s" % e, "warn")

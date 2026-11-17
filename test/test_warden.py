@@ -55,6 +55,7 @@ sch = w.sch
 sp = w.sp
 
 TMP = tempfile.mkdtemp(prefix="warden-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 # 所有落盘的东西都关进临时目录：绝不碰仓库里的真 data.csv / 状态文件
 CSV = os.path.join(TMP, "data.csv")
 sch.DATA_CSV = CSV

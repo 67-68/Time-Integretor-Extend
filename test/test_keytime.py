@@ -52,6 +52,7 @@ def check_not_in(label, needle, haystack):
 
 
 TMP = tempfile.mkdtemp(prefix="keytime-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 os.environ["TI_KEYTIME_JSON"] = os.path.join(TMP, "keytime.json")
 os.environ["TI_KEYTIME_STATE"] = os.path.join(TMP, "keytime-state.json")
 os.environ["TI_KEYTIME_DEVICES"] = os.path.join(TMP, "devices.json")

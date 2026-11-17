@@ -657,6 +657,12 @@ class NetMixin(object):
                 done.append(entry)
         rep.progress(1.0)
         written = len(done) + len(dropped) + len(marked)
+        rl.log_event("omnifocus", "writeback_flush",
+                     level="warning" if failed else "info",
+                     ops=len(ops), written=written, completed=len(done),
+                     dropped=len(dropped), marked=len(marked),
+                     failed=[{"task_id": f[0], "error": str(f[1])[:200]}
+                             for f in failed])
         rep.log("写回 %d 条%s" % (written,
                                 ("；%d 条失败" % len(failed)) if failed else ""),
                 "ok" if not failed else "warn")
@@ -846,7 +852,9 @@ class NetMixin(object):
             "archived": archived,
             "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
         })
-        rl.log_event("focusmate", "task_pull_result", **summary)
+        rl.log_change("focusmate", "task_pull_result",
+                      key=summary.get("source"), volatile=("elapsed_ms",),
+                      **summary)
         if archived:
             self.announce_completions(before)
         self.writeback_completions()
@@ -1343,6 +1351,9 @@ class NetMixin(object):
     def _net_action_failed(self, action, error):
         """没有专属失败钩子的失败（重放时的就是这种）：说话 + 记账就够了。"""
         self.had_error = True
+        rl.log_event("net", "action_failed", level="error",
+                     action=getattr(action, "name", ""),
+                     label=getattr(action, "label", ""), error=str(error)[:500])
         self.say("❌ %s 失败：%s（已记进失败账，re-action 可以重放）"
                  % (action.label, error), "error")
         self.invalidate()

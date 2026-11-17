@@ -412,6 +412,17 @@ preferences: { favorites: { value: "noPreference"|"preferred" }, quietMode: { va
 
 ### 4.4 cancel session
 
+> **白屏 ≠ 按钮改版（2026-11-17 实测）**：dashboard 渲染成纯白页（`body.innerText`
+> 长度 0、`app-root` 里没有内容）时，先看 profile 有没有被别的 Chromium 占着
+> —— warden 的 bridge 每条命令后会**持锁一段空闲时间**，keep_session daemon 一轮
+> 下单也全程持锁；这段窗口里另起浏览器取消/下单就会白屏，等它让位后再试通常就好。
+> `scripts/cancel.mjs` 已能识别白屏并直接报「profile 写不进去 / 另一只浏览器在用它」；
+> `focusmate-mcp` 的 `cancel_session` 也补了同样的检测（patches/cancel-session-blank-detection.patch）。
+> 判断登录态不要看白屏：直接读 IndexedDB `firebaseLocalStorageDb` →
+> `firebaseLocalStorage` 里有没有 `firebase:authUser:*`。
+
+
+
 **UI 流程（实测）**
 
 - 位置：session 卡片**右下角**（实测 box `{x:254,y:645,w:24,h:24}`，卡片范围 `x:69–287,y:586–678`）。

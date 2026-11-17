@@ -42,6 +42,7 @@ from rich.console import Console  # noqa: E402
 sch = w.sch
 ks = w.ks
 TMP = tempfile.mkdtemp(prefix="relocate-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 CSV = os.path.join(TMP, "data.csv")
 sch.DATA_CSV = CSV
 sch.BACKUP_CSV = os.path.join(TMP, "data.csv.bak")

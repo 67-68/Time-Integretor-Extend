@@ -18,6 +18,7 @@ from rich.console import Console
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="keytime-warden-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 for _name, _file in (
     ("TI_CALENDAR_DOWNLOAD", "download.json"),
     ("TI_SESSION_LAYOUTS", "layouts.json"),

@@ -9,6 +9,7 @@ from .common import (
     TASK_SESSION_NONE,
     ks,
     pj,
+    rl,
     sch,
     sp,
     th,
@@ -332,7 +333,12 @@ class TaskPipelineMixin(object):
                 break
         if period is None or not start or fit <= 0:
             # 没有时段信息（比如 data.csv 手写模式）：退回「只补一场」的老路。
+            rl.log_event("carve", "no_period", level="debug", day=iso,
+                         period=period_id, start=start, fit=fit)
             return self._ensure_carved_session(day, chosen, task=task)
+        rl.log_event("carve", "cut", level="debug", day=iso, period=period_id,
+                     start=start, fit=fit, prefix=prefix,
+                     task=(task or {}).get("id"))
 
         try:
             planned = sp.plan_period(period, prefix + [fit])

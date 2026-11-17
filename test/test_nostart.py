@@ -49,6 +49,7 @@ def check_true(label, got):
 
 
 TMP = tempfile.mkdtemp(prefix="nostart-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 os.environ["TI_CALENDAR_DOWNLOAD"] = os.path.join(TMP, "download.json")
 os.environ["TI_SESSION_LAYOUTS"] = os.path.join(TMP, "layouts.json")
 os.environ["TI_SESSION_EXTRAS"] = os.path.join(TMP, "extras.json")

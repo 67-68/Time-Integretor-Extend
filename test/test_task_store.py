@@ -27,6 +27,7 @@ def check_true(label, got):
 
 
 TMP = tempfile.mkdtemp(prefix="task-store-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 TASKS = os.path.join(TMP, "tasks.json")
 ARCHIVE = os.path.join(TMP, "archive.json")
 # 兜底：这个文件里所有 store 都显式给了路径，但**默认路径**（ts.TaskStore()）

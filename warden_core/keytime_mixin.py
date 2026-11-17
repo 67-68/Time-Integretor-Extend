@@ -39,6 +39,7 @@ from .common import (
     Text,
     kt,
     repl_kit,
+    rl,
 )
 
 #: 每帧最多 1 秒驱动一次（tick=1.0 本来就是这个量级，多一层保护）。
@@ -97,6 +98,12 @@ class KeyTimeMixin(object):
         self.keytime_events = kt.load_config()
         self.keytime_rules, self.keytime_rules_error = kt.load_rules()
         self.keytimes, self.keytime_error = kt.load_keytimes(rules=self.keytime_rules)
+        if self.keytime_rules_error:
+            rl.log_change("keytime", "rules_error", level="warning", key="rules",
+                          error=str(self.keytime_rules_error)[:300])
+        if self.keytime_error:
+            rl.log_change("keytime", "keytimes_error", level="warning",
+                          key="keytimes", error=str(self.keytime_error)[:300])
         self._keytime_state = kt.load_state()
         self.invalidate()
         return self.keytimes
@@ -243,6 +250,10 @@ class KeyTimeMixin(object):
 
     def _keytime_announce(self, target, now):
         """一次完整播报：置顶 + 锁死桌面 + 语音 + mac 横幅 + （人不在时）手机推送。"""
+        rl.log_event("keytime", "announce", level="debug", key=target.key(),
+                     rule=(target.rule or {}).get("name") if isinstance(
+                         target.rule, dict) else None,
+                     calendar=target.calendar, label=target.label())
         self._keytime_summon()
         ctx = self.keytime_ctx(target, now)
         text = kt.speech_text(target, now, ctx, self.keytime_events)
@@ -291,8 +302,13 @@ class KeyTimeMixin(object):
                     log=lambda msg: self.say("[keytime] " + msg, "warn"))
                 if ok:
                     self.keytime_focus_on = True
+                    rl.log_event("keytime", "focus_lock", profile=profile,
+                                 reason=reason)
                     self.say("🔒 已锁死桌面：Focus.app profile「%s」，只留 iTerm"
                              "（%s；解锁：keytime focus off）" % (profile, reason), "cmd")
+                else:
+                    rl.log_event("keytime", "focus_lock_failed", level="warning",
+                                 profile=profile, reason=reason)
             finally:
                 self._keytime_focus_busy = False
 
@@ -314,12 +330,16 @@ class KeyTimeMixin(object):
         if blocking:
             ok = kt.focus_stop(self.keytime_events, profile, log=say)
             if ok:
+                rl.log_event("keytime", "focus_release", profile=profile,
+                             reason=reason or "warden 退出")
                 self.say("🔓 已解锁桌面（%s）" % (reason or "warden 退出"), "cmd")
             return ok
 
         def run():
             ok = kt.focus_stop(self.keytime_events, profile, log=say)
             if ok:
+                rl.log_event("keytime", "focus_release", profile=profile,
+                             reason=reason or "结束")
                 self.say("🔓 已解锁桌面（%s）" % (reason or "结束"), "cmd")
 
         threading.Thread(target=run, name="keytime-unfocus", daemon=True).start()
@@ -341,6 +361,9 @@ class KeyTimeMixin(object):
                 if not self._keytime_notify_failed:
                     self.say("[keytime] " + msg, "warn")
             if not kt.notify(title, body, sound, log=log):
+                if not self._keytime_notify_failed:
+                    rl.log_event("keytime", "notify_failed", level="warning",
+                                 key=target.key())
                 self._keytime_notify_failed = True    # 只报一次，别每分钟刷屏
 
         threading.Thread(target=run, name="keytime-notify", daemon=True).start()
@@ -383,6 +406,10 @@ class KeyTimeMixin(object):
                                       timeout=timeout) or []
                 bad = [r for r in results if not r[1]]
                 if bad:
+                    rl.log_event("keytime", "push_failed", level="warning",
+                                 key=target.key(), mode=mode,
+                                 errors=["%s %s" % (name, detail)
+                                         for name, _ok, detail in bad])
                     self.say("keytime 推送失败：%s" % "；".join(
                         "%s %s" % (name, detail) for name, _ok, detail in bad), "warn")
             finally:
@@ -609,6 +636,8 @@ class KeyTimeMixin(object):
             "at": now.isoformat(timespec="minutes"),
             "left_mac": bool(self.keytime_acked_left_mac),
         }
+        rl.log_event("keytime", "ack", key=key, calendar=target.calendar,
+                     left_mac=bool(self.keytime_acked_left_mac))
         self._keytime_save_state()
         self._keytime_stop_announcer()
         if (self.keytime_events.get("focus") or {}).get("release_on_ack"):

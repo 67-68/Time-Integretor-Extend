@@ -1,0 +1,46 @@
+diff --git a/src/tools/cancel-session.ts b/src/tools/cancel-session.ts
+index b30d6e5..181e4fd 100644
+--- a/src/tools/cancel-session.ts
++++ b/src/tools/cancel-session.ts
+@@ -8,7 +8,11 @@ import {
+   CancelSessionInput,
+   type CancelSessionOutput
+ } from '../schemas/session.js';
+-import { SessionNotFoundError, AuthExpiredError } from '../utils/errors.js';
++import {
++  SessionNotFoundError,
++  AuthExpiredError,
++  AutomationFailedError
++} from '../utils/errors.js';
+ 
+ const MAX_RETRIES = 1;
+ 
+@@ -51,6 +55,28 @@ export function registerCancelSessionTool(server: McpServer): void {
+             // Wait for the page to load
+             await page.waitForTimeout(2000);
+ 
++            // 白屏检测：SPA 没挂载时 body 是空的，再往下等按钮只会 5 秒 locator
++            // 超时，报出来的错完全看不出真正原因。2026-11-17 实测：warden 的
++            // bridge / keep_session daemon 和这里抢同一个 Chromium profile，
++            // dashboard 渲染成纯白页（body 空、app-root 里什么都没有），取消 8 场
++            // 全部超时，过几分钟 profile 空下来又自己好了。所以先把「白屏」这句话
++            // 说清楚，别让人以为按钮改版了。
++            const mounted = await page
++              .evaluate(() => {
++                const root = document.querySelector('app-root, #root, [id="root"]');
++                const text = (document.body?.innerText || '').trim();
++                return !!root && text.length > 0;
++              })
++              .catch(() => false);
++            if (!mounted) {
++              throw new AutomationFailedError(
++                `dashboard 白屏（SPA 没挂载，body 是空的）：profile 正被另一只` +
++                `浏览器占着（warden bridge / keep_session daemon），或者上次` +
++                `浏览器没退干净。profile=${process.env.FOCUSMATE_CONFIG_DIR || '~/.focusmate-mcp'}` +
++                `；等几秒重试，或先退出 warden 再取消。`
++              );
++            }
++
+             // Find the session card and its cancel/clear button
+             // Strategy 1: Look for a session card that links to this session ID
+             const sessionLink = page.locator(`a[href*="${sessionId}"]`);

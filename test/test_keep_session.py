@@ -45,6 +45,7 @@ ks = load("ks", "keep_session.py")
 sch = ks.sch
 
 TMP = tempfile.mkdtemp(prefix="keep-session-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 CSV = os.path.join(TMP, "data.csv")
 ks.STATE_FILE = os.path.join(TMP, "state.json")
 ks.LOCK_FILE = os.path.join(TMP, "lock")

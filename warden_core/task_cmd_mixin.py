@@ -1194,6 +1194,9 @@ class TaskCmdMixin(object):
                                    % (self.task_label(task), self.task_label(task)))
         note = "" if local_only else self.omni_drop(task, all_occurrences=template)
         task = self.task_store.set_status(task["id"], ts.STATUS_DROPPED, reason="cmd-drop")
+        rl.log_event("task", "drop", task_id=task.get("id"),
+                     title=self.task_store.focusmate_title(task, 60),
+                     local_only=bool(local_only), template=bool(template))
         self.say("✗ 任务 %s「%s」已放弃%s%s"
                  % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                     ("；" + note) if note else "（只改了本地）",
@@ -1303,6 +1306,11 @@ class TaskCmdMixin(object):
         note_fm = self.fm_complete(task)
         note_of = self.omni_complete(task)
         note_sub = self._project_child_completed(task, writeback=True)
+        rl.log_event("task", "done", task_id=task.get("id"),
+                     title=self.task_store.focusmate_title(task, 60),
+                     minutes=minutes, why=why,
+                     focusmate=bool(has_fm), omnifocus=bool(has_omni),
+                     project_child=bool(note_sub))
         self.say("✓ 任务 %s「%s」完成%s%s%s%s"
                  % (self.task_label(task), self.task_store.focusmate_title(task, 40),
                     ("（%d 分钟）" % minutes) if minutes else "",

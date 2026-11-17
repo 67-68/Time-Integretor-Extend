@@ -70,6 +70,10 @@ try:
     import session_plan as sp
 except Exception:                                    # noqa: BLE001
     sp = None
+try:
+    import runtime_log as rl
+except Exception:                                    # noqa: BLE001
+    rl = None
 TEMP = os.path.join(HERE, "temp")
 PYLIBS = os.path.join(TEMP, "pylibs")
 CONFIG_FILE = os.path.join(TEMP, "calendar.json")
@@ -1066,6 +1070,13 @@ def cmd_populate(args):
         info("md 写到 %s" % md_out)
     info("")
     info("data.csv 已更新：%s" % DATA_CSV)
+    if rl is not None:
+        rl.log_event("calendar", "populate",
+                     periods=len(download or []),
+                     mode=meta.get("download_mode"),
+                     rows=len([ln for ln in csv.splitlines()
+                               if ln.strip() and not ln.startswith("#")]),
+                     download=os.path.basename(str(download_json_path(args))))
     return 0
 
 
@@ -1108,6 +1119,11 @@ def cmd_layout(args):
         shutil.copy2(DATA_CSV, BACKUP_CSV)
     write_text(DATA_CSV, csv)
     counts = sp.plan_counts(download, layouts)
+    if rl is not None:
+        rl.log_event("calendar", "layout", day=day, period=period_id,
+                     durations=durations, sessions=len(sessions),
+                     rows=len([ln for ln in csv.splitlines()
+                               if ln.strip() and not ln.startswith("#")]))
     info("data.csv 已重算：%s（时段 %d / 一次性 %d / 长期规则 %d）"
          % (DATA_CSV, counts.get("period", 0), counts.get("extra", 0),
             counts.get("rule", 0)))

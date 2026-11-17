@@ -427,16 +427,17 @@ class TaskSyncMixin(object):
         """
         started = time.monotonic()
         enabled = self.omnifocus_enabled()
-        rl.log_event("omnifocus", "status_pull_start", enabled=enabled)
+        rl.log_event("omnifocus", "status_pull_start", level="debug", enabled=enabled)
         if not enabled:
-            rl.log_event("omnifocus", "status_pull_skipped", reason="disabled_or_unavailable")
+            rl.log_event("omnifocus", "status_pull_skipped", level="debug",
+                         reason="disabled_or_unavailable")
             return {}
         rows = None
         try:
             rows = self.omnifocus.list_tasks(refresh=True)
         except of.OmniFocusError as e:
             self.had_error = True
-            rl.log_event("omnifocus", "status_pull_error", kind=e.kind,
+            rl.log_event("omnifocus", "status_pull_error", level="error", kind=e.kind,
                          exit_code=e.exit_code, detail=e.detail, message=str(e),
                          elapsed_ms=round((time.monotonic() - started) * 1000, 1))
             self.say("读 OmniFocus 失败：%s" % e, "warn")
@@ -481,8 +482,11 @@ class TaskSyncMixin(object):
             "completed": bool(row.get("completed")),
             "completed_at": row.get("completed_at"),
         } for task_id, row in out.items()]
-        rl.log_event(
-            "omnifocus", "status_pull_result", row_count=len(rows or []),
+        # 只在「对上账的结果变了」时写：这条以前每轮 refresh / 收尾都刷一遍，
+        # 一天能刷掉几千行，真正想看的「哪条任务被认成完成了」反而被埋了。
+        rl.log_change(
+            "omnifocus", "status_pull_result", key="status", volatile=("elapsed_ms",),
+            row_count=len(rows or []),
             linked_count=len(out), completed_count=sum(1 for x in done if x["completed"]),
             claimed_pks=sorted(claimed), held_task_ids=held,
             linked=done, elapsed_ms=round((time.monotonic() - started) * 1000, 1))
@@ -499,7 +503,7 @@ class TaskSyncMixin(object):
         这一批会**并进当前那一步操作**（refresh / task sync），不会另起一个标题。
         """
         if not self.omnifocus_enabled():
-            rl.log_event("omnifocus", "writeback_scan_skipped",
+            rl.log_event("omnifocus", "writeback_scan_skipped", level="debug",
                          reason="disabled_or_unavailable")
             return []
         pool = list(tasks if tasks is not None else self.task_store.list())
@@ -543,9 +547,11 @@ class TaskSyncMixin(object):
         # 扫描到的完成 + 攒在 outbox 里的意图，合成一批，一次 osascript 写完。
         ops = self.pending_writebacks(pool)
         if not ops:
-            rl.log_event("omnifocus", "writeback_scan_result", written=[])
+            rl.log_change("omnifocus", "writeback_scan_result", level="debug",
+                         key="empty", written=[])
             return []
-        rl.log_event("omnifocus", "writeback_scan_start", pending=len(ops))
+        rl.log_event("omnifocus", "writeback_scan_start", level="debug",
+                     pending=len(ops))
         self.flush_omnifocus(ops)
         return [(op.get("task_id"), "丢后台了") for op in ops]
 

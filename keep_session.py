@@ -100,6 +100,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import main as fm  # noqa: E402  复用 resolve_target / mcp_call / book_once / TOKEN
+import runtime_log as rl  # noqa: E402  和 warden 同一份 JSONL 日志（一条时间线）
 import schedule as sch  # noqa: E402  data.csv 的解析/编辑：唯一实现（TUI 也 import 它）
 import postsession as psv  # noqa: E402  收尾：谁该收、什么时候收（纯逻辑 + 状态文件）
 
@@ -1650,6 +1651,9 @@ def _run_once_locked(dry_run=False, force=False):
     due, past = win["due"], win["past"]
     log("  窗口 %s → %s：执行区 %d 场、已开始 %d 场"
         % (now.strftime("%m-%d %H:%M"), horizon.strftime("%m-%d %H:%M"), len(due), len(past)))
+    rl.log_event("daemon", "round_start", level="debug", dry_run=bool(dry_run),
+                 force=bool(force), due=len(due), past=len(past),
+                 horizon=horizon.strftime("%Y-%m-%d %H:%M"))
     if not due and not past:
         log("  [warn] 未来 %d 小时里**一条契约都没有** —— 不是放假就是 data.csv 断了档，"
             "去 warden 敲 `day 0` / `day 1` 看一眼" % WINDOW_HOURS)
@@ -1890,6 +1894,9 @@ def _run_once_locked(dry_run=False, force=False):
         else:
             log("  %s 缺失，开始第 %d/%d 次预定...（目标时间 %s，%smin）"
                 % (key, try_attempts, MAX_ATTEMPTS, fmt_local_utc(start), slot["duration"]))
+        rl.log_event("book", "attempt", key=key, duration=slot["duration"],
+                     attempt=try_attempts, max_attempts=MAX_ATTEMPTS,
+                     target=fmt_local_utc(start), force=bool(force))
         debounce()
         # 直接用算好的 start（带日期），不走 fm.resolve_target 的"过了就顺延到明天"猜谜：
         # 窗口里同时有今天和明天的场次时，那种猜法会挑错日子。
@@ -1905,6 +1912,9 @@ def _run_once_locked(dry_run=False, force=False):
             ok, detail = verify_slot_booked(start)
             if ok:
                 log("  %s 复核通过：API 确认该 session 已存在" % key)
+                rl.log_event("book", "booked", key=key, duration=slot["duration"],
+                             session_id=sess.get("id"), attempt=try_attempts,
+                             target=fmt_local_utc(start))
                 state["slots"][key] = {"status": "booked", "duration": slot["duration"],
                                        "attempts": try_attempts, "infra_attempts": 0}
                 changed = True
@@ -1915,6 +1925,10 @@ def _run_once_locked(dry_run=False, force=False):
         else:
             reason = payload.get("error") or payload.get("errorCode") or "未知错误"
         code = payload.get("errorCode") or ""
+        rl.log_event("book", "failed", level="warning", key=key,
+                     duration=slot["duration"], attempt=try_attempts,
+                     error=str(reason)[:300], error_code=code or None,
+                     infra=bool(is_infra_failure(reason, code)))
 
         # 环境/浏览器类失败：不占 3 次上限，也不写 failed；用更长退避继续试。
         if is_infra_failure(reason, code):
@@ -1980,6 +1994,8 @@ def _run_once_locked(dry_run=False, force=False):
         except Exception as e:                 # noqa: BLE001 - 叫不起来就算了
             log("  [nostart] 没叫起来：%s" % e)
     log("=== round done ===")
+    rl.log_event("daemon", "round_done", level="debug", due=len(due),
+                 past=len(past), dry_run=bool(dry_run), force=bool(force))
     return 0
 
 

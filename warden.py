@@ -1073,6 +1073,9 @@ class Warden(
             self.go_to_view(ContractView)
         if not exec_lines:
             self.write_tui_state()
+        rl.log_event("warden", "start", day=self.sel_date.isoformat(),
+                     offline=bool(self.offline), script=bool(exec_lines),
+                     day_offset=self.day_offset)
         self.emit("[dim]起 bridge、拉 session…[/]")
         # 启动这一批：session 列表 + Focusmate task 完成状态。
         # 后台模式下 TUI 立刻出来，这两件事在面板里跑（干完面板自己消失，
@@ -1188,6 +1191,7 @@ def main(argv=None):
     try:
         return warden.run(exec_lines=exec_lines)
     finally:
+        rl.log_event("warden", "stop", level="debug")
         bridge.stop()
 
 

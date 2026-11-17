@@ -21,6 +21,7 @@ from .common import (
     ks,
     parse_relocate_spec,
     parse_session_spec,
+    rl,
     run_keep_session,
     sch,
     sp,
@@ -249,6 +250,9 @@ class SessionMixin(object):
             return False
         ks.mark_abandoned(key, why="walk-of-shame",
                           note="TUI 里放弃这一场（#%d %s）" % (idx, row["startLabel"]))
+        rl.log_event("session", "abandoned", key=key, index=idx,
+                     start=row.get("startLabel"), zone=row.get("zone"),
+                     booked=bool(row.get("id")))
         if row.get("planned"):
             self.say("已判 %s 为「已放弃」：daemon 不会再重订这个时间点的这一场"
                      "（日历规则还在；`cancel %d --permanent` 才从日历删掉）。"
@@ -268,6 +272,9 @@ class SessionMixin(object):
             return False
         ks.mark_abandoned(key, why="permanent",
                           note="TUI 里永久取消这一场（#%d %s）" % (idx, row["startLabel"]))
+        rl.log_event("session", "cancelled_permanent", key=key, index=idx,
+                     start=row.get("startLabel"), booked=bool(row.get("id")),
+                     contract_row=bool(row.get("lineno")))
         self.say("已判 %s 为「永久不要」：daemon 不会再重订这一场。" % key, "ok")
         self._remove_contract_row_for_cancel(idx, row)
         if row.get("id") is None:
@@ -1438,6 +1445,9 @@ class SessionMixin(object):
         """
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         period_id = period.get("id")
+        rl.log_event("layout", "commit_start", level="debug", day=iso,
+                     period=period_id, mode=mode, source=source,
+                     durations=list(durations or ()), book=bool(book))
         if mode == "clear":
             effective = []
         elif mode == "remove":
@@ -1448,7 +1458,13 @@ class SessionMixin(object):
             # 注意 ``[]`` 是「这个时段当天不排了」，不能当成「没给」回落默认排布。
             effective = (list(durations) if durations is not None else [])
         # 纯计算先验证；这里抛 ValueError = 零副作用。
-        new_sessions = sp.plan_period(period, effective)
+        try:
+            new_sessions = sp.plan_period(period, effective)
+        except ValueError as e:
+            rl.log_event("layout", "reject", level="warning", day=iso,
+                         period=period_id, source=source,
+                         durations=list(effective), error=str(e))
+            raise
 
         # 排布一变，动过的场次上的任务绑定就该清掉；先算出来，好写进取消前的面板。
         dropped = (self._task_bindings_dropped(period, new_sessions)
@@ -1472,6 +1488,8 @@ class SessionMixin(object):
             on_wait=lambda: self.say("daemon 正在跑一轮，等它跑完再改排布（最多等 %d 秒）…"
                                      % int(lock_timeout), "cmd"))
         if lock is None:
+            rl.log_event("layout", "lock_timeout", level="warning", day=iso,
+                         period=period_id, timeout=lock_timeout)
             self.say("daemon 正在跑一轮（等不到 round lock），改成挂号单兜底："
                      "会让它别把这次改动记成罪。", "warn")
         cancelled, failed = [], False
@@ -1483,6 +1501,8 @@ class SessionMixin(object):
                 day, period, new_sessions, dropped, reason=reason)
             if failed:
                 # 取消失败 = 新排布没生效，别再往下写 layout（否则 50/25 并存）。
+                rl.log_event("layout", "cancel_failed", level="error", day=iso,
+                             period=period_id, sessions=len(new_sessions))
                 return {"ok": False, "sessions": new_sessions,
                         "cancelled": cancelled, "dropped": dropped,
                         "cleared": [], "failed": True}
@@ -1519,6 +1539,11 @@ class SessionMixin(object):
             if lock is not None:
                 lock.__exit__(None, None, None)
 
+        rl.log_event("layout", "commit_done", day=iso, period=period_id,
+                     source=source, mode=mode, sessions=len(new_sessions),
+                     cancelled=len(cancelled or []), dropped=len(dropped or []),
+                     cleared=len(cleared or []),
+                     spans=["%s-%s" % (s["start"], s["end"]) for s in new_sessions])
         if book:
             self.book(day, why="排布变了，要把新场次订上")
         return {"ok": True, "sessions": new_sessions, "cancelled": cancelled,
@@ -1718,6 +1743,8 @@ class SessionMixin(object):
         失败不拦路：任何一块刷不动就记一句警告，其余照刷 —— refresh 是「再对一次账」，
         不是「全有或全无」。
         """
+        rl.log_event("refresh", "start", level="debug",
+                     day=self.sel_date.isoformat())
         project_sync = self._project_tasks_refreshable()
         self.jobs.begin(2 + (1 if project_sync else 0), title="刷新（refresh）")
         self.forget_caches()
@@ -1753,6 +1780,7 @@ class SessionMixin(object):
         self.refresh_review_state()
         self.forget_caches()
         self.invalidate()
+        rl.log_event("refresh", "done", day=self.sel_date.isoformat())
         return True
 
     def forget_caches(self):
@@ -1924,7 +1952,11 @@ class SessionMixin(object):
         重新定义离线语义。唯一的全局守卫是 ``_suppress_book``（refresh 的对账轮
         只对账、不新造外部动作）。
         """
+        rl.log_event("book", "start", level="debug",
+                     day=str(day or getattr(self, "sel_date", "")),
+                     why=why, force=bool(force), wait=wait)
         if getattr(self, "_suppress_book", False):
+            rl.log_event("book", "suppressed", level="debug", why=why)
             return None
         if getattr(self, "_booking", False):
             return None                       # 已经在订了，别嵌套
@@ -1942,9 +1974,12 @@ class SessionMixin(object):
                     self.say(line)
                 if rc != 0:
                     self.had_error = True
+                    rl.log_event("book", "failed", level="error", rc=rc,
+                                 error=(err or "")[:500], why=why)
                     self.say("❌ check 退出码 %d%s（契约已落盘，daemon 后续还会补）"
                              % (rc, ("：" + err) if err else ""), "error")
                     return False
+                rl.log_event("book", "done", why=why, force=bool(force))
                 if announce:
                     self.say("✅ check 跑完。", "ok")
                 # 订完必须回头把表拉一遍：否则界面上那几场还是「未订上 / 没有
@@ -1966,10 +2001,14 @@ class SessionMixin(object):
                 on_ok=(lambda _payload: self.say("✅ check 跑完（契约已落盘）。", "ok"))
                 if announce else None)
             if not do_wait:
+                rl.log_event("book", "triggered", why=why, force=bool(force))
                 return True
             outcome = job.outcome
             if outcome is None or not outcome.ok:
                 self.had_error = True
+                rl.log_event("book", "failed", level="error",
+                             error=str((outcome and outcome.error) or "没跑"),
+                             why=why)
                 self.say("❌ check 没跑成%s（契约已落盘，daemon 下一轮还会补）"
                          % (("：" + outcome.error) if outcome else ""), "error")
                 return False

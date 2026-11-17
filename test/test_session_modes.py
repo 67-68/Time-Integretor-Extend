@@ -12,6 +12,7 @@ def check(label, got, want):
 def check_true(label, got, want=True):
     check(label, bool(got), want)
 TMP = tempfile.mkdtemp(prefix="session-modes-test-")
+os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 for key, name in (("TI_CALENDAR_DOWNLOAD", "download.json"),
                   ("TI_SESSION_LAYOUTS", "layouts.json"),
                   ("TI_SESSION_EXTRAS", "extras.json"),

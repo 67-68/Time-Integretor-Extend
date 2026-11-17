@@ -344,6 +344,12 @@ temp/logs/YYYY-MM-DD.jsonl
 日志不会写 token / cookie。`TI_LOG_DIR=/path` 可以改目录（Node 桥和 Python
 共用这个变量）。日志只是旁路：目录写不进去不会影响任务流程。
 
+每行还带 `level`（DEBUG / INFO / WARNING / ERROR）。2026-11-17 起：
+`*_pull_start` / `*_scan_start` / `*_skipped` 这类纯流程事件是 **DEBUG**
+（`TI_LOG_LEVEL=debug` 才写）；`task_pull_result` / `writeback_scan_result`
+改成 **只在结果变化时写**，中间一样的几轮记进 `skipped_same`。完整口径见
+`feature_intents/logging.md`。
+
 ## 6. 权限（第一次用之前点一次）
 
 macOS 不允许一个 app 悄悄控制另一个 app。第一次跑
