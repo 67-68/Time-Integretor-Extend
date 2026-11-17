@@ -438,6 +438,25 @@ check("绝不带 --new", "--new" in _args, False)
 check("带 warden 的 tty", "/dev/ttys002" in _args, True)
 check("不打 refresh", "--no-refresh" in _args, True)
 
+# ---------------------------------------------------------------- 撤销判决要连 state 一起撤
+
+print("== 重新排布撤判决：verdicts 和 state.slots 必须一起清（2026-11-17 事故）==")
+clear()
+_day2 = datetime.date.today() + datetime.timedelta(days=1)
+KEY2 = sch.key_of(_day2, "13:00")
+KEY3 = sch.key_of(_day2, "14:30")
+ks.save_verdicts({"abandoned": {KEY2: {"at": "stub"}}})
+ks.save_state({"date": datetime.date.today().isoformat(),
+               "slots": {KEY2: {"status": "abandoned", "duration": 75},
+                         KEY3: {"status": "booked", "duration": 50}}})
+check("clear_abandoned 撤掉 1 条判决", ks.clear_abandoned([KEY2]), 1)
+check("clear_slot_status 撤掉 1 条 state 判决", ks.clear_slot_status([KEY2]), 1)
+_slots = ks.load_state()["slots"]
+check("state 里不再有 abandoned", _slots.get(KEY2), None)
+check("已订上的记录不许被撤", (_slots.get(KEY3) or {}).get("status"), "booked")
+check("再撤一次是 0（幂等）", ks.clear_slot_status([KEY2]), 0)
+check("没给 key 时不动 state", ks.clear_slot_status([]), 0)
+
 _calls[:] = []
 ks.tui_alive = lambda state=None: (False, {})
 check("TUI 没开时 focus_only 直接放弃", ks.summon_warden(focus_only=True, quiet=True),

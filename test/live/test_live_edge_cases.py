@@ -356,6 +356,45 @@ def case_7_booked_rows_untouched():
           layout("T3"), [75, 50])
 
 
+def case_8_revived_session_not_pruned():
+    """特征 16（2026-11-17 事故）：重新 plan 到「曾判死」的时刻，refresh 不许剪掉。
+
+    现场：`commit_layout` 撤了 verdicts 里的 abandoned，但 `keep_session-state.json`
+    的 ``slots[key].status`` 还留着 abandoned。下一次 refresh 的
+    ``_prune_dead_auto_slots`` 把刚排好的场次当幽灵剪掉，连带清空项目 plan
+    （用户原话：「每次 plan 之后 r -c，计划会被冲掉」）。
+    """
+    reset_sandbox()
+    wd = new_warden()
+    run(wd, "plan 0")
+    run(wd, "task 1 3")
+    check("第一轮 complete 没报错", run(wd, "complete"), "")
+    items = plan_items()
+    check_true("第一轮排出了一条计划", bool(items))
+    start = str(items[0].get("start"))
+    dur = int(items[0].get("duration") or 0)
+    check_true("排出来的场次在 csv 里（%s/%d）" % (start, dur),
+               (start, dur) in csv_rows())
+
+    # 模拟 daemon 曾经把这一刻判死（abandoned 同时写进判决和 state）
+    key = "%sT%s" % (DAY.isoformat(), start)
+    w.ks.mark_abandoned(key, "test", "模拟历史放弃")
+    w.ks.mark_slot(key, "abandoned", "模拟历史放弃", duration=dur)
+
+    # 重新 plan 同一批 = 又一次「我要这几场」→ 两个账本都要撤
+    run(wd, "plan 0")
+    run(wd, "task 1 3")
+    check("第二轮 complete 没报错", run(wd, "complete"), "")
+    wd.refresh(quiet=True)
+
+    check("重新 plan 之后场次还在（没被当成幽灵剪掉）",
+          (start, dur) in csv_rows(), True)
+    check_true("plan 还在（没被整片清空）", bool(plan_items()))
+    check("state 里那条 abandoned 已经撤掉",
+          (w.ks.load_state().get("slots") or {}).get(key), None)
+    return wd
+
+
 def main(argv):
     print("fixture：%s" % FIXTURE)
     print("现场：%s %s，next quarter = %s\n" % (DAY.isoformat(),
@@ -374,6 +413,8 @@ def main(argv):
         case_6_over_allocation_refused()
         print()
         case_7_booked_rows_untouched()
+        print()
+        case_8_revived_session_not_pruned()
     finally:
         if "--keep" not in argv and not fails:
             shutil.rmtree(PATHS["root"], ignore_errors=True)

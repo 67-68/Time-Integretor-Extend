@@ -1472,11 +1472,17 @@ class SessionMixin(object):
 
         # 重新排布 = 你又想要这几场：先撤掉「永不重订」的判决，否则认过罪的场次
         # 永远补不回来（daemon 在 due 之前就把 abandoned 的 key 滤掉了）。
-        revived = ks.clear_abandoned(
-            [sch.key_of(day, s["start"]) for s in new_sessions])
-        if revived:
+        revived_keys = [sch.key_of(day, s["start"]) for s in new_sessions]
+        revived = ks.clear_abandoned(revived_keys)
+        # 判决清了还不够：daemon 把同一批结论也抄进了 state.json 的 slots。
+        # 留着它，下一轮 refresh 的 _prune_dead_auto_slots 会把这些刚排好的场次
+        # 当成「已被取消/作废」剪掉，连带把项目 plan 清空（2026-11-17 事故）。
+        revived_state = ks.clear_slot_status(revived_keys)
+        if revived or revived_state:
+            rl.log_event("layout", "revive", day=iso, period=period_id,
+                         verdicts=revived, slots=revived_state)
             self.say("撤销 %d 条「永不重订」判决：这几场重新进 daemon 的下单队列。"
-                     % revived, "ok")
+                     % (revived or revived_state), "ok")
 
         # 取消旧场 → 清 state → 写新排布 这三步必须和 daemon 的一轮互斥（同一把锁），
         # 否则它会在缝隙里把 warden 自己干的活记成「你手动取消」的罪。

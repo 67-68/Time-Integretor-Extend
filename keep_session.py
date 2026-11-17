@@ -562,6 +562,37 @@ def clear_abandoned(keys):
     return n
 
 
+def clear_slot_status(keys, statuses=("abandoned", "missed")):
+    """重新排布 = 这几场重新要了：把 daemon 记在 ``state`` 里的「判死」结论也撤掉。
+
+    为什么光撤判决不够（2026-11-17 事故）：``commit_layout`` 只清了
+    ``keep_session-verdicts.json`` 里的 abandoned，``state.json`` 的
+    ``slots[key].status`` 还留着 ``abandoned``。下一轮 ``refresh`` 的
+    ``_prune_dead_auto_slots`` 读到这条旧结论 → 把刚 plan 好的场次当成
+    「已被取消/作废」剪掉 → 项目 plan 整片清空（用户原话：「每次 plan 之后
+    r -c，计划会被冲掉」）。
+
+    只撤判决类状态（abandoned / missed）；已订上、进行中的记录是**事实**，
+    留着（``booked`` / ``actual`` 那些字段后面还要用）。
+    返回撤掉几条。
+    """
+    want = {str(k) for k in (keys or [])}
+    if not want:
+        return 0
+    st = load_state()
+    slots = st.get("slots") or {}
+    n = 0
+    for key in list(slots):
+        rec = slots.get(key)
+        if (key in want and isinstance(rec, dict)
+                and str(rec.get("status") or "") in statuses):
+            slots.pop(key, None)
+            n += 1
+    if n:
+        save_state(st)
+    return n
+
+
 def load_sins():
     """待认罪的罪：{"sins": [{key, what, at, note}]}。"""
     s = _load_json(SINS_FILE, {})

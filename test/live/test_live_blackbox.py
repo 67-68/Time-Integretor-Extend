@@ -14,6 +14,7 @@ data.csv / data/*.json / temp/*.json 传递。所以它测得到进程边界上�
 不订场：目标日在 +10 天，执行区 24 小时永远够不到；PATH 里没有 node，
 bridge / focusmate-mcp 一律瞬间失败（外部世界在测试里不存在）。
 """
+import json
 import os
 import shutil
 import sys
@@ -126,6 +127,51 @@ def case_2_plan_after_clear_is_idempotent():
     check("plan items 也回到 3 条", len(bb.plan_items(paths)), 3)
 
 
+def case_3_revived_session_is_not_pruned():
+    """重新 plan 到「曾经被放弃」的时刻：refresh 不许把新计划当成幽灵剪掉。
+
+    复刻 2026-11-17 用户报的 bug：「每次 plan 之后 r -c，计划会被冲掉」。
+    现场是两个账本不一致：`commit_layout` 撤了 verdicts 里的 abandoned，
+    但 `keep_session-state.json` 的 slots[key].status 还留着 abandoned，
+    于是下一次 refresh 的 `_prune_dead_auto_slots` 把刚排的场次判死、剪掉，
+    连带把项目 plan 整片清空。
+    """
+    paths = bb.make_sandbox(offset=1)          # 用明天：不依赖现在几点
+    day = paths["day"]
+    iso = day.isoformat()
+    key = "%sT13:00" % iso
+    with open(os.path.join(paths["temp"], "keep_session-verdicts.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"abandoned": {key: {"at": "%sT11:50:00" % iso,
+                                       "why": "manual-cancel"}}}, f)
+    with open(os.path.join(paths["temp"], "keep_session-state.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"date": iso, "slots": {key: {"status": "abandoned", "duration": 75}},
+                   "api_snapshot": {"at": "%sT11:50:00" % iso,
+                                    "horizon": "%sT23:59:00" % iso,
+                                    "sessions": [], "details": []}}, f)
+
+    first = bb.run(paths, ["plan 1", "task 1 2", "task 2 2", "task 3 1", "complete"])
+    check("重新 plan 到被放弃过的时刻，退出码 0", first["rc"], 0)
+    check("场次按 plan 写出来了", bb.csv_rows(paths), [("13:00", 75), ("14:30", 50)])
+    check("plan items 3 条", len(bb.plan_items(paths)), 3)
+    # say() 进的是 Recent 面板，脚本模式只保留最后几条 —— 判据用日志更稳
+    check_true("撤销动作进了日志（layout revive）",
+               any(r.get("event") == "revive" for r in bb.log_events(paths)))
+    state = json.load(open(os.path.join(paths["temp"], "keep_session-state.json"),
+                           encoding="utf-8"))
+    check("state 里那条 abandoned 被一起撤掉了",
+          [k for k, v in (state.get("slots") or {}).items()
+           if str((v or {}).get("status") or "") == "abandoned"], [])
+
+    second = bb.run(paths, ["day 1", "refresh"])
+    check("refresh 退出码 0", second["rc"], 0)
+    check("refresh 之后场次还在", bb.csv_rows(paths), [("13:00", 75), ("14:30", 50)])
+    check("refresh 之后 plan items 还在", len(bb.plan_items(paths)), 3)
+    check_true("refresh 没有把计划冲掉", "和当前时间资源对不上" not in second["out"])
+    return paths
+
+
 def main(argv):
     keep = "--keep" in argv
     print("== 场景 1：plan → 重新 plan（上一轮场次必须释放）==")
@@ -134,6 +180,14 @@ def main(argv):
     except Exception as e:                         # noqa: BLE001 - 黑盒也要留现场
         import traceback
         fails.append("场景 1 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 3：重新 plan 到「曾经被放弃」的时刻，refresh 不许剪掉==")
+    try:
+        case_3_revived_session_is_not_pruned()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 3 异常：%s: %s" % (type(e).__name__, e))
         traceback.print_exc()
 
     print("\n== 场景 2：plan → plan clear → 再 plan（幂等）==")

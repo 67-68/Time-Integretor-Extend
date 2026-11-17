@@ -17,6 +17,7 @@ from .common import (
     of,
     parse_relate_markdown,
     parse_relate_task,
+    ks,
     pj,
     pp,
     repl_kit,
@@ -950,7 +951,23 @@ class ProjectMixin(object):
             return children[0], parent
         return first, None
 
-    def _wake_project_leaf(self, op, item, parent=None):
+    def _plan_task_reusable(self, existing, day=None, exclude=()):
+        """plan 唤起已有镜像任务时，这条任务能不能直接复用（而不是再建一条）。
+
+        项目导入时就把叶子任务镜像进本地任务库了，plan 唤起时复用它、只更新这次
+        分到的 count/duration。**已经绑着 session 的不复用**：那说明它已经在
+        某个场次上了（可能是手动的、也可能是明天的一次性场次），这一轮不该把它
+        抢走。``exclude`` 是这一轮已经用掉的任务（一条 4 count 的任务落成
+        75+25 两段时，第二段必须新建一条）。
+        """
+        if existing is None or not ts.TaskStore.is_open(existing):
+            return False
+        if existing.get("id") in set(exclude or ()):
+            return False
+        return not (existing.get("session") or {})
+
+    def _wake_project_leaf(self, op, item, parent=None, day=None,
+                           exclude=()):
         """把项目叶子任务变成可挂 session 的本地任务（复用已有镜像）。"""
         item = dict(item or {})
         pk = str(item.get("pk") or "").strip()
@@ -988,8 +1005,7 @@ class ProjectMixin(object):
         if parent_pk:
             source.update({"parent_id": parent_pk, "parent_title": parent_title})
         existing = self._project_local_task(op["id"], pk)
-        if (existing is not None and ts.TaskStore.is_open(existing)
-                and not existing.get("session")):
+        if self._plan_task_reusable(existing, day, exclude=exclude):
             return self.task_store.apply_project_plan(
                 existing["id"], fields, source=source)
         return self.task_store.create(
@@ -1010,7 +1026,8 @@ class ProjectMixin(object):
         else:
             idx, row = self.pick(session_token)
         date_iso = str(row.get("date") or self.sel_date.isoformat())
-        task = self._wake_project_leaf(op, item, parent=parent)
+        task = self._wake_project_leaf(op, item, parent=parent,
+                                       day=self.sel_date)
         note = self._assign_task(task, str(idx), refresh=False,
                                  allow_unbooked=True)
         task = self.task_store.get(task["id"])
@@ -1225,7 +1242,8 @@ class ProjectMixin(object):
                 "项目清单和本地赋闲任务里都没有合适的未排任务。"
                 % (remaining, max_minutes))
         op, item, parent = picked
-        task = self._wake_project_leaf(op, item, parent=parent)
+        task = self._wake_project_leaf(op, item, parent=parent,
+                                       day=self.sel_date)
         note = self._assign_task(task, str(idx), refresh=False,
                                  allow_unbooked=True)
         task = self.task_store.get(task["id"])
@@ -3649,10 +3667,12 @@ class ProjectMixin(object):
                 continue
             if task.get("formatter") or ts.task_is_deferred(task):
                 excluded.setdefault(pid, set()).add(str(pk))
-            elif append_to_plan and (task.get("session") or {}).get("start"):
-                # 追加语义的必然后果：上一轮**已经排进 session** 的项目任务（含清单
-                # 派生行）这一轮不能再排。以前不查，`plan` 会把同一条清单行再唤起
-                # 一条本地任务，于是同一行出现两份「(0+3/3)」。
+            elif str((task.get("session") or {}).get("start") or ""):
+                # 已经站在某场 session 上的项目任务（含清单派生行）这一轮不再排：
+                # 追加语义下这是必须的；整天重排下同样必须 —— 它的绑定要么是
+                # 用户手动挂的，要么是当天的一次性场次，plan 重复唤起只会让
+                # 同一条清单行出现两份（2026-11-17 ``edge_list#d1`` 事故：
+                # 上一轮绑在 23:15，这一轮又建了一条同 pk 的任务）。
                 excluded.setdefault(pid, set()).add(str(pk))
                 skip_pks.setdefault(pid, set()).add(str(pk))
         items, notes = pp.distribute(
@@ -3755,7 +3775,21 @@ class ProjectMixin(object):
                 existing = pj.plan_of(alloc["project"], day) or {}
                 count += int(existing.get("count") or 0)
             self.projects.set_allocation(alloc["project_id"], day, count)
+        # 这一次 plan 要用的场次 = 「我又想要它们了」：把「永不重订」判决和
+        # daemon 记在 state 里的判死结论一起撤掉。commit_layout 只对**重切过**的
+        # 时段做这件事；计划没变（layout 没动）时它根本不会跑，旧判决就留到下一次
+        # refresh —— 那正是「plan 之后 r -c，计划被冲掉」的另一条路。
+        revive_keys = []
+        for place in placements:
+            start = str((place.get("slot") or {}).get("start") or "")
+            if start:
+                revive_keys.append(sch.key_of(day, start))
+        if revive_keys:
+            ks.clear_abandoned(revive_keys)
+            ks.clear_slot_status(revive_keys)
+
         made, failed = {}, 0
+        used_ids = set()
         for place in placements:
             item = place["item"]
             slot = place["slot"]
@@ -3821,8 +3855,7 @@ class ProjectMixin(object):
                                "parent_title": parent_title})
             existing = self._project_local_task(item["project_id"], item["pk"])
             try:
-                if (existing is not None and ts.TaskStore.is_open(existing)
-                        and not existing.get("session")):
+                if self._plan_task_reusable(existing, day, exclude=used_ids):
                     # 项目导入时已经把叶子任务镜像进任务库了：plan 唤起时复用
                     # 同一条，并把这次分到的 count / duration / 父任务来源写上去。
                     task = self.task_store.apply_project_plan(
@@ -3838,6 +3871,7 @@ class ProjectMixin(object):
                 failed += 1
                 self.say("⚠ 「%s」没建成本地任务：%s" % (item.get("title"), e), "error")
                 continue
+            used_ids.add(task.get("id"))
             try:
                 self._assign_task(task, str(slot["index"]), refresh=False,
                                   allow_unbooked=True)

@@ -841,13 +841,24 @@ for width in (40, 120):
 buf = io.StringIO()
 # 表格加了「没有设定任务🔞」列宽之后，120 列会把标题列截成「已匹」；
 # 这个用例只验渲染内容，用足够宽的画布看完整标记。
-console = Console(file=buf, width=180, force_terminal=False)
-wd = w.Warden(console, FakeBridge(replies={
-    "snapshot": lambda kw: {"date": kw.get("date"), "now": int(NOW.timestamp() * 1000),
-                            "sessions": [api_row("21:00", 25, "s1", "t", True, True, "未开始")]}
-}), no_clear=True, net_async=False)
-wd.refresh()
-wd.paint()
+console = Console(file=buf, width=260, force_terminal=False)
+# 「已匹配」= API 那一场对上了 data.csv 的契约，所以这里必须先写一行契约；
+# 以前这块吃的是真实 temp/data.csv（今天恰好没 21:00），于是数据一变就红。
+_old_csv = open(CSV, encoding="utf-8").read() if os.path.exists(CSV) else ""
+with open(CSV, "w", encoding="utf-8") as _fh:
+    _fh.write("# t\n%s,21:00,25\n" % TODAY.isoformat())
+try:
+    wd = w.Warden(console, FakeBridge(replies={
+        "snapshot": lambda kw: {"date": kw.get("date"),
+                                "now": int(NOW.timestamp() * 1000),
+                                "sessions": [api_row("21:00", 25, "s1", "t", True, True,
+                                                     "未开始")]}
+    }), no_clear=True, net_async=False)
+    wd.refresh()
+    wd.paint()
+finally:
+    with open(CSV, "w", encoding="utf-8") as _fh:
+        _fh.write(_old_csv)
 out = buf.getvalue()
 check("已匹配标记渲染干净（没有裸露的 markup）", "[cyan]" in out, False)
 check("已匹配标记真的出现了", "已匹配" in out, True)
