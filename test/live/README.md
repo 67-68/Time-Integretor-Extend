@@ -104,3 +104,50 @@ fixture（沙盒 + mock 数据）
 * 探针每次要开一次浏览器（~10-15 秒，dashboard 首屏要等），一次真跑大约 3 分钟。
 * `--exec` 过去会被「琐事屏」吞掉命令（空闲屏整屏接管，只认 m/c/q）；已修：
   脚本模式下不接管，且固定从契约视图起跑。`test/test_warden.py` 里有回归。
+
+## 纯黑盒（`test_live_blackbox.py` + `blackbox_kit.py`）
+
+上面那几个入口是「同进程 import warden、只 stub 预约出口」的半黑盒：测得到逻辑，
+测不到**进程边界**。`test/live/test_live_blackbox.py` 补的就是这一层 ——
+它**一个 warden 模块都不 import**，只做三件事：
+
+1. 造沙盒数据（或从一份真实工作区快照复制）；
+2. `subprocess.run(warden.py --exec "cmd; cmd; ...")`，每条命令一个全新进程；
+3. 读落盘文件断言（`data.csv` / `data/*.json` / `temp/session-layouts.json` /
+   `temp/logs/*.jsonl`）。
+
+```
+python3 -B test/live/test_live_blackbox.py        # 场景：plan → 重新 plan（释放旧场次）
+```
+
+现有场景：
+
+| 场景 | 钉住的口径 |
+|---|---|
+| 1. plan → 重新 plan | 上一轮 plan 的场次被释放、layout 按新分配重切（不是追加）、旧 plan items 整体替换、任务只解绑不复制、被释放的时段能原样再用 |
+| 2. plan → plan clear → 再 plan | `plan clear` 撤计划（items/绑定/分配）但不删排布；重排结果和第一次一致 |
+
+不订场、不开浏览器：目标日在 +10 天（执行区 24h 够不到）；PATH 里**故意没有
+node**，所以 bridge / focusmate-mcp 一律瞬间失败 —— 这也是为什么断言只看文件，
+不看 `rc`（`rc` 之外还有 `temp/keep_session.log` 里的拉取错误，属正常噪声）。
+
+### 复刻 bug 的固定流程
+
+用户 2026-11-17 定的规矩：**碰到 bug 先把 bug 数据复制一份，在黑盒里跑出同样的
+效果，然后再开始 debug**（拿不到复现就先补日志，别猜）。
+
+```
+# 1) bug 现场把工作区拷一份（只读复制，不动原目录）
+cp -R ~/projects/ti_extend /tmp/ti-bug-copy
+
+# 2) 用那份数据跑出 bug 时的命令（--keep 保留沙盒，--show 打印落盘结果）
+python3 -B test/live/blackbox_kit.py --from /tmp/ti-bug-copy --keep \
+    --cmd "day 0; plan 0; refresh --check"
+
+# 3) 复现了 → 在这里改代码、加断言；复现不了 → 说明依赖外部世界（真 API /
+#    真桥），先给那条路径补日志，再回来
+```
+
+`--from` 只复制数据文件（`data.csv`、`data/*.json`、`temp/session-layouts.json`、
+`temp/keep_session-*.json`、`temp/calendar-download.json`），不会带任何代码。
+`--with-node` 会保留真 PATH（会开 bridge，慢，只在必须复现网络相关 bug 时用）。

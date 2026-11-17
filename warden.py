@@ -1083,7 +1083,12 @@ class Warden(
         self.jobs.begin(1 if self.offline else 2)
         try:
             self.refresh()
-            self.sync_task_completions(quiet=True)
+            # 离线模式**不碰任何外部世界**：jobs.begin(1) 已经说明这一轮只拉
+            # 本地能拿到的东西。以前这里不看 offline，照样拼一次
+            # ``GET /v1/tasks``（bridge 起 Chromium），于是 `--offline` 也会开
+            # 浏览器、还会把「拉不到」记成 had_error（--exec 因此退出码 1）。
+            if not self.offline:
+                self.sync_task_completions(quiet=True)
         except Exception as e:
             self.say("首次拉列表失败：%s" % e, "error")
             self.had_error = True
