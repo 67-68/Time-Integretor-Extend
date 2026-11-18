@@ -3513,6 +3513,233 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-18T15:15:16",
+      "task_id": 232,
+      "fields": {
+        "title": "History: Complete 1 Mother question",
+        "project": "History EOS Review",
+        "project_id": 13,
+        "project_task": "i0kCbdwyabN",
+        "duration": 75,
+        "notes": "父任务：History EOS Review",
+        "count": 3,
+        "count_total": 3,
+        "due": "2026-11-18T15:15:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 3,
+        "date": "2026-11-18",
+        "start": "14:00",
+        "end": "15:15",
+        "duration": 75,
+        "focusmate_session_id": "22b1a97c-74ba-473c-a07c-dcde7718ec4d"
+      },
+      "notes": "父任务：History EOS Review",
+      "focusmate": {
+        "task_id": "7b7f1652-fe42-4619-8355-87d14b566872",
+        "title": "History: Complete 1 Mother question",
+        "description": "父任务：History EOS Review",
+        "completed_at": "2026-11-18T07:14:30.615970+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "22b1a97c-74ba-473c-a07c-dcde7718ec4d"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-18T17:22:16",
+      "task_id": 269,
+      "fields": {
+        "title": "语法难41-73",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "dIcADD53lWK",
+        "count_total": 1,
+        "notes": "父任务：sat review",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-18T17:25:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 5,
+        "date": "2026-11-18",
+        "start": "17:00",
+        "end": "17:25",
+        "duration": 25,
+        "focusmate_session_id": "148fe1d0-e962-47a9-982c-a65f9ddca7a8"
+      },
+      "notes": "父任务：sat review",
+      "focusmate": {
+        "task_id": "978e4682-99a1-487c-b54e-7fb897caded3",
+        "title": "语法难41-73",
+        "description": "父任务：sat review",
+        "completed_at": "2026-11-18T09:17:01.501459+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "148fe1d0-e962-47a9-982c-a65f9ddca7a8"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-18T17:26:06",
+      "task_id": 268,
+      "fields": {
+        "title": "mockTest",
+        "count": 3,
+        "duration": 75,
+        "due": "2026-11-18T16:45:00",
+        "due_source": "session",
+        "count_invested": 3
+      },
+      "session": {
+        "index": 4,
+        "date": "2026-11-18",
+        "start": "15:30",
+        "end": "16:45",
+        "duration": 75,
+        "focusmate_session_id": "bd21be6a-aa7e-43d1-8412-c7ea61f75680"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 75,
+      "status_at": "2026-11-18T17:26:06",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "dc31194e-6b6f-41ea-b161-df295c7d4b38",
+        "title": "mockTest",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-18T17:26:14",
+      "task_id": 268,
+      "fields": {
+        "title": "mockTest",
+        "count": 3,
+        "duration": 75,
+        "due": "2026-11-18T16:45:00",
+        "due_source": "session",
+        "count_invested": 3
+      },
+      "session": {
+        "index": 4,
+        "date": "2026-11-18",
+        "start": "15:30",
+        "end": "16:45",
+        "duration": 75,
+        "focusmate_session_id": "bd21be6a-aa7e-43d1-8412-c7ea61f75680"
+      },
+      "notes": null,
+      "focusmate": {
+        "task_id": "dc31194e-6b6f-41ea-b161-df295c7d4b38",
+        "title": "mockTest",
+        "description": "",
+        "completed_at": "2026-11-18T09:26:12.179182+00:00",
+        "attachments": [
+          {
+            "type": "session",
+            "externalId": "bd21be6a-aa7e-43d1-8412-c7ea61f75680"
+          }
+        ]
+      }
+    },
+    {
+      "archived_at": "2026-11-18T20:16:26",
+      "task_id": 272,
+      "fields": {
+        "title": "语法难41-73",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "dIcADD53lWK",
+        "count_total": 1,
+        "notes": "父任务：sat review",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-18T17:55:00",
+        "due_source": "session",
+        "count_invested": 1
+      },
+      "session": {
+        "index": 6,
+        "date": "2026-11-18",
+        "start": "17:30",
+        "end": "17:55",
+        "duration": 25,
+        "focusmate_session_id": "49d6b294-1a4f-4e73-9451-dcbf9cce4d16"
+      },
+      "notes": "父任务：sat review",
+      "tags": [],
+      "manual": true,
+      "reason": "review-count",
+      "actual_minutes": null,
+      "status_at": "2026-11-18T20:16:26",
+      "omnifocus": {
+        "id": "dIcADD53lWK",
+        "url": "omnifocus:///task/dIcADD53lWK",
+        "title": "语法难41-73",
+        "linked_at": "2026-11-18T17:26:37"
+      },
+      "focusmate": {
+        "task_id": "4a31a50f-ecff-464a-b999-bc0023d27316",
+        "title": "语法难41-73",
+        "description": "父任务：sat review",
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-18T20:18:39",
+      "task_id": 273,
+      "fields": {
+        "title": "Lit: Complete 1 Scene：scene 2",
+        "project": "English EOS Review",
+        "project_id": 12,
+        "project_task": "ke3tlcbOu5Z#d2",
+        "count_total": 3,
+        "count": 4,
+        "derived_line": 2,
+        "derived_text": "scene 2",
+        "derived_parent_pk": "ke3tlcbOu5Z",
+        "derived_parent_title": "Lit: Complete 1 Scene",
+        "duration": 100,
+        "due": "2026-11-18T20:15:00",
+        "due_source": "session",
+        "count_invested": 4
+      },
+      "session": {
+        "index": 7,
+        "date": "2026-11-18",
+        "start": "19:00",
+        "end": "20:15",
+        "duration": 75,
+        "focusmate_session_id": "c0c2b11a-8c53-44f2-a0d5-0c5381c9cd2e"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "manual-complete",
+      "actual_minutes": null,
+      "status_at": "2026-11-18T20:18:39",
+      "omnifocus": null,
+      "focusmate": {
+        "task_id": "601b254b-be04-4330-9828-a989a93dc742",
+        "title": "Lit: Complete 1 Scene：scene 2",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

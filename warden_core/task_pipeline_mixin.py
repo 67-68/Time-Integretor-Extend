@@ -1783,6 +1783,18 @@ class TaskPipelineMixin(object):
                 child, template, action="repeat", day=day, quiet=quiet)
         except Exception as e:                          # noqa: BLE001 - 一条排不上不该挡别的
             self.had_error = True
+            # 这条失败以前只进 TUI 警告板，日志里一个字都没有 —— 用户看到
+            # 「每分钟刷一条 formatter end 没排上」却查不到是哪天/哪条、
+            # 为什么排不上。落进同一份 JSONL，下一次直接能搜；用 log_change
+            # 按 (子任务, 模板) 去重，同一场失败不会每分钟刷一行。
+            rl.log_change("repeat", "formatter_failed",
+                          key="%s:%s" % (child.get("id"), template.get("name") or "?"),
+                          level="warning",
+                          day=day.isoformat() if hasattr(day, "isoformat") else str(day),
+                          task_id=child.get("id"),
+                          parent_id=parent.get("id"),
+                          template=template.get("name") or "?",
+                          error=str(e))
             self.say("⚠ 重复任务子任务 %s 的 formatter %s 没排上：%s"
                      % (self.task_label(child), template.get("name") or "?", e), "warn")
             return self.task_store.get(child["id"])
@@ -1835,12 +1847,25 @@ class TaskPipelineMixin(object):
                 changed.append(child)
             # formatter 属于**子任务**：本体只留模板。今天及以后自动排；
             # 过去那天不补排（formatter 不允许排到过去）。
+            #
+            # 那天**一场 session 都没有**时不跑（例如「提前准备明天那条」而明天
+            # 还没被 plan 切过）：formatter end 只会抛「这一天没有任何已排的
+            # session」，然后下一分钟再抛一次 —— 用户看到状态框每分钟刷同一句。
+            # 等那天真的切出场次，下一轮会自己补上；用户显式 `-f` 时仍然照跑，
+            # 好让他立刻看到「这天排不了」。
             if (apply_formatters and day >= today and parent.get("formatter")
                     and (force_formatters or not self._repeat_formatter_done(child, day))):
-                before = child.get("formatter") or {}
-                child = self._format_repeat_child(parent, child, day, quiet=True)
-                if (child.get("formatter") or {}) != before:
-                    changed.append(child)
+                if not sessions and not force_formatters:
+                    rl.log_change("repeat", "formatter_deferred",
+                                  key=str(child.get("id")), level="debug",
+                                  day=iso, reason="no_session",
+                                  template=(ts.TaskStore.hook_template(
+                                      parent.get("formatter")) or {}).get("name"))
+                else:
+                    before = child.get("formatter") or {}
+                    child = self._format_repeat_child(parent, child, day, quiet=True)
+                    if (child.get("formatter") or {}) != before:
+                        changed.append(child)
             occ = ((parent.get("repeat") or {}).get("occurrences") or {}).get(iso) or {}
             target = child.get("session") or session
             fm = child.get("focusmate") or {}

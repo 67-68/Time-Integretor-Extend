@@ -962,11 +962,117 @@ class ProjectMixin(object):
         抢走。``exclude`` 是这一轮已经用掉的任务（一条 4 count 的任务落成
         75+25 两段时，第二段必须新建一条）。
         """
-        if existing is None or not ts.TaskStore.is_open(existing):
-            return False
+        return self._plan_reuse_reason(existing, day, exclude=exclude)[0]
+
+    def _plan_reuse_reason(self, existing, day=None, exclude=()):
+        """``_plan_task_reusable`` 的判定 + 理由（``(bool, reason)``，给日志用）。
+
+        ``reason``：``reuse`` / ``no_mirror`` / ``closed``（已收工）/
+        ``used_this_round``（本轮已用）/ ``already_bound``（挂在别的场次上）。
+        """
+        if existing is None:
+            return False, "no_mirror"
+        if not ts.TaskStore.is_open(existing):
+            return False, "closed"
         if existing.get("id") in set(exclude or ()):
-            return False
-        return not (existing.get("session") or {})
+            return False, "used_this_round"
+        if existing.get("session"):
+            return False, "already_bound"
+        return True, "reuse"
+
+    def _open_mirrors_except(self, project_id, pk, exclude=()):
+        """同一个 ``(project_id, pk)`` 下**还没挂 session 的**开放镜像（按 id）。
+
+        ``_project_local_task`` 只返回清单里第一条同 pk 的记录，而那条很可能是
+        以前已经完成/挂过场次的老副本 —— 于是每轮 plan 都判定「不能复用」再造
+        一条，任务库里堆出一串同 pk 的幽灵（2026-11-18 用户看到的
+        「一堆 Lit 都是 4/3」就是这么来的）。
+        """
+        want = str(pk or "").strip()
+        if not want:
+            return []
+        skip = set(exclude or ())
+        out = []
+        for task in self.task_store.list():
+            pid, _title, got = ts.TaskStore.project_task_fields(task)
+            if got != want or str(pid) != str(project_id):
+                continue
+            if task.get("id") in skip:
+                continue
+            if not ts.TaskStore.is_open(task) or task.get("session"):
+                continue
+            out.append(task)
+        return out
+
+    def _plan_mirror_pick(self, project_id, pk, exclude=()):
+        """plan 唤起项目任务时该复用哪条镜像：优先**开放且没挂 session** 的那条。
+
+        老的 ``_project_local_task`` 只返回清单里第一条同 pk 记录，而那条常常是
+        几天前就完成/挂过场次的老副本 —— 判定「不能复用」→ 再造一条，于是任务
+        库里同 pk 幽灵越堆越多（2026-11-18：数学 8 条、Lit scene 2 六条）。
+        这里先看默认那条，不行再在同 pk 的开放镜像里挑 **id 最新**的一条。
+        """
+        found = self._project_local_task(project_id, pk)
+        spares = self._open_mirrors_except(project_id, pk, exclude=exclude)
+        if spares:
+            # 同 pk 有多条开放镜像时固定挑**最新**那条：复用哪一条必须可预测，
+            # 剩下的由 _prune_duplicate_mirrors 收掉。
+            return sorted(spares, key=lambda t: int(t.get("id") or 0))[-1]
+        return found
+
+    def _prune_duplicate_mirrors(self, day=None):
+        """同一个 ``(project_id, pk)`` 只留一条开放、没挂 session 的**派生**镜像。
+
+        用户 2026-11-18 的要求：反复 plan 之后堆出来的那些任务「不要展示在这里；
+        如果是重复任务产生的，应该删除」。删除只针对**清单派生的幽灵**（它们是
+        plan 自己生成的，删了没有任何外部账要还），条件全部满足才动：
+
+        * ``source.kind == derived`` / 带 ``derived_text``（清单派生）；
+        * 开放、没挂 session；
+        * 今天/过去没有任何处理痕迹（``history`` 空）；
+        * 同一个 pk 还有别的开放镜像（留 id 最大的那条）。
+
+        普通项目镜像（``source.kind == project``）是 OmniFocus 的镜子，不在这里
+        删；它们没挂 session 时由 :meth:`TaskStore.is_project_backlog` 挡在契约
+        面板之外。
+        """
+        groups = {}
+        for task in self.task_store.list():
+            if not ts.TaskStore.is_open(task) or task.get("session"):
+                continue
+            if task.get("history") or task.get("formatter"):
+                continue
+            fields = task.get("fields") or {}
+            pk = str(fields.get(pj.PROJECT_TASK_FIELD) or "").strip()
+            if not pk:
+                continue
+            try:
+                import derived as _dv
+                if not _dv.is_derived(task):
+                    continue
+            except Exception:                    # noqa: BLE001 - 判不出来就别删
+                continue
+            groups.setdefault((str(fields.get(pj.PROJECT_ID_FIELD)), pk), []).append(task)
+        removed = []
+        for _key, tasks in groups.items():
+            if len(tasks) < 2:
+                continue
+            tasks.sort(key=lambda t: int(t.get("id") or 0))
+            for task in tasks[:-1]:              # 留最新那条
+                try:
+                    self.task_store.drop(task["id"], reason="duplicate-mirror")
+                    removed.append(task["id"])
+                except (ValueError, TypeError):
+                    continue
+        if removed:
+            rl.log_event("plan", "mirror_pruned", level="info",
+                         day=day.isoformat() if hasattr(day, "isoformat") else str(day),
+                         removed=removed)
+            try:
+                self.invalidate()
+            except Exception:                    # noqa: BLE001 - 缓存刷不掉不挡主流程
+                pass
+        return removed
 
     def _wake_project_leaf(self, op, item, parent=None, day=None,
                            exclude=()):
@@ -1006,7 +1112,7 @@ class ProjectMixin(object):
             source["url"] = ""
         if parent_pk:
             source.update({"parent_id": parent_pk, "parent_title": parent_title})
-        existing = self._project_local_task(op["id"], pk)
+        existing = self._plan_mirror_pick(op["id"], pk, exclude=exclude)
         if self._plan_task_reusable(existing, day, exclude=exclude):
             return self.task_store.apply_project_plan(
                 existing["id"], fields, source=source)
@@ -2712,11 +2818,16 @@ class ProjectMixin(object):
         if pinned:
             self._save_plan_pins(day, ())
             cleared_items += len(pinned)
+        # 重排前顺手清掉「上一轮 plan 留下的同 pk 派生幽灵」：用户 2026-11-18 要求
+        # 「重复任务产生的、被取消 plan 的任务应该删除」，而且它们会一直挂在面板上。
+        pruned = self._prune_duplicate_mirrors(day)
         if (cleared_plans or pinned) and announce:
-            self.say("♻️ 重排 %s：先撤掉旧 plan 的 %d 条任务，再从当前空场重新排"
-                     % (iso, cleared_items), "info")
+            self.say("♻️ 重排 %s：先撤掉旧 plan 的 %d 条任务，再从当前空场重新排%s"
+                     % (iso, cleared_items,
+                        ("（另清掉 %d 条重复的派生任务）" % len(pruned)) if pruned else ""),
+                     "info")
         return {"plans": cleared_plans, "items": cleared_items,
-                "detached": detached, "pins": len(pinned)}
+                "detached": detached, "pins": len(pinned), "pruned": len(pruned)}
 
     # -- 排期流水线的「阶段 1：period 层」 -------------------------------
     def available_periods(self, day):
@@ -4017,9 +4128,13 @@ class ProjectMixin(object):
             if parent_pk:
                 source.update({"parent_id": parent_pk,
                                "parent_title": parent_title})
-            existing = self._project_local_task(item["project_id"], item["pk"])
+            existing = self._plan_mirror_pick(item["project_id"], item["pk"],
+                                              exclude=used_ids)
+            reusable, why = self._plan_reuse_reason(existing, day, exclude=used_ids)
+            spares = [] if reusable else self._open_mirrors_except(
+                item["project_id"], item["pk"], exclude=used_ids)
             try:
-                if self._plan_task_reusable(existing, day, exclude=used_ids):
+                if reusable:
                     # 项目导入时已经把叶子任务镜像进任务库了：plan 唤起时复用
                     # 同一条，并把这次分到的 count / duration / 父任务来源写上去。
                     task = self.task_store.apply_project_plan(
@@ -4031,6 +4146,16 @@ class ProjectMixin(object):
                             "id": item["pk"], "url": url,
                             "title": item.get("title")},
                         source=source)
+                    if spares:
+                        # 明明有能复用的开放镜像，却因为「第一条同 pk 记录」是
+                        # 老副本（已收工/挂着别处）又新建了一条 —— 这就是任务库里
+                        # 同 pk 幽灵越堆越多的那条路，落了日志才好查。
+                        rl.log_event("plan", "mirror_duplicate", level="warning",
+                                     pk=item["pk"], project_id=item["project_id"],
+                                     new_id=task.get("id"),
+                                     existing_id=(existing or {}).get("id"),
+                                     reason=why,
+                                     spare_ids=[t.get("id") for t in spares])
             except ValueError as e:
                 failed += 1
                 self.say("⚠ 「%s」没建成本地任务：%s" % (item.get("title"), e), "error")

@@ -1571,6 +1571,51 @@ check("warden 自动排到下一场",
       ("2026-10-27", "12:00"))
 check("处理完收尾面板消失", g_wd.review, None)
 
+print("== 收尾「额外 count」：连按不叠加、派生任务不许抬 ==")
+psv.clear()
+wd.review = None
+wd.offline = True
+_ext_msgs = []
+wd.say = lambda text, kind="info": _ext_msgs.append(str(text))
+_ext_entry = {"key": "2026-10-27T13:00", "date": "2026-10-27", "start": "13:00",
+              "end": "13:50", "duration": 50}
+_ext_task = store.create({"title": "连按三次", "count": 2, "duration": 50})
+store.assign(_ext_task["id"], _ext_entry)
+wd.begin_review(_ext_entry, sync=False)
+_rev = wd.review
+check_true("收尾面板开着", _rev is not None)
+_rev._extend_count(store.get(_ext_task["id"]), 1)
+_ext_cap1 = ts.task_count(store.get(_ext_task["id"]))
+_rev._extend_count(store.get(_ext_task["id"]), 1)
+_ext_cap2 = ts.task_count(store.get(_ext_task["id"]))
+check("第一次抬上限生效（2 → 3）", _ext_cap1, 3)
+check("第二次不再叠加（还是 3）", _ext_cap2, 3)
+check_true("第二次给出「已经抬到」的明确提示",
+           any("已经抬到" in m for m in _ext_msgs))
+check("第二次没有再记一条 count-extend",
+      [h.get("action") for h in (store.get(_ext_task["id"]).get("history") or [])],
+      ["count-extend"])
+
+wd.review = None
+_ext_entry2 = {"key": "2026-10-27T13:50", "date": "2026-10-27", "start": "13:50",
+               "end": "14:40", "duration": 50}
+_ext_derived = store.create({"title": "Lit: Complete 1 Scene：scene 2",
+                             "count": 3, "duration": 75,
+                             "derived_line": 2, "derived_text": "scene 2",
+                             "derived_parent_pk": "ke3tlcbOu5Z",
+                             "project_task": "ke3tlcbOu5Z#d2"},
+                            source={"kind": "derived", "line": 2, "text": "scene 2",
+                                    "pk": "ke3tlcbOu5Z"})
+store.assign(_ext_derived["id"], _ext_entry2)
+wd.begin_review(_ext_entry2, sync=False)
+wd.review._extend_count(store.get(_ext_derived["id"]), 1)
+check("派生任务的 count 上限不许抬", ts.task_count(store.get(_ext_derived["id"])), 3)
+check_true("明说派生任务不能抬",
+           any("派生任务" in m and "不能抬" in m for m in _ext_msgs))
+check("派生任务没有 count-extend 痕迹",
+      [h.get("action") for h in (store.get(_ext_derived["id"]).get("history") or [])], [])
+wd.review = None
+
 print()
 if fails:
     print("%d 项失败：" % len(fails))

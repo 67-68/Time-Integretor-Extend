@@ -1110,8 +1110,26 @@ class Review(object):
         """「额外 count」= **抬高上限**：count = 已投入 + extra，任务留着继续干。
 
         这是用户选的那种语义（另一种「加已投入」会在超过上限时立刻收工，等于没得选）。
+
+        两条防呆（用户 2026-11-18 要求「程序应该阻止我」）：
+
+        * **派生/清单任务不许抬**：清单行是一个单元，它的 count 来自父任务 note
+          那一行，抬上限只会让同一 pk 汇总出一个 ``(4/3)`` 这种自相矛盾的数。
+        * **同一场只抬一次**：收尾面板连按 ``f`` 时不再一路 3→4→5，而是明确
+          告诉你「已经抬到 N 了」。（用户当时以为没生效，连按几次把上限按到 4。）
         """
+        if self._derived_task(task):
+            self.say("⚠ 任务 %s「%s」是清单派生任务，count 由父任务那一行决定，"
+                     "不能抬上限。做不完就 A 延期，或 D 缺漏完成。"
+                     % (self.label_of(task), self.title_of(task)), "warn")
+            return {"action": "handled"}
         state = self.count_state(task) or {}
+        if state.get("extended"):
+            self.say("ℹ 任务 %s「%s」这一场的 count 上限已经抬到 %d 了（不会继续叠加）。"
+                     "还想加就下一场再说，或者 A 延期 / G 延长排期。"
+                     % (self.label_of(task), self.title_of(task),
+                        state.get("cap") or 0), "info")
+            return {"action": "handled"}
         invested = state.get("invested")
         if invested is None:
             invested = ts.task_count_invested(task)
@@ -1123,11 +1141,22 @@ class Review(object):
             self.store.set_count(task["id"], cap)
         self.mark_processed(task, "count-extend")
         self.counts[task.get("id")] = dict(state, cap=cap, invested=invested,
-                                           maxed=False)
+                                           maxed=False, extended=True)
         self.say("➕ 任务 %s「%s」的 count 上限抬到 %d（已投入 %d，还剩 %d 个）—— 继续干。"
                  % (self.label_of(task), self.title_of(task), cap, invested,
                     cap - int(invested)), "ok")
         return self._advance()
+
+    @staticmethod
+    def _derived_task(task):
+        """这条任务是不是 note 清单派生出来的（``source.kind == derived``）。"""
+        if not isinstance(task, dict):
+            return False
+        try:
+            import derived as _dv
+            return _dv.is_derived(task)
+        except Exception:                       # noqa: BLE001 - 判不出来就当普通任务
+            return (task.get("source") or {}).get("kind") == "derived"
 
     def _extend_and_schedule(self, task, invested, remaining):
         """G：记下「已投入 + 还需」，把任务自动排到下一场。

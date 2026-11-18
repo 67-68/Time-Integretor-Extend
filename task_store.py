@@ -1538,16 +1538,21 @@ class TaskStore(object):
     def is_project_backlog(task):
         """项目库里**还没被 plan 唤起**的叶子任务（只进任务视图，不进契约面板）。
 
-        判据故意只认「source.kind == project + project_task 非空 + 没有 session」：
-        plan 唤起之后同一条任务会挂上 session，从此按正常任务处理。这样契约视图
-        的任务面板不会被几十条项目备选任务淹掉，而任务视图里搜 project / 分组
-        又都能看到它们。
+        判据：「带 ``project_task`` + 没有 session + 还是开放状态」，kind 是
+        ``project``（项目叶子）或 ``derived``（note 标题清单派生）。
+
+        派生那一半是 2026-11-18 补的：反复 plan 会在任务库里留下同 pk 的派生
+        幽灵（Lit scene 2 一上午堆了 6 条），它们不挂 session 却全挤进契约面板，
+        用户看到一排 ``🧬(4/3)`` 完全不知道哪条是真的。它们和项目叶子一样只
+        属于「任务视图 / 备选池」，等 plan 真正唤起（挂上 session）才回到面板。
         """
         task = task or {}
         source = task.get("source") or {}
         fields = task.get("fields") or {}
+        kind = str(source.get("kind") or "")
+        if kind not in ("project", "derived"):
+            return False
         return (TaskStore.is_open(task)
-                and str(source.get("kind") or "") == "project"
                 and bool(str(fields.get("project_task") or "").strip())
                 and not task.get("session"))
 

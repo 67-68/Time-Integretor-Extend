@@ -1,5 +1,6 @@
 """warden_core.task_sync_mixin —— Focusmate 完成同步与 OmniFocus 单向联动写回。"""
 import copy
+import datetime
 import time
 
 from .bridge import BridgeError
@@ -581,7 +582,50 @@ class TaskSyncMixin(object):
             linked=done, elapsed_ms=round((time.monotonic() - started) * 1000, 1))
         return out
 
+    def _pk_claimed_by(self, pool=None):
+        """``{pk: task}``：这些 pk 已经有一条**写回标记为完成**的本地任务。
+
+        去重的粒度是「pk + 同一天」：同一天里同一个 OmniFocus 任务被拆成多个
+        part 时只写一次；跨天的重复 occurrence 各写各的（否则一条 11-11 的老
+        副本会把 pk 永久占住，今天做完的那条永远写不回）。
+        """
+        claimed = {}
+        for task in (pool if pool is not None else self.task_store.list()):
+            if ts.TaskStore.is_repeat_template(task):
+                continue
+            if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
+                continue
+            pk = ts.TaskStore.omnifocus_id(task)
+            wb = ((task.get("omnifocus") or {}).get("writeback") or {})
+            if pk and wb.get("completed"):
+                claimed.setdefault(str(pk), task)
+        return claimed
+
+    @staticmethod
+    def _completion_day(task):
+        """这条任务的完成落在本地哪一天：``status_at`` 优先，其次 session 日期。"""
+        task = task or {}
+        candidates = [str(task.get("status_at") or ""),
+                      str(((task.get("session") or {}).get("date")) or "")]
+        for text in candidates:
+            text = text.strip()
+            if not text:
+                continue
+            try:
+                return datetime.date.fromisoformat(text[:10])
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _same_completion_day(cls, task, other):
+        """两条本地记录是不是**同一天**的完成（== 同一次 occurrence）。"""
+        left = cls._completion_day(task)
+        right = cls._completion_day(other)
+        return bool(left and right and left == right)
+
     def writeback_completions(self, tasks=None):
+
         """把「本地已完成、但还没写回 OmniFocus」的任务写回去（幂等，靠 writeback 标记）。
 
         需求（第 2 条）：任务被分配到的 session 时间＝它的截止时间；完成的时候
@@ -599,16 +643,12 @@ class TaskSyncMixin(object):
         # 同一个 OmniFocus primary key 只写一次。重复任务/项目任务在本地可能留下
         # 多条共享同一个 key 的完成记录；逐条写回会把 OmniFocus 的重复表连着
         # 往前推两周（用户看到的「完成一次，下下周才有」）。
-        claimed = set()
-        for task in pool:
-            if ts.TaskStore.is_repeat_template(task):
-                continue
-            if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
-                continue
-            pk = ts.TaskStore.omnifocus_id(task)
-            wb = ((task.get("omnifocus") or {}).get("writeback") or {})
-            if pk and wb.get("completed"):
-                claimed.add(str(pk))
+        #
+        # 但**跨天的占位不算**：11-11 完成的那条老副本会把 pk 永久占住，今天
+        # 真正做掉的那条反而永远写不回 OmniFocus（2026-11-18 用户看到的
+        # 「17:00 做完的语法，17:30 又被排一遍」就是这个）。只有同一天（同一次
+        # occurrence）的完成才互相去重。
+        claimed = self._pk_claimed_by(pool)
         todo = []
         seen_pks = set()
         for task in pool:
@@ -621,7 +661,17 @@ class TaskSyncMixin(object):
             if not pk:
                 continue
             pk = str(pk)
-            if pk in claimed or pk in seen_pks:
+            if pk in claimed and claimed[pk].get("id") != task.get("id"):
+                if not self._same_completion_day(task, claimed[pk]):
+                    rl.log_change("omnifocus", "complete_claim_ignored",
+                                  key="%s:%s" % (pk, task.get("id")), level="info",
+                                  reason="claim_other_day", pk=pk,
+                                  task_id=task.get("id"),
+                                  claimed_by=claimed[pk].get("id"),
+                                  source="writeback_scan")
+                else:
+                    continue
+            if pk in seen_pks:
                 continue
             try:
                 allowed, why = pj.completion_guard(task, self.projects, self.task_store)
@@ -663,15 +713,7 @@ class TaskSyncMixin(object):
             if pk:
                 ops["%s:%s" % (str(item.get("op") or "complete"), pk)] = dict(item)
         pool = list(pool if pool is not None else self.task_store.list())
-        claimed = set()
-        for task in pool:
-            if ts.TaskStore.is_repeat_template(task):
-                continue
-            if self.task_store.status_of(task) != ts.STATUS_COMPLETED:
-                continue
-            pk = ts.TaskStore.omnifocus_id(task)
-            if pk and ((task.get("omnifocus") or {}).get("writeback") or {}).get("completed"):
-                claimed.add(str(pk))
+        claimed = self._pk_claimed_by(pool)
         for task in pool:
             if ts.TaskStore.is_repeat_template(task):
                 continue
@@ -682,7 +724,26 @@ class TaskSyncMixin(object):
                 continue
             pk = str(pk)
             wb = ((task.get("omnifocus") or {}).get("writeback") or {})
-            if pk in claimed or wb.get("completed"):
+            claimant = claimed.get(pk)
+            if not wb.get("completed") and claimant and claimant.get("id") != task.get("id"):
+                if self._same_completion_day(task, claimant):
+                    # 同一天里同一个 pk 已经写回/正在写：以前这里静默跳过，于是
+                    # 「今天这条做完了、OmniFocus 里那条还开着」查不到原因。
+                    rl.log_change("omnifocus", "complete_skipped",
+                                  key="%s:%s" % (pk, task.get("id")),
+                                  level="info", reason="pk_claimed_by_other",
+                                  pk=pk, task_id=task.get("id"),
+                                  claimed_by=claimant.get("id"),
+                                  source="writeback_scan")
+                    continue
+                # 跨天的老账不算占位（旧的完成早该写过了；这里再挡就会让今天
+                # 真正做掉的那条永远写不回 OmniFocus）。
+                rl.log_change("omnifocus", "complete_claim_ignored",
+                              key="%s:%s" % (pk, task.get("id")), level="info",
+                              reason="claim_other_day", pk=pk,
+                              task_id=task.get("id"),
+                              claimed_by=claimant.get("id"), source="writeback_scan")
+            if wb.get("completed"):
                 continue
             try:
                 allowed, _why = pj.completion_guard(task, self.projects, self.task_store)
