@@ -2443,6 +2443,12 @@ class BoardMixin(object):
             self._maybe_sync_chore_mode()
         except Exception:                          # noqa: BLE001 - 空闲屏坏了也不能没帧
             pass
+        try:
+            # 「今天还没 plan」的提醒 + 兜底自动分配：和收尾 / 项目对账同一个节拍，
+            # 内部自己节流 60 秒（见 PlanWatchdogMixin）。
+            self._maybe_plan_watchdog()
+        except Exception:                          # noqa: BLE001 - 提醒坏了也不能没帧
+            pass
         now = time.time()
         if not force and self.warnings_at and now - self.warnings_at < max_age:
             return self.warnings

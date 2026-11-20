@@ -277,6 +277,7 @@ from warden_core import (  # noqa: E402,F401
     PYLIBS,
     Panel,
     ProjectMixin,
+    PlanWatchdogMixin,
     REPL_KIT_CANDIDATES,
     ReviewMixin,
     SESSION_COLUMN_ALIASES,
@@ -390,6 +391,7 @@ from warden_core import (  # noqa: E402,F401
     parse_session_spec,
     pj,
     pp,
+    pw,
     psv,
     quiet_call,
     register_view,
@@ -426,6 +428,7 @@ class Warden(
     TaskSyncMixin,
     ReviewMixin,
     ProjectMixin,
+    PlanWatchdogMixin,
 ):
     def __init__(self, console, bridge, no_clear=False, offline=False, day_offset=0,
                  net_async=None):
@@ -608,6 +611,7 @@ class Warden(
         self.read_at = {}
         self._keytime_init()
         self._derived_init()
+        self._plan_watchdog_init()
         self._register_net_actions()
         # 旧账本里「每日检查」可能攒了几十条（args 带快照，永远不相等）。这类
         # 动作跑一次就够，启动时把旧的合并成一条 —— 否则 re-action 会挨个重放，

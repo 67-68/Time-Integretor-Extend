@@ -3740,6 +3740,49 @@
         "completed_at": null,
         "attachments": []
       }
+    },
+    {
+      "archived_at": "2026-11-19T00:29:58",
+      "task_id": 276,
+      "fields": {
+        "title": "数学26年易错1-20",
+        "project": "SAT_Tasks",
+        "project_id": 1,
+        "project_task": "hbO13Wv2PLr",
+        "count_total": 2,
+        "notes": "父任务：sat review",
+        "duration": 10,
+        "count": 1,
+        "due": "2026-11-18T21:25:00",
+        "due_source": "session"
+      },
+      "session": {
+        "index": 9,
+        "date": "2026-11-18",
+        "start": "21:00",
+        "end": "21:25",
+        "duration": 25,
+        "focusmate_session_id": null
+      },
+      "notes": "父任务：sat review",
+      "tags": [],
+      "manual": true,
+      "reason": "review-manual",
+      "actual_minutes": 30,
+      "status_at": "2026-11-19T00:29:58",
+      "omnifocus": {
+        "id": "hbO13Wv2PLr",
+        "url": "omnifocus:///task/hbO13Wv2PLr",
+        "title": "数学26年易错1-20",
+        "linked_at": "2026-11-18T20:19:27"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "数学26年易错1-20",
+        "description": "父任务：sat review",
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

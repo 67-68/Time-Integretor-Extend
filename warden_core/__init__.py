@@ -66,3 +66,4 @@ from .review_mixin import ReviewMixin  # noqa: F401
 from .project_mixin import ProjectMixin  # noqa: F401
 from .keytime_mixin import KeyTimeMixin  # noqa: F401
 from .derived_mixin import DerivedMixin  # noqa: F401
+from .plan_watchdog_mixin import PlanWatchdogMixin  # noqa: F401

@@ -97,6 +97,7 @@ import derived as dv  # noqa: E402  note 标题清单 → 每日重复任务的�
 import postsession as psv  # noqa: E402  session 结束 15s 后的收尾（纯逻辑）
 import project_store as pj  # noqa: E402  项目库：OmniFocus Project 的存在与进度
 import project_plan as pp  # noqa: E402  plan：空闲容量 → 分资源 → 排任务（纯逻辑）
+import plan_watchdog as pw  # noqa: E402  「今天还没 plan」的提醒与兜底（纯逻辑）
 import runtime_log as rl  # noqa: E402  按天落盘的 JSONL 运行日志（Focusmate 拉取 / OmniFocus 写回）
 
 
@@ -206,6 +207,12 @@ OMNIFOCUS_OUTBOX_FILE = (os.environ.get("TI_OMNIFOCUS_OUTBOX")
 #: 必须能把它们解绑，否则它们永远占着场次。``{"<iso>": [item...]}``。
 PLAN_PINS_FILE = (os.environ.get("TI_PLAN_PINS")
                   or os.path.join(TEMP, "plan-pins.json"))
+
+#: 「今天还没 plan」提醒 + 兜底自动 plan 的账本。两件事都记在这：
+#: ① 每天最多造一条提醒任务（``created``）；② 兜底自动 plan 每天最多跑一次
+#: （``auto_planned``，失败也记，避免每 60 秒重试）。
+PLAN_WATCHDOG_FILE = (os.environ.get("TI_PLAN_WATCHDOG")
+                      or os.path.join(TEMP, "plan-watchdog.json"))
 
 
 class OmniOutbox(object):

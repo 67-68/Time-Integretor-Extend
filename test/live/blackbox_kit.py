@@ -147,7 +147,7 @@ PATHS_KEYS = ("root", "day", "temp", "data", "csv", "tasks", "projects", "archiv
               "settings", "project_sync", "calendar", "layouts", "extras", "rules",
               "mutes", "keytime_json", "keytime_state", "keytime_devices",
               "keytime_rules", "nostart", "postsession", "failed_actions",
-              "of_outbox", "plan_pins", "logs")
+              "of_outbox", "plan_pins", "plan_watchdog", "logs")
 
 
 def _paths_for(root, day):
@@ -175,6 +175,7 @@ def _paths_for(root, day):
         "failed_actions": os.path.join(temp, "failed-actions.json"),
         "of_outbox": os.path.join(temp, "omnifocus-outbox.json"),
         "plan_pins": os.path.join(temp, "plan-pins.json"),
+        "plan_watchdog": os.path.join(temp, "plan-watchdog.json"),
         "logs": os.path.join(temp, "logs"),
     }
 
@@ -218,7 +219,7 @@ SNAPSHOT_FILES = (
     "temp/keep_session-state.json", "temp/keep_session-verdicts.json",
     "temp/keep_session-expected.json", "temp/keep_session-nostart.json",
     "temp/keep_session-postsession.json", "temp/keep_session-relocations.json",
-    "temp/plan-pins.json",
+    "temp/plan-pins.json", "temp/plan-watchdog.json",
 )
 
 
@@ -307,6 +308,7 @@ def env_for(paths, offset=DEFAULT_OFFSET, with_node=False, extra_env=None):
         "TI_FAILED_ACTIONS": paths["failed_actions"],
         "TI_OMNIFOCUS_OUTBOX": paths["of_outbox"],
         "TI_PLAN_PINS": paths["plan_pins"],
+        "TI_PLAN_WATCHDOG": paths["plan_watchdog"],
         "TI_LOG_DIR": paths["logs"],
         "TI_LOG_LEVEL": "debug",
         "TI_KEYTIME_JSON": paths["keytime_json"],
