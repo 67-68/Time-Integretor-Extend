@@ -826,6 +826,7 @@ class NetMixin(object):
         self.api_rows = api_rows
         self.rows_source = "bridge"
         self.rows_note = ""
+        self.rows_error = ""
         self.rows_at = time.time()
         self.read_at["session"] = self.rows_at
         self.rebuild_rows(now_ms)

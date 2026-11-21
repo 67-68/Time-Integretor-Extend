@@ -446,6 +446,9 @@ class Warden(
         self.rows_source = ""
         self.rows_note = ""
         self.rows_at = 0
+        # 最近一次拉 session 失败的原文（成功就清空）：current_session 报错时
+        # 必须能说清「是表格过期/拉取失败，还是真的没有场次」。
+        self.rows_error = ""
         self.had_error = False
         self.bridge_note = ""
         self.day_offset = int(day_offset)

@@ -45,8 +45,10 @@ from .common import (
     normalize_task_column,
     now_local,
     pj,
+    pp,
     psv,
     repl_kit,
+    rl,
     sch,
     sp,
     st,
@@ -62,6 +64,21 @@ from .views import ChoreView, ContractView, FocusView, StatsView, TaskView
 
 class BoardMixin(object):
     # -- 新鲜度：这份数据是什么时候来的 --------------------------------
+
+    @staticmethod
+    def _subtract_minute_window(pieces, hole):
+        """把 ``hole`` 从分钟区间列表里挖掉（跨午夜用绝对分钟）。"""
+        h_start, h_end = hole
+        out = []
+        for s, e in pieces:
+            if h_end <= s or h_start >= e:
+                out.append((s, e))
+                continue
+            if h_start > s:
+                out.append((s, min(h_start, e)))
+            if h_end < e:
+                out.append((max(h_end, s), e))
+        return out
 
     def _age_text(self, stamp, limit_ok=True):
         """epoch → 「12 秒前」/「6 分钟前」/「还没拉过」。"""
@@ -542,6 +559,113 @@ class BoardMixin(object):
 
     def periods_for_day(self, day=None):
         return sp.periods_for_date(self.download, day or self.sel_date)
+
+    # -- 可用时间窗：period 减去「用户手动预定」的场次 -------------------
+
+    def manual_session_rows(self, day=None):
+        """这一天**用户手动预定**的场次（自动排序要当硬洞的）。
+
+        判定（2026-11-21 用户确认）：API 里有 id、本地 plan（layout/extras/data.csv）
+        没有同一 ``(date, start)`` 的来源、也没有挂任务 —— 就是用户自己订的。
+        正在进行中的场次同样算洞：不许往里塞任务，也不许取消/改挪。
+        """
+        day = day or self.sel_date
+        iso = day.isoformat()
+        try:
+            plan_starts = {str(s.get("start"))
+                           for s in self.sessions_for_day_plan(day)}
+        except Exception:                          # noqa: BLE001 - 坏排布按没有来源
+            plan_starts = set()
+        now_ms = int(time.time() * 1000)
+        out = []
+        for row in self.rows or ():
+            if str(row.get("date") or "") != iso:
+                continue
+            if row.get("period_only"):
+                continue
+            label = str(row.get("startLabel") or "")
+            start_ms = row.get("startMs")
+            end_ms = row.get("endMs")
+            live = (start_ms is not None and end_ms is not None
+                    and start_ms <= now_ms < end_ms)
+            if not row.get("id") and not live:
+                continue                           # 没有真 session，也不是进行中
+            if label in plan_starts and not live:
+                continue                           # TI 自己排的，可重排
+            try:
+                tasks = self.tasks_for_session(iso, label)
+            except Exception:                      # noqa: BLE001 - 坏绑定按没任务
+                tasks = []
+            if tasks and not live:
+                continue                           # 挂着任务的场次由任务占着
+            out.append(dict(row))
+        return out
+
+    def available_windows(self, day=None):
+        """period 减去手订/进行中场次后的可用时间窗（跨午夜按绝对分钟）。
+
+        规则（2026-11-21 用户定）：自动排序只在「period ∩ 非用户手订」上做；
+        跨 period 的手订场按交集从每个 period 扣；扣完不足 25 分钟的段直接
+        丢弃（不硬塞、不报错）。
+        """
+        day = day or self.sel_date
+        iso = day.isoformat()
+        holes = []
+        for row in self.manual_session_rows(day):
+            got = th._range_of(row)
+            if got is None:
+                # 表格行只有 startLabel/endLabel：起点直接读，占用按
+                # session_span（25→30 / 50→60 / 75→90）算，不能只加会话分钟。
+                start_min = th._clock_minutes(row.get("startLabel"))
+                if start_min is None:
+                    continue
+                duration = row.get("durationMin")
+                if duration in (None, ""):
+                    start_ms, end_ms = row.get("startMs"), row.get("endMs")
+                    duration = (int((end_ms - start_ms) / 60000)
+                                if start_ms and end_ms else 0)
+                try:
+                    span = sp.session_span(int(duration))
+                except (TypeError, ValueError):
+                    span = int(duration or 0)
+                got = (start_min, start_min + max(1, int(span)))
+            holes.append((int(got[0]), int(got[1])))
+        out = []
+        for period in self.periods_for_day(day):
+            got = th._range_of(period)
+            if got is None:
+                continue
+            p_start, p_end = int(got[0]), int(got[1])
+            pieces = [(p_start, p_end)]
+            try:
+                muted = mute_window_for(day, period.get("start"), period.get("end"))
+            except Exception:                      # noqa: BLE001 - 静音表坏了照排
+                muted = None
+            if muted:
+                muted_got = th._range_of(muted)
+                if muted_got is not None:
+                    pieces = self._subtract_minute_window(
+                        pieces, (int(muted_got[0]), int(muted_got[1])))
+            for h_start, h_end in holes:
+                pieces = self._subtract_minute_window(pieces, (h_start, h_end))
+            for s, e in pieces:
+                minutes = e - s
+                if minutes < pp.MINUTES_PER_COUNT:
+                    continue                       # 不足 1 count：直接放弃该段
+                out.append({
+                    "date": iso,
+                    "period_id": period.get("id"),
+                    "period": dict(period),
+                    "start_min": s, "end_min": e, "minutes": minutes,
+                    "start": "%02d:%02d" % ((s // 60) % 24, s % 60),
+                    "end": "%02d:%02d" % ((e // 60) % 24, e % 60),
+                    "blocks": minutes // 30,
+                    "full": (s == p_start and e == p_end),
+                    "period_start_min": p_start,
+                    "period_end_min": p_end,
+                })
+        out.sort(key=lambda w: (w["start_min"], w["end_min"]))
+        return out
 
     def period_first_start(self, period):
         """这个时段第一场 session 的 HH:MM；没排出来就是 None。"""
@@ -1556,6 +1680,13 @@ class BoardMixin(object):
 
     def _snapshot_failed(self, error, quiet=False):
         self.had_error = True
+        self.rows_error = str(error or "")
+        rl.log_event("session", "snapshot_failed", level="warning",
+                     day=self.sel_date.isoformat(),
+                     error=self.rows_error[:300],
+                     rows=len(self.rows), source=self.rows_source or "?",
+                     age=int(time.time() - self.rows_at) if self.rows_at else None,
+                     kept_bridge=bool(self.rows and self.rows_source == "bridge"))
         if self.rows and self.rows_source == "bridge":
             self.say("拉列表失败（表格保持上一次的结果）：%s" % error, "error")
         else:
@@ -1839,6 +1970,7 @@ class BoardMixin(object):
         api_rows.sort(key=lambda r: r["startMs"])
         self.api_rows = api_rows
         self.rows_source = "snapshot"
+        self.rows_error = "snapshot: %s" % why
         self.rows_note = ("来自 keep_session 的 state.json 快照（%s）——只有时间，"
                           "没有标题/静音/伙伴/契约行" % why)
         self.rows_at = time.time()

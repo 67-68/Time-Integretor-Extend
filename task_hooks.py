@@ -528,6 +528,125 @@ def _already_past(ctx, start_min):
     return int(start_min) < now.hour * 60 + now.minute
 
 
+def _format_end_over_windows(ctx, windows, task, duration, break_got, fit,
+                             reservations, task_id):
+    """``end`` 的 period-first 版本：在「可用时间窗」的尾巴切一场。
+
+    窗口 = period 减去用户手订 / 静音 / 进行中的场次（见
+    ``Warden.available_windows``）。窗口覆盖整个 period 时，切出来的那一场能
+    写进 layout（``cut_period_id``），TI 自己生成的旧场次按「不是约束」取消重排；
+    窗口被手订场切过时，layout 表达不了空洞，只在**不重叠**的前提下补一场
+    一次性 session（``cut_period_id=None``）。
+    """
+    date = ctx.get("date")
+    sessions = [dict(s) for s in (ctx.get("sessions") or ()) if isinstance(s, dict)]
+    best = None
+    for window in windows or ():
+        if not isinstance(window, dict):
+            continue
+        start = int(window.get("start_min") or 0)
+        end = int(window.get("end_min") or 0)
+        if end - start < int(fit) + int(break_got):
+            continue
+        carve_start = grid_floor(end - int(break_got) - int(fit))
+        if carve_start < start:
+            continue
+        carve_end = carve_start + int(fit) + int(break_got)
+        if carve_end > end:
+            continue
+        if _already_past(ctx, carve_start):
+            continue
+        if not is_free({"start_min": carve_start, "end_min": carve_end},
+                       reservations):
+            continue
+        prefix, prefix_exact, cut_pid = None, False, None
+        if window.get("full"):
+            pref, exact = _cut_prefix_for(
+                (int(window.get("period_start_min") or start),
+                 int(window.get("period_end_min") or end)),
+                carve_start, reservations)
+            if exact and pref:
+                prefix, prefix_exact, cut_pid = pref, True, window.get("period_id")
+        if cut_pid is None:
+            span = (carve_start, carve_end)
+            if any(_range_of(sess) is not None and overlaps(span, _range_of(sess))
+                   for sess in sessions):
+                continue
+        key = (-end, -carve_start, 0 if cut_pid else 1)
+        if best is None or key < best[0]:
+            best = (key, window, carve_start, carve_end, prefix, prefix_exact,
+                    cut_pid)
+    if best is None:
+        raise HookError(
+            "formatter end：%s 没有能放下 %d 分钟（含 %d 分钟休息）的空位；"
+            "可用时间窗：%s"
+            % (date or "这一天", duration, int(break_got),
+               "、".join("%s–%s" % (w.get("start"), w.get("end"))
+                         for w in windows or () if isinstance(w, dict)) or "无"))
+    _key, window, carve_start, carve_end, prefix, prefix_exact, cut_pid = best
+    session_duration = int(fit)
+    session_end = carve_start + session_duration
+    existing = None
+    for sess in sessions:
+        got = _range_of(sess)
+        if got is None or got[0] != carve_start:
+            continue
+        dur = parse_minutes(sess.get("duration"))
+        if dur is None:
+            dur = got[1] - got[0]
+        if int(dur) == session_duration:
+            existing = sess
+        break
+    conflicts = [str(s) for s in sessions
+                 if not (existing is not None and s is existing)
+                 and _range_of(s) is not None
+                 and overlaps((carve_start, carve_end), _range_of(s))]
+    period = dict(window.get("period") or {})
+    reservation = {
+        "date": date,
+        "period_id": window.get("period_id"),
+        "start": fmt_minutes(carve_start),
+        "end": fmt_minutes(carve_end),
+        "start_min": carve_start,
+        "end_min": carve_end,
+        "session_start": fmt_minutes(carve_start),
+        "session_end": fmt_minutes(session_end),
+        "session_duration": session_duration,
+        "duration": int(duration),
+        "break_minutes": int(break_got),
+        "task_id": task_id,
+        "exclusive": True,
+        "carved": True,
+        "windowed": True,
+        "existing_session": existing is not None,
+        "cut_period_id": cut_pid,
+        "cut_prefix": list(prefix or []),
+        "cut_prefix_exact": bool(prefix_exact),
+        "source_session": {"start": window.get("start"),
+                           "end": window.get("end"),
+                           "duration": window.get("minutes"),
+                           "period_id": window.get("period_id")},
+        "created_at": _now(),
+    }
+    session = {
+        "date": date,
+        "start": fmt_minutes(carve_start),
+        "end": fmt_minutes(session_end),
+        "duration": session_duration,
+        "period_id": window.get("period_id"),
+        "period_start": period.get("start"),
+        "period_end": period.get("end"),
+        "carved": True,
+        "existing": existing is not None,
+        "source_start": window.get("start"),
+        "cut_period_id": cut_pid,
+        "cut_prefix": list(prefix or []),
+        "cut_prefix_exact": bool(prefix_exact),
+    }
+    return {"name": "end", "reservation": reservation, "session": session,
+            "new_session": existing is None, "conflicts": conflicts}
+
+
 @register_formatter(
     "end",
     params=("break_minutes", "date"),
@@ -578,7 +697,7 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
                         % (break_minutes,))
 
     sessions = [dict(s) for s in (ctx.get("sessions") or ()) if isinstance(s, dict)]
-    if not sessions:
+    if not sessions and ctx.get("windows") is None:
         raise HookError("formatter end：这一天没有任何已排的 session，没法排期。")
 
     # 时段区间必须是**绝对分钟**（相对时段起点归一），否则 23:15–00:05 会算成 5 分钟，
@@ -599,6 +718,16 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
         reservations.append(rec)
 
     fit = fit_session_duration(duration)
+
+    # 2026-11-21：当天**一场计划 session 都没有**时，直接在「可用时间窗」
+    # （period 减去用户手订场次）的尾巴切 —— 旧逻辑要求先有 session，导致
+    # 只有真实订场/只有 period 的那天直接报「没有已排的 session」。
+    # 有 session 时仍走原来的尾巴/剪断路径（period-first 的大改另做，避免
+    # 一次动到表格、对账和剪断三条已覆盖的路径）。
+    windows = ctx.get("windows") if not sessions else None
+    if windows is not None:
+        return _format_end_over_windows(ctx, windows, task, duration, break_got,
+                                        fit, reservations, task_id)
 
     # 每个时段里**起点最靠后的那一场** = 这个时段的尾巴（end 要的就是它）。
     last_start = {}

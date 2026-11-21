@@ -1118,6 +1118,10 @@ class TaskPipelineMixin(object):
             # 「现在几点」由 warden 注入，formatter 才能判断某一块是不是已经
             # 过去了（测试用 clock_now 钉死，不依赖墙上时钟）。
             "now": self._now_dt(),
+            # period-first（2026-11-21）：end 在「period − 手订场次」的可用窗口
+            # 尾巴切，不再依赖当天已经排过 session。
+            "windows": (self.available_windows(day)
+                        if str(spec.get("name") or "").lower() == "end" else None),
         }
         try:
             out = th.call_preset("formatter", spec, ctx)
@@ -1276,20 +1280,99 @@ class TaskPipelineMixin(object):
         需求（``task 8 -ac``）：正在干的那一场就是「当前」；一场都不在进行时，
         取**最近一场还没开始、而且真的订上了**的（下一场马上就来，先挂上去就是
         为了别手忙脚乱）。已结束/取消掉、只剩计划窗口的幽灵场不参与判定。
+
+        **表格过期 / bridge 失败时当场同步拉一次**（2026-11-21 用户确认）：
+        以前 bridge 拉不到、表格停在旧数据时，这里会对着旧表说「没有正在进行的
+        session」，而 Focusmate 上其实正在开 —— 判据必须建立在新鲜数据上。
+        拉完仍然没有才报错，并把行数 / 来源 / 上次成功时间 / bridge 错误一起说清。
         """
         live = self.live_session()
         if live:
             return live
+        found = self._upcoming_session()
+        if found is not None:
+            return found
+        pulled = self._pull_sessions_for_current()
+        if pulled is not None:
+            return pulled
+        self._log_current_session_missing()
+        raise ValueError(self._current_session_error_text())
+
+    def _upcoming_session(self):
+        """最近一场还没开始、且（权威模式下）真订上了的 session。"""
         now_ms = int(time.time() * 1000)
         upcoming = [r for r in self._actual_rows(self.rows)
                     if (r.get("startMs") or 0) > now_ms]
-        upcoming.sort(key=lambda r: (r.get("startMs") or 0, self.rows.index(r)))
         if not upcoming:
-            raise ValueError("现在没有正在进行的 session，也没有还没开始的已订场次"
-                             "（%s 只有 %d 行）；用表格编号挂吧。"
-                             % (self.sel_date.isoformat(), len(self.rows)))
+            return None
+        upcoming.sort(key=lambda r: (r.get("startMs") or 0, self.rows.index(r)))
         row = upcoming[0]
         return self.rows.index(row) + 1, row
+
+    def _pull_sessions_for_current(self):
+        """当场同步拉一次 session；拿到「当前/下一场」就返回 ``(编号, 行)``。
+
+        离线模式不拉（没网络）；拉取本身失败也只记日志，让调用方用同一句
+        「没有场次」的报错——文案里会带上失败原因。
+        """
+        if self.offline:
+            return None
+        rl.log_event("session", "current_pull_start", level="debug",
+                     day=self.sel_date.isoformat(), rows=len(self.rows),
+                     source=self.rows_source or "?",
+                     age=int(time.time() - self.rows_at) if self.rows_at else None,
+                     error=getattr(self, "rows_error", "")[:200])
+        try:
+            ok = self.refresh(quiet=True, wait=True)
+        except Exception as e:                     # noqa: BLE001 - 拉不到就用现有表
+            rl.log_event("session", "current_pull_error", level="warning",
+                         day=self.sel_date.isoformat(),
+                         error="%s: %s" % (type(e).__name__, e))
+            return None
+        live = self.live_session()
+        if live:
+            return live
+        found = self._upcoming_session()
+        if found is not None:
+            return found
+        rl.log_event("session", "current_pull_empty", level="warning",
+                     day=self.sel_date.isoformat(), ok=bool(ok),
+                     rows=len(self.rows), source=self.rows_source or "?",
+                     error=getattr(self, "rows_error", "")[:200])
+        return None
+
+    def _log_current_session_missing(self):
+        """报「没有 session」之前，把这一票判定依据写进 JSONL。"""
+        now_ms = int(time.time() * 1000)
+        detail = []
+        for row in (self.rows or ())[:20]:
+            detail.append({
+                "start": row.get("startLabel"),
+                "id": bool(row.get("id")),
+                "planned": bool(row.get("planned")),
+                "shell": bool(row.get("period_only")),
+                "startMs": row.get("startMs"),
+                "endMs": row.get("endMs"),
+            })
+        rl.log_event("session", "current_missing", level="warning",
+                     day=self.sel_date.isoformat(), now_ms=now_ms,
+                     rows=len(self.rows), source=self.rows_source or "?",
+                     age=int(time.time() - self.rows_at) if self.rows_at else None,
+                     error=getattr(self, "rows_error", "")[:200],
+                     rows_detail=detail)
+
+    def _current_session_error_text(self):
+        age = self._age_text(self.rows_at) if self.rows_at else "还没拉过"
+        bits = ["%s 只有 %d 行（来源 %s，上次成功 %s）"
+                % (self.sel_date.isoformat(), len(self.rows),
+                   self.rows_source or "未知", age)]
+        error = str(getattr(self, "rows_error", "") or "").strip()
+        if error:
+            bits.append("bridge 报错：%s" % error[:120])
+        tried = ("离线模式没有重拉" if self.offline
+                 else "已当场重拉一次仍没有")
+        return ("现在没有正在进行的 session，也没有还没开始的已订场次（%s）；"
+                "%s，用表格编号挂吧。" % ("；".join(bits), tried))
 
     def _resolve_assign_target(self, token):
         """``-a`` 的取值 → ``(编号, 行)``；``none`` 返回 ``(None, None)``（下架）。"""
