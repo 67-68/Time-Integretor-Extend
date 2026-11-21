@@ -3097,6 +3097,22 @@ class ProjectStore(object):
             return project
         raise ValueError("没有项目 %s" % project_id)
 
+    def clear_items(self, project_id, day):
+        """只清「这一天的排期条目」，保留 ``count``（资源决定还要用于预填）。"""
+        store = self.load()
+        key = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            plan = (project.get("plans") or {}).get(key)
+            if not plan:
+                return project
+            plan["items"] = []
+            plan["at"] = _now()
+            self.save(store)
+            return project
+        raise ValueError("没有项目 %s" % project_id)
+
     def record_items(self, project_id, day, items, append=False):
         """记下「这一天真的排了哪些本地任务」（唤起完成的证据）。
 

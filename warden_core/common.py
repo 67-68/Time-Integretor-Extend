@@ -211,6 +211,13 @@ PLAN_PINS_FILE = (os.environ.get("TI_PLAN_PINS")
 #: 「今天还没 plan」提醒 + 兜底自动 plan 的账本。两件事都记在这：
 #: ① 每天最多造一条提醒任务（``created``）；② 兜底自动 plan 每天最多跑一次
 #: （``auto_planned``，失败也记，避免每 60 秒重试）。
+#: plan 的「资源决定」台账（2026-11-21）：按天记 ``pro N M`` 的项目 count 与
+#: ``task <任务> <count>`` 的固定项。决定与「时间安排」分开存 —— 重新打开 plan
+#: 要按它预填，`plan clear` 才把它清掉。``{"<iso>": {"alloc": {...}, "pins": [...]}}``。
+PLAN_DECISIONS_FILE = (os.environ.get("TI_PLAN_DECISIONS")
+                       or os.path.join(TEMP, "plan-decisions.json"))
+
+#: 「今天还没 plan」提醒 + 兜底自动 plan 的账本。两件事都记在这：
 PLAN_WATCHDOG_FILE = (os.environ.get("TI_PLAN_WATCHDOG")
                       or os.path.join(TEMP, "plan-watchdog.json"))
 

@@ -583,6 +583,8 @@ class BoardMixin(object):
                 continue
             if row.get("period_only"):
                 continue
+            if row.get("planned") or row.get("contract"):
+                continue                           # 本地契约行 = TI 排的，可重排
             label = str(row.get("startLabel") or "")
             start_ms = row.get("startMs")
             end_ms = row.get("endMs")

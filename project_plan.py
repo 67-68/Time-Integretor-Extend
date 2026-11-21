@@ -873,6 +873,9 @@ class Allocator(object):
         #: ``token -> 本地任务 dict``；契约界面按面板序号，数据界面按内部 id。
         self.resolve_task = resolve_task
         self.closed = False
+        #: 打开面板时是否载入了上一轮的资源决定（决定可以在「全部 clear」之后
+        #: 仍然 complete —— 那表示用户要把这一天的计划回收掉）。
+        self.had_decision = False
         self.notes = []
         # 和 Review / NostartReview 对齐的字段名（画帧缓存通用）
         self.pending_task = None
@@ -1326,7 +1329,7 @@ class Allocator(object):
 
     # -- 收尾 ---------------------------------------------------------
     def _complete(self):
-        if not self.allocations and not self.pins:
+        if not self.allocations and not self.pins and not self.had_decision:
             self.say("还没有任何分配 —— 先 `pro 1 4` / `task 5 2`，或者 `q` 放弃这次 plan。",
                      "warn")
             return {"action": "handled"}

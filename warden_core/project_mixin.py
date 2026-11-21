@@ -7,6 +7,7 @@ import time
 
 from .common import (
     HERE,
+    PLAN_DECISIONS_FILE,
     PLAN_PINS_FILE,
     Panel,
     SRC_OMNIFOCUS,
@@ -2751,7 +2752,80 @@ class ProjectMixin(object):
                          day=iso, error=str(e))
         return list(merged.values())
 
-    def _reset_day_plans(self, day, announce=True):
+    # -- plan 的「资源决定」台账（2026-11-21）-------------------------
+    #
+    # 决定 = 项目 count（`pro N M`）+ 任务固定项（`task <任务> <count>`）。
+    # 它和时间安排（items / start / duration）分开存：重新打开 plan 要按它预填，
+    # 重新 complete 要按它复现同一份计划；只有 `plan clear` 才清掉。
+
+    def _plan_decisions(self):
+        try:
+            with open(PLAN_DECISIONS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _plan_decision(self, day):
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        rec = self._plan_decisions().get(iso)
+        return dict(rec) if isinstance(rec, dict) else None
+
+    def _save_plan_decision(self, day, allocator=None, pins=None, allocs=None):
+        """写当天的资源决定；``allocator=None`` = 清掉这一天的决定。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        data = self._plan_decisions()
+        if allocator is None:
+            data.pop(iso, None)
+        else:
+            counts = {str(a.get("project_id")): int(a.get("count") or 0)
+                      for a in (allocs or ())}
+            alloc = {}
+            for project in (getattr(allocator, "projects", None) or ()):
+                alloc[str(project.get("id"))] = counts.get(str(project.get("id")), 0)
+            data[iso] = {"alloc": alloc,
+                         "pins": [dict(p) for p in (pins or ())],
+                         "at": ts._now()}
+        try:
+            tmp = PLAN_DECISIONS_FILE + ".tmp"
+            os.makedirs(os.path.dirname(PLAN_DECISIONS_FILE), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, PLAN_DECISIONS_FILE)
+        except OSError as e:                       # noqa: BLE001 - 台账坏了不挡排期
+            rl.log_event("plan", "decision_save_failed", level="warning",
+                         day=iso, error=str(e))
+
+    def _prefill_plan_allocator(self, allocator, day):
+        """把上一轮的决定填回面板（项目「变亮」、固定项还在）。"""
+        rec = self._plan_decision(day)
+        if not rec:
+            return False
+        allocator.had_decision = True
+        by_id = {str(p.get("id")): p for p in (allocator.projects or ())}
+        for pid, count in (rec.get("alloc") or {}).items():
+            project = by_id.get(str(pid))
+            if project is None or int(count or 0) <= 0:
+                continue
+            allocator.allocations.append({"project_id": project["id"],
+                                          "count": int(count)})
+        keys = ("task_id", "pk", "title", "count", "project_id",
+                "project_title", "priority", "minutes")
+        for pin in rec.get("pins") or ():
+            try:
+                task = self.task_store.get(pin.get("task_id"))
+            except (ValueError, TypeError):
+                task = None
+            if not task or not ts.TaskStore.is_open(task) or task.get("formatter"):
+                continue
+            item = {k: pin.get(k) for k in keys if pin.get(k) is not None}
+            allocator.pins.append(item)
+        rl.log_event("plan", "prefilled", level="debug",
+                     day=day.isoformat(), allocs=len(allocator.allocations),
+                     pins=len(allocator.pins))
+        return True
+
+    def _reset_day_plans(self, day, announce=True, keep_decision=True):
         """重新 plan 前撤掉当天旧的 project plan / task 绑定。
 
         普通 ``plan`` 是「这一天整体重排」：旧的 plan items 和它们挂着的
@@ -2791,7 +2865,12 @@ class ProjectMixin(object):
                     detached += 1
                 except ValueError:
                     pass
-            self.projects.set_allocation(project.get("id"), day, 0)
+            if keep_decision:
+                # 决定（count）保留：重新打开 plan 要预填、complete 要复现。
+                # 这里只清「这一天排了哪些条目」。
+                self.projects.clear_items(project.get("id"), day)
+            else:
+                self.projects.set_allocation(project.get("id"), day, 0)
             cleared_plans += 1
             cleared_items += len(items)
         # 任务级固定项（`task <任务> <count>`）不记在项目库里：它们可能压根不属于
@@ -2815,8 +2894,9 @@ class ProjectMixin(object):
                 detached += 1
             except ValueError:
                 pass
-        if pinned:
+        if pinned and not keep_decision:
             self._save_plan_pins(day, ())
+        if pinned:
             cleared_items += len(pinned)
         # 重排前顺手清掉「上一轮 plan 留下的同 pk 派生幽灵」：用户 2026-11-18 要求
         # 「重复任务产生的、被取消 plan 的任务应该删除」，而且它们会一直挂在面板上。
@@ -3108,7 +3188,87 @@ class ProjectMixin(object):
             if not th.is_free({"start_min": s_min, "end_min": e_min}, reservations):
                 slots.extend(original_by_pid.get(pid) or [])
                 continue
+            # 2026-11-21：手订场是硬洞。可用时间 = period 减洞，拆成若干窗口：
+            #   * 前缀窗口（从时段起点开始）能用 layout 表达 → 普通 auto slot；
+            #   * 洞后面的窗口 layout 表达不了起点 → 标 window=True，落盘时写成
+            #     extras（_plan_apply → _commit_window_sessions）。
             blocks = pp._period_blocks(period)
+            try:
+                mine = [w for w in self.available_windows(day)
+                        if str(w.get("period_id") or "") == str(pid)]
+            except Exception:                      # noqa: BLE001 - 窗口算不出来就照旧
+                mine = []
+            if mine and not (len(mine) == 1 and mine[0].get("full")):
+                prefix = next((w for w in mine
+                               if int(w.get("start_min") or 0) == s_min), None)
+                pieces = []
+                if prefix is not None:
+                    p_blocks = min(int(prefix.get("minutes") or 0) // 30,
+                                   pp._period_blocks(period))
+                    if p_blocks > 0:
+                        prefix_end = prefix.get("end") or period.get("end")
+                        pieces.append({
+                            "start": period.get("start"), "end": prefix_end,
+                            "counts": p_blocks,
+                            "period": dict(period, end=prefix_end),
+                            "window": False,
+                        })
+                for win in mine:
+                    if win is prefix:
+                        continue
+                    w_blocks = min(int(win.get("minutes") or 0) // 30,
+                                   pp._period_blocks(period))
+                    if w_blocks <= 0:
+                        continue
+                    pieces.append({
+                        "start": win.get("start"), "end": win.get("end"),
+                        "counts": w_blocks,
+                        "period": dict(period, start=win.get("start"),
+                                       end=win.get("end")),
+                        "window": True,
+                    })
+                if not pieces:
+                    rl.log_event("plan", "window_skipped", level="debug",
+                                 day=day.isoformat(), period=pid,
+                                 reason="manual-hole", windows=len(mine))
+                    slots.extend(original_by_pid.get(pid) or [])
+                    continue
+                for piece in pieces:
+                    counts = int(piece["counts"])
+                    if include_current and p_start <= now < p_end:
+                        piece_end = datetime.datetime.combine(
+                            day, datetime.time(*sp.parse_hhmm(piece["end"])))
+                        remaining = int(
+                            (piece_end - max(now, anchor)).total_seconds() // 60)
+                        counts = min(counts, remaining // pp.MINUTES_PER_COUNT)
+                    if counts <= 0:
+                        continue
+                    slots.append({
+                        "index": len(slots) + 1,
+                        "date": day.isoformat(),
+                        "start": piece["start"],
+                        "end": piece["end"],
+                        "duration": counts * pp.MINUTES_PER_COUNT,
+                        "counts": counts,
+                        "id": None,
+                        "period_id": pid,
+                        "period": piece["period"],
+                        "period_start": piece["period"].get("start"),
+                        "period_end": piece["period"].get("end"),
+                        "period_total_minutes": pp._period_total_minutes(
+                            piece["period"]),
+                        "period_blocks": counts,
+                        "period_auto": True,
+                        "windowed": True,
+                        "window": piece["window"],
+                        "window_end": piece["end"],
+                        "current": bool(include_current and p_start <= now < p_end),
+                    })
+                rl.log_event("plan", "window_split", level="debug",
+                             day=day.isoformat(), period=pid,
+                             windows=[(p["start"], p["end"], p["counts"])
+                                      for p in pieces])
+                continue
             if include_current and p_start <= now < p_end:
                 remaining = int((p_end - max(now, anchor)).total_seconds() // 60)
                 blocks = min(blocks, remaining // pp.MINUTES_PER_COUNT)
@@ -3130,6 +3290,9 @@ class ProjectMixin(object):
                 "period_total_minutes": pp._period_total_minutes(period),
                 "period_blocks": blocks,
                 "period_auto": True,
+                "windowed": False,
+                "window": False,
+                "window_end": period.get("end"),
                 "current": bool(include_current and p_start <= now < p_end),
             })
         # 阶段 3.5：**已经切了一半的时段**，尾巴那截也得算容量。
@@ -3379,6 +3542,12 @@ class ProjectMixin(object):
             day, plan_ops, slots, task_store=self.task_store,
             hooks=self.plan_hooks(), pro_map=pro_map,
             resolve_task=self._plan_task_ref)
+        # 重新打开 plan：把上一轮的决定填回来（项目变亮、固定项还在）。
+        if self._prefill_plan_allocator(self.planning, day):
+            self.say("· 已载入 %s 上一轮的计划决定（%d 个项目 / %d 条固定项，"
+                     "改完直接 `complete` 就按它复现）"
+                     % (day.isoformat(), len(self.planning.allocations),
+                        len(self.planning.pins)), "info")
         by_type = {}
         for op in plan_ops:
             kind = pj.normalize_op_type(op.get("op_type")) or "?"
@@ -3711,13 +3880,14 @@ class ProjectMixin(object):
         return now + datetime.timedelta(minutes=(-now.minute) % 15)
 
     def cmd_plan_clear(self, day=None):
-        """``plan clear`` —— 撤掉这一天的计划（未开始的条目 + 绑定 + 分配）。
+        """``plan clear`` —— 撤掉这一天的计划（未开始的条目 + 绑定 + 分配 + 决定）。
 
-        `plan` 本身现在是**整天重排**语义（上一轮 plan 的任务不算占用）；这条
-        命令用来「我不想再排了、把这些计划清掉」—— 清完不会自动补排。
+        ``plan`` 本身保留资源决定（重新打开会预填）；只有这条命令是真清空。
         """
         day = day or self.sel_date
-        res = self._reset_day_plans(day, announce=False) or {}
+        res = self._reset_day_plans(day, announce=False,
+                                    keep_decision=False) or {}
+        self._save_plan_decision(day, None)
         try:
             self.rebuild_rows()
         except Exception:                          # noqa: BLE001 - 清完拉不到表也不算失败
@@ -3850,14 +4020,69 @@ class ProjectMixin(object):
                                  for a in allocs]
         allocator.closed = True
         self._plan_apply(allocator, allocs, append_to_plan=False, book=False,
-                         title="按计划重算排布（refresh）")
+                         title="按计划重算排布（refresh）",
+                         record_decision=False)
         self._stamp_auto_plan_signature(day)
         self.say("♻️ 检测到计划变化：已按 period 重算未来 session，当前正在进行的场次没动。",
                  "info")
         return True
 
+    def _commit_window_sessions(self, day, slot, durations):
+        """把手订场之外「窗口」的排布落成 extras（layout 表达不了洞后的起点）。
+
+        幂等：已经存在的同起点同长度 extra 复用；窗口里不再需要的 extra 删掉；
+        已订上的旧场次先走 :meth:`_cancel_stale_period_sessions` 取消（手订场由
+        它内部的手订保护跳过）。
+        """
+        period = dict(slot.get("period") or {})
+        try:
+            sessions = sp.plan_period(period, list(durations or ()))
+        except ValueError as e:
+            rl.log_event("plan", "window_layout_failed", level="warning",
+                         day=day.isoformat(), period=period.get("id"),
+                         error=str(e))
+            return
+        try:
+            self._cancel_stale_period_sessions(day, period, sessions,
+                                               reason="plan-window")
+        except Exception as e:                     # noqa: BLE001 - 取消失败也要写排布
+            rl.log_event("plan", "window_cancel_error", level="warning",
+                         day=day.isoformat(), period=period.get("id"),
+                         error="%s: %s" % (type(e).__name__, e))
+        want = {(str(s["start"]), int(s["duration"])) for s in sessions}
+        span = th._range_of(period)
+        for rec in list(sp.extras_for_date(sp.load_extras(), day)):
+            start = str(rec.get("start") or "")
+            dur = int(rec.get("duration") or 0)
+            if (start, dur) in want:
+                continue
+            got = th._clock_minutes(start)
+            if span is None or got is None or not (span[0] <= got < span[1]):
+                continue
+            sp.remove_extra(day, start)
+        have = {(str(r.get("start")), int(r.get("duration") or 0))
+                for r in sp.extras_for_date(sp.load_extras(), day)}
+        for sess in sessions:
+            key = (str(sess["start"]), int(sess["duration"]))
+            if key in have:
+                continue
+            try:
+                sp.add_extra(day, sess["start"], int(sess["duration"]),
+                             note="plan 切的（避开手订场）")
+            except ValueError as e:
+                rl.log_event("plan", "window_extra_failed", level="warning",
+                             day=day.isoformat(), start=sess["start"],
+                             error=str(e))
+        try:
+            keys = [sch.key_of(day, s["start"]) for s in sessions]
+            ks.clear_abandoned(keys)
+            ks.clear_slot_status(keys)
+        except Exception:                          # noqa: BLE001 - 判决清不掉不挡排期
+            pass
+        return sessions
+
     def _plan_apply(self, allocator, allocs, append_to_plan=False, book=True,
-                    title="排期（plan complete）"):
+                    title="排期（plan complete）", record_decision=True):
         """分配完了：先记资源，再挑任务、排进 session。
 
         ``append_to_plan=True`` 给 sessional plan / 手工单场安排用：当天已有
@@ -3941,7 +4166,23 @@ class ProjectMixin(object):
             _layouts_now = sp.load_layouts()
         except Exception:                          # noqa: BLE001
             _layouts_now = {}
+        window_by_key = {}
+        for slot in (getattr(allocator, "slots", None) or ()):
+            if not slot.get("window"):
+                continue
+            window_by_key[pp._period_key(slot.get("period") or {})] = dict(slot)
         for key, durations in (auto_layouts or {}).items():
+            if key in window_by_key:
+                # 手订场后面的窗口：layout 表达不了起点，落成 extras。
+                try:
+                    self._commit_window_sessions(day, window_by_key[key], durations)
+                except Exception as e:             # noqa: BLE001 - 一段坏了不挡其余
+                    rl.log_event("plan", "window_commit_error", level="error",
+                                 day=day.isoformat(),
+                                 period=(window_by_key[key].get("period") or {}).get("id"),
+                                 error="%s: %s" % (type(e).__name__, e))
+                    notes.append("窗口排布落盘出错：%s" % e)
+                continue
             period = period_by_key.get(key)
             if not period:
                 continue
@@ -4011,6 +4252,18 @@ class ProjectMixin(object):
                 existing = pj.plan_of(alloc["project"], day) or {}
                 count += int(existing.get("count") or 0)
             self.projects.set_allocation(alloc["project_id"], day, count)
+        if record_decision and not append_to_plan:
+            # `pro N clear` 之后 complete：这一天的 count 也要真的归 0（不只是
+            # 不排任务）。决定台账里记 0，下一次打开面板就不会又亮回旧数字。
+            kept = {str(a.get("project_id")) for a in allocs
+                    if int(a.get("count") or 0) > 0}
+            for project in (getattr(allocator, "projects", None) or ()):
+                if str(project.get("id")) in kept:
+                    continue
+                try:
+                    self.projects.set_allocation(project["id"], day, 0)
+                except Exception:                  # noqa: BLE001 - 单条清不掉不挡别
+                    pass
         # 这一次 plan 要用的场次 = 「我又想要它们了」：把「永不重订」判决和
         # daemon 记在 state 里的判死结论一起撤掉。commit_layout 只对**重切过**的
         # 时段做这件事；计划没变（layout 没动）时它根本不会跑，旧判决就留到下一次
@@ -4194,6 +4447,14 @@ class ProjectMixin(object):
         # 但重排 / `plan clear` 必须能把它们解绑。
         if pin_records or pins:
             self._save_plan_pins(day, pin_records, append=bool(append_to_plan))
+        # 资源决定与时间安排分开存：下次打开 plan 按它预填/复现。
+        if record_decision and not append_to_plan:
+            try:
+                self._save_plan_decision(day, allocator, pin_records, allocs=allocs)
+            except Exception as e:                 # noqa: BLE001 - 台账坏了不挡排期
+                rl.log_event("plan", "decision_error", level="warning",
+                             day=day.isoformat(),
+                             error="%s: %s" % (type(e).__name__, e))
         if progress is not None:
             progress.step("把 %d 条任务挂到 session 上" % len(placements))
         self.rebuild_rows()

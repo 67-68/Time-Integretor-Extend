@@ -375,8 +375,10 @@ wd.handle("plan +1")
 check_true("第二轮 plan 打开", wd.planning is not None)
 wd.handle("pro 1 2")
 wd.handle("complete")
-check("第二轮把第一轮的固定项解绑了", session_of(wd, solo), {})
-check("台账里当天没有固定项了", ledger(), [])
+# 2026-11-21 起：资源决定（含固定项）跨 plan 保留，重新打开会预填；
+# 只有 `task <任务> clear` / `plan clear` 才解绑。
+check_true("第二轮保留第一轮的固定项（决定预填）", bool(session_of(wd, solo)))
+check("台账里还有那条固定项", len(ledger()), 1)
 check("独立任务还在库里（解绑 ≠ 丢任务）",
       len([t for t in wd.task_store.list()
            if (t.get("fields") or {}).get("title") == "独立任务"]), 1)
@@ -432,9 +434,10 @@ wd.handle("task %d 2" % wd.task_no(busy, day=wd.sel_date))
 wd.handle("complete")
 auto_day(wd)
 wd.handle("plan +1")
+_before_pins = len(wd.planning.pins)
 wd.handle("task %d 1" % wd.task_no(busy, day=wd.sel_date))
 check_true("已挂场次的任务被拒绝", any("已经挂在" in t for t in texts(wd)))
-check("被拒绝时没有新增固定项", wd.planning.pins, [])
+check("被拒绝时没有新增固定项", len(wd.planning.pins), _before_pins)
 wd.handle("q")
 
 # 已经收工/投满的任务不能固定

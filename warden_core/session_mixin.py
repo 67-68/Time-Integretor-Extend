@@ -1042,11 +1042,19 @@ class SessionMixin(object):
             return [], False
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         new_by_start = {s["start"]: int(s["duration"]) for s in new_sessions or []}
+        # 用户手订的场次是硬洞：重切 layout 时**不取消、不挪**（2026-11-21 规则）。
+        try:
+            manual_starts = {str(r.get("startLabel"))
+                             for r in self.manual_session_rows(day)}
+        except Exception:                          # noqa: BLE001 - 坏行就不保护
+            manual_starts = set()
         stale = []
         for row in self._layout_rows(day):
             if not row.get("id"):
                 continue
             if str(row.get("date") or "") != iso:
+                continue
+            if str(row.get("startLabel") or "") in manual_starts:
                 continue
             if sp.period_for_session([period], row.get("startLabel")) is None:
                 continue
