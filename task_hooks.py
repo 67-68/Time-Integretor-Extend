@@ -528,6 +528,24 @@ def _already_past(ctx, start_min):
     return int(start_min) < now.hour * 60 + now.minute
 
 
+def _anchor_min(ctx):
+    """今天 `plan` 的起点（下一个 15 分钟整点）→ 当天分钟数；不是今天返回 None。
+
+    和 ``Warden._plan_anchor`` 同一口径：已经流走的分钟不是资源。formatter 在
+    「整段还没切过、但已经开始了」的时段上只能从 anchor 之后切。
+    """
+    now = ctx.get("now")
+    if now is None:
+        return None
+    if str(ctx.get("date") or "") != now.date().isoformat():
+        return None
+    anchor = now.replace(second=0, microsecond=0)
+    anchor += datetime.timedelta(minutes=(-anchor.minute) % 15)
+    if anchor.date() != now.date():
+        return None                        # anchor 跨到明天了，今天没得排
+    return anchor.hour * 60 + anchor.minute
+
+
 def _format_end_over_windows(ctx, windows, task, duration, break_got, fit,
                              reservations, task_id):
     """``end`` 的 period-first 版本：在「可用时间窗」的尾巴切一场。
@@ -979,6 +997,9 @@ def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
 
     fit = int(fit_session_duration(duration))
     span = fit + break_got
+    windows = (ctx.get("windows")
+               if isinstance(ctx.get("windows"), (list, tuple)) else None)
+    anchor_min = _anchor_min(ctx)
     candidates = []
     for period in periods:
         pid = str(period.get("id") or "")
@@ -986,6 +1007,61 @@ def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
         if not pid or period_range is None:
             continue
         real = by_period.get(pid) or []
+        # period-first：整段还没切过 session 的时段按「可用窗口的头部」切。
+        # 窗口起点可能就是时段起点；如果时段已经开始，从 anchor 之后切；
+        # 手订场把时段切成洞时，洞后面的窗口也能用 —— 这几种起点 layout 都
+        # 表达不了，落盘走 extras（结果里不带 cut_period_id）。
+        if windows is not None and not real:
+            picked = None
+            start_min = None
+            mine = [w for w in windows
+                    if str(w.get("period_id") or "") == pid]
+            for win in sorted(mine, key=lambda w: int(w.get("start_min") or 0)):
+                w_start = int(win.get("start_min") or 0)
+                w_end = int(win.get("end_min") or 0)
+                start_min = w_start
+                if _already_past(ctx, start_min) or (
+                        anchor_min is not None and start_min < anchor_min):
+                    if anchor_min is None:
+                        continue
+                    start_min = max(start_min, anchor_min)
+                start_min += (-start_min) % 15     # Focusmate 只认 15 分钟整点
+                if start_min + span > w_end:
+                    continue
+                reserve = (start_min, start_min + span)
+                if not is_free({"start_min": reserve[0], "end_min": reserve[1]},
+                               reservations):
+                    continue
+                if any(overlaps(reserve, got) for got in all_ranges):
+                    continue
+                picked = win
+                break
+            if picked is None:
+                continue
+            picked_start = int(picked.get("start_min") or 0)
+            if start_min == picked_start and picked_start == int(period_range[0]):
+                # 窗口起点就是时段起点：和尾巴追加同形，能直接写进 layout
+                # （只有起点被 anchor/手订洞挪过才需要 extras）。
+                try:
+                    planned = sp.plan_period(period, [fit])
+                except ValueError:
+                    planned = []
+                if (len(planned) == 1
+                        and int(planned[-1].get("start_min") or 0) == start_min):
+                    candidates.append({
+                        "period": period, "pid": pid, "prefix": [],
+                        "planned": planned, "session": dict(planned[-1]),
+                        "start_min": start_min, "period_range": period_range,
+                    })
+                    continue
+            candidates.append({
+                "period": period, "pid": pid, "prefix": [], "planned": [],
+                "start_min": start_min,
+                "period_range": (int(picked.get("start_min") or 0),
+                                 int(picked.get("end_min") or 0)),
+                "window": True,
+            })
+            continue
         gap = sp.tail_gap(period, real)
         if not gap:
             continue                       # 序列对不上 / 没有尾巴：这一段不许追加
@@ -1023,7 +1099,8 @@ def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
     period = pick["period"]
     prefix = pick["prefix"]
     start_min = pick["start_min"]
-    planned = pick["planned"]
+    planned = pick.get("planned") or []
+    windowed = bool(pick.get("window"))
     session_end = start_min + fit
     reserve_end = start_min + span
     prior = planned[:-1]
@@ -1069,10 +1146,18 @@ def format_enlist(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
         "cut_prefix": prefix,
         "cut_prefix_exact": True,
     }
+    if windowed:
+        # 窗口起点不是时段起点（整段没切过 / 洞后窗口）：layout 表达不了，
+        # 由 _ensure_carved_session 写成一次性 session；不带 cut_period_id，
+        # 免得 _cut_period_for_carve 去重写整段 layout。
+        session.pop("cut_period_id", None)
+        session.pop("cut_prefix_exact", None)
+        session["windowed"] = True
     return {"name": "enlist", "reservation": reservation, "session": session,
             "new_session": True, "cut_period_id": pick["pid"],
             "cut_prefix": prefix,
             "carved_from": fmt_minutes(int(pick["period_range"][0])),
+            "windowed": windowed,
             "conflicts": [], "created_at": _now()}
 
 

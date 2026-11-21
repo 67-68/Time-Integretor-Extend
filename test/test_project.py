@@ -34,6 +34,9 @@ os.environ["TI_SESSION_RULES"] = os.path.join(TMP, "rules.json")
 # 用到例跑在周三晚上、看的是「明天」（周四）时，T1 那两场会被当成静音 → 空场凭空少两场。
 os.environ["TI_SESSION_MUTES"] = os.path.join(TMP, "mutes.json")
 os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
+os.environ["TI_PLAN_PINS"] = os.path.join(TMP, "plan-pins.json")
+os.environ["TI_PLAN_DECISIONS"] = os.path.join(TMP, "plan-decisions.json")
+os.environ["TI_PLAN_WATCHDOG"] = os.path.join(TMP, "plan-watchdog.json")
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
 os.environ["TI_TASK_ARCHIVE"] = os.path.join(TMP, "archive.json")
 os.environ["TI_PROJECTS_FILE"] = os.path.join(TMP, "projects.json")
@@ -1715,15 +1718,18 @@ except ValueError as e:
 wd_flag = fresh(rows_ok)
 wd_flag.omnifocus.rows = [dict(r) for r in rows_ok]
 wd_flag.handle("task import sop omnifocus:///project/p-lunwen")
-_seen_flag = {}
+_seen_flag = {"calls": []}
 def _fake_plan_slots(day, include_current=False, **_kw):
     _seen_flag["include_current"] = include_current
+    _seen_flag["calls"].append(include_current)
     return [pp.slot_record(1, day.isoformat(), "12:15", 25, "s99")], []
 wd_flag._plan_slots = _fake_plan_slots
 wd_flag.handle("plan -c")
 check("plan -c 命令打开分配问答", wd_flag.planning is not None, True)
+# 命令结束后的 refresh_warnings 还会用 include_current=False 调一次
+# _plan_slots（「今天还没 plan」的容量），所以断言「至少有一次 True」。
 check("命令入口把 include_current=True 传给空场收集",
-      _seen_flag.get("include_current"), True)
+      True in _seen_flag["calls"], True)
 wd_flag.handle("q")
 
 print("== 6) help 页面澄清 op / pro / task 三个数据模型的区别 ==")

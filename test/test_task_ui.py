@@ -24,6 +24,12 @@ def check(label, got, want):
 def check_true(label, got):
     check(label, bool(got), True)
 
+def task_panel_of(panels):
+    """契约视图里按标题找任务面板（契约表下面多了「自动添加条件」小表，
+    任务面板不再是固定 index）。"""
+    return next(p for p in panels
+                if hasattr(p, "title") and "Task · 任务" in str(p.title))
+
 
 TMP = tempfile.mkdtemp(prefix="task-ui-test-")
 os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
@@ -32,6 +38,9 @@ os.environ["TI_SESSION_LAYOUTS"] = os.path.join(TMP, "layouts.json")
 os.environ["TI_SESSION_EXTRAS"] = os.path.join(TMP, "extras.json")
 os.environ["TI_SESSION_RULES"] = os.path.join(TMP, "rules.json")
 os.environ["TI_SETTINGS_FILE"] = os.path.join(TMP, "settings.json")
+os.environ["TI_PLAN_PINS"] = os.path.join(TMP, "plan-pins.json")
+os.environ["TI_PLAN_DECISIONS"] = os.path.join(TMP, "plan-decisions.json")
+os.environ["TI_PLAN_WATCHDOG"] = os.path.join(TMP, "plan-watchdog.json")
 os.environ["TI_TASKS_FILE"] = os.path.join(TMP, "tasks.json")
 os.environ["TI_PROJECTS_FILE"] = os.path.join(TMP, "projects.json")
 os.environ["TI_PROJECT_SYNC_FILE"] = os.path.join(TMP, "project-sync.json")
@@ -359,10 +368,13 @@ check_true("标题长的那条被 trim 了（带 …）或本来就不长",
 
 contract = [v for v in w.VIEWS if v.key == "1"][0](wd)
 parts = contract.render()
-check("契约视图先给契约表格、再给任务面板（收尾面板在打断栏位里）", len(parts), 2)
-check_true("第二块就是那张任务面板（一张表，不拆）", hasattr(parts[1], "columns"))
-check_true("任务面板标题里写了记号图例", "Task · 任务" in str(parts[1].title))
-check("面板里是 number/task 一对一对的", len(parts[1].columns) % 2, 0)
+check("契约视图：契约表 → 条件表 → 任务面板（收尾面板在打断栏位里）",
+      len(parts), 3)
+check_true("第一块是契约表格", "The Contract Table" in str(parts[0].title))
+check_true("第二块是自动添加条件", "自动添加条件" in str(parts[1].title))
+check_true("第三块就是那张任务面板（一张表，不拆）", hasattr(parts[2], "columns"))
+check_true("任务面板标题里写了记号图例", "Task · 任务" in str(parts[2].title))
+check("面板里是 number/task 一对一对的", len(parts[2].columns) % 2, 0)
 
 print("== 任务面板：屏幕够宽就摊成 3 / 4 列（不再固定两列）==")
 # 列数只跟「终端有多宽」和「标题最长有多长」有关，所以把宽度显式喂进去。
@@ -391,7 +403,7 @@ for _t in (_many[:1],):
     pass
 wd.frame_width = lambda: 160
 _wide_cols = wd.task_index_layout(wd.task_panel_tasks() or _many, width=160)[0]
-_wide_panel = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+_wide_panel = task_panel_of([v for v in w.VIEWS if v.key == "1"][0](wd).render())
 wd.frame_width = _real_width
 wide_table = _wide_panel
 check("160 列 → 表里的 column 数 = 2 * 列数", len(wide_table.columns), 2 * _wide_cols)
@@ -422,7 +434,7 @@ check("完成的染绿", str(num_d.style), "green")
 check("进行中的打 ·", str(title_f).startswith("·"), True)
 check("task_mark：进行中 = ·", wd.task_mark(task_free), "·")
 check("task_mark：完成 = ✓", wd.task_mark(done_task), "✓")
-index_table = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+index_table = task_panel_of([v for v in w.VIEWS if v.key == "1"][0](wd).render())
 check_true("任务面板标题里写了记号图例", "✓ 完成" in str(index_table.title))
 check_true("表尾有一行账（几条进行中/完成/放弃）",
            "%d 条：" % len(wd.task_panel_tasks()) in str(index_table.caption))
@@ -480,7 +492,7 @@ yday_ids = [t["id"] for t in wd.task_panel_tasks()]
 check("昨天面板固化：只剩那天处理过的", a_id in yday_ids, True)
 check("跳过的也算那天处理过（问过它、你说先放着）", d_id in yday_ids, True)
 check("昨天面板上今天还开着、昨天没碰过的不出现", b_id in yday_ids, False)
-_past = [v for v in w.VIEWS if v.key == "1"][0](wd).render()[1]
+_past = task_panel_of([v for v in w.VIEWS if v.key == "1"][0](wd).render())
 check_true("过去那天的表尾写清「固化」口径", "过去就固化" in str(_past.caption))
 check_true("过去那天的表尾带日期", yday_iso in str(_past.caption))
 
@@ -1203,6 +1215,13 @@ def plan_sessions(wd, day=None, drop=()):
     return out
 
 
+def task_panel_of(panels):
+    """契约视图里按标题找任务面板（契约表下面多了「自动添加条件」小表，
+    任务面板不再是固定 index）。"""
+    return next(p for p in panels
+                if hasattr(p, "title") and "Task · 任务" in str(p.title))
+
+
 def fresh_warden():
     """干净的 warden：任务库清空、bridge 里没有历史 attachment。"""
     wd_ = mkwarden()
@@ -1629,7 +1648,11 @@ check("放弃的那条仍记得自己挂在哪一场（位置没丢）",
 # 渲染里真的按这个顺序摆 —— 把列数钉成 1 列，读出来就该等于 task_panel_order()
 _orig_layout = wd3.task_index_layout
 wd3.task_index_layout = lambda tasks, width=None: (1, len(tasks))
-_panel = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()[1]
+_panels = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()
+# 契约表下面多了「自动添加条件」小表，任务面板不再是固定 index 1；
+# 按标题找，别把条件表当成任务面板。
+_panel = next(p for p in _panels
+              if hasattr(p, "title") and "Task · 任务" in str(p.title))
 _buf = io.StringIO()
 w.Console(file=_buf, width=80, highlight=False, color_system=None).print(_panel)
 wd3.task_index_layout = _orig_layout
@@ -1664,7 +1687,11 @@ def panel_numbers(renderable):
 
 _real_width = wd3.frame_width
 wd3.frame_width = lambda: 160
-_panel = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()[1]
+_panels = [v for v in w.VIEWS if v.key == "1"][0](wd3).render()
+# 契约表下面多了「自动添加条件」小表，任务面板不再是固定 index 1；
+# 按标题找，别把条件表当成任务面板。
+_panel = next(p for p in _panels
+              if hasattr(p, "title") and "Task · 任务" in str(p.title))
 _cols, _rows = wd3.task_index_layout(wd3.task_panel_order())
 wd3.frame_width = _real_width
 _lines = panel_numbers(_panel)

@@ -38,14 +38,15 @@ for _name, _file in (
     ("TI_SESSION_RULES", "rules.json"),
     ("TI_SESSION_MUTES", "mutes.json"),
     ("TI_SETTINGS_FILE", "settings.json"),
+    ("TI_PLAN_PINS", "plan-pins.json"),
+    ("TI_PLAN_DECISIONS", "plan-decisions.json"),
+    ("TI_PLAN_WATCHDOG", "plan-watchdog.json"),
     ("TI_TASKS_FILE", "tasks.json"),
     ("TI_TASK_ARCHIVE", "archive.json"),
     ("TI_PROJECTS_FILE", "projects.json"),
     ("TI_PROJECT_SYNC_FILE", "project-sync.json"),
     ("TI_NOSTART_FILE", "nostart.json"),
     ("TI_POSTSESSION_FILE", "postsession.json"),
-    ("TI_PLAN_PINS", "plan-pins.json"),
-    ("TI_PLAN_WATCHDOG", "plan-watchdog.json"),
     ("TI_OMNIFOCUS_OUTBOX", "omnifocus-outbox.json"),
     ("TI_FAILED_ACTIONS", "failed-actions.json"),
 ):
@@ -126,8 +127,13 @@ def reset_files():
     store = ts.TaskStore()
     for task in store.list():
         store.delete(task["id"])
+    # 每个用例都从「干净的这一天」开始：layout / extras / data.csv 不能带着上一条
+    # 用例的场次（有 layout 的话「没有 plan」的场景会被误判成已经有空场）。
     for path in (os.path.join(TMP, "plan-watchdog.json"),
-                 os.path.join(TMP, "archive.json")):
+                 os.path.join(TMP, "archive.json"),
+                 os.path.join(TMP, "layouts.json"),
+                 os.path.join(TMP, "extras.json"),
+                 os.path.join(TMP, "data.csv")):
         try:
             os.remove(path)
         except OSError:
@@ -135,10 +141,14 @@ def reset_files():
 
 
 def save_period(period=None):
+    save_periods([dict(period or PERIOD)])
+
+
+def save_periods(periods):
     sp.save_download({
         "version": 1, "generated_at": "x", "start_date": ISO, "days": 8,
         "profiles": ["工作"], "events": [],
-        "periods": [dict(period or PERIOD)]})
+        "periods": [dict(p) for p in periods]})
 
 
 TASKS = [
@@ -159,12 +169,15 @@ def seed_projects(pois=None):
     return op
 
 
-def fresh(layout="session T1 50", period=None):
-    """干净任务库/项目库 + 一份今天的时段 + 一条 layout；返回 (wd, op)。"""
+def fresh(layout="session T1 50", period=None, periods=None, clock=None):
+    """干净任务库/项目库 + 今天的时段 + 一条 layout；返回 (wd, op)。"""
     global wd
     reset_files()
-    save_period(period)
-    wd = mkwarden()
+    if periods is not None:
+        save_periods(periods)
+    else:
+        save_period(period)
+    wd = mkwarden(clock)
     op = seed_projects()
     if layout:
         if not wd.handle(layout):
@@ -314,6 +327,108 @@ wd.handle("session T1 50")
 wd.rebuild_rows()
 check("没有可排项目 → 不建", wd._plan_watchdog_check(), None)
 check("任务库干净（无项目）", reminders(wd), [])
+
+print("== 真的没 plan：只有 period、没有 layout → 按整段容量建提醒 ==")
+wd, op = fresh(layout=None)
+_pend = wd.pending_plan() or {}
+check("容量按 period 整段算（11:00–15:00 = 8 count）", _pend.get("counts"), 8)
+check("检查结果 = create", wd._plan_watchdog_check(), "create")
+_rem = reminders(wd)[0]
+check("提醒场落在时段起点 11:00",
+      [(_rem.get("session") or {}).get("start"),
+       (_rem.get("session") or {}).get("duration")], ["11:00", 25])
+check("layout 被切成 [25]", sp.get_layout(sp.load_layouts(), DAY, "T1"), [25])
+
+print("== 只有晚场空着（早场已经过去）→ 提醒排在晚场起点 ==")
+_late = dict(PERIOD, id="T3", start="22:15", end="23:40")
+_morning = dict(PERIOD, id="T1", start="09:00", end="10:00")
+wd, op = fresh(layout=None, periods=[_morning, _late],
+               clock=datetime.datetime.combine(DAY, datetime.time(21, 20)))
+check("容量只算晚场（85 分钟 → 2 count）",
+      (wd.pending_plan() or {}).get("counts"), 2)
+check("检查结果 = create", wd._plan_watchdog_check(), "create")
+_rem = reminders(wd)[0]
+check("提醒场在 22:15",
+      [(_rem.get("session") or {}).get("start"),
+       (_rem.get("session") or {}).get("duration")], ["22:15", 25])
+
+print("== 时段已经开始、又还没切 → 从 anchor 之后切（13:15）==")
+wd, op = fresh(layout=None,
+               clock=datetime.datetime.combine(DAY, datetime.time(13, 5)))
+check("容量 = 13:15–15:00 → 3 count",
+      (wd.pending_plan() or {}).get("counts"), 3)
+check("检查结果 = create", wd._plan_watchdog_check(), "create")
+_rem = reminders(wd)[0]
+check("提醒场从 anchor 之后开始（13:15）",
+      [(_rem.get("session") or {}).get("start"),
+       (_rem.get("session") or {}).get("duration")], ["13:15", 25])
+check("layout 没被改（起点不在时段起点，走 extras）",
+      sp.get_layout(sp.load_layouts(), DAY, "T1"), None)
+check("一次性场写进当天排期",
+      [e.get("start") for e in sp.extras_for_date(sp.load_extras(), DAY)
+       if e.get("start") == "13:15"], ["13:15"])
+
+print("== 提醒任务在、但没排上场次 → 只补排，不重复建 ==")
+wd, op = fresh(layout="session T1 50")
+_rem = wd.task_store.create({"title": pw.TITLE, "duration": 25},
+                            source={"kind": pw.SOURCE_KIND})
+check("检查结果 = schedule", wd._plan_watchdog_check(), "schedule")
+check("排到最早空位 12:00",
+      (wd.task_store.get(_rem["id"]).get("session") or {}).get("start"), "12:00")
+check("再检查幂等", wd._plan_watchdog_check(), None)
+check("任务库仍只有一条提醒",
+      len([t for t in reminders(wd) if t["status"] == "active"]), 1)
+
+print("== 提醒场被取消（绑定清空）→ 重排，不直接兜底 ==")
+wd, op = fresh(layout="session T1 50")
+wd._plan_watchdog_check()
+_rem = reminders(wd)[0]
+wd.task_store.assign(_rem["id"], {"date": ISO, "start": "", "duration": 0})
+check("检查结果 = schedule", wd._plan_watchdog_check(), "schedule")
+check_true("重新挂上了",
+           bool((wd.task_store.get(_rem["id"]).get("session") or {}).get("start")))
+check("没有走兜底（今天还没兜底）",
+      (ledger().get("auto_planned") or {}).get(ISO), None)
+
+print("== 提醒场过去 + 今天没容量 → 兜底记 empty，一天只跑一次 ==")
+wd, op = fresh(layout="session T1 50")
+wd._plan_watchdog_check()
+_rem = reminders(wd)[0]
+wd.task_store.assign(_rem["id"], {"date": ISO, "start": "08:00", "duration": 25})
+wd.clock_now = datetime.datetime.combine(DAY, datetime.time(12, 30))
+wd._plan_slots = lambda day, **_kw: ([], [])
+_detail = wd._plan_watchdog_check()
+check_true("兜底真的跑了", isinstance(_detail, dict))
+check("兜底结果 = empty",
+      (ledger().get("auto_planned") or {}).get(ISO, {}).get("status"), "empty")
+check("提醒任务退休", wd.task_store.get(_rem["id"])["status"], "completed")
+check("再检查不再动", wd._plan_watchdog_check(), None)
+
+print("== 条件表：契约表正下方，今天/明天都能看 ==")
+wd, op = fresh(layout=None)
+_rows = wd.condition_rows()
+check("规则条数（5 条：2 formatter + plan + 2 watchdog）", len(_rows), 5)
+_by_key = {row["key"]: row for row in _rows}
+check("今天 formatter end 是无条件添加",
+      _by_key["formatter.end"]["ok"], True)
+check("今天没 plan + 有容量 → 提醒条件满足",
+      _by_key["plan_watchdog.reminder"]["ok"], True)
+check("今天没分配 → plan 条件不满足",
+      _by_key["plan.complete"]["ok"], False)
+_out_io = io.StringIO()
+Console(file=_out_io, width=220, force_terminal=False).print(
+    wd.render_conditions_table())
+_out = _out_io.getvalue()
+check_true("表里有标题", "自动添加条件" in _out)
+check_true("条件列用了 operator", "always" in _out and "∧" in _out)
+check_true("不满足的原因写在说明里", "还没有分配 count" in _out)
+wd.day_offset = 1
+wd.rebuild_rows()
+_by_key2 = {row["key"]: row for row in wd.condition_rows()}
+check("看明天时 watchdog 规则不适用",
+      _by_key2["plan_watchdog.reminder"]["applicable"], False)
+check("明天表仍然有 formatter 行",
+      _by_key2["formatter.enlist"]["ok"], True)
 
 print("== 接线：refresh_warnings（每帧钩子）真的会触发检查 ==")
 wd, op = fresh()

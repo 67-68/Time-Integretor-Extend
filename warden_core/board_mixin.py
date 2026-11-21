@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 
+from . import conditions
 from .bridge import focusmate_home
 from .common import (
     FRESH_SESSION,
@@ -1838,6 +1839,7 @@ class BoardMixin(object):
             rows.extend(shells)
             rows.sort(key=lambda r: r["startMs"])
         self.rows = rows
+        self._condition_rows_cache = None      # 条件表跟着这一帧的状态重算
         self.invalidate()          # 表格换了内容 → 画帧缓存作废
 
     @staticmethod
@@ -2313,6 +2315,57 @@ class BoardMixin(object):
         if captions:
             t.caption = Text("\n".join(captions), style="dim")
             t.caption_justify = "left"
+        return t
+
+    def condition_rows(self, day=None):
+        """「自动添加条件」表的数据（5 秒缓存：每帧不必重算容量）。"""
+        day = day or self.sel_date
+        bucket = int(time.time() // 5)
+        key = (day.isoformat(), bucket)
+        cached = getattr(self, "_condition_rows_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            rows = conditions.condition_rows(self, day)
+        except Exception as exc:               # noqa: BLE001 - 条件表坏了不该没帧
+            rl.log_event("conditions", "error", level="warning",
+                         day=day.isoformat(),
+                         error="%s: %s" % (type(exc).__name__, exc))
+            rows = []
+        self._condition_rows_cache = (key, rows)
+        return rows
+
+    def render_conditions_table(self):
+        """契约表正下方的「自动添加条件」小表（只读）。
+
+        用户 2026-11-21：「在 Contract Table 下方添加几行『条件』，展示自动添加
+        任务的条件，以及当前是否满足」，并且「今天也展示」、看明天那张表时也
+        展示。plan_watchdog 的两条只在「今天」有状态，其它日期显示不适用。
+        """
+        rows = self.condition_rows()
+        if not rows:
+            return None
+        title = "自动添加条件 · %s" % (
+            "今天" if self.day_offset == 0 else self.sel_date.isoformat())
+        t = Table(title=title, box=box.SIMPLE, header_style="bold yellow",
+                  title_justify="left", expand=False)
+        t.add_column("来源", no_wrap=True, style="cyan")
+        t.add_column("条件", no_wrap=True, overflow="crop")
+        t.add_column("现在", no_wrap=True)
+        t.add_column("说明", no_wrap=True, overflow="crop")
+        for row in rows:
+            if not row.get("applicable"):
+                status = Text("— 不适用", style=STYLE_MUTED)
+                detail = Text(row.get("detail") or "", style=STYLE_MUTED)
+            elif row.get("ok"):
+                status = Text("✅ 满足", style="bold green")
+                detail = Text(row.get("detail") or "", style=STYLE_MUTED)
+            else:
+                status = Text("❌ 不满足", style="yellow")
+                detail = Text(row.get("detail") or "", style="yellow")
+            t.add_row(Text(row.get("source") or ""),
+                      Text(row.get("condition") or ""),
+                      status, detail)
         return t
 
     def unbooked_reason_rows(self, missing=None):

@@ -30,6 +30,9 @@ for key, name in (
         ("TI_SESSION_EXTRAS", "extras.json"),
         ("TI_SESSION_RULES", "rules.json"),
         ("TI_SETTINGS_FILE", "settings.json"),
+        ("TI_PLAN_PINS", "plan-pins.json"),
+        ("TI_PLAN_DECISIONS", "plan-decisions.json"),
+        ("TI_PLAN_WATCHDOG", "plan-watchdog.json"),
         ("TI_TASKS_FILE", "tasks.json"),
         ("TI_TASK_ARCHIVE", "archive.json"),
         ("TI_PROJECTS_FILE", "projects.json"),
@@ -132,6 +135,11 @@ def fresh(periods):
             pass
     console = Console(file=io.StringIO(), width=200, force_terminal=False)
     wd = w.Warden(console, FakeBridge(), no_clear=True, offline=False)
+    # 收尾/到点提醒按 time.time() 触发，不看 clock_now：测试如果正好跑在
+    # 「某场刚结束」的那几分钟里，refresh 会被问答吃掉（今天 23:05 就踩了）。
+    # 这两问不是本文件要测的东西，直接关掉，保证一天里任何时刻都能跑。
+    wd.settings.set("postsession", "0")
+    wd.settings.set("nostart", "0")
     wd.reload_periods()
     wd.reload_entries()
     return wd
@@ -163,6 +171,8 @@ wd = fresh([{"id": "T1", "date": ISO, "start": "22:15", "end": "00:05",
 check("先排一场 50 分钟", wd.handle("period T1 50"), True)
 wd.reload_entries()
 sync_api(wd)
+# 这一段要切 23:15 那场：固定时钟，别让「正好跑到 23:15 之后」把用例跑红。
+wd.clock_now = datetime.datetime.combine(TODAY, datetime.time(21, 0))
 check("task create ... -f end 受理",
       wd.handle("task create title=夜读 duration=25 -f end"), True)
 night = [t for t in wd.task_store.list()

@@ -78,6 +78,9 @@ def build_sandbox():
         "postsession": os.path.join(temp, "postsession.json"),
         "failed_actions": os.path.join(temp, "failed.json"),
         "of_outbox": os.path.join(temp, "outbox.json"),
+        "plan_pins": os.path.join(temp, "plan-pins.json"),
+        "plan_decisions": os.path.join(temp, "plan-decisions.json"),
+        "plan_watchdog": os.path.join(temp, "plan-watchdog.json"),
     }
     return paths
 

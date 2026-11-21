@@ -3132,6 +3132,65 @@ class ProjectMixin(object):
                         "duration": row.get("durationMin")})
         return out
 
+    def _started_period_slot(self, day, period, anchor):
+        """已经开始了、但整段还没切过 session 的时段 → anchor 之后的可用窗口 slot。
+
+        「只排未来」：已经流走的分钟不是资源；但 13:00 打开 TI、11:00–15:00 还没
+        切的时候，13:15–15:00 仍然是空的。窗口起点不在时段起点，layout 表达不了，
+        所以 ``window=True``（落盘由 :meth:`_commit_window_sessions` 写成 extras）。
+        手订场/进行中场由 :meth:`available_windows` 先扣掉。
+        """
+        pid = str(period.get("id") or "")
+        if not pid:
+            return None
+        if anchor.date() != day:
+            return None                     # anchor 已经跨到明天，今天没得排
+        anchor_min = anchor.hour * 60 + anchor.minute
+        try:
+            windows = [w for w in self.available_windows(day)
+                       if str(w.get("period_id") or "") == pid]
+        except Exception:                   # noqa: BLE001 - 窗口算不出来退回整段
+            windows = []
+        if not windows:
+            got = th._range_of(period)
+            if got is None:
+                return None
+            windows = [{"start_min": int(got[0]), "end_min": int(got[1])}]
+        total_blocks = pp._period_blocks(period)
+        for win in sorted(windows, key=lambda w: int(w.get("start_min") or 0)):
+            start_min = max(int(win.get("start_min") or 0), anchor_min)
+            end_min = int(win.get("end_min") or 0)
+            minutes = end_min - start_min
+            if minutes < pp.MINUTES_PER_COUNT:
+                continue
+            blocks = min(minutes // 30, total_blocks)
+            if blocks <= 0:
+                continue
+            start = th.fmt_minutes(start_min)
+            end = th.fmt_minutes(end_min)
+            trimmed = dict(period, start=start, end=end)
+            return {
+                "index": 0,
+                "date": day.isoformat(),
+                "start": start,
+                "end": end,
+                "duration": blocks * pp.MINUTES_PER_COUNT,
+                "counts": blocks,
+                "id": None,
+                "period_id": pid,
+                "period": trimmed,
+                "period_start": start,
+                "period_end": end,
+                "period_total_minutes": pp._period_total_minutes(trimmed),
+                "period_blocks": blocks,
+                "period_auto": True,
+                "windowed": True,
+                "window": True,
+                "window_end": end,
+                "current": False,
+            }
+        return None
+
     def _auto_period_slots(self, day, period_meta, blocked_periods, slots, *,
                            include_current=False, now=None):
         """阶段 3：自动排布的 period 整段换成「工作容量」伪 slot。
@@ -3170,8 +3229,19 @@ class ProjectMixin(object):
             if p_end <= p_start:
                 p_end += datetime.timedelta(days=1)
             if p_start < anchor and not (include_current and now < p_end):
-                # 这一段已经过去了（或者来不及在下一个整点开始），不重切。
-                slots.extend(original_by_pid.get(pid) or [])
+                # 这一段已经开始了。已经切出过真实 session 的时段保持原样（由行层
+                # 和尾巴逻辑处理）；**整段还没切过**的时段只把 anchor 之后的剩余
+                # 时间算成容量 —— 「先分时间、再落 session」，已经流走的分钟不是
+                # 资源，但下午 13:00 打开 TI、11:00–15:00 还没切时，13:15–15:00
+                # 仍然应该能排。窗口起点不在时段起点，layout 表达不了，标
+                # ``window=True``，_plan_apply 会写成 extras。
+                if original_by_pid.get(pid):
+                    slots.extend(original_by_pid.get(pid))
+                    continue
+                cut = self._started_period_slot(day, period, anchor)
+                if cut is not None:
+                    cut["index"] = len(slots) + 1
+                    slots.append(cut)
                 continue
             if mute_window_for(day, period.get("start"), period.get("end")):
                 slots.extend(original_by_pid.get(pid) or [])
@@ -3847,6 +3917,11 @@ class ProjectMixin(object):
         三条同时成立才算「该提醒」：项目库里有 active 项目、这一天**一个项目都没分过
         count**、而且这一天还有没开始、没挂任务、没静音的场次。已经 plan 过（哪怕只
         排了一部分）就不再吵 —— 提醒是用来「别忘了」，不是用来记账的。
+
+        容量口径和 ``plan`` 共用 :meth:`_plan_slots`（period-first）：**没有 layout
+        的时段、半截时段的尾巴都算空场**。以前这里用 :meth:`free_plan_slots`
+        只数「已经切出来的 session」，于是「今天一次 plan 都没做、连 layout 都没有」
+        的日子会得到 0 个空场 —— 提醒任务在这种最该出现的日子里反而不建。
         """
         day = day or datetime.date.today()
         try:
@@ -3861,10 +3936,15 @@ class ProjectMixin(object):
             allocated += int((plan or {}).get("count") or 0)
         if allocated:
             return None
-        slots = self.free_plan_slots(day)
+        try:
+            slots, _notes = self._plan_slots(day, replan=True)
+        except Exception:                          # noqa: BLE001 - 排期算不出来就当没空场
+            return None
         if not slots:
             return None
-        counts = sum(int(s.get("duration") or 0) // pp.MINUTES_PER_COUNT for s in slots)
+        counts = sum(int(s.get("counts") or 0) for s in slots)
+        if counts <= 0:
+            return None
         return {"sessions": len(slots), "counts": counts,
                 "starts": [s.get("start") for s in slots]}
 
@@ -4138,7 +4218,10 @@ class ProjectMixin(object):
             skip_pks.setdefault(pid, set()).add(pk)
         items, notes = pp.distribute(
             allocs, [a["project"] for a in allocs], invested,
-            now=datetime.datetime.now(), exclude_pks=excluded,
+            # 用 warden 的时钟（测试可以钉死；生产就是墙上时钟）。以前这里
+            # 直接 datetime.now()，测试把 clock_now 定在 15:58 也没用，defer
+            # 到 23:00 的任务会按真实时间被当成「已经可以做了」。
+            now=self._now_dt(), exclude_pks=excluded,
             rotation=self.derived_rotation(), skip_pks=skip_pks, pins=pins)
         # period-first：只要这一天的空场里有“自动 layout”的 period，就先把任务
         # 按 period 排好，再根据任务反推 session durations；手动 layout 仍然

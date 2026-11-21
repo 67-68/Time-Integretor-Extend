@@ -67,8 +67,14 @@ def case_1_replan_releases_previous_sessions():
     check("第 1 轮 plan items 3 条", len(items), 3)
     check("第 1 轮挂上本地任务 3 条", len(bb.bound_tasks(sb)), 3)
 
-    # ---- 第 2 轮：只给 A 2 count（**新进程**，只能靠落盘状态） ----------
-    second = bb.run(sb, ["plan %d" % bb.DEFAULT_OFFSET, "pro 1 2", "complete"])
+    # ---- 第 2 轮：打开 plan → 预填上一轮决定（新进程只能靠落盘状态） -----
+    opened = bb.run(sb, ["plan %d" % bb.DEFAULT_OFFSET])
+    check("第 2 轮打开 plan 时预填了上一轮的决定（变亮）",
+          "已载入" in (opened.get("out") or ""), True)
+    # 现行语义（2026-11-20）：二次打开保持原本的计划；要换掉旧项目必须显式
+    # `pro <序号> clear` 回收 count，不能指望重排自动清空。
+    second = bb.run(sb, ["plan %d" % bb.DEFAULT_OFFSET,
+                         "pro 1 2", "pro 2 clear", "pro 3 clear", "complete"])
     check("第 2 轮 plan+complete 退出码 0", second["rc"], 0)
     check("上一轮的 14:30 场被释放（csv 只剩这一轮要的）",
           bb.csv_rows(sb), [("13:00", 50)])
@@ -209,26 +215,29 @@ def case_4_pin_standalone_task():
     check("台账里的起点对得上", led[0].get("start"), "13:00")
     check("项目库没有被写进固定项", bb.plan_items(paths), [])
 
-    # ---- 进程 3：重新 plan（项目分资源）→ 固定项释放、场次可重新用 -----
+    # ---- 进程 3：重新 plan → 固定项从台账预填（二次打开不丢旧决定） ----
     second = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET, "pro 1 2", "complete"])
     check("重新 plan 退出码 0", second["rc"], 0)
-    check("固定项被解绑（只剩项目那条）",
-          [t[0] for t in bb.bound_tasks(paths)], ["A · 写方案骨架"])
-    check("台账里当天没有固定项了", bb.plan_pins(paths), [])
+    check("固定项被预填保留（不是被重排丢掉）",
+          sorted((t[0], t[1]) for t in bb.bound_tasks(paths)),
+          [("A · 写方案骨架", "14:00"), ("独立任务", "13:00")])
+    check("台账里固定项还在", len(bb.plan_pins(paths)), 1)
     check("独立任务还在库里（解绑 ≠ 丢任务）",
           len([t for t in bb.tasks(paths) if bb.task_title(t) == "独立任务"]), 1)
 
-    # ---- 进程 4：再固定一次，然后 plan clear ---------------------------
+    # ---- 进程 4：plan clear 才是显式清空（连固定项台账一起） -----------
+    cleared = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "plan clear"])
+    check("plan clear 退出码 0", cleared["rc"], 0)
+    check("plan clear 之后任务全部解绑", bb.bound_tasks(paths), [])
+    check("plan clear 之后台账清空", bb.plan_pins(paths), [])
+
+    # ---- 进程 5：清空之后固定项可以重新用 -----------------------------
     third = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
                            "task id:%d 2" % tid, "complete"])
     check("固定项可以重新用", third["rc"], 0)
     check("重新用上的是同一场",
           [(t[0], t[1]) for t in bb.bound_tasks(paths) if t[0] == "独立任务"],
           [("独立任务", "13:00")])
-    cleared = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "plan clear"])
-    check("plan clear 退出码 0", cleared["rc"], 0)
-    check("plan clear 之后任务全部解绑", bb.bound_tasks(paths), [])
-    check("plan clear 之后台账清空", bb.plan_pins(paths), [])
     return paths
 
 

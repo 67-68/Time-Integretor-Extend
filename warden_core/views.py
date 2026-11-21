@@ -249,6 +249,10 @@ class ContractView(View):
         out.append(self.w.render_table())
         if self.w.rows_note:
             out.append(Text("  " + self.w.rows_note, style="dim"))
+        # 紧贴契约表：这一天的「自动添加条件」+ 当前是否满足（今天/明天都看）。
+        conditions = self.w.render_conditions_table()
+        if conditions is not None:
+            out.append(conditions)
         # 看未来日期时，额外给一张「这一天每个 session 挂什么任务、属于哪个项目」
         # 的编排表；今天已经有契约表 + 任务面板，不重复占高度。
         binder = self.w.render_day_binder()

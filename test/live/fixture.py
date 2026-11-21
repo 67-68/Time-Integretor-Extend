@@ -224,6 +224,12 @@ def env_for(paths, *, live=False, window_hours=None):
         "TI_SETTINGS_FILE": paths["settings"],
         "TI_NOSTART_FILE": paths["nostart"],
         "TI_POSTSESSION_FILE": paths["postsession"],
+        "TI_PLAN_PINS": paths.get("plan_pins")
+                        or os.path.join(paths["temp"], "plan-pins.json"),
+        "TI_PLAN_DECISIONS": paths.get("plan_decisions")
+                        or os.path.join(paths["temp"], "plan-decisions.json"),
+        "TI_PLAN_WATCHDOG": paths.get("plan_watchdog")
+                        or os.path.join(paths["temp"], "plan-watchdog.json"),
         "TI_FAILED_ACTIONS": paths["failed_actions"],
         "TI_OMNIFOCUS_OUTBOX": paths["of_outbox"],
         "TI_LOG_DIR": paths["logs"],

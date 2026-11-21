@@ -166,7 +166,7 @@ class TaskPipelineMixin(object):
         already = [s for s in self.sessions_for_day_plan(day) if s.get("start") == start]
         if already:
             return None                        # 同起点那场已经有了，复用，不重复造
-        note = "formatter end 切的（任务 %s）" % (
+        note = "formatter 切的（任务 %s）" % (
             self.task_label(task) if task is not None else "?")
         try:
             sp.add_extra(day, start, duration, note=note)
@@ -1119,9 +1119,11 @@ class TaskPipelineMixin(object):
             # 过去了（测试用 clock_now 钉死，不依赖墙上时钟）。
             "now": self._now_dt(),
             # period-first（2026-11-21）：end 在「period − 手订场次」的可用窗口
-            # 尾巴切，不再依赖当天已经排过 session。
+            # 尾巴切；enlist 在可用窗口的头部切（整段还没切过的时段，起点可能
+            # 已经过去，只能从 anchor 之后切 —— 落盘走 extras）。
             "windows": (self.available_windows(day)
-                        if str(spec.get("name") or "").lower() == "end" else None),
+                        if str(spec.get("name") or "").lower() in ("end", "enlist")
+                        else None),
         }
         try:
             out = th.call_preset("formatter", spec, ctx)

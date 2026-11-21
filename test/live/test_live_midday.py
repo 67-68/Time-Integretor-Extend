@@ -94,6 +94,9 @@ def build_sandbox():
         "postsession": os.path.join(temp, "postsession.json"),
         "failed_actions": os.path.join(temp, "failed.json"),
         "of_outbox": os.path.join(temp, "outbox.json"),
+        "plan_pins": os.path.join(temp, "plan-pins.json"),
+        "plan_decisions": os.path.join(temp, "plan-decisions.json"),
+        "plan_watchdog": os.path.join(temp, "plan-watchdog.json"),
     }
     mapping = {
         "csv": "data.csv", "tasks": "tasks.json", "projects": "projects.json",
@@ -449,12 +452,13 @@ def scenario_leftovers_reused():
 
 
 def scenario_preserve_previous():
-    """3) 再 plan 一次是**整体替换**上一轮（旧的「上一轮保留」已推翻）。
+    """3) 再 plan 一次：预填上一轮 → 显式 clear 回收 → 时间安排整体重算。
 
-    2026-11-17 之前这里断言的是「第二轮之后第一轮的计划还在」「第一轮挂好的任务
-    仍在原来那场」。用户当天明确定成整天重排（上一轮 plan 不算占用），所以现在
-    正确的断言是反过来的：第一轮的 items 被换掉、任务被解绑。`plan clear` 才是
-    「我不想排了」的显式清空（它只清计划 items/绑定/分配，不动 layout）。
+    2026-11-20 用户把「整天重排＝自动丢掉旧计划」改成「二次打开保持原本的
+    计划」：面板预填上一轮的 alloc（项目变亮），用户可以用 `pro <序号> clear`
+    回收 count，`complete` 之后按**当前**分配重算；时间安排交给算法。
+    所以这里先验证预填，再显式 clear 旧项目，断言旧 items 被替换、任务解绑。
+    `plan clear` 仍是「我不想排了」的显式清空（只清 items/绑定/分配，不动 layout）。
     """
     reset_sandbox()
     wd = new_warden()
@@ -467,8 +471,15 @@ def scenario_preserve_previous():
     check_true("第一轮排出了计划", bool(first))
     check_true("第一轮挂上了任务", bool(first_ids))
 
-    # 第二轮：只给一个无关项目 1 count。整天重排 → 第一轮的计划整体换掉。
+    # 第二轮：打开 plan → 面板预填上一轮的决定（用户的「第二次打开变亮」）。
+    # 现行语义是「保持原本的计划 + 增量/减少」：要换掉旧项目，必须显式
+    # `pro <序号> clear` 回收 count（11-20 用户原话），不能指望重排自动清空。
     run(wd, "plan 0")
+    text_open = say(wd)
+    check_true("第二次打开 plan 预填了上一轮的决定（项目变亮）",
+               "已载入" in text_open and "上一轮的计划决定" in text_open)
+    run(wd, "pro 2 clear")
+    run(wd, "pro 5 clear")
     run(wd, "pro 6 1")
     err = run(wd, "complete")
     check("第二轮 complete 没报错（%s）" % (err or "ok"), err, "")

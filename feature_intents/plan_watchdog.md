@@ -127,3 +127,24 @@ reminders = active 且 source.kind == "plan-watchdog" 的任务
 - 不做跨天计划检查（明天/后天的 plan 不会被本模块盯）；
 - 所有落盘都走 `TI_*`；新增文件时记得同时接 `common.py` / 测试 / `blackbox_kit`
   的 `_paths_for` + `env_for` + `SNAPSHOT_FILES`。
+
+## 2026-11-21 复核修复：两个真实入口
+
+复核发现测试只覆盖了「当天已经有 layout/session」的分支，真实入口有洞：
+
+1. **virgin day 不建提醒**：`pending_plan` 原来用 `free_plan_slots`，只数已经切出来
+   的 session；有 period、没有 layout 的日子 → 0 个空场 → 不建提醒。现在
+   `pending_plan` 和 plan 共用 `_plan_slots(day, replan=True)`（period-first）。
+2. **已开始的时段排不上**：`enlist` 原来只从时段尾巴追加；下午 13:00 打开 TI、
+   11:00–15:00 还没切时，尾巴起点 11:00 已过 → 排不上，提醒卡在「重排」分支，
+   永远到不了兜底。现在 `enlist` 也吃 `available_windows`：整段没切过的时段从
+   anchor（下一个 15 分钟整点）之后切；起点不是时段起点时落成一次性 session
+   （extras），不动 layout。
+
+同时把 `plan_watchdog/check` 的 `skip reason=no-free-slots` 补上 `capacity=0`，
+并在真正建提醒前记一条 `pending` 事件（counts / slots / starts），下次能直接看
+出「容量算漏了」还是「真的没空场」。
+
+回归：`test/test_plan_watchdog.py` 新增 6 组（只有 period 没 layout、只有晚场、
+已开始时段从 anchor 切、提醒未排上只补排、提醒场被取消重排、兜底 empty 一天一次），
+加上条件表渲染的今天/明天断言。

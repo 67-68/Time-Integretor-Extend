@@ -181,9 +181,18 @@ class PlanWatchdogMixin(object):
             except Exception:                      # noqa: BLE001 - 警告板同款兜底
                 pending = None
             if not pending:
+                # 记下容量口径的解释：以前只有一句 no-free-slots，看不出是
+                # 「计划里没空场」还是「容量算漏了」（2026-11-21 的 virgin day
+                # bug 就是后者）。
                 rl.log_event("plan_watchdog", "skip", level="debug",
-                             reason="no-free-slots")
+                             reason="no-free-slots", allocated=allocated,
+                             capacity=0)
                 return None
+            rl.log_event("plan_watchdog", "pending", level="debug",
+                         day=today.isoformat(),
+                         counts=int((pending or {}).get("counts") or 0),
+                         slots=int((pending or {}).get("sessions") or 0),
+                         starts=(pending or {}).get("starts"))
             return self._plan_watchdog_create(today, pending)
 
         # ④ 提醒任务在、但还没排上场次（enlist 上次失败了）：再试一次。
