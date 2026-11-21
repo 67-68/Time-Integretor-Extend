@@ -239,6 +239,21 @@ class Rule(object):
         return self.condition.explain(facts)
 
     def row(self, facts, day):
+        """给表格一行。今天 = 现在；未来 = 预测（「到时候会不会触发」）。"""
+        today = datetime.date.today()
+        if day < today:
+            return {
+                "key": self.key,
+                "source": self.source,
+                "action": self.action,
+                "condition": self.describe(),
+                "applicable": False,
+                "forecast": False,
+                "ok": None,
+                "detail": "过去的日期不再检查",
+            }
+        if day > today:
+            return self._forecast_row(facts, day)
         applicable = self.applies_to(day)
         ok = self.evaluate(facts) if applicable else None
         if not applicable:
@@ -253,6 +268,45 @@ class Rule(object):
             "action": self.action,
             "condition": self.describe(),
             "applicable": applicable,
+            "forecast": False,
+            "ok": ok,
+            "detail": detail,
+        }
+
+    def _forecast_row(self, facts, day):
+        """未来某一天的预测。
+
+        和今天的区别只有两处，都是「未来还没发生」：
+
+        * ``reminder_ended`` 在未来表示「提醒场会在那天结束」而不是「已经结束」；
+        * 兜底的预测看的是**链条**：当天没 plan、还有可排容量（或已经有提醒），
+          就会先建提醒、提醒结束后仍没 plan → 会兜底。所以这里不直接拿
+          ``reminder_ended`` 卡它，而是把「提醒会不会先建出来」算进去。
+        """
+        ok = self.evaluate(facts)
+        detail = self.note or self.action
+        if self.key == "plan_watchdog.fallback":
+            capacity = int(facts.get("capacity_counts") or 0)
+            ok = (not facts.get("has_plan")
+                  and not facts.get("fallback_today")
+                  and (capacity > 0 or facts.get("reminder_open")))
+            if ok:
+                detail = "前提：提醒任务先建出来、结束后仍没 plan"
+            elif facts.get("has_plan"):
+                detail = "当天已有 plan"
+            elif facts.get("fallback_today"):
+                detail = "当天已经兜底过"
+            else:
+                detail = "当天没有可排容量，提醒也建不出来"
+        elif not ok:
+            detail = self.reason(facts)
+        return {
+            "key": self.key,
+            "source": self.source,
+            "action": self.action,
+            "condition": self.describe(),
+            "applicable": True,
+            "forecast": True,
             "ok": ok,
             "detail": detail,
         }
@@ -261,8 +315,8 @@ class Rule(object):
 def auto_add_rules():
     """当前所有「会自动多出一条任务」的规则（顺序 = 表格里的顺序）。"""
     not_planned = Not(Fact(
-        "has_plan", label="有 plan", false_text="今天没 plan",
-        true_text="今天已 plan（{allocated_counts} count）"))
+        "has_plan", label="有 plan", false_text="当天没 plan",
+        true_text="当天已 plan（{allocated_counts} count）"))
     return [
         Rule("formatter.end", "formatter · end",
              "把任务切进当天最后一段空档", Always(),
@@ -279,19 +333,19 @@ def auto_add_rules():
              "建 1 条 25 分钟提醒任务并排进最早空场",
              All(not_planned,
                  Ge("capacity_counts", 1, label="可用容量",
-                    false_text="今天没有可排容量"),
+                    false_text="当天没有可排容量"),
                  Not(Fact("reminder_open", label="提醒任务在",
                           true_text="已经有一条提醒任务")),
-                 Not(Fact("created_today", label="今天建过提醒",
-                          true_text="今天已经建过一条提醒"))),
-             "今天还没 plan 时自动加", today_only=True),
+                 Not(Fact("created_today", label="当天建过提醒",
+                          true_text="当天已经建过一条提醒"))),
+             "当天还没 plan 时自动加", today_only=True),
         Rule("plan_watchdog.fallback", "plan_watchdog · 兜底",
              "提醒场过去仍没 plan → 随机分资源自动 plan",
              All(not_planned,
                  Fact("reminder_ended", label="提醒场已结束",
                       false_text="提醒场还没结束"),
-                 Not(Fact("fallback_today", label="今天兜底过",
-                          true_text="今天已经兜底过"))),
+                 Not(Fact("fallback_today", label="当天兜底过",
+                          true_text="当天已经兜底过"))),
              "提醒场过去仍没 plan 时自动跑", today_only=True),
     ]
 
@@ -333,21 +387,35 @@ def facts_for(warden, day=None):
                      if pw.is_reminder(task) and ts.TaskStore.is_open(task)]
     except Exception:                          # noqa: BLE001
         reminders = []
-    facts["reminder_open"] = bool(reminders)
     try:
         now = warden._now_dt()
     except Exception:                          # noqa: BLE001
         now = datetime.datetime.now()
+    key = day.isoformat()
+    mine = []
     for task in reminders:
-        end = pw.session_end(task.get("session") or {})
-        if end is not None and end.date() == day and end <= now:
-            facts["reminder_ended"] = True
-            break
+        sess_date = str((task.get("session") or {}).get("date") or "")
+        if sess_date == key:
+            mine.append(task)
+        elif not sess_date and day == now.date():
+            # 还没排上场次的提醒任务属于「今天」（建出来但 enlist 失败）。
+            mine.append(task)
+    if day > now.date():
+        # 未来那天：只看「挂在那天」的提醒任务。它现在还不存在是正常的；
+        # 如果已经有（提前建了），它那天一定会结束，所以 reminder_ended 记 True。
+        facts["reminder_open"] = bool(mine)
+        facts["reminder_ended"] = bool(mine)
+    else:
+        facts["reminder_open"] = bool(mine)
+        for task in mine:
+            end = pw.session_end(task.get("session") or {})
+            if end is not None and end.date() == day and end <= now:
+                facts["reminder_ended"] = True
+                break
     try:
         ledger = warden._plan_watchdog_ledger()
     except Exception:                          # noqa: BLE001 - 账本坏了不挡展示
         ledger = {}
-    key = day.isoformat()
     facts["created_today"] = bool((ledger.get("created") or {}).get(key))
     facts["fallback_today"] = bool((ledger.get("auto_planned") or {}).get(key))
     return facts

@@ -82,6 +82,8 @@ w.run_keep_session = lambda *a, **kw: (0, "", "")
 
 DAY = datetime.date.today()
 ISO = DAY.isoformat()
+TOMORROW = DAY + datetime.timedelta(days=1)
+TOMORROW_ISO = TOMORROW.isoformat()
 CLOCK = datetime.datetime.combine(DAY, datetime.time(9, 0))
 PERIOD = {"id": "T1", "date": ISO, "start": "11:00", "end": "15:00",
           "type": "工作", "name": "测试时段", "calendar": "工作", "title": "测试时段"}
@@ -405,7 +407,11 @@ check("提醒任务退休", wd.task_store.get(_rem["id"])["status"], "completed"
 check("再检查不再动", wd._plan_watchdog_check(), None)
 
 print("== 条件表：契约表正下方，今天/明天都能看 ==")
-wd, op = fresh(layout=None)
+# 明天也给一段 period：预测「明天会不会触发」靠的是明天的容量，不是今天的。
+wd, op = fresh(layout=None, periods=[
+    PERIOD,
+    dict(PERIOD, id="T2", date=TOMORROW_ISO, start="09:00", end="15:00"),
+])
 _rows = wd.condition_rows()
 check("规则条数（5 条：2 formatter + plan + 2 watchdog）", len(_rows), 5)
 _by_key = {row["key"]: row for row in _rows}
@@ -425,10 +431,23 @@ check_true("不满足的原因写在说明里", "还没有分配 count" in _out)
 wd.day_offset = 1
 wd.rebuild_rows()
 _by_key2 = {row["key"]: row for row in wd.condition_rows()}
-check("看明天时 watchdog 规则不适用",
-      _by_key2["plan_watchdog.reminder"]["applicable"], False)
+check("看明天时 watchdog 也给预测（不是不适用）",
+      (_by_key2["plan_watchdog.reminder"]["applicable"],
+       _by_key2["plan_watchdog.reminder"]["forecast"]), (True, True))
+check("明天没 plan + 有容量 → 预计会建提醒",
+      _by_key2["plan_watchdog.reminder"]["ok"], True)
+check("兜底预测：前提是提醒先建出来",
+      (_by_key2["plan_watchdog.fallback"]["ok"],
+       "前提" in _by_key2["plan_watchdog.fallback"]["detail"]), (True, True))
 check("明天表仍然有 formatter 行",
       _by_key2["formatter.enlist"]["ok"], True)
+_out2_io = io.StringIO()
+Console(file=_out2_io, width=220, force_terminal=False).print(
+    wd.render_conditions_table())
+_out2 = _out2_io.getvalue()
+check_true("明天的表头是「预计」", "预计" in _out2)
+check_true("明天的状态写「预计会」", "预计会" in _out2)
+check_true("明天不再写「不适用」", "不适用" not in _out2)
 
 print("== 接线：refresh_warnings（每帧钩子）真的会触发检查 ==")
 wd, op = fresh()

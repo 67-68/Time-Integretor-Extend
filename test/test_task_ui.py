@@ -3,6 +3,7 @@
 import datetime
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -368,13 +369,14 @@ check_true("标题长的那条被 trim 了（带 …）或本来就不长",
 
 contract = [v for v in w.VIEWS if v.key == "1"][0](wd)
 parts = contract.render()
-check("契约视图：契约表 → 条件表 → 任务面板（收尾面板在打断栏位里）",
-      len(parts), 3)
+check("契约视图：契约表 → 条件表 → 任务面板 → 块状态行（收尾面板在打断栏位里）",
+      len(parts), 4)
 check_true("第一块是契约表格", "The Contract Table" in str(parts[0].title))
 check_true("第二块是自动添加条件", "自动添加条件" in str(parts[1].title))
 check_true("第三块就是那张任务面板（一张表，不拆）", hasattr(parts[2], "columns"))
 check_true("任务面板标题里写了记号图例", "Task · 任务" in str(parts[2].title))
 check("面板里是 number/task 一对一对的", len(parts[2].columns) % 2, 0)
+check_true("最后一行是块状态行", "块：" in getattr(parts[3], "plain", ""))
 
 print("== 任务面板：屏幕够宽就摊成 3 / 4 列（不再固定两列）==")
 # 列数只跟「终端有多宽」和「标题最长有多长」有关，所以把宽度显式喂进去。
@@ -2139,6 +2141,9 @@ check("再排一次不改排布、不再取消任何场次",
 
 print("== 独占（exclusive）：一场 session 只能有一条任务 ==")
 wdx = fresh_warden()
+# 后面要跑 `task -f end`（切当天最后一段）：钉在上午，别让「跑测试时恰好
+# 已经过了 15:00」把用例跑红。
+wdx.clock_now = datetime.datetime.combine(TODAY, datetime.time(9, 0))
 wdx.bridge.sessions = plan_sessions(wdx)
 wdx.messages = []
 check("task create ... -e true 受理",
@@ -2550,6 +2555,90 @@ wdp.task_group_by = "project"
 _tbl_proj = wdp.view.render()[0]
 check("任务视图可按 project 分组", str(_tbl_proj.columns[0].header), "grouping(project)")
 wdp.task_group_by = None
+
+print("== 块折叠：Day Plan / Task / Project / Conditions ==")
+wdblk = fresh_warden()
+wdblk.handle("task create title=块测试 duration=25")
+_view = [v for v in w.VIEWS if v.key == "1"][0](wdblk)
+
+
+def _blocks_line(parts):
+    return next((p for p in parts
+                 if hasattr(p, "plain") and "块：" in getattr(p, "plain", "")),
+                None)
+
+
+_parts = _view.render()
+_line = _blocks_line(_parts)
+check_true("契约视图下面有块状态行", _line is not None)
+check_true("今天列出 Task", "Task [展示]" in _line.plain)
+check_true("今天列出 Conditions", "Conditions [展示]" in _line.plain)
+check_true("今天不列 Day Plan（今天没有编排表）",
+           "Day Plan" not in _line.plain)
+
+check_true("close conditions 受理", wdblk.handle("close conditions"))
+_parts = _view.render()
+check("折叠后不画条件表",
+      [p for p in _parts
+       if hasattr(p, "title") and "自动添加条件" in str(p.title)], [])
+check_true("状态行只改 Conditions 的标记",
+           "Conditions [折叠]" in _blocks_line(_parts).plain)
+check_true("open conditions 受理", wdblk.handle("open conditions"))
+check_true("展开后恢复画条件表",
+           any(hasattr(p, "title") and "自动添加条件" in str(p.title)
+               for p in _view.render()))
+
+check_true("close tasktable 受理", wdblk.handle("close tasktable"))
+_parts = _view.render()
+check("折叠后不画任务面板",
+      [p for p in _parts
+       if hasattr(p, "title") and "Task · 任务" in str(p.title)], [])
+check_true("状态行标 Task [折叠]", "Task [折叠]" in _blocks_line(_parts).plain)
+check_true("open tasktable 受理", wdblk.handle("open tasktable"))
+
+_prefs_path = os.path.join(os.path.dirname(os.path.abspath(w.cfg.settings_path())),
+                           "warden-ui.json")
+check_true("close tasktable --permanent 受理",
+           wdblk.handle("close tasktable --permanent"))
+check_true("偏好里记了折叠 task",
+           "task" in (json.load(open(_prefs_path, encoding="utf-8"))
+                      .get("folded_blocks") or []))
+wdblk.permanent_folded_blocks.clear()
+wdblk._load_ui_prefs()
+check("重新加载偏好后 task 仍是折叠", wdblk.block_folded("task"), True)
+check_true("open tasktable --permanent 受理",
+           wdblk.handle("open tasktable --permanent"))
+check_true("偏好里删掉了 task",
+           "task" not in (json.load(open(_prefs_path, encoding="utf-8"))
+                          .get("folded_blocks") or []))
+
+# Day Plan：造明天的时段 + 一场，切到明天才看得到。
+_tomorrow_iso = (TODAY + datetime.timedelta(days=1)).isoformat()
+_dl = sp.load_download()
+_dl.setdefault("periods", []).append({
+    "id": "T9", "date": _tomorrow_iso, "start": "10:00", "end": "11:00",
+    "type": "工作", "name": "明天", "calendar": "工作", "title": "明天"})
+sp.save_download(_dl)
+wdblk.reload_periods()
+wdblk.day_offset = 1
+wdblk.rebuild_rows()
+check_true("给明天切一场", wdblk.handle("session T9 50"))
+_parts = _view.render()
+_line = _blocks_line(_parts)
+check_true("明天列出 Day Plan", "Day Plan [展示]" in _line.plain)
+check_true("close dayplan 受理", wdblk.handle("close dayplan"))
+_parts = _view.render()
+check("折叠后不画编排表",
+      [p for p in _parts
+       if hasattr(p, "title") and "Day Plan" in str(p.title)], [])
+check_true("状态行标 Day Plan [折叠]",
+           "Day Plan [折叠]" in _blocks_line(_parts).plain)
+check_true("open dayplan 受理", wdblk.handle("open dayplan"))
+
+check_true("open task 受理", wdblk.handle("open task"))
+check("open task 仍是数据模型（没被块折叠抢走）",
+      wdblk.data_view_model, "task")
+check_true("切到了 Task 数据视图", isinstance(wdblk.view, w.TaskView))
 
 print("== TUI 在场证明（daemon 靠它判断「人叫得回来吗」）==")
 info = wd.write_tui_state()

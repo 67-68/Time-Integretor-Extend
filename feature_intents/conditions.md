@@ -20,8 +20,9 @@
 > 对于明天我的本义是明天那一张契约表看的时候，不过我希望你在今天也展示 condition
 > 的表。
 
-所以：**今天、明天、任意一天都画**；`plan_watchdog` 两条只在「今天」有状态，
-看别的日期时「现在」列显示「— 不适用」。
+所以：**今天、明天、任意一天都画**。今天看「现在是否满足」；看未来某一天时
+表头变成「预计」，plan_watchdog 两条给的是**预测**（「到时候会不会触发」），
+不再显示「— 不适用」。
 
 ## 文件
 
@@ -51,7 +52,16 @@
 | `allocated_counts` / `has_plan` | `pw.allocated_counts(projects.plan_ops(), day)`（和 plan 同口径） |
 | `capacity_counts` | `warden.pending_plan(day)`（内部走 `_plan_slots`，period-first） |
 | `reminder_open` / `reminder_ended` | task_store 里 `pw.is_reminder` + `pw.session_end` + `warden._now_dt()` |
-| `created_today` / `fallback_today` | `_plan_watchdog_ledger()` 的 `created` / `auto_planned` |
+| `created_today` / `fallback_today` | `_plan_watchdog_ledger()` 的 `created` / `auto_planned`（按**选中那天**取 key） |
+
+未来日期的两处差别（`facts_for` 里处理）：
+
+- `reminder_open` 只看**挂在那天**的提醒（今天多认「还没排上场次」的那条）；
+- `reminder_ended` 在未来表示「提醒场会在那天结束」（已经有那天的提醒 → True），
+  今天才是「已经结束」；
+- 兜底的预测不直接卡 `reminder_ended`，而是算链条：当天没 plan、有可排容量
+  （或已经有提醒）→ 会先建提醒、提醒结束后仍没 plan → 会兜底；说明里写
+  「前提：提醒任务先建出来、结束后仍没 plan」。
 
 ## 显示
 
@@ -61,8 +71,17 @@
  formatter · end      always                                       ✅ 满足   每次执行 task -f end 都会加
  formatter · enlist   always                                       ✅ 满足   每次执行 task -f enlist 都会加
  plan · complete      已分配 count≥1                               ❌ 不满足 还没有分配 count（0）
- plan_watchdog · 提醒  ¬有 plan ∧ 可用容量≥1 ∧ ¬提醒任务在 ∧ ¬今天建过提醒  ✅ 满足 今天还没 plan 时自动加
- plan_watchdog · 兜底  ¬有 plan ∧ 提醒场已结束 ∧ ¬今天兜底过          ❌ 不满足 提醒场还没结束
+ plan_watchdog · 提醒  ¬有 plan ∧ 可用容量≥1 ∧ ¬提醒任务在 ∧ ¬当天建过提醒  ✅ 满足 当天还没 plan 时自动加
+ plan_watchdog · 兜底  ¬有 plan ∧ 提醒场已结束 ∧ ¬当天兜底过          ❌ 不满足 提醒场还没结束
+```
+
+看明天（表头「预计」）时：
+
+```
+自动添加条件 · 2026-11-22
+ 来源                 条件                                          预计         说明
+ plan_watchdog · 提醒  ¬有 plan ∧ 可用容量≥1 ∧ ¬提醒任务在 ∧ ¬当天建过提醒  ✅ 预计会   当天还没 plan 时自动加
+ plan_watchdog · 兜底  ¬有 plan ∧ 提醒场已结束 ∧ ¬当天兜底过          ✅ 预计会   前提：提醒任务先建出来、结束后仍没 plan
 ```
 
 - 缓存 5 秒；`rebuild_rows()`（任何命令/刷新的状态落点）会立刻让缓存失效。

@@ -431,6 +431,25 @@ working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列
 任意 session 行的 task 栏如果没有任何任务，会显示红色警告 `没有设定任务🔞`；
 不能留空，否则「空」和「没渲染」在界面上分不出来。
 
+### 整块表格折叠：`open` / `close` + 块名
+
+契约表下面那些**整块表格**也能折叠，块名和命令：
+
+| 块 | 显示名 | `open/close` 认的写法 |
+|---|---|---|
+| 条件表 | Conditions | `conditions` / `条件表` |
+| 编排表 | Day Plan | `dayplan` / `day plan` / `编排表` |
+| 任务面板 | Task | `tasktable` / `task table` / `任务表` |
+| 项目表 | Project | `projecttable` / `project table` / `项目表` |
+
+- 这些块下面固定有一行状态：`块：Conditions [展示] · Day Plan [展示] · Task [折叠] · Project [展示]`；
+  折叠只改这一行的 `[展示]/[折叠]` 标记，并且不再画对应块本身。
+- 只有**这一屏真的存在**的块才出现在状态行里（今天没有 Day Plan，就不列）。
+- `--permanent` 写进 `data/warden-ui.json` 的 `folded_blocks`（和列折叠共用文件、
+  同样跟 `TI_SETTINGS_FILE` 隔离）；不带 `--permanent` 只覆盖本次运行。
+- 故意不认裸 `task` / `project`：`open task` / `open project` 仍是切数据模型，
+  `close task` 仍是折叠契约表的 task 列。
+
 ### 未来日期的 `Day Plan` 编排表
 
 看**明天或更晚**的日期时，契约表下面会多一张 `Day Plan`：每一场 session 一行，

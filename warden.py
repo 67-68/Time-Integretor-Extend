@@ -461,6 +461,10 @@ class Warden(
         self.permanent_visible_columns = {m: set() for m in UI_PREF_MODES}
         self.session_hidden_columns = {m: set() for m in UI_PREF_MODES}
         self.session_visible_columns = {m: set() for m in UI_PREF_MODES}
+        # 整块表格的折叠（Day Plan / Task / Project / Conditions）：
+        # 和列折叠同一套偏好文件；`--permanent` 写进 warden-ui.json。
+        self.permanent_folded_blocks = set()
+        self.folded_blocks = set()
         self._load_ui_prefs()
         # 视图（Shift+Tab 切换）：默认「契约」视图，第二个是「专注」视图。
         self.view_impls = [cls(self) for cls in VIEWS] or [ContractView(self)]

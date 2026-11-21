@@ -105,27 +105,32 @@ class View(object):
                  usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
             _cmd("open", w.cmd_open,
                  "open task|project|op 切换数据模型；open working|detail 切口径；"
-                 "open <表头> [--permanent] 打开当前表的一列",
+                 "open <表头> [--permanent] 打开当前表的一列；"
+                 "open <块名> [--permanent] 展开表下方的整块表格",
                  ("看板",), "通用",
-                 usage="open task|project|op | open working|detail | open <列名> [--permanent]",
+                 usage="open task|project|op | open working|detail | open <列名> <块名> [--permanent]",
                  options=tuple(dict.fromkeys(
                      ("task", "project", "op", "working", "detail")
                      + tuple(h for h, _kw in SESSION_TABLE_COLUMNS)
                      + tuple(h for h, _kw in TASK_TABLE_COLUMNS)
-                     + (TASK_CONTENT_COLUMN,))),
+                     + (TASK_CONTENT_COLUMN, "dayplan", "conditions",
+                        "tasktable", "projecttable"))),
                  hint=_hint_actions("task", "project", "op", "working", "detail",
-                                    "时段类型", "id", "状态",
+                                    "dayplan", "tasktable", "projecttable",
                                     note="open task/project/op = 看三个数据模型；"
-                                         "open 表头名 = 展开列")),
+                                         "open 表头名 = 展开列；"
+                                         "open dayplan/tasktable/projecttable = 展开块")),
             _cmd("close", w.cmd_close,
-                 "close <表头> [--permanent]：折叠当前表的一列（--permanent = 永久折叠）",
-                 ("关闭",), "通用", usage="close <列名> [--permanent]",
+                 "close <表头|块名> [--permanent]：折叠当前表的一列或契约表下方的整块表格",
+                 ("关闭",), "通用", usage="close <列名|块名> [--permanent]",
                  options=tuple(dict.fromkeys(
                      tuple(h for h, _kw in SESSION_TABLE_COLUMNS)
                      + tuple(h for h, _kw in TASK_TABLE_COLUMNS)
-                     + (TASK_CONTENT_COLUMN, "--permanent"))),
-                 hint=_hint_actions("时段类型", "id", "状态",
-                                    note="close 表头名 = 折叠列；数据视图操作任务表")),
+                     + (TASK_CONTENT_COLUMN, "dayplan", "conditions",
+                        "tasktable", "projecttable", "--permanent"))),
+                 hint=_hint_actions("dayplan", "tasktable", "projecttable",
+                                    "时段类型", "id", "状态",
+                                    note="close 表头名 = 折叠列；close 块名 = 折叠整块表格")),
             _cmd("keytime", w.cmd_keytime,
                  "Key Time：按规则匹配的日历时间块 —— 报警、确认、规则、Bark 设备",
                  ("kt", "key-time"),
@@ -225,7 +230,8 @@ class ContractView(View):
             ("session", "period", "cancel", "mute", "mute-universal",
              "title", "day", "sync", "open working", "open detail",
              "close 时段类型", "help", "quit"),
-            note="Tab 切下一个视图；open/close + 表头名折叠列；open working|detail 切口径",
+            note="Tab 切下一个视图；open/close + 表头名折叠列；"
+                 "open/close + 块名（dayplan/tasktable/projecttable）折叠整块表格",
         )
 
     def status_box(self):
@@ -249,23 +255,29 @@ class ContractView(View):
         out.append(self.w.render_table())
         if self.w.rows_note:
             out.append(Text("  " + self.w.rows_note, style="dim"))
+        # 表下方的整块表格：先全部算出来（折叠时也要知道这一屏有没有这块），
+        # 再按折叠状态决定画不画；最后一行是这些块的状态行。
+        blocks = []
+
+        def add_block(key, renderable):
+            if renderable is not None:
+                blocks.append((key, self.w._block_label(key), renderable))
+
         # 紧贴契约表：这一天的「自动添加条件」+ 当前是否满足（今天/明天都看）。
-        conditions = self.w.render_conditions_table()
-        if conditions is not None:
-            out.append(conditions)
-        # 看未来日期时，额外给一张「这一天每个 session 挂什么任务、属于哪个项目」
-        # 的编排表；今天已经有契约表 + 任务面板，不重复占高度。
-        binder = self.w.render_day_binder()
-        if binder is not None:
-            out.append(binder)
-        # 契约表格下面那块任务表格（Recent 由框架接在后面）
-        index = self.w.render_task_index()
-        if index is not None:
-            out.append(index)
-        # 任务面板**下面**那块项目表（剩余 count / 进度 / 今天排了多少）
-        projects = self.w.render_projects_table()
-        if projects is not None:
-            out.append(projects)
+        add_block("conditions", self.w.render_conditions_table())
+        # 看未来日期时，「这一天每个 session 挂什么任务、属于哪个项目」的编排表。
+        add_block("dayplan", self.w.render_day_binder())
+        # 契约表格下面那块任务表格（Recent 由框架接在后面）。
+        add_block("task", self.w.render_task_index())
+        # 任务面板**下面**那块项目表（剩余 count / 进度 / 今天排了多少）。
+        add_block("project", self.w.render_projects_table())
+        for key, _label, renderable in blocks:
+            if not self.w.block_folded(key):
+                out.append(renderable)
+        line = self.w.render_blocks_line(
+            [(key, label) for key, label, _renderable in blocks])
+        if line is not None:
+            out.append(line)
         return out
 
     def unknown_hint(self):
@@ -821,7 +833,8 @@ class DataView(View):
                      "search", "inspect-due", "review"),
             note="默认 filter=disposable 只看 active · "
                  "open task/project/op = 切换数据模型（task / 真正项目 pro / "
-                 "OmniFocus op）· task 模式 open 1/2/3 翻页 · open/close <表头> 折叠列"
+                 "OmniFocus op）· task 模式 open 1/2/3 翻页 · open/close <表头> 折叠列 / "
+                 "<块名> 折叠整块表格"
                  " · sort/group/search 操作任务数据 · Tab 切视图",
         )
 

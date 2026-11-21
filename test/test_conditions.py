@@ -87,7 +87,7 @@ check("watchdog 提醒：没 plan + 有容量 + 无提醒 + 没建过 → 满足
 check("watchdog 提醒：没容量 → 不满足",
       RULES["plan_watchdog.reminder"].row(
           dict(_f0, capacity_counts=0), DAY)["detail"],
-      "今天没有可排容量")
+      "当天没有可排容量")
 check("watchdog 提醒：已有提醒 → 不满足",
       RULES["plan_watchdog.reminder"].row(
           dict(_f0, reminder_open=True), DAY)["detail"],
@@ -95,11 +95,11 @@ check("watchdog 提醒：已有提醒 → 不满足",
 check("watchdog 提醒：今天建过 → 不满足",
       RULES["plan_watchdog.reminder"].row(
           dict(_f0, created_today=True), DAY)["detail"],
-      "今天已经建过一条提醒")
+      "当天已经建过一条提醒")
 check("watchdog 提醒：已 plan → 不满足且说明是 plan 挡的",
       RULES["plan_watchdog.reminder"].row(
           dict(_f0, has_plan=True, allocated_counts=2), DAY)["detail"],
-      "今天已 plan（2 count）")
+      "当天已 plan（2 count）")
 
 check("watchdog 兜底：提醒场已结束 + 没 plan + 没兜底 → 满足",
       RULES["plan_watchdog.fallback"].row(
@@ -110,12 +110,35 @@ check("watchdog 兜底：提醒场没结束 → 不满足",
 check("watchdog 兜底：今天兜底过 → 不满足",
       RULES["plan_watchdog.fallback"].row(
           dict(_f0, reminder_ended=True, fallback_today=True), DAY)["detail"],
-      "今天已经兜底过")
+      "当天已经兜底过")
 
 _tomorrow = DAY + datetime.timedelta(days=1)
 _row = RULES["plan_watchdog.reminder"].row(_f0, _tomorrow)
-check("watchdog 规则看别的日期 = 不适用", _row["applicable"], False)
-check("不适用时写明只在当天检查", "只在当天" in _row["detail"], True)
+check("看未来日期时 watchdog 也求值（预测，不是不适用）",
+      (_row["applicable"], _row["forecast"]), (True, True))
+check("没 plan + 有容量 → 预计明天会建提醒", _row["ok"], True)
+_row = RULES["plan_watchdog.reminder"].row(
+    dict(_f0, has_plan=True, allocated_counts=2), _tomorrow)
+check("明天已有 plan → 预计不会建提醒", _row["ok"], False)
+check("原因也按「当天」说", _row["detail"], "当天已 plan（2 count）")
+
+_fb = RULES["plan_watchdog.fallback"].row(_f0, _tomorrow)
+check("兜底预测：没 plan + 有容量 → 预计会（提醒先建出来）",
+      (_fb["ok"], "前提" in _fb["detail"]), (True, True))
+check("兜底预测：已有 plan → 预计不会",
+      RULES["plan_watchdog.fallback"].row(
+          dict(_f0, has_plan=True), _tomorrow)["detail"], "当天已有 plan")
+check("兜底预测：没容量也没提醒 → 预计不会",
+      RULES["plan_watchdog.fallback"].row(
+          dict(_f0, capacity_counts=0), _tomorrow)["detail"],
+      "当天没有可排容量，提醒也建不出来")
+check("兜底预测：已经有那天的提醒 → 预计会",
+      RULES["plan_watchdog.fallback"].row(
+          dict(_f0, capacity_counts=0, reminder_open=True), _tomorrow)["ok"],
+      True)
+check("过去的日子不再检查",
+      RULES["plan_watchdog.reminder"].row(
+          _f0, DAY - datetime.timedelta(days=1))["detail"], "过去的日期不再检查")
 
 
 print("== facts_for：走同一批函数收集事实 ==")
@@ -179,6 +202,23 @@ check("有 plan 时按 count 判", _facts2["has_plan"], True)
 check("有 plan 时分配数", _facts2["allocated_counts"], 2)
 check("有 plan 时不再算容量", _facts2["capacity_counts"], 0)
 check("没有提醒任务", _facts2["reminder_open"], False)
+
+_tomorrow_iso = _tomorrow.isoformat()
+_w3 = FakeWarden(
+    ops=[{"id": 1, "plans": {}}],
+    tasks=[{"id": 8, "status": "active", "source": {"kind": pw.SOURCE_KIND},
+            "session": {"date": _tomorrow_iso, "start": "11:00",
+                        "duration": 25}}],
+    pending={"counts": 4, "sessions": 1, "starts": ["14:00"]},
+    ledger={},
+)
+_f3 = c.facts_for(_w3, _tomorrow)
+check("未来：挂在那天的提醒算 reminder_open", _f3["reminder_open"], True)
+check("未来：那天的提醒一定会结束 → reminder_ended 记为 True",
+      _f3["reminder_ended"], True)
+check("未来：容量从 pending_plan(那天) 来", _f3["capacity_counts"], 4)
+_f4 = c.facts_for(_w3, DAY)
+check("今天不看明天那条提醒", _f4["reminder_open"], False)
 
 _rows = c.condition_rows(_w, DAY)
 check("condition_rows 给出全部规则", len(_rows), 5)

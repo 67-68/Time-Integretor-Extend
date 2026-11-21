@@ -143,6 +143,7 @@ class BoardMixin(object):
             getattr(self, "data_view_model", "task"),
             getattr(self, "data_filter", "disposable"),
             tuple(sorted(self.effective_hidden_columns())),
+            tuple(sorted(self.effective_folded_blocks())),
             tuple(sorted(self.effective_task_hidden_columns(self.task_store.list()))),
             self.task_view_page, self.task_sort_key, self.task_sort_desc,
             self.task_group_by, self.task_search_query,
@@ -160,6 +161,79 @@ class BoardMixin(object):
             self.jobs.signature(),
         )
 
+    # -- 块折叠（Day Plan / Task / Project / Conditions）------------------
+
+    #: 契约视图下面那些「整块表格」。key 是稳定标识，label 给状态行，aliases 是
+    #: open/close 认的写法（用单 token 或带空格的都行；不抢 `open task` 这类
+    #: 数据模型别名，所以 Task/Project 必须写 "task table"/"project table"）。
+    BLOCK_SPECS = (
+        ("dayplan", "Day Plan",
+         ("dayplan", "day-plan", "day plan", "编排", "编排表", "day binder")),
+        ("conditions", "Conditions",
+         ("conditions", "condition", "condition table", "条件表", "条件行", "条件")),
+        ("task", "Task",
+         ("tasktable", "task-table", "task table", "任务表", "任务面板")),
+        ("project", "Project",
+         ("projecttable", "project-table", "project table", "项目表", "项目面板")),
+    )
+
+    def _resolve_block(self, text):
+        """``open/close`` 的参数是不是一个块名 → key；不是返回 None。"""
+        low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not low:
+            return None
+        for key, _label, aliases in self.BLOCK_SPECS:
+            # 不认裸 label：`open task` / `open project` 是数据模型别名，
+            # `close task` 是契约表的 task 列 —— 块必须写 tasktable/projecttable。
+            if low in aliases:
+                return key
+        return None
+
+    def _block_label(self, key):
+        for k, label, _aliases in self.BLOCK_SPECS:
+            if k == key:
+                return label
+        return key
+
+    def effective_folded_blocks(self):
+        return set(self.permanent_folded_blocks) | set(self.folded_blocks)
+
+    def block_folded(self, key):
+        return key in self.effective_folded_blocks()
+
+    def _set_block_folded(self, key, folded, permanent=False):
+        if folded:
+            self.folded_blocks.add(key)
+        else:
+            self.folded_blocks.discard(key)
+        if permanent:
+            if folded:
+                self.permanent_folded_blocks.add(key)
+            else:
+                self.permanent_folded_blocks.discard(key)
+            self._save_ui_prefs()
+
+    def render_blocks_line(self, blocks):
+        """块状态行（放在这些块下面）：``Day Plan [展示] · Task [折叠]``。
+
+        ``blocks`` 是 ``[(key, label), ...]``，只列**这一屏真的存在**的块；
+        折叠只影响这一行的 ``[展示]/[折叠]`` 和对应块是否画出来。
+        """
+        blocks = list(blocks or ())
+        if not blocks:
+            return None
+        text = Text("块：", style=STYLE_MUTED)
+        for pos, (key, label) in enumerate(blocks):
+            if pos:
+                text.append("   ·   ", style=STYLE_MUTED)
+            folded = self.block_folded(key)
+            text.append(label, style=STYLE_MUTED if folded else "bold")
+            text.append(" [折叠]" if folded else " [展示]",
+                        style="yellow" if folded else "green")
+        text.append("    open/close <块名>：dayplan / conditions / tasktable / projecttable",
+                    style=STYLE_MUTED)
+        return text
+
     # -- 表头折叠 -------------------------------------------------------
 
     def ui_prefs_path(self):
@@ -173,6 +247,15 @@ class BoardMixin(object):
                 raw = json.load(f) or {}
         except (OSError, ValueError, TypeError):
             return
+        valid_blocks = {key for key, _label, _aliases in self.BLOCK_SPECS}
+        for name in raw.get("folded_blocks") or []:
+            key = str(name or "").strip().lower()
+            # 偏好里存的是 canonical key（task），不是命令别名（tasktable）；
+            # 先按 key 认，再把旧文件里可能写过的别名折算回来。
+            if key not in valid_blocks:
+                key = self._resolve_block(key)
+            if key:
+                self.permanent_folded_blocks.add(key)
         for section, target in (("hidden", self.permanent_hidden_columns),
                                 ("visible", self.permanent_visible_columns)):
             data = raw.get(section) or {}
@@ -197,6 +280,7 @@ class BoardMixin(object):
                        for m in UI_PREF_MODES},
             "visible": {m: sorted(self.permanent_visible_columns[m])
                         for m in UI_PREF_MODES},
+            "folded_blocks": sorted(self.permanent_folded_blocks),
         }
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -2340,7 +2424,7 @@ class BoardMixin(object):
 
         用户 2026-11-21：「在 Contract Table 下方添加几行『条件』，展示自动添加
         任务的条件，以及当前是否满足」，并且「今天也展示」、看明天那张表时也
-        展示。plan_watchdog 的两条只在「今天」有状态，其它日期显示不适用。
+        展示。**今天 = 现在；未来 = 预测**（「到时候会不会触发」）。
         """
         rows = self.condition_rows()
         if not rows:
@@ -2351,17 +2435,21 @@ class BoardMixin(object):
                   title_justify="left", expand=False)
         t.add_column("来源", no_wrap=True, style="cyan")
         t.add_column("条件", no_wrap=True, overflow="crop")
-        t.add_column("现在", no_wrap=True)
+        t.add_column("现在" if self.day_offset == 0 else "预计", no_wrap=True)
         t.add_column("说明", no_wrap=True, overflow="crop")
         for row in rows:
+            forecast = bool(row.get("forecast"))
             if not row.get("applicable"):
                 status = Text("— 不适用", style=STYLE_MUTED)
                 detail = Text(row.get("detail") or "", style=STYLE_MUTED)
             elif row.get("ok"):
-                status = Text("✅ 满足", style="bold green")
-                detail = Text(row.get("detail") or "", style=STYLE_MUTED)
+                status = Text("✅ 预计会" if forecast else "✅ 满足",
+                              style="bold green")
+                detail = Text(row.get("detail") or "",
+                              style="cyan" if forecast else STYLE_MUTED)
             else:
-                status = Text("❌ 不满足", style="yellow")
+                status = Text("❌ 预计不会" if forecast else "❌ 不满足",
+                              style="yellow")
                 detail = Text(row.get("detail") or "", style="yellow")
             t.add_row(Text(row.get("source") or ""),
                       Text(row.get("condition") or ""),
@@ -2839,6 +2927,16 @@ class BoardMixin(object):
                 "detail" if self.session_ui_mode == "working" else "working")
             self._open_associated_project_files()
             return mode
+        # 整块表格的展开先认：`open task table` / `open dayplan` / `open conditions`。
+        # 注意 `open task` / `open project` 仍是数据模型（故意不抢这两个词）。
+        block = self._resolve_block(text)
+        if block is not None:
+            self._set_block_folded(block, False, permanent=permanent)
+            self.say("已展开块「%s」%s"
+                     % (self._block_label(block),
+                        "并写入偏好" if permanent else "（本次运行）"), "cmd")
+            self.invalidate()
+            return block
         # 三个数据模型优先于同名的任务表表头：open project = 看 pro 数据，
         # 想看任务表的 project 列请用 `open 项目`。
         model = self.DATA_MODEL_ALIASES.get(text.strip().lower())
@@ -2907,12 +3005,21 @@ class BoardMixin(object):
                              % "、".join(task_table_headers(self.task_store.list())
                                          if isinstance(self.view, TaskView)
                                          else [h for h, _kw in SESSION_TABLE_COLUMNS]))
+        block = self._resolve_block(text)
+        if block is not None:
+            self._set_block_folded(block, True, permanent=permanent)
+            self.say("已折叠块「%s」%s"
+                     % (self._block_label(block),
+                        "并写入偏好" if permanent else "（本次运行）"), "cmd")
+            self.invalidate()
+            return block
         task_mode = isinstance(self.view, TaskView)
         col, target_mode, headers, table_name = self._resolve_open_close_column(
             text, task_mode=task_mode)
         if not col:
             raise ValueError(
-                "close 只认表头名（当前表：%s）；你给的是 %r"
+                "close 只认表头名或块名（块：dayplan / conditions / tasktable / "
+                "projecttable；当前表头：%s）；你给的是 %r"
                 % ("、".join(headers), text))
         # 至少留一列，否则 rich 会画一张没有列的表。
         if target_mode == TASK_UI_MODE:
