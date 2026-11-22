@@ -237,19 +237,25 @@ wd.messages = []
 check("进入软中断检查", wd.handle("pro 1 interrupt --soft --check"), True)
 check("逐条检查第一项", wd.pending_soft_interrupt.get("stage"), "check")
 check("选择处理入队", wd.handle("2"), True)
-check("进入任务时长选择", wd.pending_soft_interrupt.get("stage"), "minutes")
-check("选择 50 分钟", wd.handle("50"), True)
-check("问答结束", wd.pending_soft_interrupt, None)
+check("入队后问答结束（不再问时长）", wd.pending_soft_interrupt, None)
 pro_after = wd.projects.pro_by_id(pro["id"])
-check("项目自动切到 bottleneck", pro_after["stage"], "bottleneck")
-op_after = wd.projects.by_id(op_inc["id"])
-check("incubator 第一条是软中断任务",
+check("入队不自动切阶段（等切 incubator 时 dump）",
+      pro_after["stage"], "running")
+check("软中断记录状态 queued",
+      wd.projects.soft_interrupts(pro["id"])[0]["status"], "queued")
+check("还没建任务", [t for t in wd.task_store.list()
+                     if "总分题" in str(t["fields"].get("title") or "")], [])
+wd.messages = []
+check("切换到 incubator（pro 1 -a）", wd.handle("pro 1 -a"), True)
+pro_after = wd.projects.pro_by_id(pro["id"])
+check("项目切到 bottleneck", pro_after["stage"], "bottleneck")
+op_after = wd.projects.current_op_for_pro(pro_after)
+check("dump 的任务每条 25 分钟、带 incubator 标签",
+      [(t.get("duration"), t.get("tags")) for t in op_after["tasks"][:1]],
+      [(25, ["incubator", "软中断"])])
+check("插在项目清单最前",
       op_after["tasks"][0]["title"].startswith("Alpha 的总分题总是超时"), True)
-check("incubator 任务是本地任务", op_after["tasks"][0].get("local_only"), True)
-soft_tasks = [t for t in wd.task_store.list()
-              if t["fields"].get("title", "").startswith("Alpha 的总分题总是超时")]
-check("本地生成了 50 分钟任务", len(soft_tasks), 1)
-check("本地任务时长 50", int(soft_tasks[0]["fields"].get("duration") or 0), 50)
+check("dump 的任务是本地任务", op_after["tasks"][0].get("local_only"), True)
 check("软中断记录状态 handled",
       wd.projects.soft_interrupts(pro["id"])[0]["status"], "handled")
 check("处理完项目名不再带问号",

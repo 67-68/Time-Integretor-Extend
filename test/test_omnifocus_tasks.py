@@ -20,6 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import omnifocus_tasks as m  # noqa: E402
+import omnifocus as oc  # noqa: E402
 
 fails = []
 
@@ -385,7 +386,11 @@ const mk = o => Object.assign({
 const t1 = mk({ id: { primaryKey: "t1" }, name: "写论文", tags: [writing] });
 const t3 = mk({ id: { primaryKey: "t3" }, name: "带标签", tags: [writing, workDeep] });
 const t2 = mk({ id: { primaryKey: "t2" }, name: "项目", project: { name: "P" }, containingProject: { name: "P" } });
-const DB = { t1: t1, t2: t2, t3: t3 };
+// 已经冻结的任务：用来验证 clear_defer / --clear-defer 真能清掉（不然 before 就是 null，
+// 「改了」和「没改」分不出来）。
+const t4 = mk({ id: { primaryKey: "t4" }, name: "冻结的", tags: [workDeep],
+                deferDate: new Date(2036, 0, 1, 0, 0, 0) });
+const DB = { t1: t1, t2: t2, t3: t3, t4: t4 };
 '''
 
 
@@ -400,6 +405,8 @@ def set_payload(**overrides):
         "at": None,
         "due": None,
         "clearDue": False,
+        "defer": None,
+        "clearDefer": False,
         "tags": {"add": [], "remove": [], "set": None, "clear": False},
         "dryRun": False,
         "allowProjectRoot": False,
@@ -415,6 +422,25 @@ def set_payload(**overrides):
 
 def run_set_js(payload):
     js = m.SET_OMNIJS_TEMPLATE.replace(
+        "{{ARGS}}",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+    source = NODE_SET_MOCKS + "\nconst result = " + js.strip() + ";\nconsole.log(result);\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as fh:
+        fh.write(source)
+        path = fh.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    if proc.returncode != 0:
+        raise AssertionError(proc.stderr)
+    return json.loads(proc.stdout)
+
+
+def run_batch_js(payload):
+    """跑 batch 那段 JS（同一个 Node mock）；返回解析后的信封。"""
+    js = m.BATCH_JS.replace(
         "{{ARGS}}",
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
@@ -506,8 +532,172 @@ if shutil.which("node"):
 
     r = run_set_js(set_payload(clearDue=True, dryRun=True, ops=["clear-due"]))
     check("set JS：dry-run 不改截止时间", r["changed"], [])
+
+    # defer 也是「修饰」：warden 的 SOP/incubator 冻结就靠它（defer 到十年后）
+    r = run_set_js(set_payload(id="t1", defer="2026-11-01T09:00:00",
+                               ops=["defer:2026-11-01T09:00:00"]))
+    check("set JS：只设 defer",
+          (r["ok"], r["after"]["defer"], r["after"]["completed"]),
+          (True, "2026-11-01T09:00:00", False))
+    check("set JS：changed 里带上 defer", r["changed"], ["defer"])
+
+    r = run_set_js(set_payload(id="t1", complete=True, defer="2036-01-01T00:00:00",
+                               ops=["complete", "defer:2036-01-01T00:00:00"]))
+    check("set JS：complete + defer 一条搞定",
+          (r["after"]["completed"], r["after"]["defer"]),
+          (True, "2036-01-01T00:00:00"))
+    check("set JS：complete + defer 的 changed",
+          sorted(r["changed"]), ["completed", "completion_date", "defer"])
+
+    r = run_set_js(set_payload(id="t4", clearDefer=True, ops=["clear-defer"]))
+    check("set JS：--clear-defer 清掉 defer",
+          (r["ok"], r["before"]["defer"], r["after"]["defer"]),
+          (True, "2036-01-01T00:00:00", None))
+    check("set JS：--clear-defer 记进 changed", r["changed"], ["defer"])
+
+    # defer 和标签可以同一条命令给（due 仍不行，那是另一条约束）
+    r = run_set_js(set_payload(id="t3", defer="2036-01-01T00:00:00",
+                               tags={"add": ["Work"]},
+                               ops=["add-tag:Work", "defer:2036-01-01T00:00:00"]))
+    check("set JS：标签 + defer 一条命令",
+          (r["ok"], r["after"]["defer"], sorted(r["after"]["tags"])),
+          (True, "2036-01-01T00:00:00", ["Deep", "Work", "写作"]))
+    check("set JS：标签 + defer 的 changed", sorted(r["changed"]), ["defer", "tags"])
+
+    r = run_set_js(set_payload(id="t1", defer="2026-11-01T09:00:00",
+                               dryRun=True, ops=["defer:2026-11-01T09:00:00"]))
+    check("set JS：dry-run 不改 defer",
+          (r["after"]["defer"], r["changed"]), (None, []))
 else:
     print("skip set Node mock（没装 node）")
+
+print("== batch 脚本（静态 + Node mock）==")
+batch_payload = {
+    "ops": [{"id": "t3", "op": "set", "defer": "2036-01-01T00:00:00",
+             "tags": {"add": ["写作"]}}]
+}
+batch_script = m.build_batch_script(batch_payload)
+# JS 级断言看模板本身：build_batch_script 会切成 600 字符的 AppleScript 片段，
+# 长字符串可能正好被切断，所以不在包装文本上做逐字断言。
+batch_source = m.BATCH_JS
+check("batch 脚本 snapshot 带 defer", "defer: iso(t.deferDate)" in batch_source, True)
+check("batch 脚本 snapshot 带排序后的 tags",
+      "tags: Array.from(t.tags).map(g => g.name).sort()" in batch_source, True)
+check("batch 脚本有 op === \"set\" 分支", 'op === "set"' in batch_source, True)
+check("batch 脚本写 deferDate",
+      "task.deferDate = item.defer ? new Date(item.defer) : null" in batch_source, True)
+check("batch 脚本写 dueDate",
+      "task.dueDate = item.due ? new Date(item.due) : null" in batch_source, True)
+check("batch 脚本认 clear_defer", "item.clear_defer" in batch_source, True)
+check("batch 脚本认 clear_due", "item.clear_due" in batch_source, True)
+check("batch 脚本复用 resolveList 解析标签",
+      "resolveList(want.set || [])" in batch_source, True)
+check("batch 包装脚本把 defer 原样塞进 args",
+      "2036-01-01T00:00:00" in batch_script, True)
+check("batch 包装脚本走 evaluate javascript",
+      "evaluate javascript js" in batch_script, True)
+for old_op in ("complete", "drop", "note_mark", "move"):
+    check("batch 旧的 %s 分支还在" % old_op,
+          'op === "%s"' % old_op in batch_source, True)
+
+if shutil.which("node"):
+    def batch_results(ops):
+        return run_batch_js({"ops": ops})["results"]
+
+    rows = batch_results([{"id": "t1", "op": "set", "defer": "2036-01-01T00:00:00"}])
+    check("batch set：只设 defer",
+          (rows[0]["ok"], rows[0]["op"], rows[0]["after"]["defer"], rows[0]["changed"]),
+          (True, "set", "2036-01-01T00:00:00", ["defer"]))
+
+    rows = batch_results([{"id": "t4", "op": "set", "clear_defer": True}])
+    check("batch set：clear_defer 清掉 defer",
+          (rows[0]["before"]["defer"], rows[0]["after"]["defer"], rows[0]["changed"]),
+          ("2036-01-01T00:00:00", None, ["defer"]))
+
+    rows = batch_results([{"id": "t1", "op": "set",
+                           "tags": {"add": ["Work/Deep"]},
+                           "due": "2026-12-01T00:00:00"}])
+    check("batch set：标签 + due 一趟",
+          (rows[0]["after"]["tags"], rows[0]["after"]["due"], sorted(rows[0]["changed"])),
+          (["Deep", "写作"], "2026-12-01T00:00:00", ["due", "tags"]))
+    check("batch set：resolved_tags 带路径",
+          rows[0]["resolved_tags"]["add"][0]["path"], "Work/Deep")
+
+    rows = batch_results([{"id": "t3", "op": "set", "tags": {"clear": True}}])
+    check("batch set：tags.clear", (rows[0]["ok"], rows[0]["after"]["tags"]), (True, []))
+
+    rows = batch_results([{"id": "t3", "op": "set", "tags": {"set": ["写作"]}}])
+    check("batch set：tags.set 替换", rows[0]["after"]["tags"], ["写作"])
+
+    rows = batch_results([{"id": "t3", "op": "set", "tags": {"set": []}}])
+    check("batch set：tags.set 空数组 = 清空", rows[0]["after"]["tags"], [])
+
+    rows = batch_results([{"id": "t3", "op": "set", "tags": {"remove": ["写作"]}}])
+    check("batch set：tags.remove", rows[0]["after"]["tags"], ["Deep"])
+
+    # 标签问题只让这一条失败（ok:false + tag_problem），同批其它任务照常写
+    rows = batch_results([
+        {"id": "t1", "op": "set", "tags": {"add": ["不存在"]}},
+        {"id": "t1", "op": "set", "defer": "2036-01-01T00:00:00"},
+    ])
+    check("batch set：坏标签只失败这一条",
+          (rows[0]["ok"], rows[0]["error"], rows[0]["op"]),
+          (False, "tag_problem", "set"))
+    check("batch set：同批其它条照常成功",
+          (rows[1]["ok"], rows[1]["changed"]), (True, ["defer"]))
+
+    rows = batch_results([{"id": "nope", "op": "set", "defer": "2036-01-01T00:00:00"}])
+    check("batch set：任务不存在", (rows[0]["ok"], rows[0]["error"]), (False, "not_found"))
+
+    rows = batch_results([{"id": "t1", "op": "set"}])
+    check("batch set：什么都不给要报错",
+          (rows[0]["ok"], rows[0]["error"]), (False, "bad_request"))
+
+    # 老的 op 不能被改坏
+    rows = batch_results([{"id": "t1", "op": "complete", "due": "2026-12-01T00:00:00"}])
+    check("batch complete 仍能跑",
+          (rows[0]["ok"], rows[0]["after"]["completed"], rows[0]["after"]["due"]),
+          (True, True, "2026-12-01T00:00:00"))
+    rows = batch_results([{"id": "t1", "op": "complete"},
+                          {"id": "t1", "op": "complete"}])
+    check("batch complete 第二次幂等",
+          (rows[1]["ok"], rows[1]["skipped"]), (True, "already_completed"))
+    rows = batch_results([{"id": "t1", "op": "drop"}])
+    check("batch drop 仍能跑", (rows[0]["ok"], rows[0]["after"]["dropped"]), (True, True))
+    rows = batch_results([{"id": "t1", "op": "bogus"}])
+    check("batch 未知 op 仍是 bad_op",
+          (rows[0]["ok"], rows[0]["error"]), (False, "bad_op"))
+else:
+    print("skip batch Node mock（没装 node）")
+
+if sys.platform == "darwin" and shutil.which("osacompile"):
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "batch.applescript")
+        dst = os.path.join(tmp, "batch.scpt")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(batch_script)
+        proc = subprocess.run(["osacompile", "-o", dst, src], capture_output=True, text=True)
+        check("batch osacompile 编译", (proc.returncode, proc.stderr.strip()), (0, ""))
+else:
+    print("skip batch osacompile（不是 macOS）")
+
+if sys.platform == "darwin" and os.path.exists("/usr/bin/osascript"):
+    probe = batch_script.replace(
+        'tell application "OmniFocus"\n\treturn evaluate javascript js\nend tell',
+        "return js",
+    )
+    proc = subprocess.run(
+        ["/usr/bin/osascript"], input=probe.encode("utf-8"), capture_output=True
+    )
+    expected_batch_js = m.BATCH_JS.replace(
+        "{{ARGS}}",
+        json.dumps(batch_payload, ensure_ascii=False, separators=(",", ":")),
+    ).strip("\n")
+    check("batch 包装 osascript 退出 0", proc.returncode, 0)
+    check("batch 包装还原的 JS 一致",
+          proc.stdout.decode("utf-8").rstrip("\n"), expected_batch_js)
+else:
+    print("skip batch 包装探针（不是 macOS）")
 
 print("== _tsv_cell ==")
 check("None → 空串", m._tsv_cell(None), "")
@@ -768,6 +958,9 @@ with tempfile.TemporaryDirectory() as tmp:
         (["set", "--id", "t1", "--add-tag", "x", "--due", "2026-10-28"], "标签+截止混用"),
         (["set", "--id", "t1", "--due", "2026-10-28", "--clear-due"], "due 和 clear-due 互斥"),
         (["set", "--id", "t1", "--due", "garbage"], "坏 --due"),
+        (["set", "--id", "t1", "--defer", "2026-11-01", "--clear-defer"],
+         "defer 和 clear-defer 互斥"),
+        (["set", "--id", "t1", "--defer", ""], "空 --defer"),
     ):
         code, out, err = run_main(argv)
         check("set 参数错：%s → 2" % label, code, 2)
@@ -797,6 +990,42 @@ args = set_parser.parse_args(["--id", "t1", "--clear-due", "--yes"])
 clear_due = m.build_set_payload(args)
 check("--clear-due",
       (clear_due["due"], clear_due["clearDue"], clear_due["ops"]), (None, True, ["clear-due"]))
+args = set_parser.parse_args(["--id", "t1", "--defer", "2026-11-01T09:00", "--yes"])
+defer_only = m.build_set_payload(args)
+check("--defer 单独可用",
+      (defer_only["defer"], defer_only["clearDefer"], defer_only["ops"]),
+      ("2026-11-01T09:00", False, ["defer:2026-11-01T09:00"]))
+check("--defer 不影响 dryRun 判定", defer_only["dryRun"], False)
+args = set_parser.parse_args(["--id", "t1", "--complete", "--defer", "2036-01-01", "--yes"])
+defer_complete = m.build_set_payload(args)
+check("--complete + --defer 组合（defer 是修饰，不冲突）",
+      (defer_complete["complete"], defer_complete["ops"]),
+      (True, ["complete", "defer:2036-01-01T00:00:00"]))
+args = set_parser.parse_args(["--id", "t1", "--set-tags", "A,B",
+                              "--defer", "2036-01-01", "--yes"])
+defer_tags = m.build_set_payload(args)
+check("--set-tags + --defer 一条命令",
+      defer_tags["ops"], ["set-tags:A,B", "defer:2036-01-01T00:00:00"])
+args = set_parser.parse_args(["--id", "t1", "--complete", "--due", "2026-10-27T11:50",
+                              "--defer", "2036-01-01", "--yes"])
+check("--due 和 --defer 可以同时给",
+      m.build_set_payload(args)["ops"],
+      ["complete", "due:2026-10-27T11:50", "defer:2036-01-01T00:00:00"])
+args = set_parser.parse_args(["--id", "t1", "--clear-defer", "--yes"])
+clear_defer = m.build_set_payload(args)
+check("--clear-defer",
+      (clear_defer["defer"], clear_defer["clearDefer"], clear_defer["ops"]),
+      (None, True, ["clear-defer"]))
+args = set_parser.parse_args(["--id", "t1", "--defer", "2036/01/01", "--yes"])
+defer_raw = m.build_set_payload(args)
+check("--defer 非 ISO 原样透传给 new Date()",
+      defer_raw["defer"], "2036/01/01")
+check_raises(
+    "空 --defer 报 ValueError",
+    lambda: m.build_set_payload(
+        set_parser.parse_args(["--id", "t1", "--defer", ""])
+    ),
+)
 check_raises(
     "坏 --at 报 ValueError",
     lambda: m.build_set_payload(
@@ -836,6 +1065,74 @@ if sys.platform == "darwin" and os.path.exists("/usr/bin/osascript"):
     check("set 包装还原的 JS 一致", proc.stdout.decode("utf-8").rstrip("\n"), expected_js)
 else:
     print("skip set 包装探针（不是 macOS）")
+
+print("== omnifocus.Client 便捷方法（假 _run）==")
+
+
+def fake_client(payload):
+    """造一个不碰系统的 Client：_run 只记录 argv / stdin 并回一段 JSON。"""
+    client = oc.Client(script=os.path.join(ROOT, "omnifocus_tasks.py"))
+    calls = []
+
+    def fake_run(args, timeout=None, expect_jsonl=False, stdin_text=None):
+        calls.append({"args": [str(a) for a in args], "timeout": timeout,
+                      "stdin_text": stdin_text})
+        return 0, json.dumps(payload, ensure_ascii=False), ""
+
+    client._run = fake_run
+    client.available = lambda: True
+    return client, calls
+
+
+SET_OK = {"tool": "omnifocus_tasks_set", "version": 1, "ok": True, "changed": ["defer"]}
+
+client, calls = fake_client(SET_OK)
+result = client.set_defer("t1", "2036-01-01T00:00:00")
+check("Client.set_defer 发 --defer",
+      calls[-1]["args"],
+      ["set", "--id", "t1", "--defer", "2036-01-01T00:00:00", "--yes"])
+check("Client.set_defer 返回结果 dict", result["ok"], True)
+
+client, calls = fake_client(SET_OK)
+client.set_defer("t1", None)
+check("Client.set_defer(None) 发 --clear-defer",
+      calls[-1]["args"], ["set", "--id", "t1", "--clear-defer", "--yes"])
+client.set_defer("t1", "")
+check("Client.set_defer('') 也发 --clear-defer",
+      calls[-1]["args"], ["set", "--id", "t1", "--clear-defer", "--yes"])
+
+client, calls = fake_client(SET_OK)
+client.remove_tag("t1", "SOP")
+check("Client.remove_tag 发 --remove-tag",
+      calls[-1]["args"], ["set", "--id", "t1", "--remove-tag", "SOP", "--yes"])
+
+client, calls = fake_client(SET_OK)
+client.set_tags("t1", ["Work/Deep", "写作"])
+check("Client.set_tags 逗号连接",
+      calls[-1]["args"],
+      ["set", "--id", "t1", "--set-tags", "Work/Deep,写作", "--yes"])
+client.set_tags("t1", [])
+check("Client.set_tags([]) 发 --clear-tags",
+      calls[-1]["args"], ["set", "--id", "t1", "--clear-tags", "--yes"])
+client.set_tags("t1", None)
+check("Client.set_tags(None) 也发 --clear-tags",
+      calls[-1]["args"], ["set", "--id", "t1", "--clear-tags", "--yes"])
+
+# flush 只做 json.dumps：batch 的 op=set（defer / tags）必须原样进 stdin
+BATCH_OK = {
+    "tool": "omnifocus_tasks_batch",
+    "version": 1,
+    "ok": True,
+    "results": [{"id": "t1", "op": "set", "ok": True, "changed": ["defer"]}],
+}
+client, calls = fake_client(BATCH_OK)
+ops = [{"id": "t1", "op": "set", "defer": "2036-01-01T00:00:00",
+        "tags": {"add": ["SOP"], "clear": False}}]
+data = client.flush(ops)
+check("Client.flush 走 batch 子命令", calls[-1]["args"], ["batch"])
+check("Client.flush 原样透传 op=set（defer + tags）",
+      json.loads(calls[-1]["stdin_text"])["ops"], ops)
+check("Client.flush 返回 results", data["results"][0]["changed"], ["defer"])
 
 # ---------------------------------------------------------------- 叫人的脚本
 

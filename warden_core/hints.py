@@ -199,7 +199,7 @@ def _context_detail(command, args):
             return "把该项目第一条可排任务挂到指定 session"
         if "interrupt" in words:
             if "--check" in words or "-c" in words:
-                return "逐条检查软中断：不处理 / 入队 / 丢弃，最后合成一条 incubator 任务"
+                return "逐条检查软中断：不处理 / 入队 / 丢弃；切到 incubator 时 dump 成 25 分钟任务"
             if "--hard" in words:
                 return "硬中断：下架当前场全部任务，再建一整场新任务挂回去"
             return "软中断：保存建议并选 A/B/C，不下架当前任务"
@@ -746,7 +746,7 @@ def _hint_task(parts):
                              note="后缀：-a <编号|none|current> · -s <编号> 批量 · -n 备注"
                                   " · -e true|false 独占 · -m complete|discard"
                                   " · -d 派生 @list 清单里的一条（重复任务是复制）"
-                                  " · -p <项目序号> 改归属（-ps SOP / -pi incubator）"
+                                  " · -p <项目序号> 改归属（-ps/-pi 旧写法，同一个 op）"
                                   " · 字段随便写")
     if any(tok in words for tok in ("--mark", "-m")):
         return repl_kit.Hint("取值", TASK_MARK_WORDS,

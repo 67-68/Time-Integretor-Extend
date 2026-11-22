@@ -1421,6 +1421,13 @@ class TaskCmdMixin(object):
         note_fm = self.fm_complete(task)
         note_of = self.omni_complete(task)
         note_sub = self._project_child_completed(task, writeback=True)
+        # pop：bottleneck 下最后一条 incubator 任务勾掉 → 自动切回 running 并解冻
+        # SOP 任务（2026-11-21 用户定的 pop 语义）。失败不挡完成流程。
+        try:
+            self._maybe_resume_from_bottleneck(task)
+        except Exception as e:                     # noqa: BLE001
+            rl.log_event("project", "auto_resume_failed", level="warning",
+                         task=task.get("id"), error="%s: %s" % (type(e).__name__, e))
         rl.log_event("task", "done", task_id=task.get("id"),
                      title=self.task_store.focusmate_title(task, 60),
                      minutes=minutes, why=why,

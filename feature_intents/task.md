@@ -288,7 +288,7 @@ session 表格和下方任务栏都不显示它（`(0+2/1)` 同理）。有进�
 项目导入 / 刷新 / 每日对账时，项目库里的**叶子任务**会幂等镜像进任务库：
 
 - `fields.project` = 项目名，`fields.project_id` = 项目序号，`fields.project_task` = OmniFocus 任务 pk；
-- 这里说的“项目”是 **op（OmniFocus Project）**；`plan` 按关联 **pro** 的当前阶段选择 SOP / incubator op；
+- 这里说的“项目”是 **op（OmniFocus Project）**；`plan` 只挑关联 **pro** 当前阶段那一侧（SOP / incubator 任务标签）的任务；
 - `source.kind == "project"`；没有 session 时 `TaskStore.is_project_backlog()` 为真；
 - 这些镜像**只进任务视图**（可搜索、可 `group project`、可排序），不会进契约视图的任务面板；
 - `plan` 挑中同一条任务时**复用镜像**并挂 session，不会建重复任务；

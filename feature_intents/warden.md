@@ -189,7 +189,7 @@ pro 1 interrupt --hard
 cst                快速征召：按剩余时间每 5 分钟取档，把合适任务塞进当前/下一场
 pro 1 file <路径>   关联“open + Enter 顺便打开”的文件
 open                切口径 + 顺便打开相关 pro 的文件
-plan [天数]         一次分配：每个 pro 只取当前阶段的 SOP/incubator op；
+plan [天数]         一次分配：每个 pro 用它唯一的 op，只挑当前阶段那一侧的任务；
                     不带参数 = 今天；plan +1 = 明天；今天没 plan 会在状态框里提醒
 ```
 
@@ -698,7 +698,7 @@ A–E 的语义不变。结束时不写 postsession 状态文件（没有那一�
 - op 用 OmniFocus 标签 `project/<pro名称>` 自动关联 pro；也可手动
   `pro <序号> op <op序号>` / `op <序号> pro <pro序号>`。
 
-`plan` 只有**一次**：每个 pro 按当前阶段取一个 op（running → SOP /
+`plan` 只有**一次**：每个 pro 用它的那一个 op，任务按侧别标签挑（running → SOP /
 bottleneck → incubator），汇总所有空场后一次分配、`complete` 一次应用并结束。
 只关联了 pro 的 op 才进 plan；同一项目不会同时出现 SOP 和 incubator。
 `plan` 的分资源问答和收尾 / 到点没开始共用同一个打断栏位 —— **一次只问一件事**。

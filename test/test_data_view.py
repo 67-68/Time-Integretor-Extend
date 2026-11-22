@@ -199,12 +199,11 @@ check("current_op_for_pro 取到 incubator",
 check("plan_ops 不丢这个项目",
       ti_op["id"] in [op["id"] for op in wd2.projects.plan_ops()], True)
 rows = wd2.current_project_rows()
-ti_rows = [(row["pro_title"], row["active_op_type"]) for row in rows
+ti_rows = [(row["pro_title"], row["active_side"]) for row in rows
            if row["pro_title"] == "TimeIntegrator"]
 check("契约项目表显示 TimeIntegrator", ti_rows,
       [("TimeIntegrator", "incubator")])
-# 防御旧数据：即使 stage 字段没来得及校正，current_op_for_pro 也按唯一
-# active op 兜底，不会让整行消失。
+# 防御旧数据：一个 pro 只有一个 op 时 stage 只决定「排哪一侧」，不再决定「取哪个 op」。
 store = wd2.projects.load()
 for pro in store.get("pros") or []:
     if pro["id"] == ti_pro["id"]:
@@ -212,9 +211,9 @@ for pro in store.get("pros") or []:
 wd2.projects.save(store)
 fallback = wd2.projects.display_op_for_pro(ti_pro["id"])
 check("旧 stage 数据仍能按唯一 incubator 展示兜底", fallback["id"], ti_op["id"])
-check("严格 plan 入口仍尊重 stage",
-      wd2.projects.current_op_for_pro(ti_pro["id"]), None)
-check("effective_stage 推导为 bottleneck",
+check("单 op 时 current_op_for_pro 不再被 stage 拦掉",
+      wd2.projects.current_op_for_pro(ti_pro["id"])["id"], ti_op["id"])
+check("effective_stage 按 op 类型推导为 bottleneck",
       wd2.projects.effective_stage_for_pro(ti_pro["id"]), "bottleneck")
 
 print("== 从别的视图也能直接 open project ==")

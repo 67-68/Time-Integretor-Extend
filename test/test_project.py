@@ -230,6 +230,14 @@ def by_num(wd, num=1):
     return wd.projects.active()[num - 1]
 
 
+def no_chore(wd):
+    """把琐事空闲屏收掉：否则命令会被它吃掉（测试环境共用 settings）。"""
+    wd.settings.set("chore-project", "")
+    if isinstance(wd.view, w.ChoreView):
+        wd.handle("q")
+    return wd
+
+
 def plan_day(wd):
     """切到明天再 plan（今天那几场在真实时钟下可能已经开始了）。
 
@@ -1456,171 +1464,269 @@ check_true("自动创建并关联了真正项目 pro「学术论文」",
 check("自动创建的 pro 阶段为 running", _linked_pro["stage"], "running")
 check("导入时已说明类型 → 不弹待补全提示", wd_tag.pending_op_type, [])
 
-print("== 3) 导入未说明类型 / refresh 检查缺少类型的 op → 让用户输入 SOP / incubator ==")
+print("== 3) 导入不再问类型；SOP / incubator 是任务标签 ==")
 _snap_before_3 = _snapshot_data()
-wd_untyped = fresh(_tagged_rows)
-check("不带类型导入 op",
-      wd_untyped.handle("task import omnifocus:///project/p-inc-1"), True)
-check("未说明类型时进入 pending_op_type 队列",
-      len(wd_untyped.pending_op_type), 1)
-check_true("打断栏位展示补全 op 类型面板",
-           wd_untyped.render_interrogate() is not None
-           and "SOP" in wd_untyped.render_interrogate().renderable.plain)
-check("用户输入 incubator 补全",
-      wd_untyped.handle("incubator"), True)
-check("补全后队列清空", wd_untyped.pending_op_type, [])
-check("op 类型已写入 incubator",
-      wd_untyped.projects.active()[0]["op_type"], "incubator")
+_mixed_rows = [
+    {"id": "p-mix-1", "name": "混合清单", "kind": "project_root",
+     "tags": ["project/混合项目"], "completed": False, "dropped": False},
+    {"id": "t-mix-sop", "name": "写正文", "kind": "action", "project": "混合清单",
+     "project_id": "p-mix-1", "estimated_minutes": 50, "completed": False,
+     "tags": ["SOP"]},
+    {"id": "t-mix-inc", "name": "试新启发式", "kind": "action", "project": "混合清单",
+     "project_id": "p-mix-1", "estimated_minutes": 25, "completed": False,
+     "tags": ["incubator"]},
+    {"id": "t-mix-none", "name": "忘了打标签", "kind": "action", "project": "混合清单",
+     "project_id": "p-mix-1", "estimated_minutes": 25, "completed": False},
+]
+wd_untyped = fresh(_mixed_rows)
+check("不带类型也能导入 op",
+      wd_untyped.handle("task import omnifocus:///project/p-mix-1"), True)
+check("导入不再排队问类型", wd_untyped.pending_op_type, [])
+check("op 没有类型也能入库", wd_untyped.projects.active()[0]["op_type"], None)
+_mix_op = wd_untyped.projects.active()[0]
+_mix_pro = wd_untyped.projects.active_pros()[0]
+check("pro 默认 running", _mix_pro["stage"], "running")
+check("唯一 op 写成 op_id", _mix_pro["op_id"], _mix_op["id"])
+check("任务标签原样进清单",
+      sorted(pj.task_side({"tags": t.get("tags")}) or "none"
+             for t in _mix_op["tasks"]),
+      ["SOP", "incubator", "none"])
+check("没打标签的任务按 legacy 类型也算不上一侧（op 无类型）",
+      pj.task_side(_mix_op["tasks"][2]), None)
+no_chore(wd_untyped)
+plan_day(wd_untyped)
+check("没有 op_type 也能 plan", wd_untyped.handle("plan +1"), True)
+check("plan 只列一个项目", len(wd_untyped.planning.projects), 1)
+_side_view = wd_untyped.planning.projects[0]
+check("running 时活跃侧是 SOP", _side_view["side"], "SOP")
+check("running 只挑 SOP 标签的任务",
+      [t["title"] for t in pj.remaining_tasks(
+          _side_view, {}, side=_side_view["side"],
+          default_side=_side_view.get("default_side"))],
+      ["写正文"])
+wd_untyped.handle("q")
 
-# 模拟旧数据缺少 op_type，refresh 时自动检查并让用户补
-_raw_store = wd_untyped.projects.load()
-_raw_store["projects"][0]["op_type"] = None
-wd_untyped.projects.save(_raw_store)
-check("旧数据 op_type 置空", wd_untyped.projects.active()[0]["op_type"], None)
-check("refresh 检查出缺少 op_type 的项目",
-      wd_untyped.handle("refresh"), True)
-check("refresh 后 pending_op_type 有待补项",
-      len(wd_untyped.pending_op_type), 1)
-# 现在 plan 只收「关联了真正项目 pro」的 op；先把它绑到 pro，验证未设类型
-# 的 linked op 仍然会挡住 plan，而不是被静默跳过。
-wd_untyped.handle("pro create 未类型项目")
-wd_untyped.handle("op 1 pro 1")
-check("未说明类型时 eligible_ops 不把它当成 SOP",
-      wd_untyped.projects.eligible_ops("SOP"), [])
-check("未说明类型时 plan 直接拒绝", wd_untyped.handle("plan"), True)
-check_true("plan 拒绝理由说清要先补类型",
-           any("没说明类型" in t for t in texts(wd_untyped)))
-check("用户输入 SOP 完成补全", wd_untyped.handle("SOP"), True)
-check("op_type 更新为 SOP", wd_untyped.projects.active()[0]["op_type"], "SOP")
+print("== 4) 切阶段：冻结旧侧（defer 十年）/ 解冻新侧；incubator 阶段 dump 软中断 ==")
+no_chore(wd_untyped)
+check("pro 1 -a 切到 bottleneck", wd_untyped.handle("pro 1 -a"), True)
+_mix_pro = wd_untyped.projects.pro_by_id(_mix_pro["id"])
+check("阶段已是 bottleneck", _mix_pro["stage"], "bottleneck")
+_mix_op = wd_untyped.projects.by_id(_mix_op["id"])
+_by_title = {t["title"]: t for t in _mix_op["tasks"]}
+check("SOP 任务被冻到十年后",
+      pj.is_frozen_defer(_by_title["写正文"].get("defer")), True)
+check("SOP 任务带上 manual_defer 标签",
+      pj.task_has_tag(_by_title["写正文"], "manual_defer"), True)
+check("incubator 任务没有被动 defer",
+      _by_title["试新启发式"].get("defer"), None)
+check("冻结写的是十年后（不是普通 defer）",
+      pj.task_is_frozen(_by_title["写正文"]), True)
+check("普通 defer 不会被当成冻结哨兵",
+      pj.is_frozen_defer("2026-12-01T09:00:00"), False)
 
-_restore_data(_snap_before_3)
-# 前面琐事屏用例把 chore-project 设成了 #1；这会让后续没有 session 的测试
-# 自动切进 ChoreView（只吃 m/c/q），所以这里把绑定清掉，保持普通契约视图。
-wd_tag.settings.set("chore-project", "")
-if isinstance(wd_tag.view, w.ChoreView):
-    wd_tag.handle("q")
+# 软中断：攒着，切 incubator 时 dump
+wd_untyped.projects.add_soft_interrupt(_mix_pro["id"], "SAT 双篇对比总超时 2 分钟")
+wd_untyped.projects.add_soft_interrupt(_mix_pro["id"], "数学错题回顾没有固定入口")
+check("pro 1 -a 切回 running", wd_untyped.handle("pro 1 -a"), True)
+_mix_pro = wd_untyped.projects.pro_by_id(_mix_pro["id"])
+check("阶段已是 running", _mix_pro["stage"], "running")
+_mix_op = wd_untyped.projects.by_id(_mix_op["id"])
+_by_title = {t["title"]: t for t in _mix_op["tasks"]}
+check("切回 running 后 SOP 任务解冻（defer 清掉）",
+      _by_title["写正文"].get("defer"), None)
+check("manual_defer 标签摘掉",
+      pj.task_has_tag(_by_title["写正文"], "manual_defer"), False)
+check("inactive 侧（incubator）现在被冻结",
+      pj.task_is_frozen(_by_title["试新启发式"]), True)
+check("软中断还在攒着（2 条）",
+      wd_untyped.projects.soft_interrupt_count(_mix_pro["id"]), 2)
 
-print("== 4) pro <序号> -a / --advance 快捷切换状态并关联新 op（task import 或 op） ==")
-# wd_tag 里已有 Pro #1「学术论文」(running) 关联 op #1「论文写作 SOP」(SOP)
-check("初始阶段 running 下 SOP op 允许进行",
-      [p["id"] for p in wd_tag.projects.eligible_ops("SOP")], [_op1["id"]])
-check("初始阶段 running 下 incubator op 为空",
-      wd_tag.projects.eligible_ops("incubator"), [])
+check("切到 bottleneck 时 dump 软中断", wd_untyped.handle("pro 1 -a"), True)
+_mix_op = wd_untyped.projects.by_id(_mix_op["id"])
+_heads = [t.get("title") for t in _mix_op["tasks"][:2]]
+check("两条软中断各 dump 成一条 25 分钟任务，插在清单最前",
+      [(t.get("duration"), t.get("count"), t.get("tags"))
+       for t in _mix_op["tasks"][:2]],
+      [(25, 1, ["incubator", "软中断"]), (25, 1, ["incubator", "软中断"])])
+check("原来排在最前的 SOP 任务退到它们后面",
+      "写正文" in [t.get("title") for t in _mix_op["tasks"][2:]], True)
+check("软中断记录标成 handled",
+      [r["status"] for r in wd_untyped.projects.soft_interrupts(_mix_pro["id"])],
+      ["handled", "handled"])
+check("dump 出来的任务不带 cut_period_id（本地任务）",
+      all(t.get("local_only") for t in _mix_op["tasks"][:2]), True)
 
-# 用 project 1 --advance（不带尾参数）进入问答，再用 task import 关联新 incubator op
-check("project 1 --advance 打开阶段切换问答",
-      wd_tag.handle("project 1 --advance"), True)
-check_true("pending_advance 已挂起，目标是 bottleneck / incubator",
-           wd_tag.pending_advance is not None
-           and wd_tag.pending_advance["target_stage"] == "bottleneck"
-           and wd_tag.pending_advance["required_op_type"] == "incubator")
-check("在 advance 问答里直接敲 task import 导入新 op 作为关联",
-      wd_tag.handle("task import omnifocus:///project/p-inc-1"), True)
-check("advance 问答已完成关闭", wd_tag.pending_advance, None)
-_pro_after_bn = wd_tag.projects.pro_by_id(_linked_pro["id"])
-check("Pro #1 已切换到 bottleneck 阶段", _pro_after_bn["stage"], "bottleneck")
-_op_inc = wd_tag.projects.by_omnifocus("p-inc-1")
-check("新导入的 op 自动标为 incubator 并绑定到 Pro #1",
-      (_op_inc["op_type"], _op_inc["pro_id"]), ("incubator", _pro_after_bn["id"]))
-check("bottleneck 阶段禁止该项目的 SOP op 进行",
-      wd_tag.projects.eligible_ops("SOP"), [])
-check("bottleneck 阶段允许该项目对应的 incubator op 进行",
-      [p["id"] for p in wd_tag.projects.eligible_ops("incubator")], [_op_inc["id"]])
+print("== 4b) pop：最后一条 incubator 任务勾掉 → 自动切回 running 并解冻 ==")
+wd_pop = fresh(_mixed_rows)
+wd_pop.handle("op import omnifocus:///project/p-mix-1")
+no_chore(wd_pop)
+_pop_pro = wd_pop.projects.active_pros()[0]
+wd_pop.handle("pro 1 -a")                     # → bottleneck（SOP 侧冻结）
+no_chore(wd_pop)
+plan_day(wd_pop)
+check("pop 前 plan 打开", wd_pop.handle("plan +1"), True)
+wd_pop.handle("pro 1 1")
+wd_pop.handle("complete")
+_inc = [t for t in wd_pop.task_store.list()
+        if (t.get("fields") or {}).get("title") == "试新启发式"]
+check("incubator 任务被唤起并挂场", len(_inc), 1)
+check("勾掉最后一条 incubator 任务",
+      wd_pop.handle("task %d done" % _inc[0]["id"]), True)
+_pop_pro = wd_pop.projects.pro_by_id(_pop_pro["id"])
+check("勾完自动切回 running", _pop_pro["stage"], "running")
+_pop_op = wd_pop.projects.by_id(_pop_pro["op_id"])
+_pop_tasks = {t["title"]: t for t in _pop_op["tasks"]}
+check("SOP 任务解冻（defer 清掉）", _pop_tasks["写正文"].get("defer"), None)
+check("SOP 任务摘掉 manual_defer",
+      pj.task_has_tag(_pop_tasks["写正文"], "manual_defer"), False)
 
-# 再导入第二个 SOP op，然后用 pro 1 -a op <序号> 切回 running
-check("op import sop 导入新的 SOP op",
-      wd_tag.handle("op import sop omnifocus:///project/p-sop-2"), True)
-_op_sop2 = wd_tag.projects.by_omnifocus("p-sop-2")
-_op_sop2_num = wd_tag.projects.number_of(_op_sop2["id"])
-check("pro 1 -a op <序号> 快捷切回 running 并关联新 SOP op",
-      wd_tag.handle("pro 1 -a op %d" % _op_sop2_num), True)
-_pro_after_run = wd_tag.projects.pro_by_id(_linked_pro["id"])
-check("Pro #1 已切回 running 阶段", _pro_after_run["stage"], "running")
-check("running 阶段允许 SOP op 进行",
-      _op_sop2["id"] in [p["id"] for p in wd_tag.projects.eligible_ops("SOP")], True)
-check("running 阶段不再允许该项目的 incubator op 进行",
-      wd_tag.projects.eligible_ops("incubator"), [])
+print("== 4c) refresh 检查：按阶段补冻结 / 解冻（幂等） ==")
+_sync_pro = wd_pop.projects.pro_by_id(_pop_pro["id"])
+wd_pop.handle("pro 1 -a")                     # → bottleneck：SOP 又冻上
+_store = wd_pop.projects.load()
+for pro in _store.get("pros") or ():
+    if pro["id"] == _sync_pro["id"]:
+        pro["stage"] = "running"              # 模拟在 OmniFocus 里改了阶段
+wd_pop.projects.save(_store)
+wd_pop._side_sync_at = 0
+check("refresh 检查能跑", wd_pop._maybe_sync_sides(), True)
+_pop_op = wd_pop.projects.by_id(_sync_pro["op_id"])
+_pop_tasks = {t["title"]: t for t in _pop_op["tasks"]}
+check("切回 running 后 SOP 解冻、incubator 冻上",
+      (pj.task_is_frozen(_pop_tasks["写正文"]),
+       pj.task_is_frozen(_pop_tasks["试新启发式"])),
+      (False, True))
+wd_pop._side_sync_at = 0
+wd_pop._maybe_sync_sides()
+_pop_tasks = {t["title"]: t for t in wd_pop.projects.by_id(_sync_pro["op_id"])["tasks"]}
+check("再跑一次不改任何东西（幂等）",
+      pj.task_has_tag(_pop_tasks["写正文"], "manual_defer"), False)
 
-print("== 5) plan 只有一次：每个项目按阶段取当前的 SOP / incubator op ==")
+print("== 4d) merge：旧双 op 迁移（离线只预览 / 单 op 补标签） ==")
+_merge_rows = [
+    {"id": "p-old-sop", "name": "旧 SOP 流", "kind": "project_root",
+     "tags": ["project/合并项目"], "completed": False, "dropped": False},
+    {"id": "t-old-sop", "name": "写结论", "kind": "action", "project": "旧 SOP 流",
+     "project_id": "p-old-sop", "estimated_minutes": 25, "completed": False},
+    {"id": "p-old-inc", "name": "旧孵化流", "kind": "project_root",
+     "tags": ["project/合并项目"], "completed": False, "dropped": False},
+    {"id": "t-old-inc", "name": "试新写法", "kind": "action", "project": "旧孵化流",
+     "project_id": "p-old-inc", "estimated_minutes": 25, "completed": False},
+]
+wd_merge = fresh(_merge_rows)
+wd_merge.handle("op import sop omnifocus:///project/p-old-sop")
+wd_merge.handle("op import incubator omnifocus:///project/p-old-inc")
+no_chore(wd_merge)
+wd_merge.messages = []
+check("merge 预览受理", wd_merge.handle("pro 1 merge"), True)
+check_true("预览说了会移动几条",
+           any("会移动 1 条" in t for t in texts(wd_merge)))
+check("预览不改数据（还是两个 op）",
+      len(wd_merge.projects.active()), 2)
+check("离线时 merge --yes 拒绝执行（要先挪 OmniFocus）",
+      wd_merge.handle("pro 1 merge --yes"), True)
+check_true("说清 OmniFocus 不在线",
+           any("OmniFocus 不在线" in t for t in texts(wd_merge)))
+check("拒绝后本地还是两个 op", len(wd_merge.projects.active()), 2)
+
+wd_merge1 = fresh(_mixed_rows)
+wd_merge1.handle("op import omnifocus:///project/p-mix-1")
+no_chore(wd_merge1)
+wd_merge1.messages = []
+check("单 op + merge --yes 受理", wd_merge1.handle("pro 1 merge --yes"), True)
+_m1_op = wd_merge1.projects.active()[0]
+_m1_sides = {t["title"]: (pj.side_of_tags(t.get("tags") or ()),
+                          pj.task_has_tag(t, "manual_defer"))
+             for t in _m1_op["tasks"]}
+check("单 op 补标签：SOP 任务打 SOP、其它打 legacy 类型",
+      (_m1_sides["写正文"][0], _m1_sides["试新启发式"][0]),
+      ("SOP", "incubator"))
+check("running 阶段把 incubator 侧冻结",
+      pj.task_is_frozen([t for t in _m1_op["tasks"]
+                         if t["title"] == "试新启发式"][0]), True)
+check_true("离线时说明只改了本地",
+           any("OmniFocus 不在线" in t for t in texts(wd_merge1)))
+
+print("== 5) plan 一次分配：不同项目按各自阶段挑自己那一侧 ==")
 _two_stage_rows = [
-    {"id": "p-run-sop", "name": "常规开发 SOP", "kind": "project_root",
+    {"id": "p-run-sop", "name": "常规开发", "kind": "project_root",
      "tags": ["project/核心系统"], "completed": False, "dropped": False},
-    {"id": "t-run-1", "name": "实现接口", "kind": "action", "project": "常规开发 SOP",
-     "project_id": "p-run-sop", "estimated_minutes": 50, "completed": False},
-    {"id": "p-bn-inc", "name": "算法破局孵化", "kind": "project_root",
+    {"id": "t-run-1", "name": "实现接口", "kind": "action", "project": "常规开发",
+     "project_id": "p-run-sop", "estimated_minutes": 50, "completed": False,
+     "tags": ["SOP"]},
+    {"id": "t-run-inc", "name": "重构猜想", "kind": "action", "project": "常规开发",
+     "project_id": "p-run-sop", "estimated_minutes": 25, "completed": False,
+     "tags": ["incubator"]},
+    {"id": "p-bn-1", "name": "算法攻关", "kind": "project_root",
      "tags": ["project/算法攻关"], "completed": False, "dropped": False},
-    {"id": "t-bn-1", "name": "验证新启发式", "kind": "action", "project": "算法破局孵化",
-     "project_id": "p-bn-inc", "estimated_minutes": 25, "completed": False},
-    {"id": "p-bn-sop", "name": "被阻塞的算法 SOP", "kind": "project_root",
-     "tags": ["project/算法攻关"], "completed": False, "dropped": False},
-    {"id": "t-bn-sop-1", "name": "常规调参", "kind": "action", "project": "被阻塞的算法 SOP",
-     "project_id": "p-bn-sop", "estimated_minutes": 25, "completed": False},
+    {"id": "t-bn-inc", "name": "验证新启发式", "kind": "action", "project": "算法攻关",
+     "project_id": "p-bn-1", "estimated_minutes": 25, "completed": False,
+     "tags": ["incubator"]},
+    {"id": "t-bn-sop", "name": "常规调参", "kind": "action", "project": "算法攻关",
+     "project_id": "p-bn-1", "estimated_minutes": 25, "completed": False,
+     "tags": ["SOP"]},
 ]
 wd_plan2 = fresh(_two_stage_rows)
-# 核心系统（running）→ p-run-sop (SOP)
-wd_plan2.handle("op import sop omnifocus:///project/p-run-sop")
-# 算法攻关：先有 SOP，再通过 -a 切换到 bottleneck 并关联 p-bn-inc (incubator)
-wd_plan2.handle("op import sop omnifocus:///project/p-bn-sop")
-wd_plan2.handle("pro 2 -a task import omnifocus:///project/p-bn-inc")
-check("Pro #1 处于 running、Pro #2 处于 bottleneck",
+wd_plan2.handle("op import omnifocus:///project/p-run-sop")
+wd_plan2.handle("op import omnifocus:///project/p-bn-1")
+wd_plan2.handle("pro 2 -a")            # 算法攻关 → bottleneck
+check("Pro #1 running、Pro #2 bottleneck",
       [(p["title"], p["stage"]) for p in wd_plan2.projects.active_pros()],
       [("核心系统", "running"), ("算法攻关", "bottleneck")])
-
-plan_day(wd_plan2)  # 明天 3 场：T1 75(3) + 25(1)、T2 50(2) = 6 count
+no_chore(wd_plan2)
+plan_day(wd_plan2)
 check("启动 plan +1", wd_plan2.handle("plan +1"), True)
 check_true("plan 开着", wd_plan2.planning is not None)
-check("一次 plan 同时列出 running 的 SOP 与 bottleneck 的 incubator",
-      [(p["title"], p.get("op_type")) for p in wd_plan2.planning.projects],
-      [("常规开发 SOP", "SOP"), ("算法破局孵化", "incubator")])
-check("不再有全局 SOP/incubator 阶段切换", wd_plan2.planning.stage, "mixed")
+check("两个项目各自带活跃侧",
+      [(p["title"], p.get("side")) for p in wd_plan2.planning.projects],
+      [("常规开发", "SOP"), ("算法攻关", "incubator")])
 check("容量是全部空场 6 count", wd_plan2.planning.cap()["counts"], 6)
-wd_plan2.handle("pro 1 2")  # 常规开发 SOP：2 count
-wd_plan2.handle("pro 2 1")  # 算法破局孵化：1 count
+wd_plan2.handle("pro 1 2")
+wd_plan2.handle("pro 2 1")
 check("complete 一次就收尾", wd_plan2.handle("complete"), True)
 check("planning 已关闭", wd_plan2.planning, None)
-_assigned_titles = sorted(
-    t["fields"]["title"] for t in wd_plan2.task_store.list()
-    if (t.get("session") or {}).get("start")
-)
-check("SOP 与 incubator 的当前 op 在**同一次 plan** 里排好",
-      _assigned_titles, ["实现接口", "验证新启发式"])
+_assigned = sorted(t["fields"]["title"] for t in wd_plan2.task_store.list()
+                   if (t.get("session") or {}).get("start"))
+check("各项目只排自己那一侧的任务", _assigned, ["实现接口", "验证新启发式"])
 
-print("== 5b) 只有 incubator op 时 plan 也一次完成；阶段门控挡住时明确拒绝 ==")
+print("== 5b) 只有 incubator 任务时 plan 也一次完成；没有可排任务时如实说不排 ==")
 _inc_only_rows = [
-    {"id": "p-only-inc", "name": "唯一孵化 op", "kind": "project_root",
+    {"id": "p-only-inc", "name": "唯一孵化项目", "kind": "project_root",
      "tags": ["project/唯一项目"], "completed": False, "dropped": False},
-    {"id": "t-only-inc", "name": "孵化任务", "kind": "action", "project": "唯一孵化 op",
-     "project_id": "p-only-inc", "estimated_minutes": 25, "completed": False},
+    {"id": "t-only-inc", "name": "孵化任务", "kind": "action", "project": "唯一孵化项目",
+     "project_id": "p-only-inc", "estimated_minutes": 25, "completed": False,
+     "tags": ["incubator"]},
 ]
 wd_inc_only = fresh(_inc_only_rows)
-check("op import incubator 受理",
-      wd_inc_only.handle("op import incubator omnifocus:///project/p-only-inc"), True)
-_inc_pro = wd_inc_only.projects.active_pros()[0]
-check("incubator op 自动关联的 pro 默认处于 bottleneck",
-      _inc_pro["stage"], "bottleneck")
+wd_inc_only.handle("op import omnifocus:///project/p-only-inc")
+no_chore(wd_inc_only)
 plan_day(wd_inc_only)
-check("只有 incubator op 时 plan 仍可启动", wd_inc_only.handle("plan +1"), True)
-check("一次 plan 就只含 incubator op",
-      [(p["title"], p.get("op_type")) for p in wd_inc_only.planning.projects],
-      [("唯一孵化 op", "incubator")])
-check("只有一种类型时 stage 也明确",
-      wd_inc_only.planning.stage, "incubator")
+check("只有 incubator 任务时 plan 仍可启动",
+      wd_inc_only.handle("plan +1"), True)
+check("清单里只有 incubator 标签 → 阶段自动推到 bottleneck",
+      wd_inc_only.projects.active_pros()[0]["stage"], "bottleneck")
+check("一次 plan 就只含 incubator 侧",
+      [(p["title"], p.get("side")) for p in wd_inc_only.planning.projects],
+      [("唯一孵化项目", "incubator")])
 wd_inc_only.handle("q")
 
 _gated_rows = [
-    {"id": "p-gated", "name": "被门控的 SOP", "kind": "project_root",
+    {"id": "p-gated", "name": "门控项目", "kind": "project_root",
      "tags": ["project/门控项目"], "completed": False, "dropped": False},
-    {"id": "t-gated", "name": "门控任务", "kind": "action", "project": "被门控的 SOP",
-     "project_id": "p-gated", "estimated_minutes": 25, "completed": False},
+    {"id": "t-gated", "name": "只有 SOP 任务", "kind": "action", "project": "门控项目",
+     "project_id": "p-gated", "estimated_minutes": 25, "completed": False,
+     "tags": ["SOP"]},
 ]
 wd_gated = fresh(_gated_rows)
-wd_gated.handle("op import sop omnifocus:///project/p-gated")
+wd_gated.handle("op import omnifocus:///project/p-gated")
 check("把项目阶段改为 bottleneck", wd_gated.handle("pro 1 stage bottleneck"), True)
-plan_day(wd_gated)
-check("bottleneck 下没有 incubator op，plan 拒绝", wd_gated.handle("plan +1"), True)
-check_true("拒绝理由说清没有当前阶段可排期的 op",
-           any("当前没有可排期的 OmniFocus 项目" in t for t in texts(wd_gated)))
-check("被门控时不会打开 plan 问答", wd_gated.planning, None)
+check("bottleneck 下没有 incubator 任务 → 候选为空",
+      pj.remaining_tasks(wd_gated.projects.active()[0],
+                         side="incubator", default_side=None), [])
+check("plan 仍会打开（没有可排任务由分配时如实报 0）",
+      wd_gated.handle("plan"), True)
+if wd_gated.planning is not None:
+    wd_gated.handle("q")
 
 print("== 5c) plan：跨午夜的场次按开始日归属（今天 23:15–明天 00:05 算今天） ==")
 wd_cross = fresh()

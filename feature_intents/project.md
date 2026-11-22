@@ -7,8 +7,8 @@
 | 模型 | 是什么 | 关键字段 | 命令 |
 |---|---|---|---|
 | `task` | 具体任务，挂 session、执行、完成的最小单位 | `fields` / `session` / `count` | `task ...` |
-| `op` | **OmniFocus Project**，任务清单的母体；只能是 `SOP` 或 `incubator` 两种类型之一 | `op_type` / `omnifocus` / `project_tag` / `pro_id` / `plans` | `op ...`、`task import [sop\|incubator]` |
-| `pro` | **真正项目 Project**，有阶段 `running` / `bottleneck`，可关联一个打开文件 | `stage` / `file` / `sop_op_id` / `incubator_op_id` / `op_ids` | `pro ...`（`project` 同义） |
+| `op` | **OmniFocus Project**，任务清单的母体；**一个 pro 只关联一个**（2026-11-21 起） | `omnifocus` / `project_tag` / `pro_id` / `plans` | `op ...`、`task import` |
+| `pro` | **真正项目 Project**，有阶段 `running` / `bottleneck`，可关联一个打开文件 | `stage` / `file` / `op_id` / `op_ids` | `pro ...`（`project` 同义） |
 
 - `task` 放 `data/tasks.json`：这一场（这一天）要干的活 + op 叶子任务的镜像。
 - `op` 和 `pro` 都放 `data/projects.json`：`projects` 是 op 库，`pros` 是真正项目库。
@@ -39,19 +39,19 @@ op -m active id:1
 ```
 
 - 只改本地账，不写 OmniFocus。
-- completed / dropped 的 op / pro 不再进入 active 列表、`plan`、当前阶段 op 选择。
+- completed / dropped 的 op / pro 不再进入 active 列表、`plan`、当前 op 选择。
 - 数据视图默认 `filter=disposable`，只显示 active；被 mark 掉的记录会隐藏。
   `filter all` 显示全部，`filter completed` / `filter dropped` 单独查看，
   `filter active` 或 `filter disposable` 恢复默认。
 
 ### `op` 和 `pro` 为什么要分开
 
-- 一个真正项目可能先处于 `bottleneck`（瓶颈）阶段，这时只做对应的 **incubator op**；
-  突破瓶颈后进入 `running` 阶段，这时只做普通的 **SOP op**。
-- `op` 是 OmniFocus 里的工作清单；`pro` 是现实中的项目生命周期。
-- 一个 `pro` 可以先后关联多个 `op`：瓶颈期一个 incubator op，运行期一个 SOP op。
+- `op` 是 OmniFocus 里的工作清单；`pro` 是现实中的项目生命周期（阶段、文件、软中断）。
 - op 通过 OmniFocus 标签 `project/<pro名称>` 自动关联 pro；也可以用
   `pro <序号> op <op序号>` / `op <序号> pro <pro序号>` 手动关联。
+- **一个 pro 只该有一个 op**（用户 2026-11-21：「一个 project 对应两个 SOP 和
+  incubator 项目的模式太拖沓了」）。瓶颈期与运行期共用同一个清单，靠**任务标签**
+  分侧，不再开两个 OmniFocus 项目；旧的双 op 数据用 `pro <序号> merge` 迁过来。
 
 ## 数据形状
 
@@ -64,7 +64,7 @@ op -m active id:1
   "projects": [{
     "id": 1,                                  // op 序号 = 预览表上的 #
     "title": "论文写作 SOP",
-    "op_type": "SOP",                         // SOP / incubator / null(待补全)
+    "op_type": null,                          // legacy 字段：新导入不再需要；侧别在任务 tags
     "task_type": "sequential",                // OmniFocus 项目排序规则：sequential / parallel
     "pro_id": 1,                              // 关联的真正项目 pro；null = 未关联
     "project_tag": "学术论文",                // 从 OmniFocus 标签 project/... 提取
@@ -80,7 +80,9 @@ op -m active id:1
       "completed": false, "dropped": false,
       "effective_completed": false, "effective_dropped": false,
       "blocked": false, "rank": 0,
-      "tags": ["project/学术论文", "P1"]  // P1/P2... = 优先级 tag；越小越优先
+      // 侧别 tag：SOP / incubator（必打）；manual_defer = 被冻结
+      // 冻结时 defer 写成十年后，解冻只看「defer 在五年之后」这个哨兵
+      "tags": ["project/学术论文", "SOP", "P1"]
     }],
     "plans": {
       "2026-11-04": {
@@ -94,10 +96,11 @@ op -m active id:1
   "pros": [{
     "id": 1,
     "title": "学术论文",
-    "stage": "running",                       // running / bottleneck
+    "stage": "running",                       // running / bottleneck（只决定排哪一侧）
     "file": "/Users/me/paper/outline.md",     // open + Enter 顺便打开的文件
-    "sop_op_id": 1,                           // 当前运行期 SOP op
-    "incubator_op_id": null,                  // 瓶颈期 incubator op
+    "op_id": 1,                               // 唯一关联的 op（新模型）
+    "sop_op_id": 1,                           // legacy：旧双 op 数据还看它
+    "incubator_op_id": null,                  // legacy
     "op_ids": [1],
     "status": "active",                       // active / completed / dropped
     "status_at": null, "status_reason": null,
@@ -152,16 +155,66 @@ op -m active id:1
    - 也可以显式 `pro <序号> op <op序号>` 手动绑定；
 5. 清单里的任务**一条都不进任务库**（不占 session、不上任务面板）。
 
-### 类型（`SOP` / `incubator`）与阶段（`running` / `bottleneck`）
+### 侧别标签（`SOP` / `incubator`）与阶段（`running` / `bottleneck`）
 
-- 每个 op 必须有一个类型：`SOP` 或 `incubator`；
-- 每个 pro 必须有一个阶段：`running` 或 `bottleneck`；
-- **门控规则**：
-  - pro 在 `running` → 只允许普通 `SOP` op 进行；
-  - pro 在 `bottleneck` → 只允许对应的 `incubator` op 进行；
-  - 未关联任何 pro 的 op → 按自身类型放行；
-- `refresh` / 每日对账会主动检查 active op：发现 `op_type` 为空的，就再次把
-  `SOP / incubator` 提示顶到打断栏位，直到用户补全或输入 `skip`。
+2026-11-21 起**类型不再是 op 的属性**，而是**任务标签**：
+
+- 每个 op 的任务打一个侧别标签：`SOP` 或 `incubator`（大小写不敏感，
+  `inc` / `patch` 也认成 incubator）；
+- 每个 pro 仍有阶段：`running` / `bottleneck`，它只决定**排哪一侧**：
+  - `running` → 只取 `SOP` 标签的任务；
+  - `bottleneck` → 只取 `incubator` 标签的任务；
+- 没打侧标签的任务**两边都不进**（用户原话：「项目文件夹中不应该出现没有 tag
+  的任务」）；`refresh` 会在警告板和 `project` 列表里点名，`pro <序号> merge`
+  会按旧的 op 类型自动补标签；
+- 导入不再问类型：`task import sop|incubator` 仍认（兼容旧脚本），但不再强制，
+  也不再弹 `pending_op_type` 补全面板。
+
+#### 冻结：非活跃侧 defer 十年
+
+为了 OmniFocus 里「只看得到当前该干的活」，用户 2026-11-21 定了冻结规则：
+
+- 非活跃一侧的每个未完成任务：`defer` 推到**十年后**，并打 `manual_defer` 标签；
+- 活跃一侧里 `defer` 在**五年之后**（我们设的哨兵）或带 `manual_defer` 的：
+  清掉 defer、摘掉标签（解冻）；
+- **普通 defer（五年以内）一个字都不动** —— 十年这个值就是用来和用户自己设的
+  普通 defer 区分开的判据；
+- 冻结只影响 `plan` 候选（以及 OmniFocus 里的可见性），**不动**
+  `count_invested`，也不取消已经挂上的 session；
+- 谁触发：`pro <序号> -a` / `pro <序号> stage ...` 切换时立即执行；`refresh`
+  每两分钟做一次幂等检查（`_maybe_sync_sides`），只写有变化的任务。
+
+#### push / defer / pop（切换时的队列语义）
+
+用户 2026-11-21 原话：「把需要改的（软中断）放到 warden 保存……在每次切换的时候
+暂停，或者说把当前没有做完的内容进行一个 defer」。落地成三条：
+
+1. **push**：切到 `bottleneck` 时，把 pro 上 `pending` / `queued` 的软中断
+   **每条 dump 成一条 25 分钟任务**（标签 `incubator`，`local_only`，不写
+   OmniFocus），按原顺序插到项目清单**最前**；
+2. **defer**：原来排在最前、没做完的 SOP 任务自然退到它们后面；`count_invested`
+   原样保留（干到 1/3 就是 1/3），状态由 `manual_defer` + 十年 defer 表达；
+3. **pop**：bottleneck 下**最后一条 incubator 任务勾掉**时，自动切回 `running`
+   并解冻 SOP 侧（不用再手敲 `pro <序号> -a`）。`task done` 那条流水线里做，
+   失败只记日志、不挡完成。
+
+软中断本身仍在 `pro.soft_interrupts`（`pending` → `queued` → `handled`），
+**不再为了它新建一个 OmniFocus 项目**；`pro <序号> interrupt --soft --check`
+只负责逐条入队，dump 发生在切阶段时（如果已经在 bottleneck，则当场 dump）。
+
+### 迁移：`pro <序号> merge [--yes]`
+
+把旧的双 op 迁成「一个项目 + 侧标签」：
+
+1. 把 incubator op 里未完成的任务在 OmniFocus 里 `moveTasks` 到 SOP op 最前
+   （倒序移动，保持原清单顺序）；
+2. 两边未完成任务补齐侧标签（`incubator` / `SOP`）；
+3. 本地合并清单（src 插到 dst 最前），src op 标 `dropped`、解除关联，
+   `pro.op_id` 指向唯一那条；
+4. 按当前阶段冻结非活跃侧。
+
+不带 `--yes` 只预览条数；OmniFocus 离线时拒绝执行（先远端后本地，避免分叉）。
+合并后 OmniFocus 里空出来的旧项目由用户自己删（warden 不动外部项目结构）。
 
 ### 标签 `project/...`
 
@@ -247,14 +300,14 @@ op「论文写作 SOP」 op_type=SOP   pro_id=1
 ## 项目表：挂在任务面板下面
 
 契约视图里，`Task · 任务` 面板**下面**那张表（`render_projects_table()`）。
-它把真正项目 `pro` 和当前活跃的 op 合成一行；**每个 pro 只显示当前阶段对应的
-那一个 op**（running → SOP，bottleneck → incubator），不会同时铺开 SOP 与
-incubator 两套账。没有关联 pro 的孤立 op 不出现在这张表里，仍用 `op` 命令管理。
+一个 pro 一行、一个 op 一行；**账只算当前活跃侧**（running → SOP 标签的任务，
+bottleneck → incubator 标签的任务），另一侧显示成「+N 冻结」。没有关联 pro 的
+孤立 op 不出现在这张表里，仍用 `op` 命令管理。
 
 ```
- #  项目 / 当前 op          阶段 / 类型      剩余 count  进度   今天 plan          未完成  OmniFocus
- 1  论文 → 论文写作 SOP      running · SOP   9          1/10   说好 4 count·已排 4   3     p-abc
- 2  算法攻关 → 破局孵化      bottleneck · inc 5         0/5    —                  2     p-inc
+ #  项目 / 当前 op        阶段 · 活跃侧    剩余 count       进度   今天 plan           未完成  OmniFocus
+ 1  论文 → 论文写作 SOP    running · SOP    9（+4 冻结）     1/10   说好 4 count·已排 4   3     p-abc
+ 2  算法攻关 → 破局清单    bottleneck · inc 5               0/5    —                   2     p-inc
 ```
 
 | 列 | 怎么算 |
@@ -277,14 +330,15 @@ incubator 两套账。没有关联 pro 的孤立 op 不出现在这张表里，�
 用户原话：*首先列出元数据，比如说总共多少空闲时间，同时，展示时间 / 25 的 count；
 然后询问每个 project 如何分配时间*。
 
-`plan` 只有**一次**分配，不再先排 SOP 再切 incubator：
+`plan` 只有**一次**分配：
 
 - 候选 op 必须**关联了真正项目 `pro`**；孤立 op 不进 plan；
-- 每个 pro 只取当前阶段的**那一个** op：`running → SOP`，
-  `bottleneck → incubator`；
-- 如果不同项目阶段不同，同一次 plan 里会同时出现这些项目的当前 op；
+- 每个 pro 用它的那一个 op，**任务按侧别过滤**：`running` 只挑 `SOP` 标签、
+  `bottleneck` 只挑 `incubator` 标签（`project_plan.plan_ops()` 把
+  `side` / `default_side` 注入给 `remaining_tasks`）；
+- 没打侧标签的任务不进候选；不同项目阶段不同时，同一次 plan 里各自挑自己那一侧；
 - 先收集所有空场，问每个项目分多少 count，`complete` 一次应用并结束；
-- 不再有「SOP 阶段 complete 后自动进入 incubator 阶段」。
+- 不再有「SOP 阶段 complete 后自动进入 incubator 阶段」，也不再需要两个 op。
 
 ### 1) 元数据（容量）
 
@@ -630,17 +684,18 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 
 | 命令 | 作用 |
 |---|---|
-| `task import sop` / `task import incubator` | 导入 OmniFocus 项目（op）并说明类型；时长缺一条就整批拒绝 |
-| `op import sop\|incubator [链接]` | 同上，专门的 op 命令 |
+| `task import` | 导入 OmniFocus 项目（op）；不再需要说明 SOP / incubator 类型；时长缺一条就整批拒绝 |
+| `op import [链接]` | 同上，专门的 op 命令 |
 | `op` / `op <序号>` | 列出 op / 看某个 op 的详情与清单 |
-| `op <序号> sop\|incubator` | 修改 op 类型（refresh 发现缺类型时也走这个） |
+| `op <序号> sop\|incubator` | legacy：给旧 op 标类型（新数据不需要；`merge` 迁移时用得上） |
 | `op <序号> pro <pro序号\|none>` | 关联 / 解绑真正项目 pro |
 | `op <序号> refresh` / `op <序号> remove` | 刷新 / 移除 op |
 | `op <序号> relate --export` / `-e` | 在 `relate-dir` 生成 incubator SOP 模板（只对 incubator op 有效） |
 | `op <序号> relate --import [绝对路径]` | 解析模板：资源准备任务列表 → incubator op；具体的 SOP 流程 → 对应 SOP op |
 | `pro` / `project` | 列出真正项目 pro 和 op 库 |
 | `pro create <名称> [file=<路径>] [stage=running\|bottleneck]` | 新建 / 更新真正项目 pro |
-| `pro <序号> -a` / `--advance [op <N>\|task import]` | 切换阶段（running ↔ bottleneck）并关联新的 op |
+| `pro <序号> -a` / `--advance` | 切换阶段（running ↔ bottleneck）：冻结旧侧、解冻新侧；切到 incubator 时把软中断 dump 成任务。旧的 `-a op <N>` / `-a task import` 仍可显式关联 op |
+| `pro <序号> merge [--yes]` | 迁移：旧双 op 合成一个项目 + 补侧标签（先预览） |
 | `project <序号> -a <session>` / `-ac` | 直接把该项目第一条任务挂到指定场 / 当前场 |
 | `pro <序号> file <路径\|clear>` | 关联 / 清空“`open` + Enter 顺便打开”的文件 |
 | `pro <序号> open` / `open pro <序号>` | 直接打开关联文件 |
@@ -648,7 +703,7 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `pro <序号> op <op序号>` | 关联已有 op |
 | `pro <序号> refresh` / `remove` | 刷新关联 op / 删除 pro |
 | `pro <序号> interrupt [--soft\|-s]` | 软中断（默认）：保存一条建议/问题，选 A/B/C 类别；不碰 session |
-| `pro <序号> interrupt --soft --check` | 逐条检查软中断：不处理 / 入队 / 丢弃（保存数据）；最后生成 incubator 任务 |
+| `pro <序号> interrupt --soft --check` | 逐条检查软中断：不处理 / 入队 / 丢弃（保存数据）；已入队的攒着，切到 incubator 时每条 dump 成 25 分钟任务 |
 | `pro <序号> interrupt --hard` | 硬中断当前进行中的 session：下架这一场所有任务，等 title 后新建整场任务挂回去 |
 | `conscription` / `cst [session序号\|current]` | 按剩余时间快速征召一条合适任务挂进当前/下一场 |
 | `project <序号> refresh` / `remove` | 刷新该 pro 关联的 op / 删除 pro（op 仍用 `op ... remove`） |
@@ -657,8 +712,8 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `plan -s <session> -p <project>` | sessional plan：把指定项目按自身 sequential/parallel 规则排进指定 session |
 | `pro <序号> <count>` / `pro <序号> clear` / `clear` / `complete` / `q` | plan 里的项目分配（`op` 与 `pro` 同义，只是强调操作对象是 op） |
 | `task <任务> <count>` / `task <任务> clear` | plan 里的**任务固定项**：把任意一条任务当成「只有一个任务的独立项目」排；序号按当前界面（契约 = 任务面板序号，数据 = 任务库 id，`id:N` 永远认 id） |
-| `task <任务> -p <项目序号>` | 改归属：移到该 pro 当前阶段的 op（写回 OmniFocus，放目标项目**第一行**） |
-| `task <任务> -ps <项目序号>` / `-pi <项目序号>` | `--project sop` / `--project incubator` 的缩写：走该 pro 的 SOP / incubator op，可越过 running/bottleneck 阶段门控 |
+| `task <任务> -p <项目序号>` | 改归属：移到该 pro 的唯一 op（写回 OmniFocus，放目标项目**第一行**） |
+| `task <任务> -ps <项目序号>` / `-pi <项目序号>` | 旧写法的兼容：现在一个 pro 只有一个 op，`-ps` / `-pi` / `-p` 都指向它 |
 
 ### `pro <序号> interrupt`：默认软中断
 
@@ -695,14 +750,15 @@ pro 1 interrupt --soft --list  # 查看历史（含 discarded）
 q 中止
 ```
 
-全部检查完后询问任务时长 `25 / 50 / 75`。确认后：
+全部检查完后，入队的条目**攒着不建任务**（2026-11-21 起）：
 
-1. 本次入队的所有条目合成一条任务（标题取第一条，备注保留全部条目和类别）；
-2. 项目自动切到 `bottleneck`；
-3. 如果项目已有 incubator op，任务以 `local_only` 记录插到该 op 清单**最前面**，
-   并镜像成本地任务；没有 incubator op / 未绑定 OmniFocus 时，任务只落本地任务库，
-   不尝试写 OmniFocus；
-4. 入队条目状态改为 `handled` 并记下 `task_id`；问号消失。
+1. 已入队的条目标为 `queued`，问号继续显示；
+2. 切到 `bottleneck`（`pro <序号> -a`）时，每条软中断 dump 成一条 **25 分钟**
+   任务：标签 `incubator`（`local_only`，不写 OmniFocus），按原顺序插到清单最前；
+3. 原来排在最前的 SOP 任务退到后面，`count_invested` 不动（defer 十年 + 
+   `manual_defer` = 冻结，OmniFocus 里看不见）；
+4. 如果切换时已经在 `bottleneck`，`--check` 结束当场 dump；条目状态改为 `handled`；
+5. `task done` 勾掉最后一条 incubator 任务时，自动切回 `running` 并解冻 SOP 侧。
 
 ### `pro <序号> interrupt --hard`
 

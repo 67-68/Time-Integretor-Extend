@@ -182,7 +182,9 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
                                        now=now, exclude_pks=excluded,
                                        rotation=rotation,
                                        derived_budget=need,
-                                       skip_pks=skipped):
+                                       skip_pks=skipped,
+                                       side=project.get("side"),
+                                       default_side=project.get("default_side")):
             if budget <= 0:
                 break
             minutes = int(item.get("minutes") or 0)
@@ -854,7 +856,7 @@ class Allocator(object):
         self.day = day
         # 现在一次 plan 里可能同时有不同项目阶段对应的 op（一个 running 的 SOP、
         # 一个 bottleneck 的 incubator），所以不再把整场 plan 标成某个全局阶段。
-        types = {pj.normalize_op_type((p or {}).get("op_type"))
+        types = {pj.normalize_pro_stage((p or {}).get("stage"))
                  for p in (projects or [])}
         types.discard(None)
         self.stage = next(iter(types)) if len(types) == 1 else "mixed"
@@ -927,7 +929,7 @@ class Allocator(object):
 
     # -- 给界面用的文字 -----------------------------------------------
     def headline(self):
-        return "%s 项目资源分配（%d 个当前 op · %d 个空场 = %d count）" % (
+        return "%s 项目资源分配（%d 个项目 · %d 个空场 = %d count）" % (
             self.day.isoformat() if hasattr(self.day, "isoformat") else self.day,
             len(self.projects), self.cap()["sessions"], self.cap()["counts"])
 
@@ -954,26 +956,30 @@ class Allocator(object):
         """面板正文：[(文本, 样式)]。"""
         cap = self.cap()
         out = [("🗂 %s" % self.headline(), "bold cyan"),
-               ("  每个项目只显示当前阶段对应的 op：running → SOP / "
-                "bottleneck → incubator", "dim"),
+               ("  每个项目只排当前阶段那一侧的任务：running → SOP / "
+                "bottleneck → incubator（同一份清单按任务标签分侧）", "dim"),
                ("  空闲 %s" % capacity_text(cap), "dim"),
                ("  空场 %s" % slots_text(self.slots), "dim")]
         if not self.projects:
-            out.append(("  （没有关联真正项目且阶段匹配的 op）", "yellow"))
+            out.append(("  （没有关联真正项目的 op）", "yellow"))
         invested_all = {}
         if self.task_store is not None:
             invested_all = pj.invested_by_project(self.task_store)
         for index, project in enumerate(self.projects, 1):
             plan = pj.plan_of(project, self.day)
-            stat = pj.stats(project, self.task_store, invested_all.get(project["id"]) or {})
+            side = project.get("side") or pj.side_for_stage(project.get("stage"))
+            stat = pj.stats(project, self.task_store,
+                            invested_all.get(project["id"]) or {},
+                            side=side, default_side=project.get("default_side"))
             got = self.allocation_of(project["id"])
-            op_kind = pj.normalize_op_type(project.get("op_type")) or pj.OP_TYPE_SOP
             pro = self.pro_map.get(project["id"])
             pro_title = ((pro or {}).get("display_title")
                          or (pro or {}).get("title"))
-            pro_txt = (" · pro:%s(%s)" % (pro_title, pro.get("stage"))
+            pro_txt = (" · pro:%s(%s)" % (pro_title,
+                                          (pro or {}).get("stage")
+                                          or project.get("stage"))
                        if pro else "")
-            bits = ["[%s · %s%s]" % (op_kind, pj.task_type_of(project), pro_txt),
+            bits = ["[%s 侧 · %s%s]" % (side, pj.task_type_of(project), pro_txt),
                     "剩余 %d count" % stat["remaining"],
                     "进度 %s" % stat["progress_text"]]
             if plan and plan.get("count"):
@@ -1003,7 +1009,7 @@ class Allocator(object):
         parts = raw.split()
         head = parts[0].lower()
         if head in HELP_TOKENS:
-            self.say("pro <序号> <count>：给第几个当前 op 分几个 count（1 count = 25 "
+            self.say("pro <序号> <count>：给第几个项目分几个 count（1 count = 25 "
                      "分钟）；再敲一次是覆盖。pro <序号> clear：清空；"
                      "pro <序号>：只看清单。", "info")
             self.say("task <任务> <count>：把一条任意任务固定分到这么多 count"
@@ -1011,7 +1017,7 @@ class Allocator(object):
                      "面板序号，数据 = 任务库内部 id。", "info")
             self.say("task <任务> clear：撤掉这条任务的固定项；"
                      "task <任务> -p <项目序号>：改归属（写回 OmniFocus，放在项目最前）；"
-                     "`-ps` / `-pi` 分别指项目的 SOP / incubator op。", "info")
+                     "`-ps` / `-pi` 是旧写法，现在和 `-p` 一样（一个项目只有一个 op）。", "info")
             self.say("complete：分配完了，开始挑任务、排进 session；q：放弃这次 plan。",
                      "info")
             return {"action": "handled"}
@@ -1277,8 +1283,12 @@ class Allocator(object):
         invested = (pj.invested_by_project(self.task_store).get(project["id"]) or {}
                     if self.task_store else {})
         items = pj.remaining_tasks(project, invested,
-                                   exclude_pks=self._queue_exclusions(project))
-        stat = pj.stats(project, self.task_store, invested)
+                                   exclude_pks=self._queue_exclusions(project),
+                                   side=project.get("side"),
+                                   default_side=project.get("default_side"))
+        stat = pj.stats(project, self.task_store, invested,
+                        side=project.get("side"),
+                        default_side=project.get("default_side"))
         self.say("📁 #%d %s：剩余 %d count（进度 %s），分到 %d count"
                  % (self.projects.index(project) + 1, project.get("title"),
                     stat["remaining"], stat["progress_text"],

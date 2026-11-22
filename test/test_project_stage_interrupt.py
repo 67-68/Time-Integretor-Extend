@@ -215,14 +215,14 @@ check("运行项目当前只取新 SOP op",
 check("孵化项目当前只取 incubator op",
       wd.projects.current_op_for_pro(_pros[1])["title"], "孵化 Inc")
 check("plan_ops 排除旧 SOP / 孤立 op，只留两个当前 op",
-      [(op["title"], op["op_type"]) for op in wd.projects.plan_ops()],
+      [(op["title"], op["side"]) for op in wd.projects.plan_ops()],
       [("运行 SOP 新", "SOP"), ("孵化 Inc", "incubator")])
 
 print("== 契约项目显示：只画当前活跃 op ==")
 rows = wd.current_project_rows()
 check("每个 pro 一行", [r["pro_title"] for r in rows], ["运行项目", "孵化项目"])
 check("行上只出现当前 op",
-      [(r["active_op_type"], r["active_op"]["title"]) for r in rows],
+      [(r["active_side"], r["active_op"]["title"]) for r in rows],
       [("SOP", "运行 SOP 新"), ("incubator", "孵化 Inc")])
 _buf = io.StringIO()
 wd.console = Console(file=_buf, width=220, force_terminal=False)
@@ -247,7 +247,7 @@ print("== plan：一次处理所有项目当前阶段 ==")
 book_all(wd)                                  # 明天 T1 50+25（尾部还空 30min）、T2 50
 check("plan +1 受理", wd.handle("plan +1"), True)
 check("同一次 plan 同时出现 SOP 与 incubator",
-      [(p["title"], p.get("op_type")) for p in wd.planning.projects],
+      [(p["title"], p.get("side")) for p in wd.planning.projects],
       [("运行 SOP 新", "SOP"), ("孵化 Inc", "incubator")])
 check("没有全局阶段切换", wd.planning.stage, "mixed")
 # T1 手动 [50,25] = 3 count，占 11:00–12:30（含休息）；尾巴 12:30–13:00 还有

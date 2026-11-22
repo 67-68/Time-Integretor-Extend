@@ -46,11 +46,12 @@ class ProjectMixin(object):
         return self.projects.preview(day or self.sel_date, self.task_store)
 
     def current_project_rows(self, day=None):
-        """契约视图用的项目行：每个 Pro 只显示**当前阶段对应的那一个 op**。
+        """契约视图用的项目行：每个 Pro 一行，账只算**当前活跃侧**。
 
-        ``running`` 只显示 SOP op，``bottleneck`` 只显示 incubator op；未关联
-        真正项目 ``pro`` 的孤立 op 不在这里出现（仍可在 ``op`` 命令里管理）。
-        行上的 ``number`` 用 Pro 序号，``op_number`` 另存 op 原序号。
+        2026-11-21 起一个 Pro 只有一个 op，SOP / incubator 是任务标签：
+        ``running`` 只算 SOP 侧，``bottleneck`` 只算 incubator 侧；另一侧的任务
+        显示成「+N 冻结」。未关联真正项目 ``pro`` 的孤立 op 不在这里出现
+        （仍可在 ``op`` 命令里管理）。
         """
         day = day or self.sel_date
         op_rows = {row["id"]: row for row in self.project_rows(day)}
@@ -60,6 +61,22 @@ class ProjectMixin(object):
             if op is None:
                 continue
             row = dict(op_rows.get(op["id"]) or {})
+            side = pr.get("active_side") or pj.side_for_stage(pr["stage"])
+            other = (pj.OP_TYPE_SOP if side == pj.OP_TYPE_INCUBATOR
+                     else pj.OP_TYPE_INCUBATOR)
+            default_side = pj.normalize_op_type(op.get("op_type"))
+            stat = pj.stats(op, self.task_store, side=side,
+                            default_side=default_side)
+            other_stat = pj.stats(op, self.task_store, side=other,
+                                  default_side=default_side)
+            open_tasks = [t for t in (op.get("tasks") or ())
+                          if not t.get("completed") and not t.get("dropped")
+                          and not t.get("effective_completed")
+                          and not t.get("effective_dropped")]
+            frozen = [t for t in open_tasks if pj.task_is_frozen(t)]
+            untagged = [t for t in open_tasks
+                        if pj.side_of_tags(t.get("tags") or ()) is None
+                        and default_side is None]
             row.update({
                 "number": pr["number"],
                 "pro_id": pr["id"],
@@ -69,10 +86,20 @@ class ProjectMixin(object):
                 "pro_title": self.pro_display_title(pr, fallback=pr["title"]),
                 "pro_title_raw": pr["title"],
                 "pro_stage": pr["stage"],
-                "effective_stage": pr.get("effective_stage") or pr["stage"],
-                "stage_mismatch": bool(pr.get("stage_mismatch")),
+                "effective_stage": pr["stage"],
+                "stage_mismatch": False,
+                "active_side": side,
                 "active_op": op,
-                "active_op_type": pr.get("active_op_type"),
+                "remaining": stat["remaining"],
+                "remaining_high": stat["remaining_high"],
+                "remaining_text": stat["remaining_text"],
+                "progress": stat["progress"],
+                "progress_text": stat["progress_text"],
+                "other_remaining": other_stat["remaining"],
+                "other_side": other,
+                "frozen_count": len(frozen),
+                "untagged": [t.get("title") or t.get("pk") for t in untagged],
+                "legacy_extra_ops": pr.get("legacy_extra_ops") or [],
             })
             out.append(row)
         return out
@@ -312,19 +339,19 @@ class ProjectMixin(object):
     def render_projects_table(self):
         """契约视图里**任务面板下面**那块项目表。
 
-        每个真正项目 ``pro`` 一行，只展示当前阶段的 op：running → SOP，
-        bottleneck → incubator。这样表里不会同时出现同一个项目的 SOP 和
-        incubator 两套资源，plan 的序号也和这张表一致。
+        每个真正项目 ``pro`` 一行，只算**当前活跃侧**的账：``running`` 算 SOP
+        任务，``bottleneck`` 算 incubator 任务。另一侧（已经冻结在十年后）
+        显示成「+N 冻结」，和 OmniFocus 列表里看不到它们一致。
         """
         rows = self.current_project_rows()
         if not rows:
             return None
-        t = Table(title="Project · 项目（每个 Pro 只显示当前阶段活跃的 op）",
+        t = Table(title="Project · 项目（一个项目一个 op；SOP / incubator 是任务标签）",
                   box=box.SIMPLE_HEAVY, header_style="bold blue",
                   title_justify="left", expand=False)
         t.add_column("#", justify="right", style="bold", no_wrap=True)
         t.add_column("项目 / 当前 op", no_wrap=True, overflow="crop")
-        t.add_column("阶段 / 类型", no_wrap=True)
+        t.add_column("阶段 · 活跃侧", no_wrap=True)
         t.add_column("排序", no_wrap=True)
         t.add_column("剩余 count", justify="right", no_wrap=True)
         t.add_column("进度", justify="right", no_wrap=True)
@@ -340,28 +367,26 @@ class ProjectMixin(object):
                     plan_txt += " · 已排 %d" % row["scheduled"]
             elif row.get("scheduled"):
                 plan_txt = "已排 %d count" % row["scheduled"]
-            op_kind = row.get("active_op_type") or row.get("op_type") or "?"
-            stage = (row.get("effective_stage") or row.get("pro_stage")
-                     or "running")
-            type_txt = "%s · %s" % (stage, op_kind)
-            type_style = ("magenta" if op_kind == pj.OP_TYPE_INCUBATOR
+            stage = row.get("pro_stage") or "running"
+            side = row.get("active_side") or pj.side_for_stage(stage)
+            type_txt = "%s · %s" % (stage, side)
+            type_style = ("magenta" if side == pj.OP_TYPE_INCUBATOR
                           else "cyan")
-            if row.get("stage_mismatch"):
-                type_txt += " ⚠阶段按实际 op 推导"
-            if not row.get("allowed", True):
-                type_txt += " ⏸"
-                type_style = STYLE_MUTED
             task_type = pj.task_type_of(row)
             task_type_style = ("yellow" if task_type == pj.TASK_TYPE_SEQUENTIAL
                                else "cyan")
             op_title = (row.get("active_op") or {}).get("title") or "?"
+            remain_txt = str(row.get("remaining_text")
+                             or row.get("remaining") or 0)
+            frozen = int(row.get("frozen_count") or 0)
+            if frozen:
+                remain_txt += "（+%d 冻结）" % frozen
             t.add_row(str(row["number"]),
                       Text("%s → %s" % (row.get("pro_title") or "?", op_title),
                            overflow="crop"),
                       Text(type_txt, style=type_style),
                       Text(task_type, style=task_type_style),
-                      Text(str(row.get("remaining_text")
-                               or row.get("remaining") or 0), style="bold cyan"),
+                      Text(remain_txt, style="bold cyan"),
                       Text(row.get("progress_text") or "—", style=STYLE_MUTED),
                       Text(plan_txt, style="green" if row.get("allocated") else STYLE_MUTED),
                       Text(str(row.get("tasks_open") or 0), style=STYLE_MUTED),
@@ -374,11 +399,19 @@ class ProjectMixin(object):
                          for r in rows)
         left_txt = ("%d-%d" % (total_remaining, total_high)
                     if total_high > total_remaining else str(total_remaining))
-        t.caption = ("%d 个活跃项目 · 剩余 %s count（%d 分钟）· 只显示当前阶段对应的 "
-                     "op（running=SOP / bottleneck=incubator）· 排序列 = 该项目检测到的 "
+        untagged = sum(len(r.get("untagged") or ()) for r in rows)
+        legacy = sum(1 for r in rows if r.get("legacy_extra_ops"))
+        extra = ""
+        if untagged:
+            extra += " · ⚠ %d 条任务没有 SOP/incubator 标签（不进 plan）" % untagged
+        if legacy:
+            extra += " · %d 个项目还是双 op，跑 `pro <序号> merge` 合并" % legacy
+        t.caption = ("%d 个活跃项目 · 剩余 %s count（%d 分钟）· 只算当前阶段那一侧；"
+                     "另一侧任务 defer 十年、在 OmniFocus 里不可见 · 排序列 = 该项目检测到的 "
                      "OmniFocus 规则（sequential / parallel）· `plan` 也按同一份清单分配"
+                     "%s"
                      % (len(rows), left_txt,
-                        total_remaining * pp.MINUTES_PER_COUNT))
+                        total_remaining * pp.MINUTES_PER_COUNT, extra))
         return t
 
     @staticmethod
@@ -492,21 +525,412 @@ class ProjectMixin(object):
             title, stage=stage, op_id=op["id"])
         return pro
 
+    # -- 单项目模型：侧别冻结 / push / pop（2026-11-21） ------------------
+
+    def _merge_pro_ops(self, pro, tail_tokens=None):
+        """``pro <序号> merge [--yes]``：把旧的双 op 迁成「一个项目 + 侧标签」。
+
+        顺序固定（先外部、后本地，失败可分叉最少）：
+
+        1. 把 incubator op 里**未完成**的任务在 OmniFocus 里 move 到 SOP op 最前；
+        2. 两边未完成任务补齐侧标签（incubator / SOP）；
+        3. 本地清单合并（src 任务插到 dst 最前），src op 标 dropped、解除关联；
+        4. 按 pro 当前阶段冻结非活跃侧。
+
+        不带 ``--yes`` 只预览（列出会动几条）。OmniFocus 不可用时拒绝执行，
+        避免本地和远端分叉。单 op 的 pro 也会跑：只补标签 + 冻结/解冻。
+        """
+        toks = [str(t).strip() for t in (tail_tokens or ()) if str(t).strip()]
+        yes = any(t.lower() in ("--yes", "-y", "yes", "确认", "执行") for t in toks)
+        pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
+        title = self.pro_display_title(pro, fallback=pro.get("title"))
+        ops = self.projects.ops_for_pro(pro)
+        stage = pj.normalize_pro_stage(pro.get("stage")) or pj.STAGE_RUNNING
+
+        def _open(project):
+            return [x for x in (project.get("tasks") or ())
+                    if not x.get("completed") and not x.get("dropped")
+                    and not x.get("effective_completed")
+                    and not x.get("effective_dropped")]
+
+        if len(ops) > 2:
+            raise ValueError("项目 #%s 关联了 %d 个 op，先手动清理到 1–2 个再 merge。"
+                             % (pnum, len(ops)))
+        if len(ops) == 2:
+            sop = next((op for op in ops
+                        if (pj.normalize_op_type(op.get("op_type")) or pj.OP_TYPE_SOP)
+                        == pj.OP_TYPE_SOP), ops[0])
+            src = next(op for op in ops if op["id"] != sop["id"])
+            dst = sop
+        elif len(ops) == 1:
+            src = None
+            dst = ops[0]
+        else:
+            # 一个 op 都没有：只按当前阶段把 pro 的绑定理顺（没有任务可动）。
+            self.projects.ensure_tagged_pros()
+            self.say("项目 #%s「%s」没有关联任何 op；先把 OmniFocus 项目导进来。"
+                     % (pnum, title), "warn")
+            return pro
+
+        src_open = _open(src) if src is not None else []
+        dst_open = _open(dst)
+        dst_side = (pj.normalize_op_type(dst.get("op_type")) or pj.OP_TYPE_SOP)
+        src_side = (pj.normalize_op_type((src or {}).get("op_type"))
+                    or pj.OP_TYPE_INCUBATOR)
+        need_tag = [(t, dst_side) for t in dst_open
+                    if pj.side_of_tags(t.get("tags") or ()) is None]
+        need_tag += [(t, src_side) for t in src_open
+                     if pj.side_of_tags(t.get("tags") or ()) is None]
+        move_tasks = [t for t in src_open
+                      if (dst.get("omnifocus") or {}).get("id")
+                      and not str(t.get("pk") or "").startswith("soft-")]
+
+        if not yes:
+            self.say("🔀 预览：项目 #%s「%s」%s"
+                     % (pnum, title,
+                        ("把 op #%s「%s」并进 op #%s「%s」" % (
+                            self.projects.number_of(src["id"]) or src["id"],
+                            src.get("title"),
+                            self.projects.number_of(dst["id"]) or dst["id"],
+                            dst.get("title")))
+                        if src is not None else "只有一个 op，只补标签"),
+                     "cmd")
+            self.say("   会移动 %d 条未完成任务、补 %d 条侧标签，然后按 %s 阶段冻结非活跃侧。"
+                     "确认后加 `--yes` 执行。"
+                     % (len(move_tasks), len(need_tag), stage), "info")
+            return pro
+
+        omni_ops = []
+        dst_pk = (dst.get("omnifocus") or {}).get("id")
+        if src is not None and move_tasks and (self.offline
+                                               or not self.omnifocus_enabled()):
+            raise ValueError("OmniFocus 不在线：merge 需要先把任务挪进目标项目，"
+                             "离线执行会让本地和远端分叉。等 OmniFocus 可用了再来。")
+        # 倒序移动：每次放进项目最前，最后顺序 = 原来的清单顺序。
+        for item in reversed(move_tasks):
+            omni_ops.append({"id": str(item.get("pk")), "op": "move",
+                             "project": dst_pk, "position": "first"})
+        for item, side in need_tag:
+            pk = str(item.get("pk") or "")
+            if pk.startswith("soft-"):
+                continue
+            omni_ops.append({"id": pk, "op": "set", "tags": {"add": [side]}})
+        omni_res = {}
+        if omni_ops and (self.offline or not self.omnifocus_enabled()):
+            # 单 op 补标签 / 冻结：本地照做，OmniFocus 侧跳过并说清楚（别撒谎）。
+            omni_res = {"skipped": "offline"}
+            self.say("⚠ OmniFocus 不在线：标签和 defer 只改了本地快照；"
+                     "等它可用了再跑一次 `pro %d merge --yes` 补写外部。"
+                     % pnum, "warn")
+        elif omni_ops:
+            res = self.omnifocus.flush(omni_ops)
+            results = res.get("results") or []
+            bad = [r for r in results if not r.get("ok")]
+            omni_res = {"ops": len(omni_ops), "failed": len(bad)}
+            if bad:
+                rl.log_event("project", "merge_partial", level="warning",
+                             pro=pro["id"], failed=len(bad),
+                             first=(bad[0].get("error") or bad[0].get("message") or ""))
+                self.say("⚠ OmniFocus 有 %d 条没处理成功（%s）；本地照常合并，"
+                         "下次 `project refresh` 会对账。"
+                         % (len(bad),
+                            bad[0].get("error") or bad[0].get("message") or "?"),
+                         "warn")
+        moved = []
+        if src is not None:
+            _dst, moved = self.projects.merge_ops(dst["id"], src["id"],
+                                                  tag=src_side, reason="merged")
+        # 合并之后给目标清单里仍没侧标签的任务补上（本地）。
+        changes = {}
+        for item in _open(self.projects.by_id(dst["id"])):
+            if pj.side_of_tags(item.get("tags") or ()) is not None:
+                continue
+            tags = [str(t).strip() for t in (item.get("tags") or ())
+                    if str(t).strip()]
+            if src_side != dst_side and src is not None and any(
+                    str(m.get("pk")) == str(item.get("pk")) for m in moved):
+                tags.append(src_side)
+            else:
+                tags.append(dst_side)
+            changes[str(item.get("pk"))] = {"tags": tags}
+        if changes:
+            self.projects.update_tasks(dst["id"], changes)
+        sync = self._sync_side_visibility(pro)
+        rl.log_event("project", "merge", level="info", pro=pro["id"],
+                     dst=dst["id"], src=(src or {}).get("id"),
+                     moved=len(moved), tagged=len(changes), omni=omni_res,
+                     frozen=sync.get("frozen"), thawed=sync.get("thawed"))
+        self.say("✅ 项目 #%s「%s」已并成一个 op #%s「%s」：移动 %d 条、补标签 %d 条、"
+                 "冻结 %d / 解冻 %d。OmniFocus 里空出来的旧项目可以自己删掉。"
+                 % (pnum, title, self.projects.number_of(dst["id"]) or dst["id"],
+                    dst.get("title"), len(moved), len(changes),
+                    sync.get("frozen") or 0, sync.get("thawed") or 0), "ok")
+        self.rebuild_rows()
+        self.invalidate()
+        return pro
+
+    def _side_plan(self, pro, now=None):
+        """算出这个 pro 当前该冻结 / 解冻哪些任务（纯计算，不落盘）。
+
+        规则（用户 2026-11-21 定）：
+        * 非活跃一侧的任务 → ``defer`` 推到十年后 + 打 ``manual_defer`` 标签，
+          OmniFocus 列表里就看不见它们了；
+        * 活跃一侧里 ``defer`` 在五年之后（我们设的哨兵）或带标签的 → 清掉
+          defer、摘掉标签（解冻）；
+        * 普通 defer（五年以内）一个字都不动；没有侧标签的任务只记录、不碰。
+
+        返回 ``(op, changes, untagged)``；``changes`` = ``{pk: {"defer", "tags"}}``。
+        """
+        op = self.projects.current_op_for_pro(pro)
+        if op is None:
+            return None, {}, []
+        now = now or self._now_dt()
+        active = pj.side_for_stage(pro.get("stage"))
+        default_side = pj.normalize_op_type(op.get("op_type"))
+        frozen_value = pj.frozen_defer_value(now)
+        changes = {}
+        untagged = []
+        for item in op.get("tasks") or ():
+            if (item.get("completed") or item.get("dropped")
+                    or item.get("effective_completed")
+                    or item.get("effective_dropped")):
+                continue
+            pk = str(item.get("pk") or "")
+            if not pk:
+                continue
+            side = pj.task_side(item, default=default_side)
+            if side is None:
+                untagged.append(item.get("title") or pk)
+                continue
+            tags = [str(t).strip() for t in (item.get("tags") or ())
+                    if str(t).strip()]
+            has_marker = pj.task_has_tag(item, pj.TAG_MANUAL_DEFER)
+            frozen = pj.is_frozen_defer(item.get("defer"), now=now)
+            if side != active:
+                if frozen and has_marker:
+                    continue                     # 已经冻好了，别每次 refresh 都重写
+                if not has_marker:
+                    tags.append(pj.TAG_MANUAL_DEFER)
+                changes[pk] = {"defer": frozen_value, "tags": tags}
+            else:
+                if not (frozen or has_marker):
+                    continue
+                kept = [t for t in tags
+                        if t.lower() != pj.TAG_MANUAL_DEFER.lower()]
+                changes[pk] = {"defer": None, "tags": kept}
+        return op, changes, untagged
+
+    def _omni_write_side_changes(self, changes, timeout=None):
+        """把冻结 / 解冻写回 OmniFocus（一次 batch，不逐条起进程）。
+
+        ``changes`` 是 :meth:`_side_plan` 的输出；只有真的挂在 OmniFocus 上的
+        任务才写（``soft-`` 开头的本地 dump 任务不在外部）。
+        """
+        if not changes:
+            return {}
+        if self.offline or not self.omnifocus_enabled():
+            return {"skipped": "offline"}
+        ops = []
+        for pk, fields in changes.items():
+            if str(pk).startswith("soft-"):
+                continue
+            op = {"id": str(pk), "op": "set"}
+            if fields.get("defer"):
+                op["defer"] = fields["defer"]
+                op["tags"] = {"add": [pj.TAG_MANUAL_DEFER]}
+            else:
+                op["clear_defer"] = True
+                op["tags"] = {"remove": [pj.TAG_MANUAL_DEFER]}
+            ops.append(op)
+        if not ops:
+            return {}
+        res = self.omnifocus.flush(ops, timeout=timeout)
+        bad = [r for r in (res.get("results") or ()) if not r.get("ok")]
+        if bad:
+            rl.log_event("project", "side_write_partial", level="warning",
+                         total=len(ops), failed=len(bad),
+                         first=(bad[0].get("error") or bad[0].get("message") or ""))
+        return {"written": len(ops) - len(bad), "failed": len(bad)}
+
+    def _sync_side_visibility(self, pro_or_id, omni=True, announce=False):
+        """按 pro 当前阶段冻结非活跃侧、解冻活跃侧（本地 + OmniFocus）。
+
+        幂等：已经冻好 / 已经解冻的任务不会产生任何写入。返回
+        ``{"frozen", "thawed", "untagged", "omni"}``。
+        """
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.projects.pro_by_id(pro_or_id))
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % (pro_or_id,))
+        op, changes, untagged = self._side_plan(pro)
+        if op is None:
+            return {"frozen": 0, "thawed": 0, "untagged": [], "omni": {}}
+        frozen = sum(1 for f in changes.values() if f.get("defer"))
+        thawed = len(changes) - frozen
+        if changes:
+            self.projects.update_tasks(op["id"], changes)
+        omni_res = {}
+        if omni and changes:
+            try:
+                omni_res = self._omni_write_side_changes(changes)
+            except Exception as e:                 # noqa: BLE001 - 外部失败不挡本地
+                omni_res = {"error": "%s: %s" % (type(e).__name__, e)}
+                rl.log_event("project", "side_write_failed", level="error",
+                             pro=pro.get("id"), op=op["id"], error=omni_res["error"])
+        if changes:
+            rl.log_event("project", "side_sync", level="debug",
+                         pro=pro["id"], op=op["id"], stage=pro.get("stage"),
+                         frozen=frozen, thawed=thawed, untagged=len(untagged),
+                         omni=omni_res)
+        if announce and (frozen or thawed):
+            self.say("🧊 项目「%s」：冻结 %d 条、解冻 %d 条（%s 侧活跃）"
+                     % (self.pro_display_title(pro, fallback=pro.get("title")),
+                        frozen, thawed, pj.side_for_stage(pro.get("stage"))),
+                     "info")
+        return {"frozen": frozen, "thawed": thawed, "untagged": untagged,
+                "omni": omni_res}
+
+    def _push_soft_interrupts(self, pro, now=None):
+        """切到 incubator：把攒下的软中断 dump 成任务，插到项目清单最前面。
+
+        粒度（用户 2026-11-21 选）：**每条软中断一条 25 分钟任务**，标签
+        ``incubator``；``local_only``（不写 OmniFocus，免得把临时整理项塞进
+        真实项目）。插入后原来的队首任务自然退到后面，``count_invested`` 不动。
+        返回新建条数。
+        """
+        recs = [rec for rec in self.projects.soft_interrupts(pro["id"])
+                if rec.get("status") in (pj.SOFT_INTERRUPT_PENDING,
+                                         pj.SOFT_INTERRUPT_QUEUED)]
+        if not recs:
+            return 0
+        op = self.projects.current_op_for_pro(pro)
+        if op is None:
+            return 0
+        stamp = int(time.time() * 1000)
+        items = []
+        for index, rec in enumerate(recs):
+            text = str(rec.get("text") or "软中断").strip()
+            title = text if len(text) <= 39 else text[:38] + "…"
+            cat = rec.get("category") or "?"
+            label = pj.SOFT_INTERRUPT_CATEGORY_LABELS.get(cat, "未分类")
+            items.append({
+                "pk": "soft-%d-%d-%d" % (pro["id"], stamp, index),
+                "title": title,
+                "duration": 25,
+                "count": 1,
+                "note": ("软中断检查生成的任务。[%s · %s]\n来源：项目「%s」"
+                         % (cat, label, pro.get("title") or "?")),
+                "tags": [pj.TAG_INCUBATOR, "软中断"],
+                "local_only": True,
+                "completed": False,
+                "dropped": False,
+            })
+        self.projects.prepend_tasks(op["id"], items)
+        for rec, item in zip(recs, items):
+            self.projects.update_soft_interrupt(
+                pro["id"], rec["id"], status=pj.SOFT_INTERRUPT_HANDLED,
+                task_id=None, note="已 dump 成任务 %s" % item["pk"])
+        rl.log_event("project", "soft_dump", level="info", pro=pro["id"],
+                     op=op["id"], count=len(items))
+        return len(items)
+
+    def _switch_pro_stage(self, pro_or_id, stage, reason="cmd-stage"):
+        """切换 pro 阶段：冻结/解冻两侧，切到 incubator 时顺手 dump 软中断。
+
+        这是 push（切 incubator）/ pop（切回 running）的唯一出口。
+        """
+        pro = (pro_or_id if isinstance(pro_or_id, dict)
+               else self.projects.pro_by_id(pro_or_id))
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % (pro_or_id,))
+        updated = self.projects.set_pro_stage(pro["id"], stage)
+        rl.log_event("project", "stage_switch", level="info", pro=updated["id"],
+                     stage=updated.get("stage"), reason=reason)
+        pushed = 0
+        if pj.normalize_pro_stage(updated.get("stage")) == pj.STAGE_BOTTLENECK:
+            try:
+                pushed = self._push_soft_interrupts(updated)
+            except Exception as e:                 # noqa: BLE001 - 别挡切换
+                rl.log_event("project", "soft_dump_failed", level="error",
+                             pro=updated["id"], error="%s: %s" % (type(e).__name__, e))
+        sync = self._sync_side_visibility(updated, announce=False)
+        self.selected_pro_id = updated["id"]
+        pnum = self.projects.pro_number_of(updated["id"]) or updated["id"]
+        bits = []
+        if sync.get("frozen"):
+            bits.append("冻结 %d 条" % sync["frozen"])
+        if sync.get("thawed"):
+            bits.append("解冻 %d 条" % sync["thawed"])
+        if pushed:
+            bits.append("dump %d 条软中断任务" % pushed)
+        self.say("📂 项目 #%s「%s」阶段 → %s%s"
+                 % (pnum, self.pro_display_title(updated, fallback=updated.get("title")),
+                    updated.get("stage"),
+                    ("（%s）" % "、".join(bits)) if bits else ""), "ok")
+        if sync.get("untagged"):
+            self.say("⚠ 项目里还有 %d 条任务没有 SOP / incubator 标签（不参与 plan）：%s"
+                     % (len(sync["untagged"]),
+                        "、".join(sync["untagged"][:5])), "warn")
+        self.rebuild_rows()
+        self.invalidate()
+        return updated
+
+    def _maybe_resume_from_bottleneck(self, task):
+        """bottleneck 下最后一条 incubator 任务勾掉 → 自动切回 running 并解冻。
+
+        用户 2026-11-21 选的 pop 语义：不用再手敲 ``pro N -a running``。
+        返回切换后的 pro；没切换返回 None。
+        """
+        fields = (task or {}).get("fields") or {}
+        op_id = fields.get(pj.PROJECT_ID_FIELD)
+        if op_id is None:
+            return None
+        op = self.projects.by_id(op_id)
+        pro = self.projects.pro_for_op(op) if op else None
+        if pro is None:
+            return None
+        if pj.normalize_pro_stage(pro.get("stage")) != pj.STAGE_BOTTLENECK:
+            return None
+        invested = pj.invested_by_project(self.task_store).get(op["id"]) or {}
+        left = pj.remaining_tasks(
+            op, invested, side=pj.OP_TYPE_INCUBATOR,
+            default_side=pj.normalize_op_type(op.get("op_type")),
+            now=self._now_dt())
+        if left:
+            return None
+        rl.log_event("project", "auto_resume", level="info", pro=pro["id"],
+                     task=task.get("id"), reason="incubator-done")
+        return self._switch_pro_stage(pro["id"], pj.STAGE_RUNNING,
+                                      reason="incubator-done")
+
     def _finish_pro_advance(self, pro_id, op_id, target_stage=None):
-        """完成 ``pro`` 的阶段切换并绑定新的 ``op``。"""
+        """完成 ``pro`` 的阶段切换并绑定新的 ``op``（兼容旧双 op 数据）。"""
         pro, op = self.projects.advance_pro(pro_id, op_id, target_stage=target_stage)
         self.pending_advance = None
         if self.pending_op_type:
             self.pending_op_type = [oid for oid in self.pending_op_type
                                     if oid != op["id"]]
         self.selected_pro_id = pro["id"]
+        pushed = 0
+        if pj.normalize_pro_stage(pro.get("stage")) == pj.STAGE_BOTTLENECK:
+            try:
+                pushed = self._push_soft_interrupts(pro)
+            except Exception as e:                 # noqa: BLE001 - 别挡切换
+                rl.log_event("project", "soft_dump_failed", level="error",
+                             pro=pro["id"], error="%s: %s" % (type(e).__name__, e))
+        try:
+            sync = self._sync_side_visibility(pro)
+        except Exception as e:                     # noqa: BLE001
+            sync = {"frozen": 0, "thawed": 0, "untagged": []}
+            rl.log_event("project", "side_sync_failed", level="error",
+                         pro=pro["id"], error="%s: %s" % (type(e).__name__, e))
         pro_num = self.projects.pro_number_of(pro["id"]) or pro["id"]
         op_num = self.projects.number_of(op["id"]) or op["id"]
-        op_type = pj.normalize_op_type(op.get("op_type")) or pj.OP_TYPE_SOP
-        self.say("🔀 项目 #%s「%s」阶段已切换为 %s，并关联 %s op #%s「%s」。"
+        self.say("🔀 项目 #%s「%s」阶段已切换为 %s（关联 op #%s「%s」；冻结 %d / 解冻 %d%s）。"
                  % (pro_num, self.pro_display_title(pro, fallback=pro.get("title")),
-                    pro.get("stage"),
-                    op_type, op_num, op.get("title")), "ok")
+                    pro.get("stage"), op_num, op.get("title"),
+                    sync.get("frozen") or 0, sync.get("thawed") or 0,
+                    ("；dump %d 条软中断任务" % pushed) if pushed else ""), "ok")
         self.rebuild_rows()
         self.invalidate()
         return pro
@@ -522,20 +946,16 @@ class ProjectMixin(object):
         self.selected_pro_id = pro["id"]
         pro_num = self.projects.pro_number_of(pro["id"]) or pro["id"]
         if not tail:
-            self.pending_advance = {
-                "pro_id": pro["id"],
-                "pro_title": pro.get("title"),
-                "from_stage": cur_stage,
-                "target_stage": target_stage,
-                "required_op_type": req_type,
-            }
-            self.say("🔀 项目 #%s「%s」准备从 %s 切换到 %s：需要提供新的 %s OmniFocus Project (op) 作为关联。"
+            # 2026-11-21 新模型：切换阶段不再需要「再导入另一个 op」——SOP 与
+            # incubator 是同一个清单里的标签，切阶段只做三件事：冻结旧侧、
+            # 解冻新侧、切到 incubator 时把攒的软中断 dump 成任务。
+            self.selected_pro_id = pro["id"]
+            self.say("🔀 项目 #%s「%s」：%s → %s（冻结非活跃侧 / 解冻活跃侧%s）"
                      % (pro_num, self.pro_display_title(pro, fallback=pro.get("title")),
-                        cur_stage, target_stage, req_type), "cmd")
-            self.say("   请直接输入 `task import [链接]`（导入新 op）或 `op <序号>`（关联已有 op），`q` 取消。",
-                     "info")
-            self.invalidate()
-            return pro
+                        cur_stage, target_stage,
+                        "；并把软中断 dump 成任务" if target_stage == pj.STAGE_BOTTLENECK
+                        else ""), "cmd")
+            return self._switch_pro_stage(pro["id"], target_stage, reason="advance")
         low0 = tail[0].lower()
         if low0 == "task" and len(tail) >= 2 and tail[1].lower() in ("import", "导入", "粘贴"):
             self.pending_advance = {
@@ -644,23 +1064,30 @@ class ProjectMixin(object):
         return pro
 
     def _pro_detail(self, pro):
-        """展示真正项目 ``pro`` 的详情 + 关联 ``op`` 的任务清单。"""
+        """展示真正项目 ``pro`` 的详情 + 它那一个 ``op`` 的任务清单。"""
         self.selected_pro_id = pro["id"]
         pro_num = self.projects.pro_number_of(pro["id"]) or pro["id"]
-        linked_ops = self.projects.ops_for_pro(pro)
-        sop_op = self.projects.by_id(pro.get("sop_op_id")) if pro.get("sop_op_id") else None
-        inc_op = self.projects.by_id(pro.get("incubator_op_id")) if pro.get("incubator_op_id") else None
+        op = self.projects.current_op_for_pro(pro)
         file_txt = pro.get("file") or "（未关联，用 `pro %s file <路径>` 绑定）" % pro_num
-        self.say("📂 Pro #%s「%s」· 阶段：%s · 关联文件：%s"
+        self.say("📂 Pro #%s「%s」· 阶段：%s（活跃侧 %s）· 关联文件：%s"
                  % (pro_num, self.pro_display_title(pro, fallback=pro.get("title")),
-                    pro.get("stage"), file_txt), "cmd")
-        self.say("   SOP op：%s · incubator op：%s"
-                 % (("#%s「%s」" % (self.projects.number_of(sop_op["id"]) or sop_op["id"],
-                                    sop_op.get("title"))) if sop_op else "—",
-                    ("#%s「%s」" % (self.projects.number_of(inc_op["id"]) or inc_op["id"],
-                                    inc_op.get("title"))) if inc_op else "—"), "info")
-        for op in linked_ops:
-            self._project_detail(op)
+                    pro.get("stage"), pj.side_for_stage(pro.get("stage")),
+                    file_txt), "cmd")
+        if op is None:
+            self.say("   还没有关联 OmniFocus 项目（op）：`pro %s op <op序号>` 或 "
+                     "`task import` 导入。" % pro_num, "warn")
+            return pro
+        self.say("   当前 op：#%s「%s」"
+                 % (self.projects.number_of(op["id"]) or op["id"], op.get("title")),
+                 "info")
+        linked = self.projects.ops_for_pro(pro)
+        extra = [x for x in linked if x["id"] != op["id"]]
+        if extra:
+            self.say("   ⚠ 还有 %d 个旧 op 没合并（%s）：跑 `pro %s merge` 合成一个。"
+                     % (len(extra),
+                        "、".join("#%s" % (self.projects.number_of(x["id"]) or x["id"])
+                                 for x in extra), pro_num), "warn")
+        self._project_detail(op)
         return pro
 
     def cmd_project(self, args=None):
@@ -671,15 +1098,19 @@ class ProjectMixin(object):
             pro <序号> -m complete|discard      本地状态（默认数据视图 disposable 会隐藏）
             pro <序号> -m active                恢复 active（非 active 时建议 id:<内部id>）
             pro <序号> -a <session> / -ac       直接把项目第一条任务挂到指定场 / 当前场
-            pro <序号> -a / --advance [...]     快捷切换阶段（running ↔ bottleneck）并关联新 op
+            pro <序号> -a / --advance           切换阶段（running ↔ bottleneck）：
+                                                冻结旧侧 / 解冻新侧；切到 incubator 时
+                                                把攒的软中断 dump 成 25 分钟任务
+            pro <序号> merge [--yes]            迁移：把旧的双 op 并成一个项目、给任务
+                                                补 SOP / incubator 标签（先预览）
             pro <序号> file <路径|clear>        关联/清空项目的打开文件（open + enter 顺便打开）
             pro <序号> open                     打开该项目关联的文件
-            pro <序号> stage <running|bottleneck>  直接设置阶段
+            pro <序号> stage <running|bottleneck>  直接设置阶段（同 -a 的效果）
             pro <序号> op <op序号>              关联已有 op
             pro <序号> interrupt [--soft]       软中断（默认）：保存一条建议 →
                                                 选 A/B/C 类别；不下架当前任务
-            pro <序号> interrupt --soft --check  逐条检查软中断：
-                                                不处理 / 入队 / 丢弃；最后建 incubator 任务
+            pro <序号> interrupt --soft --check  逐条检查软中断：不处理 / 入队 / 丢弃；
+                                                incubator 阶段当场 dump 成任务
             pro <序号> interrupt --hard         硬中断当前 session：
                                                 下架全部任务 → 输入 title → 建整场任务挂回去
             project 1                           看 #1 当前阶段 op 的详情与任务清单
@@ -714,26 +1145,32 @@ class ProjectMixin(object):
                 file_txt = (" · 文件：%s" % pr["file"]) if pr.get("file") else ""
                 row = by_pro.get(pr["id"])
                 if row is None:
-                    need = ("incubator" if pr.get("stage") == pj.STAGE_BOTTLENECK
-                            else pj.OP_TYPE_SOP)
-                    self.say("📂 Pro #%d %s [阶段:%s] · 当前缺少 %s op（先 `op import %s` "
-                             "或 `pro %d -a`）%s"
+                    self.say("📂 Pro #%d %s [阶段:%s] · 还没有关联 OmniFocus 项目（op）："
+                             "先 `task import` 导入，或 `pro %d op <op序号>` 关联。"
                              % (pr["number"], self.pro_display_title(pr),
-                                pr["stage"], need, need,
-                                pr["number"], file_txt), "warn")
+                                pr["stage"], pr["number"]), "warn")
                     continue
                 op = row.get("active_op") or {}
-                self.say("📂 Pro #%d %s [阶段:%s → %s op #%s「%s」]：剩余 %s count · "
+                frozen = int(row.get("frozen_count") or 0)
+                self.say("📂 Pro #%d %s [阶段:%s · 活跃侧 %s → op #%s「%s」]：剩余 %s count%s · "
                          "进度 %s · %d 条未完成 · 本周 %d 条%s%s"
                          % (pr["number"], self.pro_display_title(pr), pr["stage"],
-                            row.get("active_op_type") or "?",
+                            row.get("active_side") or "?",
                             row.get("op_number") or "?", op.get("title") or "?",
                             row.get("remaining_text") or row.get("remaining") or 0,
+                            ("（另 %d 条冻结）" % frozen) if frozen else "",
                             row.get("progress_text") or "—",
                             row.get("tasks_open") or 0, int(row.get("week_count") or 0),
                             (" · 今天说好 %d count（已排 %d）"
                              % (row.get("allocated"), row.get("scheduled")))
                             if row.get("allocated") else "", file_txt), "info")
+                if row.get("legacy_extra_ops"):
+                    self.say("   ⚠ 这个项目还有旧的双 op；`pro %d merge` 先预览再 --yes 合并。"
+                             % pr["number"], "warn")
+                if row.get("untagged"):
+                    self.say("   ⚠ %d 条任务没有 SOP / incubator 标签（不进 plan）：%s"
+                             % (len(row["untagged"]),
+                                "、".join(row["untagged"][:3])), "warn")
             orphans = [row for row in self.project_rows()
                        if not row.get("pro_title")]
             if orphans:
@@ -751,8 +1188,9 @@ class ProjectMixin(object):
                 if len(toks) >= 3 and toks[2].lower() not in ("op", "task", "import"):
                     return self._project_assign_first(toks[0], toks[2])
                 if len(toks) == 2:
-                    raise ValueError("用法：project <序号> -a <session序号> 或 "
-                                     "project <序号> -ac（当前场）")
+                    # `pro 1 -a` 不带参数 = 切换阶段（push / pop）；带 session 才是挂场。
+                    pro = self._ensure_pro_for_token(toks[0])
+                    return self._start_pro_advance(pro, [])
         action = toks[0].lower()
         if action in ("create", "new", "add", "新建", "创建"):
             return self._cmd_pro_create(toks[1:])
@@ -830,14 +1268,14 @@ class ProjectMixin(object):
                 st_val = rest[1]
             else:
                 st_val = rest[0]
-            updated = self.projects.set_pro_stage(pro["id"], st_val)
-            self.selected_pro_id = updated["id"]
-            pnum = self.projects.pro_number_of(updated["id"]) or updated["id"]
-            self.say("📂 项目 #%s「%s」阶段已设为 %s。"
-                     % (pnum, updated.get("title"), updated.get("stage")), "ok")
-            self.rebuild_rows()
-            self.invalidate()
+            updated = self._switch_pro_stage(pro["id"], st_val, reason="cmd-stage")
             return updated
+
+        # 迁移：pro <序号> merge [--yes] —— 把旧的 incubator op 并进 SOP op，
+        # 给任务补侧标签，再按当前阶段冻结/解冻。只做一次，之后就只有一个 op。
+        if rest and rest_low[0] in ("merge", "unify", "合并", "统一"):
+            pro = self._ensure_pro_for_token(toks[0])
+            return self._merge_pro_ops(pro, rest[1:])
 
         # 检查是否是关联已有 op：pro <序号> op <op序号>
         if rest and rest_low[0] in ("op", "link", "关联"):
@@ -933,8 +1371,8 @@ class ProjectMixin(object):
         op = self.projects.resolve(token)
         return op, self.projects.pro_for_op(op)
 
-    def _first_project_leaf(self, op, parent=None):
-        """项目清单里按 OmniFocus 顺序拿到第一条可排的叶子任务。"""
+    def _first_project_leaf(self, op, parent=None, side=None, default_side=None):
+        """项目清单里按 OmniFocus 顺序拿到第一条可排的叶子任务（只取给的那一侧）。"""
         invested = pj.invested_by_project(self.task_store).get(op["id"]) or {}
         exclude = set()
         now = datetime.datetime.now()
@@ -943,7 +1381,8 @@ class ProjectMixin(object):
             if (pk and str(pid) == str(op["id"]) and ts.TaskStore.is_open(task)
                     and (task.get("formatter") or ts.task_is_deferred(task, now=now))):
                 exclude.add(str(pk))
-        items = pj.remaining_tasks(op, invested, now=now, exclude_pks=exclude)
+        items = pj.remaining_tasks(op, invested, now=now, exclude_pks=exclude,
+                                   side=side, default_side=default_side)
         if not items:
             return None, None
         first = items[0]
@@ -1127,7 +1566,9 @@ class ProjectMixin(object):
     def _project_assign_first(self, project_token, session_token):
         """``project N -a <session>`` / ``-ac``：第一条项目任务直接挂场。"""
         op, pro = self._project_op_for_token(project_token)
-        item, parent = self._first_project_leaf(op)
+        item, parent = self._first_project_leaf(
+            op, side=(pj.side_for_stage(pro.get("stage")) if pro else None),
+            default_side=pj.normalize_op_type(op.get("op_type")))
         if item is None:
             raise ValueError("项目「%s」没有剩余的可排任务" % op.get("title"))
         if session_token == "current":
@@ -1204,7 +1645,10 @@ class ProjectMixin(object):
         invested = pj.invested_by_project(self.task_store).get(op["id"]) or {}
         try:
             items = pj.remaining_tasks(
-                op, invested, now=now, exclude_pks=self._cst_excluded_pks(op))
+                op, invested, now=now, exclude_pks=self._cst_excluded_pks(op),
+                side=op.get("side"),
+                default_side=(op.get("default_side")
+                              or pj.normalize_op_type(op.get("op_type"))))
         except Exception:                          # noqa: BLE001 - 一条项目坏了不挡其他
             return None
         for item in items:
@@ -1520,23 +1964,20 @@ class ProjectMixin(object):
                          % (pnum, title), "ok")
                 return []
             if not records:
-                self.pending_soft_interrupt = {
-                    "stage": "minutes",
-                    "pro_id": pro["id"],
-                    "pro_number": pnum,
-                    "pro_title": pro.get("title") or "?",
-                    "items": [],
-                    "index": 0,
-                    "queued_ids": [rec["id"] for rec in queued],
-                    "skipped": 0,
-                    "discarded": 0,
-                }
                 self.selected_pro_id = pro["id"]
-                self.say("项目 #%s「%s」已有 %d 条软中断在队列里；"
-                         "直接选择要创建的任务时长：25 / 50 / 75（`q` 取消）。"
-                         % (pnum, title, len(queued)), "cmd")
-                self.invalidate()
-                return self.pending_soft_interrupt
+                if pj.normalize_pro_stage(pro.get("stage")) == pj.STAGE_BOTTLENECK:
+                    pushed = self._push_soft_interrupts(pro)
+                    self._sync_side_visibility(pro)
+                    self.rebuild_rows()
+                    self.invalidate()
+                    self.say("项目 #%s「%s」已有 %d 条入队软中断 → 已 dump 成 %d 条 "
+                             "25 分钟任务（插在项目清单最前）。"
+                             % (pnum, title, len(queued), pushed), "ok")
+                else:
+                    self.say("项目 #%s「%s」已有 %d 条软中断在队列里；"
+                             "切到 incubator（`pro %s -a`）时会自动 dump 成任务。"
+                             % (pnum, title, len(queued), pnum), "info")
+                return []
             self.pending_soft_interrupt = {
                 "stage": "check",
                 "pro_id": pro["id"],
@@ -1576,16 +2017,33 @@ class ProjectMixin(object):
             self.invalidate()
             return pending
         queued = list(pending.get("queued_ids") or [])
-        if queued:
-            pending["stage"] = "minutes"
-            self.say("检查完毕：入队 %d 条、不处理 %d 条、丢弃 %d 条。"
-                     "现在选择要创建的任务时长：25 / 50 / 75（`q` 取消）。"
-                     % (len(queued), int(pending.get("skipped") or 0),
-                        int(pending.get("discarded") or 0)), "cmd")
-            self.invalidate()
-            return pending
+        skipped = int(pending.get("skipped") or 0)
+        discarded = int(pending.get("discarded") or 0)
+        pro = self.projects.pro_by_id(pending.get("pro_id"))
         self.pending_soft_interrupt = None
-        self.say("检查完毕：没有入队条目，未创建任务。", "info")
+        if not queued:
+            self.say("检查完毕：没有入队条目，未创建任务。", "info")
+            self.invalidate()
+            return None
+        if pro is None:
+            self.say("检查完毕：入队 %d 条，但项目已经不存在。"
+                     % len(queued), "warn")
+            self.invalidate()
+            return None
+        summary = ("检查完毕：入队 %d 条、不处理 %d 条、丢弃 %d 条。"
+                   % (len(queued), skipped, discarded))
+        if pj.normalize_pro_stage(pro.get("stage")) == pj.STAGE_BOTTLENECK:
+            pushed = self._push_soft_interrupts(pro)
+            self._sync_side_visibility(pro)
+            self.say(summary, "cmd")
+            self.say("✅ 已 dump 成 %d 条 25 分钟任务（标签 incubator，插在项目清单最前）。"
+                     % pushed, "ok")
+        else:
+            # 攒着：切到 incubator 时统一 dump（用户 2026-11-21 的 push 语义）。
+            self.say(summary, "cmd")
+            self.say("✅ 已入队；切到 incubator（`pro %s -a`）时会把它们 dump 成任务。"
+                     % (self.projects.pro_number_of(pro["id"]) or pro["id"]), "ok")
+        self.rebuild_rows()
         self.invalidate()
         return None
 
@@ -1681,92 +2139,6 @@ class ProjectMixin(object):
             self.say("请输入 1（不处理）/ 2（处理，入队）/ 3（丢弃，保存数据）/ q（中止）。",
                      "warn")
             return True
-        if stage == "minutes":
-            if raw.lower() in ("q", "quit", "cancel", "取消", "放弃"):
-                self.pending_soft_interrupt = None
-                self.say("⏹ 已取消创建任务；入队条目仍保持 queued。", "info")
-                self.invalidate()
-                return True
-            if raw not in ("25", "50", "75"):
-                self.say("任务时长只认 25 / 50 / 75 分钟；`q` 取消。", "warn")
-                return True
-            return self._complete_soft_interrupt_task(pending, int(raw))
-        return True
-
-    def _complete_soft_interrupt_task(self, pending, minutes):
-        """把本次入队的软中断合成一条任务，切 bottleneck，并插入 incubator 最前。"""
-        pro = self.projects.pro_by_id(pending.get("pro_id"))
-        if pro is None:
-            self.pending_soft_interrupt = None
-            raise ValueError("项目（pro）已经不存在")
-        wanted = set(pending.get("queued_ids") or ())
-        records = [rec for rec in self.projects.soft_interrupts(pro["id"])
-                   if rec.get("id") in wanted]
-        if not records:
-            self.pending_soft_interrupt = None
-            self.say("没有可生成任务的入队软中断。", "warn")
-            return True
-        first = records[0].get("text") or "软中断"
-        title = (("%s…" % first[:38]) if len(first) > 39 else first)
-        if len(records) > 1:
-            title = "软中断整理 ×%d：%s" % (len(records), title)
-        lines = ["软中断检查生成的任务。来源：项目「%s」" % (pro.get("title") or "?")]
-        for rec in records:
-            cat = rec.get("category") or "?"
-            label = pj.SOFT_INTERRUPT_CATEGORY_LABELS.get(cat, "未分类")
-            lines.append("[%s · %s] %s" % (cat, label, rec.get("text")))
-        notes = "\n".join(lines)
-        # 先切 bottleneck：这样后面 current_op_for_pro 取到的就是 incubator op。
-        updated_pro = self.projects.set_pro_stage(
-            pro["id"], pj.STAGE_BOTTLENECK)
-        inc_op = self.projects.current_op_for_pro(updated_pro)
-        count = ts.minutes_to_count(minutes) or 1
-        task = None
-        where = "本地任务库（未绑定 incubator op，未同步 OmniFocus）"
-        if inc_op is not None:
-            pk = "soft-%d-%d" % (pro["id"], int(time.time() * 1000))
-            item = {
-                "pk": pk,
-                "title": title,
-                "duration": minutes,
-                "count": count,
-                "note": notes,
-                "tags": ["软中断"],
-                "local_only": True,
-                "completed": False,
-                "dropped": False,
-            }
-            self.projects.prepend_task(inc_op["id"], item)
-            task, _created = self.task_store.ensure_project_task(
-                inc_op["id"], inc_op.get("title") or "", item)
-            where = "incubator op #%s「%s」最前面（本地快照，未写 OmniFocus）" % (
-                self.projects.number_of(inc_op["id"]) or inc_op["id"],
-                inc_op.get("title") or "?")
-        else:
-            fields = {
-                "title": title,
-                "duration": minutes,
-                "count": count,
-                "project": pro.get("title") or "",
-                "pro_id": pro["id"],
-                "soft_interrupt": True,
-                "note": notes,
-            }
-            task = self.task_store.create(fields, source={
-                "kind": "project", "title": pro.get("title") or "",
-                "local_only": True, "interrupt": "soft"})
-        for rec in records:
-            self.projects.update_soft_interrupt(
-                pro["id"], rec["id"], status=pj.SOFT_INTERRUPT_HANDLED,
-                task_id=task["id"])
-        self.pending_soft_interrupt = None
-        self.selected_task_id = task["id"]
-        self.rebuild_rows()
-        self.invalidate()
-        self.say("✅ 软中断已生成任务 #%s「%s」（%d 分钟 / %d count），"
-                 "插入 %s；项目 #%s 已切到 bottleneck。"
-                 % (task["id"], title, minutes, count, where,
-                    self.projects.pro_number_of(pro["id"]) or pro["id"]), "ok")
         return True
 
     def pending_soft_interrupt_panel(self):
@@ -1815,15 +2187,6 @@ class ProjectMixin(object):
                 body.append("  3 丢弃（保存数据，不再提醒）\n", style="red")
                 body.append("  q 中止检查", style="dim")
             return Panel(body, title="[bold yellow]🔎 soft interrupt · 逐条检查[/]",
-                         border_style="yellow", box=box.HEAVY)
-        if stage == "minutes":
-            body.append("软中断检查完毕：已入队 %d 条。\n"
-                        % len(pending.get("queued_ids") or ()), style="bold")
-            body.append("选择要创建的任务时长：\n\n", style="cyan")
-            body.append("  25 / 50 / 75 分钟\n\n", style="green")
-            body.append("创建后会：切项目到 bottleneck；把任务插到 incubator 最前面。\n"
-                        "`q` 取消任务创建（入队条目保留）。", style="dim")
-            return Panel(body, title="[bold yellow]⏱ soft interrupt · 任务时长[/]",
                          border_style="yellow", box=box.HEAVY)
         return None
 
@@ -2437,6 +2800,34 @@ class ProjectMixin(object):
                     or self.pending_interrupt is not None
                     or self.pending_soft_interrupt is not None
                     or self.project_sync is not None)
+
+    def _maybe_sync_sides(self, max_age=120.0):
+        """刷新检查：按当前阶段冻结非活跃侧、解冻活跃侧（最多两分钟一次）。
+
+        用户在 OmniFocus 里自己加任务 / 改阶段标签后，下一次 refresh 就会把
+        该冻的冻上、该解冻的解冻；幂等，没有变化时不写盘也不发外部进程。
+        """
+        now = time.time()
+        last = getattr(self, "_side_sync_at", 0)
+        if last and now - last < max_age:
+            return False
+        self._side_sync_at = now
+        frozen = thawed = 0
+        for pro in self.projects.active_pros():
+            try:
+                res = self._sync_side_visibility(pro, announce=False)
+            except Exception as e:                 # noqa: BLE001 - 一个坏了不挡别的
+                rl.log_event("project", "side_sync_failed", level="warning",
+                             pro=pro.get("id"),
+                             error="%s: %s" % (type(e).__name__, e))
+                continue
+            frozen += int(res.get("frozen") or 0)
+            thawed += int(res.get("thawed") or 0)
+        if frozen or thawed:
+            rl.log_event("project", "side_sync_refresh", level="info",
+                         frozen=frozen, thawed=thawed)
+            self.invalidate()
+        return True
 
     def _maybe_daily_project_sync(self):
         """每天第一次 TUI/refresh 时后台检查一次 OmniFocus 项目。"""
@@ -3548,26 +3939,27 @@ class ProjectMixin(object):
             return self._run_sessional_plan(*sessional)
         day, offset, include_current = self._parse_plan_args(toks)
         self.projects.ensure_tagged_pros()
-        untyped = self.projects.untyped_linked_ops()
-        if untyped:
-            self.check_untyped_ops(announce_import=False)
-            raise ValueError("还有 %d 个已关联真正项目的 OmniFocus 项目（op）没说明类型"
-                             "（SOP / incubator）；请先按提示补全类型，再 `plan`。"
-                             % len(untyped))
-        # 唯一候选清单：每个 active pro 当前阶段对应的那一个 op。running 取
-        # SOP、bottleneck 取 incubator，所以不再有全局 SOP / incubator 两阶段。
+        # 2026-11-21 起 op 不再需要 SOP / incubator 类型：侧别是任务标签，
+        # 候选清单 = 每个 active pro 的那一个 op，按 pro 阶段挑一侧的任务。
         plan_ops = self.projects.plan_ops()
         if not plan_ops:
             if not self.projects.active_pros():
-                # 没有项目 ≠ 不能 plan：`task <任务> <count>` 能把任意一条任务当成
-                # 「只有一个任务的独立项目」排掉。只提示一句，不挡路。
+                # 没有项目也不一定不能 plan：`task <任务> <count>` 能把任意一条
+                # 任务当成「只有一个任务的独立项目」排掉。只有连任务都没有时才
+                # 直接收口（否则会把后续命令吞进一张空问答里）。
+                has_task = bool(self.task_store.list())
+                if not has_task:
+                    rl.log_event("plan", "no_projects", level="info",
+                                 day=day.isoformat())
+                    self.say("· 项目库是空的：先 `task import` 一个 OmniFocus 项目，"
+                             "或 `pro create <名称>`，再来 plan。", "info")
+                    return None
                 self.say("· 项目库是空的：这次 plan 只能 `task <任务> <count>` 固定单独"
                          "任务（项目分配那半张表是空的）。", "info")
             else:
-                raise ValueError("当前没有可排期的 OmniFocus 项目（op）：只有关联了真正项目 pro、"
-                                 "且类型与项目阶段匹配的 op 才会进 plan（running 需要 SOP，"
-                                 "bottleneck 需要 incubator）。先用 `op <序号> pro <N>` 关联项目、"
-                                 "`pro <序号> -a` 切阶段，或用 `op <序号> sop|incubator` 设类型。")
+                raise ValueError("当前没有可排期的 OmniFocus 项目：只有关联了真正项目 pro "
+                                 "的 op 才会进 plan。先用 `op <序号> pro <N>` 关联项目，"
+                                 "或 `pro <序号> merge` 把旧的双 op 合成一个。")
         if offset != self.day_offset:
             # 空场、`-a <编号>` 都按**看板那一天**的表格算，所以先把看板搬过去。
             # 搬过去之后必须**等到**那天的真数据：空场判据要看「订没订上」，
@@ -3618,13 +4010,13 @@ class ProjectMixin(object):
                      "改完直接 `complete` 就按它复现）"
                      % (day.isoformat(), len(self.planning.allocations),
                         len(self.planning.pins)), "info")
-        by_type = {}
+        by_side = {}
         for op in plan_ops:
-            kind = pj.normalize_op_type(op.get("op_type")) or "?"
-            by_type[kind] = by_type.get(kind, 0) + 1
+            kind = op.get("side") or pj.side_for_stage(op.get("stage"))
+            by_side[kind] = by_side.get(kind, 0) + 1
         kind_txt = "、".join("%s %d" % (kind, count)
-                            for kind, count in sorted(by_type.items()))
-        self.say("🗂 %s 的项目资源分配：%d 个当前 op（%s）、%d 场空 session = %d count 可以分"
+                            for kind, count in sorted(by_side.items()))
+        self.say("🗂 %s 的项目资源分配：%d 个项目（%s）、%d 场空 session = %d count 可以分"
                  "（%d 分钟；1 count = %d 分钟）"
                  % (day.isoformat(), len(plan_ops), kind_txt,
                     cap["sessions"], cap["counts"], cap["minutes"],
@@ -3701,12 +4093,6 @@ class ProjectMixin(object):
         """把某一项目排进指定 session：该 session 的 count 就是本次分配量。"""
         day = self.sel_date
         self.projects.ensure_tagged_pros()
-        untyped = self.projects.untyped_linked_ops()
-        if untyped:
-            self.check_untyped_ops(announce_import=False)
-            raise ValueError("还有 %d 个已关联真正项目的 OmniFocus 项目（op）没说明类型"
-                             "（SOP / incubator）；请先补全类型再 plan。"
-                             % len(untyped))
         plan_ops = self.projects.plan_ops()
         if not plan_ops:
             raise ValueError("当前没有可排期的 OmniFocus 项目（op）")

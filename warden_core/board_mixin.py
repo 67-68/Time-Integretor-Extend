@@ -2684,6 +2684,28 @@ class BoardMixin(object):
                 "琐事项目「%s」没有未完成任务了" % (project.get("title") or project.get("id")),
                 level="warn", source="琐事",
                 hint="去 OmniFocus 加一条任务并 project refresh；或 set chore-project 换项目"))
+        # 6) 单项目模型：还留着旧双 op，或者有任务没打侧别标签。
+        try:
+            rows = self.current_project_rows()
+        except Exception:                      # noqa: BLE001 - 警告板不能因为这里坏掉
+            rows = []
+        legacy = [r for r in rows if r.get("legacy_extra_ops")]
+        if legacy:
+            out.append(repl_kit.Warning(
+                "有 %d 个项目还是旧的双 op（SOP + incubator 两个 OmniFocus 项目）"
+                % len(legacy),
+                level="warn", source="项目",
+                hint="pro <序号> merge 先预览，再加 --yes 合成一个项目"))
+        untagged = [(r.get("pro_title") or "?", t)
+                    for r in rows for t in (r.get("untagged") or ())]
+        if untagged:
+            first = untagged[0]
+            out.append(repl_kit.Warning(
+                "有 %d 条项目任务没有 SOP / incubator 标签，不参与 plan（如「%s」的「%s」）"
+                % (len(untagged), first[0], first[1]),
+                level="warn", source="项目",
+                hint="去 OmniFocus 给任务打 SOP / incubator 标签后 refresh；"
+                     "pro <序号> merge 也会按旧 op 类型自动补"))
         return out
 
     def refresh_warnings(self, force=False, max_age=5.0):
@@ -2709,6 +2731,11 @@ class BoardMixin(object):
             self._maybe_daily_project_sync()
             self._maybe_start_project_sync_conflict()
         except Exception:                          # noqa: BLE001 - 项目对账坏了也不能没帧
+            pass
+        try:
+            # 刷新检查：按当前阶段把非活跃侧冻到十年后、把活跃侧解冻。
+            self._maybe_sync_sides()
+        except Exception:                          # noqa: BLE001 - 冻结坏了也不能没帧
             pass
         try:
             self._maybe_flush_omnifocus()
@@ -3103,14 +3130,15 @@ class BoardMixin(object):
                             "会先问要不要把重复设置也复制到本地；-st / --single-task "
                             "= 只导入这一条，不问也不建 repeat"),
             ("三个数据模型区别", "pro = 真正项目 Project（有阶段 running/bottleneck、可关联文件） · "
-                                 "op = OmniFocus Project（可以是 incubator 或普通的 SOP 两种类型） · "
+                                 "op = OmniFocus Project（一个 pro 只关联一个） · "
                                  "task = 具体任务 Task（挂到 session 执行的单条任务）"),
-            ("pro / project", "管理真正项目 Project (pro)：阶段为 bottleneck 时只允许对应的 "
-                              "incubator op 进行；阶段为 running 时只允许普通的 SOP op 进行。"
-                              "SOP op 通过 OmniFocus 标签 `project/…` 自动关联真正的项目 pro"),
-            ("pro <序号> -a / --advance", "快捷切换 pro 状态（running ↔ bottleneck），"
-                                           "需提供新的 op 作为关联（可直接跟 `task import` 或 `op <序号>`，"
-                                           "也可回车后按提示输入）"),
+            ("pro / project", "管理真正项目 Project (pro)。一个 pro ↔ 一个 OmniFocus 项目；"
+                              "SOP / incubator 是**任务标签**：running 只排 SOP 侧，bottleneck 只排 incubator 侧，"
+                              "另一侧的任务 defer 到十年后（OmniFocus 里看不见）"),
+            ("pro <序号> -a / --advance", "切换阶段（running ↔ bottleneck）：冻结旧侧、解冻新侧；"
+                                           "切到 bottleneck 时把攒的软中断 dump 成 25 分钟任务插在项目最前"),
+            ("pro <序号> merge [--yes]", "迁移：把旧的双 op 并成一个项目（OmniFocus moveTasks + 补 SOP/incubator "
+                                          "标签），再按当前阶段冻结/解冻；不带 --yes 只预览"),
             ("pro <序号> -m complete|discard", "只改真正项目 pro 的本地状态；completed / dropped "
                                                "不再进入 active 列表、plan 和默认数据视图"),
             ("op <序号> -m complete|discard", "只改 OmniFocus op 的本地状态；completed / dropped "
@@ -3118,23 +3146,22 @@ class BoardMixin(object):
             ("pro <序号> interrupt [--soft|-s|--hard]", "默认软中断：保存一条建议/问题 → 选 A/B/C 类别，"
                                                            "不下架当前任务；--hard = 清空当前场后建整场任务"),
             ("pro <序号> interrupt --soft --check", "逐条检查软中断：1 不处理 / 2 入队 / 3 丢弃（保存数据）；"
-                                                     "最后选 25/50/75 分钟生成任务，项目自动切 bottleneck，"
-                                                     "任务插到 incubator 最前面"),
+                                                     "已入队的攒着，切到 incubator 时每条 dump 成 25 分钟任务"),
             ("pro <序号> file <路径>", "为项目 pro 关联一个文件，作为敲 `open` + Enter 之后顺便打开的文件"
                                        "（也可 `pro create <名> file=<路径>` 或 `pro <序号> open`）"),
-            ("op [序号] [sop|incubator]", "管理 OmniFocus Project (op)：每个 op 必须是 SOP 或 incubator "
-                                          "两种类型之一，导入时必须说明；每次 refresh 也会自动检查并让用户补全"),
-            ("task import [sop|incubator]（项目）",
-             "剪贴板里是 **OmniFocus 项目**（omnifocus:///project/PK）→ 进 op 库（也可 `op import sop|incubator`）："
-             "需说明 SOP 或 incubator 类型；带 `project/…` 标签自动关联 pro；时长不齐整批拒绝"),
+            ("op [序号]", "管理 OmniFocus Project (op)：导入不再需要说明类型；"
+                           "侧别是任务标签（SOP / incubator），一个项目只有一个 op"),
+            ("task import（项目）",
+             "剪贴板里是 **OmniFocus 项目**（omnifocus:///project/PK）→ 进 op 库："
+             "带 `project/…` 标签自动关联 pro；时长不齐整批拒绝"),
             ("project [序号] [interrupt|refresh|remove|check]", "看 pro 与当前 op / 看 #1 详情与清单 / "
                                                        "软中断（默认）或 --hard 硬中断 / 重新去 OmniFocus 读一遍 / "
                                                        "撤掉 / check = 每日对账"),
             ("conscription / cst", "快速征召：把一条合适时长的任务塞进当前/下一场 session；"
                                      "当前场只有一条任务时优先用它的项目；剩余分钟按 5 分钟向下取档；"
                                      "不足 10 分钟先找 errand 项目"),
-            ("plan [-c|--current] [天数]", "一次排期：每个真正项目只取当前阶段对应的那一个 op"
-                            "（running → SOP / bottleneck → incubator），"
+            ("plan [-c|--current] [天数]", "一次排期：每个真正项目用它的那一个 op，只挑当前阶段那一侧的任务"
+                            "（running → SOP / bottleneck → incubator 标签），"
                             "分配 count + 自动挑任务挂 session。没有关联 pro 的孤立 op 不进 plan。"
                             "**默认今天**，plan +1 = 明天；plan -c 把今天正在进行的空 session "
                             "也纳入（只算剩下的完整 25 分钟块）"),

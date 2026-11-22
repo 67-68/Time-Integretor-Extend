@@ -1317,6 +1317,11 @@ check("task assign none 也认（显式动作写法）",
 
 # --- 当前这一场
 _saved_rows = wd3.rows
+# 这一段用「相对现在」的 row 测 current_session 的分类。关网：否则它会当场
+# 拉一次 session、把 11:00 那场（凌晨跑测试时还没开始）当成「下一场」，
+# 把「一场都没有」这条错误路径掩盖掉。
+_saved_offline = wd3.offline
+wd3.offline = True
 _now_ms = int(dt.datetime.now().timestamp() * 1000)
 
 
@@ -1353,6 +1358,7 @@ except ValueError as e:
 else:
     check("一场都没有要抛错", False, True)
 wd3.rows = _saved_rows
+wd3.offline = _saved_offline
 
 # 端到端：造一场「刚开始 5 分钟」的 session，`-ac` 应该挂到它上面
 _live_start = dt.datetime.now() - dt.timedelta(minutes=5)

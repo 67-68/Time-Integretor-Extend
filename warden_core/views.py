@@ -344,7 +344,7 @@ class ContractView(View):
                  hint=_hint_actions("--all", "60", "120",
                                     note="不给参数 = 看已经过期的；给分钟数 = 提前看")),
             _cmd("plan", w.cmd_plan,
-                 "一次分配：按每个项目的阶段取其当前 SOP/incubator op，再排任务",
+                 "一次分配：每个项目用它唯一的 op，只挑当前阶段那一侧的任务，再排 session",
                  ("排期", "分配"),
                  usage="plan [+1|今天|明天|YYYY-MM-DD] → "
                        "pro <序号> <count> | task <任务> <count> | complete；"
@@ -394,7 +394,7 @@ class ContractView(View):
                  hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
                                     "1 sop", "1 incubator", "1 relate --export",
                                     "import sop", "refresh",
-                                    note="op = OmniFocus Project（SOP / incubator）；"
+                                    note="op = OmniFocus Project（一个 pro 一个）；"
                                          "-m complete|discard 只动本地状态")),
             _cmd("start", lambda a: w.cmd_start(), "启动 daemon",
                  usage="start", hint=_hint_actions("start", note="启动 daemon")),
@@ -897,7 +897,7 @@ class DataView(View):
                  hint=_hint_actions("--all", "60", "120",
                                     note="不给参数 = 看已经过期的；给分钟数 = 提前看")),
             _cmd("plan", w.cmd_plan,
-                 "一次分配：按每个项目的阶段取其当前 SOP/incubator op，再排任务",
+                 "一次分配：每个项目用它唯一的 op，只挑当前阶段那一侧的任务，再排 session",
                  ("排期", "分配"),
                  usage="plan [+1|今天|明天|YYYY-MM-DD] → "
                        "pro <序号> <count> | task <任务> <count> | complete；"
@@ -947,7 +947,7 @@ class DataView(View):
                  hint=_hint_actions("1", "1 -m complete", "1 -m discard", "1 -m active",
                                     "1 sop", "1 incubator", "1 relate --export",
                                     "import sop", "refresh",
-                                    note="op = OmniFocus Project（SOP / incubator）；"
+                                    note="op = OmniFocus Project（一个 pro 一个）；"
                                          "-m complete|discard 只动本地状态")),
         ]
 

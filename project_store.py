@@ -231,10 +231,104 @@ def priority_label(value):
     got = normalize_priority(value)
     return "P%d" % got if got is not None else ""
 
-#: 真正项目 Project (pro) 的两个阶段：running 允许 SOP op，bottleneck 允许 incubator op。
+#: 真正项目 Project (pro) 的两个阶段：running 做 SOP 任务，bottleneck 做 incubator 任务。
 STAGE_RUNNING = "running"
 STAGE_BOTTLENECK = "bottleneck"
 PRO_STAGES = (STAGE_RUNNING, STAGE_BOTTLENECK)
+
+# ---------------------------------------------------------------- 侧别与冻结
+#
+# 2026-11-21 用户定的新模型：**一个项目只有一个 OmniFocus 项目（op）**，SOP 与
+# incubator 任务混在同一个清单里，靠任务标签分侧。用户原话：
+#   「给 SOP 和 Incubator 任务分别挂 tag，同时项目文件夹中不应该出现没有 tag 的任务」
+#   「当前不活跃类型的任务（比如说当前是 sop，但这个任务是 incubator）的 defer 应该被
+#     设为十年之后（但解冻的时候检测五年之后 defer 就解锁）」
+# 所以：
+#   * 侧别标签 = ``SOP`` / ``incubator``（大小写不敏感，inc/patch 也认）；
+#   * 冻结 = defer 推到十年后 + 打 ``manual_defer`` 标签（OmniFocus 里就看不见了）；
+#   * 解冻 = 看到 defer 在五年之后（我们设的哨兵）就清掉它，并摘掉标签。
+TAG_SOP = "SOP"
+TAG_INCUBATOR = "incubator"
+TAG_MANUAL_DEFER = "manual_defer"
+SIDE_TAG_ALIASES = {
+    "sop": OP_TYPE_SOP,
+    "incubator": OP_TYPE_INCUBATOR,
+    "inc": OP_TYPE_INCUBATOR,
+    "patch": OP_TYPE_INCUBATOR,
+}
+FROZEN_DEFER_DAYS = 365 * 10
+FROZEN_DETECT_DAYS = 365 * 5
+
+
+def side_of_tags(tags):
+    """从标签列表里读出侧别（``SOP`` / ``incubator``）；没有侧别标签返回 None。"""
+    for raw in tags or ():
+        got = SIDE_TAG_ALIASES.get(str(raw).strip().lower())
+        if got:
+            return got
+    return None
+
+
+def task_side(item, default=None):
+    """一条项目任务属于哪一侧；没打侧标签时退回 ``default``（legacy op 类型）。"""
+    if not isinstance(item, dict):
+        return default
+    return side_of_tags(item.get("tags") or ()) or default
+
+
+def task_has_tag(item, tag):
+    """这条任务有没有某个标签（大小写不敏感）。"""
+    want = str(tag or "").strip().lower()
+    if not want:
+        return False
+    return any(str(x).strip().lower() == want
+               for x in ((item or {}).get("tags") or ()))
+
+
+def side_for_stage(stage):
+    """阶段 → 活跃侧：bottleneck 做 incubator，其余都按 SOP。"""
+    got = normalize_pro_stage(stage)
+    return OP_TYPE_INCUBATOR if got == STAGE_BOTTLENECK else OP_TYPE_SOP
+
+
+def active_side_of_pro(pro):
+    return side_for_stage((pro or {}).get("stage"))
+
+
+def item_defer_at(item):
+    """项目清单项的 defer 时间点；没有 / 认不出返回 None。"""
+    if not isinstance(item, dict) or not item.get("defer"):
+        return None
+    return ts.task_defer_at({"fields": {"defer": item.get("defer")}})
+
+
+def frozen_defer_value(now=None):
+    """冻结时写进 defer 的值：十年后的同一时刻（去掉微秒，OmniFocus 好认）。"""
+    now = now or datetime.datetime.now()
+    return (now + datetime.timedelta(days=FROZEN_DEFER_DAYS)).replace(
+        microsecond=0).isoformat()
+
+
+def is_frozen_defer(value, now=None):
+    """这个 defer 值是不是我们设的「冻结」哨兵（在五年之后）。"""
+    got = ts.task_defer_at({"fields": {"defer": value}})
+    if got is None:
+        return False
+    now = now or datetime.datetime.now()
+    return got > now + datetime.timedelta(days=FROZEN_DETECT_DAYS)
+
+
+def task_is_frozen(item, now=None):
+    """任务是不是被冻结了（不进任何自动排期候选）。
+
+    判据两条任一成立：defer 在五年之后（我们设的哨兵），或者带着
+    ``manual_defer`` 标签（用户手打的也算）。
+    """
+    if not isinstance(item, dict):
+        return False
+    if task_has_tag(item, TAG_MANUAL_DEFER):
+        return True
+    return is_frozen_defer(item.get("defer"), now=now)
 
 #: 唤起出来的本地任务用这几个 ``fields`` 键指回项目。字段名就是界面上显示的名字
 #: （任务视图会把 fields 的每个键摊成一列），所以要能一眼看懂。
@@ -1201,11 +1295,19 @@ def _norm_pro(raw):
         if oid is not None and oid > 0 and oid not in op_ids:
             op_ids.append(oid)
     status = normalize_status(raw.get("status")) or STATUS_ACTIVE
+    op_id = _as_int(raw.get("op_id"))
+    if len(op_ids) == 1:
+        # 新模型：一个 pro 只关联一个 op；旧数据也在读的时候把唯一那条认成 op_id。
+        op_id = op_ids[0]
+    else:
+        # 双 op 的旧数据不认 op_id（否则 -pi 会拿到阶段外的那一条）。
+        op_id = None
     return {
         "id": ident,
         "title": title,
         "stage": stage,
         "file": file_path,
+        "op_id": op_id,
         "sop_op_id": sop_op_id,
         "incubator_op_id": incubator_op_id,
         "op_ids": op_ids,
@@ -1520,7 +1622,8 @@ def _derived_open_count(item):
     return len(_dv.open_items(_dv.parse(note, title)))
 
 
-def stats(project, task_store=None, invested_map=None):
+def stats(project, task_store=None, invested_map=None, side=None, default_side=None,
+          now=None):
     """一个项目的账：``total`` / ``done`` / ``remaining`` / ``progress``。
 
     父任务壳的 ``duration/count`` 由子任务派生，不能和子任务重复计账：
@@ -1536,6 +1639,11 @@ def stats(project, task_store=None, invested_map=None):
     清单，工作量是 3–6 count（和任务面板里的 ``(0/3-6)`` 同一个口径），所以
     另外返回 ``remaining_text`` / ``total_high`` / ``remaining_high``，进度
     文字写成 ``0/3-6``。
+
+    ``side`` 给了就只算这一侧的任务（``SOP`` / ``incubator``）；没打侧标签的
+    任务按 ``default_side``（legacy op 类型）算，两边都没有就**不计入任何一侧**
+    —— 这正是「项目里不该出现没 tag 的任务」的账务表现。冻结的任务仍然计账
+    （它是这个项目还没干的活），只是不进 ``plan``。
     """
     if invested_map is None:
         invested_map = invested(task_store, project)
@@ -1548,6 +1656,8 @@ def stats(project, task_store=None, invested_map=None):
     remaining_high_minutes = 0
     for item in tasks:
         if kids.get(item.get("pk")):
+            continue
+        if side is not None and task_side(item, default=default_side) != side:
             continue
         pk = str(item.get("pk") or "")
         status = statuses.get(pk, STATUS_ACTIVE)
@@ -1601,7 +1711,8 @@ def _item_deferred(item, now=None):
 
 
 def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
-                    rotation=None, derived_budget=None, skip_pks=None):
+                    rotation=None, derived_budget=None, skip_pks=None,
+                    side=None, default_side=None):
     """还没做完、而且还有内容可干的**顶层任务**（按清单顺序）。
 
     有子任务的父任务返回成一条派生单元：``duration`` 是剩余子任务分钟数之和，
@@ -1626,6 +1737,11 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
     parallel 的容器会展开**够填满这笔预算**的条数（3 count/条的清单分到 6
     count 就展开 2 条），否则「说好 6 count」永远只能排出 3 —— 清单明明还有
     7 条没做，却报「没有更多可干的了」。
+
+    ``side``：只取这一侧（``SOP`` / ``incubator``）的任务。没打侧标签的任务
+    按 ``default_side``（legacy op 类型）算；两边都没有 → 不进任何一侧的队列
+    （用户 2026-11-21：项目文件夹里不该出现没 tag 的任务，refresh 会报警）。
+    冻结的任务（defer 在五年之后 / 带 ``manual_defer``）永远不进候选。
     """
     invested_map = invested_map or {}
     exclude = {str(pk) for pk in (exclude_pks or ())}
@@ -1635,13 +1751,19 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
     out = []
     derived_tail = []
     sequential = task_type_of(project) == "sequential"
+
+    def _side_ok(item):
+        return side is None or task_side(item, default=default_side) == side
+
     for item in top_level_tasks(tasks):
         pk = str(item.get("pk") or "")
         if pk in exclude:
             continue
+        if not _side_ok(item):
+            continue
         if statuses.get(pk, STATUS_ACTIVE) != STATUS_ACTIVE:
             continue
-        if _item_deferred(item, now=now):
+        if task_is_frozen(item, now=now) or _item_deferred(item, now=now):
             continue
         children = kids.get(item.get("pk")) or []
         if not children and _derived_eligible(item):
@@ -1661,7 +1783,9 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
                     continue
                 if statuses.get(child_pk, STATUS_ACTIVE) != STATUS_ACTIVE:
                     continue
-                if _item_deferred(child, now=now):
+                if task_is_frozen(child, now=now) or _item_deferred(child, now=now):
+                    continue
+                if not _side_ok(child):
                     continue
                 minutes = _item_minutes(child)
                 if minutes <= 0:
@@ -1983,6 +2107,7 @@ class ProjectStore(object):
             "title": clean,
             "stage": normalize_pro_stage(default_stage) or STAGE_RUNNING,
             "file": str(file_path).strip() if file_path else None,
+            "op_id": None,
             "sop_op_id": None,
             "incubator_op_id": None,
             "op_ids": [],
@@ -2021,6 +2146,9 @@ class ProjectStore(object):
             pro["incubator_op_id"] = op["id"]
         else:
             pro["sop_op_id"] = op["id"]
+        # 新模型：一个 pro 只该有一个 op。只有一个时写进 ``op_id`` 作为权威绑定；
+        # 旧数据两个 op 并存时清掉它，交给 ``current_op_for_pro`` 按阶段兜底。
+        pro["op_id"] = op["id"] if len(op_ids) == 1 else None
         pro["updated_at"] = _now()
 
     def upsert(self, payload):
@@ -2152,9 +2280,11 @@ class ProjectStore(object):
         raise ValueError("没有 OmniFocus 项目（op）%s" % project_id)
 
     def untyped_ops(self):
-        """返回还没填类型（SOP / incubator）的 active op 列表。"""
-        return [p for p in self.active()
-                if normalize_op_type(p.get("op_type")) is None]
+        """旧接口：还没填 SOP / incubator 类型的 op。
+
+        2026-11-21 起 op 不再需要类型，恒返回空表（导入 / refresh 不再打断）。
+        """
+        return []
 
     def set_op_status(self, project_id, status, reason=None):
         """修改 OmniFocus Project（``op``）的本地状态。
@@ -2715,6 +2845,24 @@ class ProjectStore(object):
         other = OP_TYPE_SOP if want == OP_TYPE_INCUBATOR else OP_TYPE_INCUBATOR
         if kinds == {other}:
             return STAGE_BOTTLENECK if other == OP_TYPE_INCUBATOR else STAGE_RUNNING
+        # 单项目模型（2026-11-21）：op 可以没有类型，阶段就按**任务标签**推断 ——
+        # 清单里只有 incubator 标签 → bottleneck；只有 SOP 标签 → running；
+        # 两边都有 / 都没打 → 保持原阶段（不猜）。
+        op = self.current_op_for_pro(pro, store=data)
+        if op is not None:
+            sides = set()
+            for item in op.get("tasks") or ():
+                if (item.get("completed") or item.get("dropped")
+                        or item.get("effective_completed")
+                        or item.get("effective_dropped")):
+                    continue
+                got = task_side(item)
+                if got is not None:
+                    sides.add(got)
+            if sides == {OP_TYPE_INCUBATOR}:
+                return STAGE_BOTTLENECK
+            if sides == {OP_TYPE_SOP}:
+                return STAGE_RUNNING
         return stage
 
     def reconcile_pro_stage(self, pro_or_id, store=None, save=True):
@@ -2742,21 +2890,24 @@ class ProjectStore(object):
         return pro, old_stage, new_stage
 
     def current_op_for_pro(self, pro_or_id, store=None):
-        """一个 ``pro`` **当前阶段**对应的那一个 op（没有返回 None）。
+        """一个 ``pro`` 当前对应的那一个 op（没有返回 None）。
 
-        - ``running`` 阶段 → 只取绑定的 SOP op；
-        - ``bottleneck`` 阶段 → 只取绑定的 incubator op；
-        - 优先 ``sop_op_id`` / ``incubator_op_id``，旧数据没写绑定字段时退回
-          该阶段类型里最后导入的 active op。
-
-        这里刻意**不**允许一个 pro 同时暴露两个 op：项目展示、plan 的资源清单
-        和契约表都只该看到当前阶段那一个。
+        新模型（2026-11-21）：**一个 pro 只关联一个 op**，SOP / incubator 是任务
+        标签而不是两个 OmniFocus 项目。所以先看 ``op_id``；旧数据没有这个字段时，
+        再按 ``sop_op_id`` / ``incubator_op_id`` 和唯一关联 op 兜底。
         """
         data = store if isinstance(store, dict) else self.load()
         pro = (pro_or_id if isinstance(pro_or_id, dict)
                else self.pro_by_id(pro_or_id, store=data))
         if not pro or pro.get("status") != STATUS_ACTIVE:
             return None
+        oid = _as_int(pro.get("op_id"))
+        if oid is not None:
+            op = next((p for p in (data.get("projects") or ())
+                       if p.get("id") == oid and p.get("status") == STATUS_ACTIVE),
+                      None)
+            if op is not None:
+                return op
         stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
         want = OP_TYPE_INCUBATOR if stage == STAGE_BOTTLENECK else OP_TYPE_SOP
         field = ("incubator_op_id" if want == OP_TYPE_INCUBATOR else "sop_op_id")
@@ -2770,6 +2921,10 @@ class ProjectStore(object):
         linked = [op for op in self.ops_for_pro(pro, store=data)
                   if normalize_op_type(op.get("op_type")) == want]
         if not linked:
+            # 单 op 但没写类型的旧数据：直接认唯一那条，不再要求 SOP/incubator。
+            linked = list(self.ops_for_pro(pro, store=data))
+            if len(linked) == 1:
+                return linked[0]
             return None
         # 同一阶段如果历史上有多个 op，绑定字段才是权威；旧数据没有字段时取
         # 最后导入的 active op，保证展示/plan 都只有一个当前 op。
@@ -2777,16 +2932,20 @@ class ProjectStore(object):
         return linked[-1]
 
     def op_for_pro_type(self, pro_or_id, op_type, store=None):
-        """一个 ``pro`` 指定类型（SOP / incubator）的那个 op，**不看阶段**。
+        """一个 ``pro`` 的 op（``-ps/-pi`` 用；旧语义「按类型取」）。
 
-        ``task <任务> -ps/-pi <项目序号>`` 用的就是它：用户显式点名要走哪一侧，
-        允许越过 running/bottleneck 的阶段门控（那门控只管自动 ``plan`` 的候选）。
+        2026-11-21 起一个 pro 只有一个 op，类型是任务标签而不是项目属性，所以
+        ``-ps`` / ``-pi`` 都指向同一个 op。旧的双 op 数据仍按类型取。
         """
         data = store if isinstance(store, dict) else self.load()
         pro = (pro_or_id if isinstance(pro_or_id, dict)
                else self.pro_by_id(pro_or_id, store=data))
         if not pro or pro.get("status") != STATUS_ACTIVE:
             return None
+        single = self.current_op_for_pro(pro, store=data)
+        if single is not None and (pro.get("op_id") is not None
+                                   or len(self.ops_for_pro(pro, store=data)) == 1):
+            return single
         want = normalize_op_type(op_type)
         if want is None:
             return None
@@ -2827,24 +2986,27 @@ class ProjectStore(object):
         return None
 
     def untyped_linked_ops(self, store=None):
-        """关联了真正项目、但还没说明 SOP / incubator 类型的 active op。"""
-        data = store if isinstance(store, dict) else self.load()
-        out = []
-        for op in data.get("projects") or ():
-            if op.get("status") != STATUS_ACTIVE:
-                continue
-            if normalize_op_type(op.get("op_type")) is not None:
-                continue
-            if self.pro_for_op(op, store=data) is not None:
-                out.append(op)
-        return out
+        """旧接口：关联了真正项目、但没说明 SOP / incubator 类型的 op。
+
+        2026-11-21 起 op 不再需要类型（侧别是任务标签），所以这里恒返回空表，
+        导入 / refresh 不会再拿「这是 SOP 还是 incubator」打断你。
+        """
+        return []
 
     def plan_ops(self, store=None):
-        """``plan`` 的唯一候选清单：每个 active pro 当前阶段对应的那一个 op。
+        """``plan`` 的唯一候选清单：每个 active pro 的那一个 op。
 
         没有关联真正项目 ``pro`` 的 op 不进 plan —— 否则一个孤立的
         OmniFocus 项目会和真正的项目阶段脱节，出现在资源分配里却没有任何
         阶段门控。返回顺序 = 真正项目序号顺序。
+
+        每条都是 op 的**浅拷贝**，额外带三个只有 plan 层认识的键：
+
+        * ``stage``：pro 当前阶段（``running`` / ``bottleneck``）；
+        * ``side``：当前活跃侧（``SOP`` / ``incubator``），候选任务按它过滤；
+        * ``default_side``：这个 op 的 legacy 类型，用来给没打侧标签的任务兜底。
+
+        这样 ``project_plan`` 不需要再回头查 pro，也保证「同一份清单只挑一侧」。
         """
         data = store if isinstance(store, dict) else self.load()
         out = []
@@ -2852,8 +3014,14 @@ class ProjectStore(object):
             if pro.get("status") != STATUS_ACTIVE:
                 continue
             op = self.current_op_for_pro(pro, store=data)
-            if op is not None:
-                out.append(op)
+            if op is None:
+                continue
+            stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+            view = dict(op)
+            view["stage"] = stage
+            view["side"] = side_for_stage(stage)
+            view["default_side"] = normalize_op_type(op.get("op_type"))
+            out.append(view)
         return out
 
     def set_task_note(self, project_id, pk, note):
@@ -2969,6 +3137,121 @@ class ProjectStore(object):
             self.save(store)
             return project
         raise ValueError("没有项目 %s" % project_id)
+
+    def prepend_tasks(self, project_id, tasks):
+        """把一批任务按给定顺序插到项目清单**最前面**（一次落盘）。
+
+        切到 incubator 时把攒下的软中断 dump 成任务用它：插入顺序 = 传入顺序，
+        原来的队首（没做完的 SOP 任务）自然退到这批任务后面，进度不动。
+        """
+        items = [rec for rec in (_norm_task(raw, rank=0) for raw in (tasks or ()))
+                 if rec is not None]
+        if not items:
+            return None
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            moved_pks = {str(x.get("pk") or "") for x in items}
+            rest = [x for x in (project.get("tasks") or ())
+                    if str(x.get("pk") or "") not in moved_pks]
+            project["tasks"] = items + rest
+            for index, item in enumerate(project["tasks"]):
+                item["rank"] = index
+            project["synced_at"] = _now()
+            self.save(store)
+            return project
+        raise ValueError("没有项目 %s" % project_id)
+
+    def update_tasks(self, project_id, changes):
+        """批量改项目清单里几条任务的字段（**一次落盘**）。
+
+        ``changes`` = ``{pk: {"defer": ..., "tags": [...], "count": ...}}``。
+        键不存在 = 不动；``defer`` / ``tags`` 传 ``None`` 表示清空该字段。
+        冻结 / 解冻要走它：pro 一侧可能一次要改几十条任务，逐条 save 会把
+        projects.json 重写几十遍。
+        """
+        wanted = {str(pk): dict(fields or {}) for pk, fields in (changes or {}).items()}
+        if not wanted:
+            return None
+        store = self.load()
+        for project in store["projects"]:
+            if project["id"] != int(project_id):
+                continue
+            touched = 0
+            for item in project.get("tasks") or ():
+                fields = wanted.get(str(item.get("pk") or ""))
+                if not fields:
+                    continue
+                for key, value in fields.items():
+                    if value is None:
+                        item.pop(key, None)
+                    elif key == "tags":
+                        item["tags"] = [str(x).strip() for x in value if str(x).strip()]
+                    else:
+                        item[key] = value
+                touched += 1
+            if touched:
+                project["synced_at"] = _now()
+                self.save(store)
+            return project
+        raise ValueError("没有项目 %s" % project_id)
+
+    def merge_ops(self, dst_op_id, src_op_id, tag=None, reason="merged"):
+        """把 ``src`` op 的任务并进 ``dst`` op（迁移：一个项目只留一个 op）。
+
+        本地快照这一步只做三件事：src 的任务按原顺序插到 dst 清单**最前面**、
+        统一打上 ``tag``（默认 src 的 legacy 类型）、src op 标 ``dropped`` 并
+        解除关联。OmniFocus 那边的任务移动 / 空项目删除由调用方负责。
+
+        返回 ``(dst_op, moved_tasks)``；同一个 src 再调一次是幂等的（任务 pk
+        相同会被覆盖，不会出现两份）。
+        """
+        store = self.load()
+        dst = next((p for p in (store.get("projects") or ())
+                    if p["id"] == int(dst_op_id)), None)
+        src = next((p for p in (store.get("projects") or ())
+                    if p["id"] == int(src_op_id)), None)
+        if dst is None or src is None:
+            raise ValueError("合并的两端 op 必须都存在（dst=%s src=%s）"
+                             % (dst_op_id, src_op_id))
+        if dst["id"] == src["id"]:
+            raise ValueError("不能把 op 合并到自己")
+        side = normalize_op_type(tag) or normalize_op_type(src.get("op_type"))
+        moved = []
+        dst_pks = {str(x.get("pk") or "") for x in (dst.get("tasks") or ())}
+        src_tasks = [x for x in (src.get("tasks") or ()) if isinstance(x, dict)]
+        for item in src_tasks:
+            rec = dict(item)
+            tags = [str(t).strip() for t in (rec.get("tags") or ()) if str(t).strip()]
+            if side and side not in tags:
+                tags.append(side)
+            rec["tags"] = tags
+            rec.pop("status", None)
+            moved.append(rec)
+        # src 里已经搬过的任务不再保留在 src；dst 里的同 pk 先删掉再插，保证幂等。
+        moved_pks = {str(x.get("pk") or "") for x in moved}
+        dst["tasks"] = moved + [x for x in (dst.get("tasks") or ())
+                                if str(x.get("pk") or "") not in moved_pks]
+        for index, item in enumerate(dst["tasks"]):
+            item["rank"] = index
+        src["tasks"] = []
+        src["status"] = STATUS_DROPPED
+        src["status_at"] = _now()
+        src["status_reason"] = reason
+        src["pro_id"] = None
+        pro = self.pro_by_id(dst.get("pro_id"), store=store)
+        if pro is not None:
+            pro["op_ids"] = [x for x in (pro.get("op_ids") or ()) if x != src["id"]]
+            if pro.get("sop_op_id") == src["id"]:
+                pro["sop_op_id"] = None
+            if pro.get("incubator_op_id") == src["id"]:
+                pro["incubator_op_id"] = None
+            pro["op_id"] = dst["id"]
+            pro["updated_at"] = _now()
+        dst["synced_at"] = _now()
+        self.save(store)
+        return dst, moved
 
     def remove_task(self, project_id, task_pk):
         """把一条任务从项目清单里摘掉（改归属时用；不动本地任务库）。"""
@@ -3209,43 +3492,34 @@ class ProjectStore(object):
         store = self.load()
         pros = [p for p in (store.get("pros") or ())
                 if include_inactive or p.get("status") == STATUS_ACTIVE]
-        ops_by_id = {p["id"]: p for p in (store.get("projects") or ())
-                     if p.get("status") == STATUS_ACTIVE}
         out = []
         for index, pro in enumerate(pros, 1):
             linked_ops = self.ops_for_pro(pro, store=store)
-            sop_ops = [op for op in linked_ops
-                       if (normalize_op_type(op.get("op_type")) or OP_TYPE_SOP) == OP_TYPE_SOP]
-            inc_ops = [op for op in linked_ops
-                       if normalize_op_type(op.get("op_type")) == OP_TYPE_INCUBATOR]
-            sop_op = ops_by_id.get(pro.get("sop_op_id")) or (sop_ops[-1] if sop_ops else None)
-            inc_op = ops_by_id.get(pro.get("incubator_op_id")) or (inc_ops[-1] if inc_ops else None)
             stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
-            active_op = self.display_op_for_pro(pro, store=store)
-            op_kind = normalize_op_type((active_op or {}).get("op_type"))
-            effective_stage = stage
-            if op_kind in OP_TYPES:
-                effective_stage = (STAGE_BOTTLENECK if op_kind == OP_TYPE_INCUBATOR
-                                   else STAGE_RUNNING)
+            active_op = self.current_op_for_pro(pro, store=store)
+            if active_op is None and len(linked_ops) == 1:
+                # 展示层兜底：阶段字段陈旧时也不能把整行吞掉。
+                active_op = linked_ops[0]
+            active_side = side_for_stage(stage)
+            legacy_op_ids = [x for x in (pro.get("op_ids") or ())
+                             if x != (active_op or {}).get("id")]
             out.append({
                 "number": index,
                 "id": pro["id"],
                 "title": pro.get("title") or ("项目 %d" % pro["id"]),
                 "stage": stage,
-                "effective_stage": effective_stage,
-                "stage_mismatch": bool(active_op and op_kind in OP_TYPES
-                                       and effective_stage != stage),
+                "effective_stage": stage,
+                "stage_mismatch": False,
+                "active_side": active_side,
                 "status": pro.get("status") or STATUS_ACTIVE,
                 "status_at": pro.get("status_at"),
                 "status_reason": pro.get("status_reason"),
                 "file": pro.get("file"),
-                "sop_op": sop_op,
-                "incubator_op": inc_op,
                 "active_op": active_op,
-                "active_op_type": (normalize_op_type((active_op or {}).get("op_type"))
-                                   or (OP_TYPE_INCUBATOR if stage == STAGE_BOTTLENECK
-                                       else OP_TYPE_SOP)),
+                "op": active_op,
                 "ops": linked_ops,
+                # 旧双 op 数据：还有另一个 op 没合并时点名，提醒跑 `pro N merge`。
+                "legacy_extra_ops": legacy_op_ids,
                 "pro": pro,
             })
         return out

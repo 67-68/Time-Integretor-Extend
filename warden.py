@@ -82,13 +82,14 @@
 **项目 + `plan`（资源 → 任务 → session）**：`task import` 认出剪贴板里是 OmniFocus
 **项目**时，把它的任务清单存进项目库（`data/projects.json`），**不建本地任务**；
 契约视图的任务面板下面多一张项目表（剩余 count / 进度 / 今天排了多少）。
-每个真正项目只显示当前阶段对应的那一个 op（running → SOP / bottleneck →
-incubator）。`plan` 只把这些关联了 pro 的当前 op 放进候选，一次问完每个项目
+一个真正项目只关联一个 OmniFocus 项目（op）；SOP / incubator 是**任务标签**
+（running 只排 SOP 侧、bottleneck 只排 incubator 侧，另一侧 defer 十年冻结）。
+`plan` 只把这些关联了 pro 的 op 放进候选，按阶段挑一侧的任务，一次问完每个项目
 「分多少」（`task 1 4` / `task 1 clear` / `complete`），再按分到的 count 唤起任务、
 排进 period：日历 period 不可变，session 由任务时长反推（25/50/75 工作分钟 +
 5/10/15 休息）；手动 `period T1 50 25` 是硬约束，`period T1 clear` 清空内容。
 `pro <序号> interrupt` 默认开软中断：
-记录一条建议 → 选 A/B/C 类别；`--check` 逐条整理并生成 incubator 任务。
+记录一条建议 → 选 A/B/C 类别；`--check` 逐条入队，切到 incubator 时 dump 成任务。
 `pro <序号> interrupt --hard` 才是硬中断当前场：全部任务下架 → 输入 title →
 新建整场任务挂回去。`cst` / `conscription` 按剩余时间快速征召一条合适任务。
 见 [`feature_intents/project.md`](feature_intents/project.md)。

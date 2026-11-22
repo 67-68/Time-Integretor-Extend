@@ -1076,10 +1076,14 @@ class Client(object):
         self._cache = list(self._rows_by_id.values())
 
     def flush(self, ops, timeout=None):
-        """一次 osascript 处理多条 complete/drop。返回 ``{"results": [...]}``。
+        """一次 osascript 处理多条写操作（complete / drop / note_mark / move / set）。
 
         本地优先写回用它：``task done`` 只改本地，空闲 / refresh 时把这些攒着的
-        账一次写回去（N 条任务 = 1 个进程，而不是 N 个）。
+        账一次写回去（N 条任务 = 1 个进程，而不是 N 个）。``ops`` 里的 dict 原样
+        进 stdin（只做 json.dumps），所以 ``{"id", "op": "set", "defer": …,
+        "tags": {...}}`` 这种整批的 defer/标签写也能直接丢进来。
+
+        返回 ``{"results": [...]}``，每条结果的形状由对应 op 决定。
         """
         payload = {"ops": [dict(op) for op in (ops or [])]}
         if not payload["ops"]:
@@ -1273,6 +1277,38 @@ class Client(object):
 
     def add_tag(self, pk, name, yes=True, timeout=None):
         return self.set_task(pk, "--add-tag", name, yes=yes, timeout=timeout)
+
+    def remove_tag(self, pk, name, yes=True, timeout=None):
+        """删掉一个标签（``set --remove-tag NAME``）；标签不存在时 OmniFocus 侧报错。
+
+        标签名可以写叶子名（唯一时）、完整路径（``Work/Deep``）或标签 primary
+        key。``yes=False`` 只预览（退出码 4 → 结果 dict 带 ``_dry_run_exit``）。
+        """
+        return self.set_task(pk, "--remove-tag", name, yes=yes, timeout=timeout)
+
+    def set_tags(self, pk, names, yes=True, timeout=None):
+        """用 ``names`` 整体替换这条任务的标签；空列表等价于 ``--clear-tags``。
+
+        ``names`` 里的标签名规则和 :meth:`remove_tag` 一样（叶子名 / 完整路径 /
+        primary key）。一次 osascript，不是逐个别。
+        """
+        items = [str(name) for name in (names or []) if str(name).strip()]
+        if not items:
+            return self.set_task(pk, "--clear-tags", yes=yes, timeout=timeout)
+        return self.set_task(pk, "--set-tags", ",".join(items),
+                             yes=yes, timeout=timeout)
+
+    def set_defer(self, pk, defer, yes=True, timeout=None):
+        """改这条任务的 defer 日期；``defer=None`` / ``""`` 就是清掉（解冻）。
+
+        传 ISO 8601（``2026-11-01T09:00`` / ``2026-11-01``）或任何 JS
+        ``new Date()`` 认得、且 Python 的 ``fromisoformat`` 也认得的字符串。
+        warden 的 SOP / incubator 冻结就是 ``set_defer(pk, 十年后)``，
+        解冻就是 ``set_defer(pk, None)``。
+        """
+        if defer is None or str(defer).strip() == "":
+            return self.set_task(pk, "--clear-defer", yes=yes, timeout=timeout)
+        return self.set_task(pk, "--defer", str(defer), yes=yes, timeout=timeout)
 
     def incomplete(self, pk, yes=True, timeout=None):
         return self.set_task(pk, "--incomplete", yes=yes, timeout=timeout)

@@ -577,6 +577,7 @@ SET_OMNIJS_TEMPLATE = r'''
       (args.tags.remove && args.tags.remove.length)
     );
     const hasDue = !!(args.due || args.clearDue);
+    const hasDefer = !!(args.defer || args.clearDefer);
     if (hasState && hasTags) {
       return reply({ ok: false, error: "bad_request", message: "状态操作和标签操作不要混在一条命令里" });
     }
@@ -639,11 +640,17 @@ SET_OMNIJS_TEMPLATE = r'''
         task.dueDate = args.due ? new Date(args.due) : null;
         afterTask = task;
       }
+      // defer 同样是「修饰」：可以跟 complete/drop/标签一起给（warden 的
+      // SOP/incubator 冻结就是「defer 到十年后」，解冻就是清掉 defer）。
+      if (hasDefer) {
+        task.deferDate = args.defer ? new Date(args.defer) : null;
+        afterTask = task;
+      }
     }
     const repeatCloneId = (idOf(afterTask) !== idOf(task)) ? idOf(afterTask) : null;
     const after = args.dryRun ? before : snapshot(afterTask);
     const changed = [];
-    for (const key of ["completed", "dropped", "completion_date", "drop_date", "due", "tags"]) {
+    for (const key of ["completed", "dropped", "completion_date", "drop_date", "due", "defer", "tags"]) {
       if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(key);
     }
     return reply({
@@ -939,11 +946,52 @@ BATCH_JS = r"""
     completion_date: iso(t.completionDate),
     drop_date: iso(t.dropDate),
     due: iso(t.dueDate),
+    defer: iso(t.deferDate),
+    // 标签按**名字**排序后比较：标签集合是 Set，顺序不稳定，直接比会假报变化。
+    tags: Array.from(t.tags).map(g => g.name).sort(),
     project_id: (function () {
       try { return t.containingProject ? idOf(t.containingProject) : null; }
       catch (e) { return null; }
     })()
   });
+  const tagPath = g => {
+    const names = [];
+    let x = g;
+    while (x) {
+      names.unshift(x.name);
+      x = x.parent;
+    }
+    return names.join("/");
+  };
+  const allTagsOf = () => ((typeof flattenedTags !== "undefined")
+    ? flattenedTags : database.flattenedTags);
+  // 和单条 set 里那份是同一套规则：叶子名唯一 / 完整路径 / primary key 都能用。
+  // 找不到或有歧义只记进 problems，由调用方决定是「这一条失败」还是整批失败。
+  const resolveList = names => {
+    const tags = [];
+    const problems = [];
+    const seenNames = [];
+    const allTags = allTagsOf();
+    for (const name of names) {
+      if (seenNames.indexOf(name) >= 0) continue;
+      seenNames.push(name);
+      const matches = [];
+      for (const g of allTags) {
+        if (g.name === name || tagPath(g) === name || idOf(g) === name) matches.push(g);
+      }
+      const seen = {};
+      const unique = [];
+      for (const g of matches) {
+        const key = idOf(g) || tagPath(g);
+        if (!seen[key]) { seen[key] = 1; unique.push(g); }
+      }
+      if (unique.length === 0) problems.push({ kind: "not_found", name: name });
+      else if (unique.length > 1) problems.push({ kind: "ambiguous", name: name, paths: unique.map(tagPath) });
+      else tags.push(unique[0]);
+    }
+    return { tags: tags, problems: problems };
+  };
+  const tagInfo = list => list.map(g => ({ id: idOf(g), name: g.name, path: tagPath(g) }));
   if (typeof Task === "undefined" || typeof Task.byIdentifier !== "function") {
     return JSON.stringify(reply({ ok: false, error: "omnijs_unavailable",
       message: "当前 OmniFocus 不支持 Task.byIdentifier" }));
@@ -1101,6 +1149,64 @@ BATCH_JS = r"""
         const after = snapshot(afterTask);
         results.push(Object.assign({}, base, { ok: true, before: before,
                        after: after, changed: ["project"] }));
+      } else if (op === "set") {
+        // 一次进程里对**多条**任务做同一批写操作（defer / due / 标签）。
+        // 字段都从 item 里读、都可缺省；标签找不到或有歧义时只让**这一条**
+        // 失败（ok:false + error:"tag_problem"），不连累同批的其他任务。
+        const want = (item.tags && typeof item.tags === "object"
+                      && !Array.isArray(item.tags)) ? item.tags : {};
+        const addRes = resolveList(want.add || []);
+        const removeRes = resolveList(want.remove || []);
+        const setRes = resolveList(want.set || []);
+        const problems = [].concat(addRes.problems, removeRes.problems, setRes.problems);
+        if (problems.length) {
+          results.push(Object.assign({}, base, { ok: false, error: "tag_problem",
+                         message: "标签找不到或有歧义", problems: problems }));
+          continue;
+        }
+        // `set` 给了数组（哪怕空数组）就是「替换全部标签」；空数组 = 清空。
+        const hasSet = Array.isArray(want.set);
+        const hasTags = !!(hasSet || want.clear
+                           || addRes.tags.length || removeRes.tags.length);
+        const hasDefer = !!(item.defer || item.clear_defer);
+        const hasDue = !!(item.due || item.clear_due);
+        if (!hasTags && !hasDefer && !hasDue) {
+          results.push(Object.assign({}, base, { ok: false, error: "bad_request",
+                         message: "set 至少要给 defer / due / tags 之一" }));
+          continue;
+        }
+        let afterTask = task;
+        if (hasSet) {
+          task.clearTags();
+          if (setRes.tags.length) task.addTags(setRes.tags);
+        } else if (want.clear) {
+          task.clearTags();
+        } else if (hasTags) {
+          if (removeRes.tags.length) task.removeTags(removeRes.tags);
+          if (addRes.tags.length) task.addTags(addRes.tags);
+        }
+        // defer / due 是「修饰」，和标签写在同一趟里；显式的 clear_* 只在
+        // 对应值缺省时生效（有值就以值为准，和单条 set 的优先级一致）。
+        if (hasDefer) {
+          task.deferDate = item.defer ? new Date(item.defer) : null;
+          afterTask = task;
+        }
+        if (hasDue) {
+          task.dueDate = item.due ? new Date(item.due) : null;
+          afterTask = task;
+        }
+        const after = snapshot(afterTask);
+        const changed = [];
+        for (const key of ["defer", "due", "tags"]) {
+          if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) changed.push(key);
+        }
+        results.push(Object.assign({}, base, { ok: true, before: before, after: after,
+                       changed: changed,
+                       resolved_tags: {
+                         add: tagInfo(addRes.tags),
+                         remove: tagInfo(removeRes.tags),
+                         set: tagInfo(setRes.tags)
+                       } }));
       } else {
         results.push({ id: pk, task_id: taskId, ok: false, error: "bad_op" });
       }
@@ -1115,13 +1221,13 @@ BATCH_JS = r"""
 
 
 def build_batch_script(payload, chunk_size=600):
-    """一次 osascript 处理多条 complete/drop（本地优先写回的 flush）。"""
+    """一次 osascript 处理多条 complete/drop/note_mark/move/set（写回 flush 用）。"""
     js = BATCH_JS.replace(
         "{{ARGS}}",
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     ).strip("\n")
     return build_omnijs_script(js, chunk_size=chunk_size,
-                               header="-- 由 omnifocus_tasks.py 生成：批量写回（complete/drop）")
+                               header="-- 由 omnifocus_tasks.py 生成：批量写回")
 
 
 def parse_batch_output(text):
@@ -1645,7 +1751,8 @@ def build_set_parser():
         description="按 primary key 修改一个 OmniFocus 任务。默认只预览，加 --yes 才真写。",
         epilog=(
             "状态操作和标签操作分两次跑，不要混在一条命令里；"
-            "--due 是修饰，可以跟 --complete/--drop 一起给。\n"
+            "--due 是修饰（可跟 --complete/--drop 一起给），"
+            "--defer 也是修饰，还能跟标签操作同一条命令给。\n"
             "标签名可以写叶子名（唯一时）、完整路径（如 Work/Deep）或标签 primary key。\n"
             "退出码：0 成功 / 1 失败 / 2 参数错 / 3 权限被拒 / 4 预览未写 / "
             "5 任务不存在 / 6 标签问题 / 7 拒绝改 project_root。"
@@ -1682,6 +1789,18 @@ def build_set_parser():
         "--clear-due",
         action="store_true",
         help="清掉截止时间",
+    )
+    defer = parser.add_mutually_exclusive_group()
+    defer.add_argument(
+        "--defer",
+        metavar="ISO",
+        help="改 defer 日期（ISO 8601 / YYYY-MM-DD，或别的能被 new Date() 解析的字符串；"
+             "可以和 --complete / 标签操作一起给）",
+    )
+    defer.add_argument(
+        "--clear-defer",
+        action="store_true",
+        help="清掉 defer 日期（解冻）",
     )
     parser.add_argument(
         "--add-tag",
@@ -1745,11 +1864,27 @@ def build_set_parser():
     return parser
 
 
-def _normalize_at(value):
-    """把 --at 规整成 JS new Date() 能按本地时间解析的 ISO 字符串。"""
+def _normalize_defer(value):
+    """规整 --defer 的值。
+
+    ISO 8601（含 ``YYYY-MM-DD`` 简写）走的和 --due 同一套校验 + 本地零点补全；
+    不是严格 ISO 的字符串**原样透传**交给 JS 的 ``new Date()``（它认得更多写法）。
+    空串拒绝：想要「解冻」请用 --clear-defer，别让空值悄悄变成「没给」。
+    """
     text = (value or "").strip()
     if not text:
-        raise ValueError("--at 不能为空")
+        raise ValueError("--defer 不能为空；想清掉 defer 请用 --clear-defer")
+    try:
+        return _normalize_at(text, "--defer")
+    except ValueError:
+        return text
+
+
+def _normalize_at(value, flag="--at"):
+    """把 --at / --defer 规整成 JS new Date() 能按本地时间解析的 ISO 字符串。"""
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("%s 不能为空" % flag)
     if len(text) == 10:  # YYYY-MM-DD → 本地零点
         text = text + "T00:00:00"
     probe = text[:-1] + "+00:00" if text.upper().endswith("Z") else text
@@ -1757,7 +1892,8 @@ def _normalize_at(value):
         datetime.datetime.fromisoformat(probe)
     except ValueError:
         raise ValueError(
-            "--at 要 ISO 8601，例如 2026-10-27T09:00:00 或 2026-10-27T09:00:00+08:00"
+            "%s 要 ISO 8601，例如 2026-10-27T09:00:00 或 2026-10-27T09:00:00+08:00"
+            % flag
         ) from None
     return text
 
@@ -1814,11 +1950,13 @@ def build_set_payload(args):
         raise ValueError("状态操作和标签操作不要混在一条命令里，分两次跑")
     if tag_modes and (args.due or args.clear_due):
         raise ValueError("标签操作和截止时间操作不要混在一条命令里，分两次跑")
-    if not state_ops and tag_modes == 0 and not (args.due or args.clear_due):
+    # defer 只是「修饰」（冻结/解冻就是它），跟状态、标签都能同一条命令里给。
+    if not (state_ops or tag_modes or args.due or args.clear_due
+            or args.defer or args.clear_defer):
         raise ValueError(
             "至少给一个操作：--complete / --incomplete / --drop / --undrop，"
             "或 --add-tag / --remove-tag / --set-tags / --clear-tags，"
-            "或 --due / --clear-due"
+            "或 --due / --clear-due / --defer / --clear-defer"
         )
 
     if args.all_occurrences and not args.drop:
@@ -1831,6 +1969,7 @@ def build_set_payload(args):
         at = _normalize_at(args.at)
 
     due = _normalize_at(args.due) if args.due else None
+    defer = _normalize_defer(args.defer) if args.defer else None
 
     ops = []
     if state_ops:
@@ -1849,6 +1988,10 @@ def build_set_payload(args):
         ops.append("due:" + due)
     elif args.clear_due:
         ops.append("clear-due")
+    if defer:
+        ops.append("defer:" + defer)
+    elif args.clear_defer:
+        ops.append("clear-defer")
 
     return {
         "id": args.id,
@@ -1860,6 +2003,8 @@ def build_set_payload(args):
         "at": at,
         "due": due,
         "clearDue": bool(args.clear_due),
+        "defer": defer,
+        "clearDefer": bool(args.clear_defer),
         "tags": {
             "add": add_tags,
             "remove": remove_tags,
@@ -1920,11 +2065,16 @@ def main_changes(argv=None):
 def build_batch_parser():
     parser = argparse.ArgumentParser(
         prog="omnifocus_tasks.py batch",
-        description="一次 osascript 处理多条 complete / drop / note_mark"
-                    "（读 stdin 的 {\"ops\":[{\"id\",\"op\",\"due\",\"at\","
-                    "\"all_occurrences\",\"match\",\"task_id\"}]}）。"
+        description="一次 osascript 处理多条 complete / drop / note_mark / move / set"
+                    "（读 stdin 的 {\"ops\":[{\"id\",\"op\",\"due\",\"defer\","
+                    "\"tags\",\"at\",\"all_occurrences\",\"match\",\"project\","
+                    "\"task_id\"}]}）。"
                     " note_mark 按 match 文本在 note 里找到那一行并改成 - [x]；"
-                    "返回新 note 和 titles 段里剩下的未勾选条数。",
+                    "返回新 note 和 titles 段里剩下的未勾选条数。"
+                    " op=\"set\" 可在一趟里同时改 defer / due / 标签："
+                    "{\"id\":pk,\"op\":\"set\",\"defer\":ISO,\"clear_defer\":bool,"
+                    "\"due\":ISO,\"clear_due\":bool,\"tags\":{\"add\":[],"
+                    "\"remove\":[],\"set\":[],\"clear\":bool}}。",
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help="osascript 超时秒数（默认 %.0f）" % DEFAULT_TIMEOUT)
