@@ -1706,6 +1706,41 @@ def _item_deferred(item, now=None):
     return ts.task_is_deferred({"fields": {"defer": item.get("defer")}}, now=now)
 
 
+def empty_reason(project):
+    """「这个项目一条可排任务都没有」的人话原因（plan / 项目表用来说实话）。
+
+    没有侧标签的任务不算任何一侧的账（``stats`` 的口径），这是单项目模型故意
+    的：项目清单里不该出现没打 SOP / incubator 标签的任务。但界面上「剩余 0
+    count、未完成 4 条」看起来就像账算错了，所以要把差额说出来。
+    """
+    project = project or {}
+    opened = [t for t in (project.get("tasks") or ())
+              if isinstance(t, dict)
+              and not t.get("completed") and not t.get("dropped")
+              and not t.get("effective_completed") and not t.get("effective_dropped")]
+    if not opened:
+        return "清单里没有未完成的任务"
+    bits = []
+    if normalize_op_type(project.get("op_type")) is None:
+        untagged = [t for t in opened
+                    if side_of_tags(t.get("tags") or ()) is None]
+        if untagged:
+            bits.append("%d 条任务没有 SOP / incubator 标签（先在 OmniFocus 里打标签，"
+                        "或 `pro <序号> merge --yes` 让 warden 补）" % len(untagged))
+    frozen = [t for t in opened if task_is_frozen(t)]
+    if frozen:
+        bits.append("%d 条被 manual_defer 冻着" % len(frozen))
+    now = datetime.datetime.now()
+    deferred = 0
+    for task in opened:
+        at = item_defer_at(task)
+        if at is not None and at > now:
+            deferred += 1
+    if deferred:
+        bits.append("%d 条还没到 defer 时间" % deferred)
+    return "、".join(bits) or "任务都在当前活跃侧之外（检查 SOP / incubator 标签）"
+
+
 def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
                     rotation=None, derived_budget=None, skip_pks=None,
                     side=None, default_side=None):
@@ -2775,14 +2810,21 @@ class ProjectStore(object):
     def is_op_allowed_by_pro(self, op, store=None):
         """根据关联 ``pro`` 的阶段判断这个 ``op`` 当前是否允许进行。
 
-        - ``pro`` 在 ``bottleneck`` 阶段：只允许对应的 ``incubator`` op 进行；
-        - ``pro`` 在 ``running`` 阶段：只允许普通的 ``SOP`` op 进行；
-        - 未关联任何 ``pro`` 的 ``op``：按自身类型（SOP / incubator）放行。
+        - 单项目模型（一个 pro 只有一个清单 op）：**永远允许** —— SOP / incubator
+          是清单里的任务标签，阶段只决定「排哪一侧」；op_type 只是未打标任务的
+          默认侧，不再门控阶段。否则 merge 之后剩下的那条 op 类型是 SOP，项目一
+          进 bottleneck 就会被判成「不允许 SOP op 进行」，计划每轮 refresh 被清掉。
+        - 老的双 op 数据（``pro`` 关联两个 op）：
+          - ``bottleneck`` 阶段：只允许对应的 ``incubator`` op 进行；
+          - ``running`` 阶段：只允许普通的 ``SOP`` op 进行；
+          - 未关联任何 ``pro`` 的 ``op``：按自身类型（SOP / incubator）放行。
         """
         data = store if isinstance(store, dict) else self.load()
         pro = self.pro_for_op(op, store=data)
         eff_type = normalize_op_type((op or {}).get("op_type")) or OP_TYPE_SOP
         if pro is None:
+            return True
+        if len(self.ops_for_pro(pro, store=data)) <= 1:
             return True
         stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
         if stage == STAGE_BOTTLENECK:
@@ -2820,11 +2862,16 @@ class ProjectStore(object):
         return out
 
     def effective_stage_for_pro(self, pro_or_id, store=None):
-        """返回 pro 的实际可用阶段：阶段字段和唯一关联 op 类型不一致时按 op 推导。
+        """返回 pro 的实际可用阶段：阶段字段和关联 op / 任务标签不一致时推导。
 
-        规则非常保守：只有当**当前阶段对应的 op 类型没有 active 关联 op**，
-        而另一种类型恰好只有一种 active 关联 op 时，才把阶段推导为那一种。
-        两种类型同时存在时仍以 pro 自己的 stage 为准（stage 决定当前做哪套）。
+        单项目模型（2026-11-21）下**任务标签才是阶段的真源**：一个 pro 只有一个
+        op，SOP / incubator 是清单里的标签，op_type 只是未打标任务的默认侧。
+        所以先看任务标签：只有 incubator → bottleneck，只有 SOP → running，
+        两边都有 / 都没打 → 再说。
+
+        老的双 op 数据（每条 op 各是一种类型）退回保守规则：只有当**当前阶段对应
+        的 op 类型没有 active 关联 op**、而另一种类型恰好只有一种 active 关联 op
+        时，才把阶段推导为那一种。
         """
         data = store if isinstance(store, dict) else self.load()
         pro = (pro_or_id if isinstance(pro_or_id, dict)
@@ -2833,6 +2880,25 @@ class ProjectStore(object):
             return STAGE_RUNNING
         stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
         linked = self.ops_for_pro(pro, store=data) if pro.get("status") == STATUS_ACTIVE else []
+        single = len(linked) <= 1
+        if single:
+            # 单 op（含「还没关联 op」）：标签优先，别拿 op_type 把阶段扳回去 ——
+            # merge 之后剩下的那条 op 类型永远是 dst 那侧（多半是 SOP），
+            # 用它推阶段会让 bottleneck 永远站不住。
+            sides = set()
+            op = self.current_op_for_pro(pro, store=data)
+            for item in ((op or {}).get("tasks") or ()):
+                if (item.get("completed") or item.get("dropped")
+                        or item.get("effective_completed")
+                        or item.get("effective_dropped")):
+                    continue
+                got = task_side(item)
+                if got is not None:
+                    sides.add(got)
+            if sides == {OP_TYPE_INCUBATOR}:
+                return STAGE_BOTTLENECK
+            if sides == {OP_TYPE_SOP}:
+                return STAGE_RUNNING
         kinds = {normalize_op_type(op.get("op_type")) for op in linked}
         kinds.discard(None)
         want = OP_TYPE_INCUBATOR if stage == STAGE_BOTTLENECK else OP_TYPE_SOP
@@ -2841,9 +2907,7 @@ class ProjectStore(object):
         other = OP_TYPE_SOP if want == OP_TYPE_INCUBATOR else OP_TYPE_INCUBATOR
         if kinds == {other}:
             return STAGE_BOTTLENECK if other == OP_TYPE_INCUBATOR else STAGE_RUNNING
-        # 单项目模型（2026-11-21）：op 可以没有类型，阶段就按**任务标签**推断 ——
-        # 清单里只有 incubator 标签 → bottleneck；只有 SOP 标签 → running；
-        # 两边都有 / 都没打 → 保持原阶段（不猜）。
+        # 单项目模型：op 可以没有类型，阶段就按**任务标签**推断。
         op = self.current_op_for_pro(pro, store=data)
         if op is not None:
             sides = set()

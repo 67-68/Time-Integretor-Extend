@@ -371,6 +371,15 @@ const otherDeep = { id: { primaryKey: "tag-other-deep" }, name: "Deep", parent: 
 const writing = { id: { primaryKey: "tag-writing" }, name: "写作", parent: null };
 const flattenedTags = [work, workDeep, otherDeep, writing];
 const database = { flattenedTags };
+// Omni Automation 的 `new Tag(name)`：建在数据库根（新版会自动进 flattenedTags）。
+// 侧别标签（SOP / incubator / manual_defer）第一次写回时就靠它补出来。
+let tagSeq = 0;
+const Tag = function (name) {
+  const t = { id: { primaryKey: "tag-new-" + (++tagSeq) }, name: name,
+              parent: null, tasks: [] };
+  flattenedTags.push(t);
+  return t;
+};
 const mk = o => Object.assign({
   id: { primaryKey: "x" }, name: "x", project: null, containingProject: { name: "P" },
   parent: null, inInbox: false, tags: [], flagged: false, completed: false,
@@ -504,6 +513,24 @@ if shutil.which("node"):
     r = run_set_js(set_payload(tags={"add": ["不存在"]}, ops=["add-tag:不存在"]))
     check("set JS：标签不存在要报错", (r["ok"], r["error"]), (False, "tag_problem"))
 
+    # --create-tags：明确要加标签时，单段名字不存在就直接建（warden 的侧别标签
+    # 第一次写回走这条；不建的话外部永远 tag_problem，刷新还会把本地标签洗掉）
+    r = run_set_js(set_payload(tags={"add": ["新标签"], "create": True},
+                               ops=["add-tag:新标签"]))
+    check("set JS：create 建出缺失标签",
+          (r["ok"], r["after"]["tags"], r["resolved_tags"]["created"][0]["name"]),
+          (True, ["写作", "新标签"], "新标签"))
+
+    r = run_set_js(set_payload(tags={"add": ["新父/新子"], "create": True},
+                               ops=["add-tag:新父/新子"]))
+    check("set JS：create 不猜父标签（路径形式仍报 tag_problem）",
+          (r["ok"], r["error"]), (False, "tag_problem"))
+
+    r = run_set_js(set_payload(tags={"remove": ["不存在"], "create": True},
+                               ops=["remove-tag:不存在"]))
+    check("set JS：create 只对「加」生效，删不存在的仍报错",
+          (r["ok"], r["error"]), (False, "tag_problem"))
+
     r = run_set_js(set_payload(id="nope", complete=True, ops=["complete"]))
     check("set JS：任务不存在", (r["ok"], r["error"]), (False, "not_found"))
 
@@ -591,7 +618,11 @@ check("batch 脚本写 dueDate",
 check("batch 脚本认 clear_defer", "item.clear_defer" in batch_source, True)
 check("batch 脚本认 clear_due", "item.clear_due" in batch_source, True)
 check("batch 脚本复用 resolveList 解析标签",
-      "resolveList(want.set || [])" in batch_source, True)
+      "resolveList(want.set || [], allowCreate)" in batch_source, True)
+check("batch 脚本支持按需建缺失标签（create）",
+      ("const createTag" in batch_source
+       and "new Tag(name)" in batch_source
+       and "const allowCreate = !!want.create" in batch_source), True)
 check("batch 包装脚本把 defer 原样塞进 args",
       "2036-01-01T00:00:00" in batch_script, True)
 check("batch 包装脚本走 evaluate javascript",
@@ -648,6 +679,31 @@ if shutil.which("node"):
 
     rows = batch_results([{"id": "nope", "op": "set", "defer": "2036-01-01T00:00:00"}])
     check("batch set：任务不存在", (rows[0]["ok"], rows[0]["error"]), (False, "not_found"))
+
+    # 侧别标签第一次写回：create=true 时把缺失标签建出来（之前只有 SOP 存在，
+    # incubator / manual_defer 每条都 tag_problem，外部永远写不进去）
+    rows = batch_results([{"id": "t1", "op": "set",
+                           "tags": {"add": ["incubator"], "create": True}}])
+    check("batch set：create 建出缺失标签",
+          (rows[0]["ok"], sorted(rows[0]["after"]["tags"]),
+           rows[0]["resolved_tags"]["created"][0]["name"]),
+          (True, ["incubator", "写作"], "incubator"))
+
+    rows = batch_results([{"id": "t1", "op": "set",
+                           "tags": {"add": ["manual_defer"], "create": True}}])
+    check("batch set：同批第二个缺失标签也能建",
+          (rows[0]["ok"], sorted(rows[0]["after"]["tags"])),
+          (True, ["manual_defer", "写作"]))
+
+    rows = batch_results([{"id": "t1", "op": "set", "tags": {"add": ["不存在"]}}])
+    check("batch set：没给 create 仍然 tag_problem",
+          (rows[0]["ok"], rows[0]["error"]), (False, "tag_problem"))
+
+    rows = batch_results([{"id": "t1", "op": "set",
+                           "tags": {"add": ["父/子"], "create": True}}])
+    check("batch set：create 不猜父标签",
+          (rows[0]["ok"], rows[0]["error"], rows[0]["problems"][0]["kind"]),
+          (False, "tag_problem", "not_found"))
 
     rows = batch_results([{"id": "t1", "op": "set"}])
     check("batch set：什么都不给要报错",

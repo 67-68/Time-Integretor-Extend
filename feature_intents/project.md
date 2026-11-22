@@ -209,13 +209,22 @@ op -m active id:1
 
 1. 把 incubator op 里未完成的任务在 OmniFocus 里 `moveTasks` 到 SOP op 最前
    （倒序移动，保持原清单顺序）；
-2. 两边未完成任务补齐侧标签（`incubator` / `SOP`）；
+2. 两边未完成任务补齐侧标签（`incubator` / `SOP`）——**标签不存在就当场建**
+   （`tags.create`；只建单段名字，`父/子` 路径不猜父标签）。侧别标签第一次
+   用时 OmniFocus 里通常只有 `SOP`，不建的话每条写回都是 `tag_problem`，
+   外部永远没有标签，下一次 `project refresh` 又会把本地补的标签洗掉；
 3. 本地合并清单（src 插到 dst 最前），src op 标 `dropped`、解除关联，
    `pro.op_id` 指向唯一那条；
-4. 按当前阶段冻结非活跃侧。
+4. 按当前阶段冻结非活跃侧（冻结 = 打 `manual_defer`，同样按需建标签）。
 
-不带 `--yes` 只预览条数；OmniFocus 离线时拒绝执行（先远端后本地，避免分叉）。
-合并后 OmniFocus 里空出来的旧项目由用户自己删（warden 不动外部项目结构）。
+迁移方向**只认 op 类型**：`SOP` 那条是目标、`incubator` 那条并进去。两个 op
+有一个没设类型时直接拒绝并让用户先 `op <序号> sop|incubator`，不许拿默认值
+猜方向（猜反了外部任务会挪进错的项目）。
+
+不带 `--yes` 只预览条数；要移动任务而 OmniFocus 离线时拒绝执行（先远端后本地，
+避免分叉）。**外部写失败不挡本地**：标签 / 移动只落本地、明确说「外部没写」，
+等 OmniFocus 可用了再跑一次 `pro <序号> merge --yes` 补写。合并后 OmniFocus 里
+空出来的旧项目由用户自己删（warden 不动外部项目结构）。
 
 ### 标签 `project/...`
 
@@ -413,6 +422,32 @@ bottleneck → incubator 标签的任务），另一侧显示成「+N 冻结」�
 - 副作用：面板上的「N count 可以分」就是**真的还能排多少**。以前同一屏会显示
   10 count（把已经排好的场次也算成空闲），分下去之后只能排 5，于是
   「说好 6 · 已排 3」这种账永远对不上。
+
+### 说好 N count 之前先确认「真有活」（2026-11-22）
+
+用户原话：*说好 8 count … 这个 count 统计不出来*。现场：项目「历史 W13 复习 2」
+的 4 条任务一条 SOP / incubator 标签都没有，op 类型也是空的 → `pj.stats` 按侧
+过滤后剩余 0 count；plan 里照样能 `pro 10 8`，`complete` 之后 0 条任务 → 0 场
+session，还把 T2–T4 已有的排布整片清空（keep_session 随后报「08:30 没有这场
+session，来不及补订了」）。
+
+落地成三道闸（都在 `project_plan.py` / `project_mixin._plan_apply`）：
+
+1. `pro <序号> <count>`（`Allocator._set`）先算这个项目**当前活跃侧**的可排
+   count，0 就整条命令不执行，并说清原因（未打标 / 冻结 / defer / 已完成）；
+2. 预填上一轮决定时（`_prefill_plan_allocator`）同样校验：落不了地的分配直接
+   作废并提示；全被作废时 `complete` 不当成「回收整天计划」，不碰任何排布；
+3. `_plan_apply` 在 `_reset_day_plans` **之前**再筛一遍；全都没活就整次 plan
+   拒绝（`plan apply_refused`），有活的保留、没活的踢掉并警告。
+
+面板上也不再自相矛盾：项目表「剩余 count」在 0 且存在未打标任务时写成
+`0（4 条未打标）`，plan 面板的项目行追加 `⚠ 4 条未打标（不计账/不进 plan）`。
+
+```
+project_plan.Allocator._project_stat / _empty_reason   （口径和 distribute 一致：side 只认 plan_ops 注入的键）
+project_store.empty_reason                             （未打标 / 冻结 / defer / 都完成）
+warden_core.project_mixin._plan_apply                  （撤旧计划前的硬闸）
+```
 
 ### 先选哪一天：`plan` 默认今天
 

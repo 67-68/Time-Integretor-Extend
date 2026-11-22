@@ -26,8 +26,22 @@ fixture（沙盒 + mock 数据）
 | `python3 -B test/live/test_live_midday.py` | 不会（进程内） | **真实数据回放**：`fixtures/midday-1558/` 是 2026-11-16 15:58 的现场快照（T1 已过去、15:15 正在进行、19:00 已订上、22:15 整段 60min），验「只排未来 / 上一轮保留 / 已订场次不重切 / 60min 段能切」 |
 | `python3 -B test/live/test_live_focusmate.py --yes --plumbing` | 不会（执行区仍是 24h） | 走**真子进程** `warden.py --exec`，验沙盒隔离 + 命令分发 + data.csv 落盘 |
 | `python3 -B test/live/test_live_focusmate.py --yes` | **会真订 2 场并取消** | 端到端：Focusmate 上真有那两场、task 真挂上 |
+| `python3 -B test/live/test_live_omnifocus.py --yes` | 不订场，但**会真建/删 2 个临时 OmniFocus 项目** | 标签写回这一层：`pro merge --yes` 之后 `SOP` / `incubator` / `manual_defer` 真的挂在 OmniFocus 任务上（22 项断言），再切阶段验冻结/解冻，`omni.failed == 0` |
 
 不带 `--yes` 只打印计划，什么都不做。
+
+### 为什么需要 `test_live_omnifocus.py`
+
+单元测试跑的是 `offline=True` 分支：算得出「要写哪些 ops」，但验不了
+「OmniFocus 里到底有没有那个标签」。2026-11-22 的真故障就长在这中间：
+`incubator` / `manual_defer` 在 OmniFocus 里根本不存在，batch 每条回
+`tag_problem` → 外部一条没写 → 下一次 `project refresh` 再拿 OmniFocus 的旧标签
+把本地补的洗掉，看起来就像「merge 不可用、没有 tag 被添加」。
+
+这一份自己建临时项目（`__ti_live_merge_sop__` / `__ti_live_merge_inc__`）+ 3 条
+任务，跑真子进程 `warden.py --exec`，用独立 OmniJS 探针回读标签与所属项目，
+最后 `deleteObject` 删掉两个临时项目（`SOP` / `incubator` / `manual_defer`
+这几个侧别标签保留 —— 它们是正式功能要用的）。
 
 ## 真实数据回放（`fixtures/midday-1558/`）
 

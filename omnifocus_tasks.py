@@ -28,6 +28,7 @@
     python3 omnifocus_tasks.py set --id <PK> --drop --all-occurrences --yes
     python3 omnifocus_tasks.py set --id <PK> --incomplete --yes
     python3 omnifocus_tasks.py set --id <PK> --add-tag 写作 --yes
+    python3 omnifocus_tasks.py set --id <PK> --add-tag 新标签 --create-tags --yes
     python3 omnifocus_tasks.py set --id <PK> --set-tags 工作,Deep --yes
     python3 omnifocus_tasks.py set --id <PK> --clear-tags --yes
     # 截止时间是「修饰」：可以和 --complete 一条命令一起给（warden 收尾就用这个）
@@ -586,9 +587,20 @@ SET_OMNIJS_TEMPLATE = r'''
     }
     const before = snapshot(task);
     const allTags = (typeof flattenedTags !== "undefined") ? flattenedTags : database.flattenedTags;
-    const resolveList = names => {
+    const createTag = name => {
+      // 只在「明确要加标签」时建，而且只建单段名字：`父/子` 路径不猜父标签
+      // （猜错会把标签树建歪），找不到就照旧报 not_found 让调用方说清楚。
+      if (!name || name.indexOf("/") >= 0) return null;
+      try {
+        return new Tag(name);
+      } catch (e) {
+        return null;
+      }
+    };
+    const resolveList = (names, allowCreate) => {
       const tags = [];
       const problems = [];
+      const created = [];
       const seenNames = [];
       for (const name of names) {
         if (seenNames.indexOf(name) >= 0) continue;
@@ -603,15 +615,19 @@ SET_OMNIJS_TEMPLATE = r'''
           const key = idOf(g) || tagPath(g);
           if (!seen[key]) { seen[key] = 1; unique.push(g); }
         }
-        if (unique.length === 0) problems.push({ kind: "not_found", name: name });
-        else if (unique.length > 1) problems.push({ kind: "ambiguous", name: name, paths: unique.map(tagPath) });
+        if (unique.length === 0) {
+          const made = allowCreate ? createTag(name) : null;
+          if (made) { tags.push(made); created.push(made); }
+          else problems.push({ kind: "not_found", name: name });
+        } else if (unique.length > 1) problems.push({ kind: "ambiguous", name: name, paths: unique.map(tagPath) });
         else tags.push(unique[0]);
       }
-      return { tags: tags, problems: problems };
+      return { tags: tags, problems: problems, created: created };
     };
-    const addRes = resolveList(args.tags.add || []);
-    const removeRes = resolveList(args.tags.remove || []);
-    const setRes = resolveList(args.tags.set || []);
+    const allowCreate = !!args.tags.create;
+    const addRes = resolveList(args.tags.add || [], allowCreate);
+    const removeRes = resolveList(args.tags.remove || [], false);
+    const setRes = resolveList(args.tags.set || [], allowCreate);
     const problems = [].concat(addRes.problems, removeRes.problems, setRes.problems);
     if (problems.length) {
       return reply({ ok: false, error: "tag_problem", message: "标签找不到或有歧义", problems: problems });
@@ -665,7 +681,8 @@ SET_OMNIJS_TEMPLATE = r'''
       resolved_tags: {
         add: tagInfo(addRes.tags),
         remove: tagInfo(removeRes.tags),
-        set: tagInfo(setRes.tags)
+        set: tagInfo(setRes.tags),
+        created: tagInfo((addRes.created || []).concat(setRes.created || []))
       }
     });
   } catch (e) {
@@ -967,9 +984,20 @@ BATCH_JS = r"""
     ? flattenedTags : database.flattenedTags);
   // 和单条 set 里那份是同一套规则：叶子名唯一 / 完整路径 / primary key 都能用。
   // 找不到或有歧义只记进 problems，由调用方决定是「这一条失败」还是整批失败。
-  const resolveList = names => {
+  // ``allowCreate`` = 明确要加标签时，单段名字不存在就直接建（侧别标签第一次
+  // 用的时候 OmniFocus 里通常还没有；不建就永远 tag_problem）。
+  const createTag = name => {
+    if (!name || name.indexOf("/") >= 0) return null;
+    try {
+      return new Tag(name);
+    } catch (e) {
+      return null;
+    }
+  };
+  const resolveList = (names, allowCreate) => {
     const tags = [];
     const problems = [];
+    const created = [];
     const seenNames = [];
     const allTags = allTagsOf();
     for (const name of names) {
@@ -985,11 +1013,14 @@ BATCH_JS = r"""
         const key = idOf(g) || tagPath(g);
         if (!seen[key]) { seen[key] = 1; unique.push(g); }
       }
-      if (unique.length === 0) problems.push({ kind: "not_found", name: name });
-      else if (unique.length > 1) problems.push({ kind: "ambiguous", name: name, paths: unique.map(tagPath) });
+      if (unique.length === 0) {
+        const made = allowCreate ? createTag(name) : null;
+        if (made) { tags.push(made); created.push(made); }
+        else problems.push({ kind: "not_found", name: name });
+      } else if (unique.length > 1) problems.push({ kind: "ambiguous", name: name, paths: unique.map(tagPath) });
       else tags.push(unique[0]);
     }
-    return { tags: tags, problems: problems };
+    return { tags: tags, problems: problems, created: created };
   };
   const tagInfo = list => list.map(g => ({ id: idOf(g), name: g.name, path: tagPath(g) }));
   if (typeof Task === "undefined" || typeof Task.byIdentifier !== "function") {
@@ -1155,9 +1186,10 @@ BATCH_JS = r"""
         // 失败（ok:false + error:"tag_problem"），不连累同批的其他任务。
         const want = (item.tags && typeof item.tags === "object"
                       && !Array.isArray(item.tags)) ? item.tags : {};
-        const addRes = resolveList(want.add || []);
-        const removeRes = resolveList(want.remove || []);
-        const setRes = resolveList(want.set || []);
+        const allowCreate = !!want.create;
+        const addRes = resolveList(want.add || [], allowCreate);
+        const removeRes = resolveList(want.remove || [], false);
+        const setRes = resolveList(want.set || [], allowCreate);
         const problems = [].concat(addRes.problems, removeRes.problems, setRes.problems);
         if (problems.length) {
           results.push(Object.assign({}, base, { ok: false, error: "tag_problem",
@@ -1205,7 +1237,8 @@ BATCH_JS = r"""
                        resolved_tags: {
                          add: tagInfo(addRes.tags),
                          remove: tagInfo(removeRes.tags),
-                         set: tagInfo(setRes.tags)
+                         set: tagInfo(setRes.tags),
+                         created: tagInfo((addRes.created || []).concat(setRes.created || []))
                        } }));
       } else {
         results.push({ id: pk, task_id: taskId, ok: false, error: "bad_op" });
@@ -1829,6 +1862,11 @@ def build_set_parser():
         help="清空全部标签",
     )
     parser.add_argument(
+        "--create-tags",
+        action="store_true",
+        help="要加的标签不存在就直接建（只建单段名字，路径形式不猜父标签）",
+    )
+    parser.add_argument(
         "--allow-project-root",
         action="store_true",
         help="允许改 project_root 任务（等于改整个项目，危险）",
@@ -2010,6 +2048,7 @@ def build_set_payload(args):
             "remove": remove_tags,
             "set": set_tags if set_tags else None,
             "clear": bool(args.clear_tags),
+            "create": bool(args.create_tags),
         },
         "dryRun": not args.yes,
         "allowProjectRoot": bool(args.allow_project_root),

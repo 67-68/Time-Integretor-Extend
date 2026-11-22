@@ -168,12 +168,61 @@ class FakeOmniFocus(object):
         self.rows = rows if rows is not None else [dict(r) for r in ONROWS]
         self.repetitions = repetitions or {}
         self.calls = []
+        # 写回（batch）的假账：merge / 冻结这条线要验「到底写了什么」。
+        self.flush_ops = []          # 每次 flush 的整批 ops
+        self.flush_raise = None      # 设了就让 flush 抛 OmniFocusError（模拟 OF 没开 / 没权限）
+        self.tags = set()            # OmniFocus 里已经存在的标签
+        self.task_tags = {}          # pk -> [标签名]
+        self.task_projects = {}      # pk -> 目标项目 primary key
 
     def available(self):
         return True
 
     def why_unavailable(self):
         return ""
+
+    def flush(self, ops, timeout=None):
+        """假 OmniFocus 的 batch：标签不存在时**只有带 create 才建**（照真机语义）。"""
+        self.flush_ops.append([dict(op) for op in (ops or [])])
+        if self.flush_raise:
+            raise of.OmniFocusError(self.flush_raise, kind="unavailable", exit_code=1)
+        results = []
+        for op in ops or ():
+            pk = str(op.get("id") or "")
+            kind = str(op.get("op") or "complete")
+            if kind == "move":
+                self.task_projects[pk] = op.get("project")
+                results.append({"id": pk, "ok": True, "changed": ["project"]})
+                continue
+            if kind != "set":
+                # 老的写回路径（complete / drop）在真 client 里也走 batch；
+                # 这里照旧记进 calls，方便断言「写了几次、写的是哪个 pk」。
+                self.calls.append((kind, pk))
+                results.append({"id": pk, "ok": True})
+                continue
+            want = op.get("tags") or {}
+            add = [str(x) for x in (want.get("add") or ())]
+            missing = [n for n in add if n not in self.tags]
+            if missing and not want.get("create"):
+                results.append({"id": pk, "ok": False, "error": "tag_problem",
+                                "problems": [{"kind": "not_found", "name": n}
+                                             for n in missing]})
+                continue
+            for name in missing:
+                self.tags.add(name)
+            tags = self.task_tags.setdefault(pk, [])
+            for name in add:
+                if name not in tags:
+                    tags.append(name)
+            for name in (want.get("remove") or ()):
+                if name in tags:
+                    tags.remove(name)
+            results.append({"id": pk, "ok": True,
+                            "changed": ["tags"] if add else []})
+        return {"results": results}
+
+    def tag_names(self, pk):
+        return sorted(self.task_tags.get(str(pk), []))
 
     def list_tasks(self, refresh=False, fields=None, timeout=None,
                    with_repetition=False):
@@ -1696,6 +1745,79 @@ _wd_all2_sides = {t["title"]: pj.side_of_tags(t.get("tags") or ())
 check("merge all 补了侧标签",
       (_wd_all2_sides["写正文"], _wd_all2_sides["试新启发式"]),
       ("SOP", "incubator"))
+
+print("== 4f) merge 真写回：标签必须真的写进 OmniFocus（fake batch 记账） ==")
+
+
+def online_warden(rows):
+    """离线开关打开、OmniFocus 可用的 warden（写回走 FakeOmniFocus.flush）。"""
+    wd = fresh(rows)
+    wd.offline = False
+    wd.settings.set("omnifocus", True)
+    return wd
+
+
+wd_write = online_warden(_merge_rows)
+_wf = wd_write.omnifocus
+_wf.tags = {"SOP"}                    # 真机一开始通常只有 SOP，没有 incubator
+wd_write.handle("op import sop omnifocus:///project/p-old-sop")
+wd_write.handle("op import incubator omnifocus:///project/p-old-inc")
+no_chore(wd_write)
+wd_write.messages = []
+check("真写回：merge 受理", wd_write.handle("pro 1 merge --yes"), True)
+_sets = [op for batch in _wf.flush_ops for op in batch if op.get("op") == "set"]
+check("真写回：每条标签 op 都带 create（不建标签就永远 tag_problem）",
+      bool(_sets) and all((op.get("tags") or {}).get("create") for op in _sets), True)
+check("真写回：SOP 侧任务在 OmniFocus 里挂上 SOP",
+      _wf.tag_names("t-old-sop"), ["SOP"])
+check("真写回：incubator 任务挪进目标项目、挂 incubator + manual_defer",
+      (_wf.task_projects.get("t-old-inc"), _wf.tag_names("t-old-inc")),
+      ("p-old-sop", ["incubator", "manual_defer"]))
+check_true("真写回：没有 tag_problem 警告",
+           not any("没处理成功" in t for t in texts(wd_write)))
+_wd_dst = wd_write.projects.active()[0]
+check("真写回：本地清单也并成一份、标签一致",
+      [(t["pk"], sorted(t.get("tags") or [])) for t in _wd_dst["tasks"]],
+      [("t-old-inc", ["incubator", "manual_defer"]), ("t-old-sop", ["SOP"])])
+# 单项目模型：merge 之后只剩一条类型为 SOP 的 op，项目进 bottleneck 仍要允许
+# 这条 op 进行（否则计划每轮 refresh 都被判成「不允许 SOP op 进行」清掉）。
+_wd_pro = wd_write.projects.active_pros()[0]
+wd_write.projects.set_pro_stage(_wd_pro["id"], "bottleneck")
+check("真写回：merge 后单 op 在 bottleneck 仍被允许（op 检测）",
+      wd_write.projects.is_op_allowed_by_pro(
+          wd_write.projects.current_op_for_pro(_wd_pro["id"])), True)
+
+wd_dead = online_warden(_merge_rows)
+wd_dead.omnifocus.flush_raise = "OmniFocus 没开 / TCC 拒绝"
+wd_dead.handle("op import sop omnifocus:///project/p-old-sop")
+wd_dead.handle("op import incubator omnifocus:///project/p-old-inc")
+no_chore(wd_dead)
+wd_dead.messages = []
+check("外部写失败：merge 仍然受理（不挡本地）",
+      wd_dead.handle("pro 1 merge --yes"), True)
+check("外部写失败：本地还是合并成一个 op", len(wd_dead.projects.active()), 1)
+_dead_op = wd_dead.projects.active()[0]
+check("外部写失败：本地标签照补",
+      [(t["pk"], sorted(t.get("tags") or [])) for t in _dead_op["tasks"]],
+      [("t-old-inc", ["incubator", "manual_defer"]), ("t-old-sop", ["SOP"])])
+check_true("外部写失败：明说外部没写（不撒谎）",
+           any("写回失败" in t for t in texts(wd_dead)))
+
+wd_unt = fresh(_merge_rows)
+no_chore(wd_unt)
+wd_unt.handle("op import omnifocus:///project/p-old-sop")
+wd_unt.handle("op import incubator omnifocus:///project/p-old-inc")
+# 把两条 op 的类型抹掉：迁移方向就分不出 SOP / incubator，必须拒绝（不许瞎猜）
+_store_unt = wd_unt.projects.load()
+for _op in _store_unt.get("projects") or ():
+    _op["op_type"] = None
+wd_unt.projects.save(_store_unt)
+wd_unt.messages = []
+check("两个 op 都没类型：merge --yes 受理（报错不崩）",
+      wd_unt.handle("pro 1 merge --yes"), True)
+check_true("两个 op 都没类型：拒绝并说清要补类型",
+           any("分不出 SOP / incubator" in t for t in texts(wd_unt)))
+check("拒绝后本地仍是两个 op", len(wd_unt.projects.active()), 2)
 
 print("== 5) plan 一次分配：不同项目按各自阶段挑自己那一侧 ==")
 _two_stage_rows = [

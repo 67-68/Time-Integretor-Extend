@@ -269,17 +269,26 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
             budget -= take * MINUTES_PER_COUNT
             took += take
         if need > 0:
-            used_count = ts.minutes_to_count(need * MINUTES_PER_COUNT - budget) or 0
-            if budget < MINUTES_PER_COUNT:
-                notes.append("「%s」分到 %d count = %d 分钟；短任务按实际分钟只塞下 "
-                             "%d 分钟（%d count），还剩 %d 分钟对不齐 25 分钟的 count 格子。"
-                             % (project.get("title") or pid, need,
-                                need * MINUTES_PER_COUNT,
-                                need * MINUTES_PER_COUNT - budget, used_count, budget))
+            if took <= 0:
+                # 一条都没挑出来：以前这里只有「任务只剩 0 count」这种误导人的
+                # 说法（听起来像活都干完了）。真正的常见原因是任务没打
+                # SOP / incubator 标签，任何一侧都不认领它们。
+                notes.append("「%s」分到 %d count，但清单里一条可排的任务都没有 "
+                             "—— 没打 SOP / incubator 标签 / 在 defer 里 / 都已完成；"
+                             "这次不会为它建任何场次。"
+                             % (project.get("title") or pid, need))
             else:
-                notes.append("「%s」的任务只剩 %d count，少排 %d（清单里没有更多可干的了）"
-                             % (project.get("title") or pid, used_count,
-                                ts.minutes_to_count(budget) or 0))
+                used_count = ts.minutes_to_count(need * MINUTES_PER_COUNT - budget) or 0
+                if budget < MINUTES_PER_COUNT:
+                    notes.append("「%s」分到 %d count = %d 分钟；短任务按实际分钟只塞下 "
+                                 "%d 分钟（%d count），还剩 %d 分钟对不齐 25 分钟的 count 格子。"
+                                 % (project.get("title") or pid, need,
+                                    need * MINUTES_PER_COUNT,
+                                    need * MINUTES_PER_COUNT - budget, used_count, budget))
+                else:
+                    notes.append("「%s」的任务只剩 %d count，少排 %d（清单里没有更多可干的了）"
+                                 % (project.get("title") or pid, used_count,
+                                    ts.minutes_to_count(budget) or 0))
     return out, notes
 
 
@@ -878,6 +887,9 @@ class Allocator(object):
         #: 打开面板时是否载入了上一轮的资源决定（决定可以在「全部 clear」之后
         #: 仍然 complete —— 那表示用户要把这一天的计划回收掉）。
         self.had_decision = False
+        #: 预填时有没有「上一轮说好、这次已经落不了地」的决定被丢掉。全空又
+        #: 只有这种情况时，complete 不能当成「回收整天计划」去清空排布。
+        self.stale_dropped = False
         self.notes = []
         # 和 Review / NostartReview 对齐的字段名（画帧缓存通用）
         self.pending_task = None
@@ -982,6 +994,11 @@ class Allocator(object):
             bits = ["[%s 侧 · %s%s]" % (side, pj.task_type_of(project), pro_txt),
                     "剩余 %d count" % stat["remaining"],
                     "进度 %s" % stat["progress_text"]]
+            untagged = self._untagged_open(project)
+            if untagged and project.get("default_side") is None:
+                # 「剩余 0 count、未完成 4 条」不是自相矛盾：这 4 条没打侧标签，
+                # 不属于任何一侧。把差额说出来，别让人以为账算错了。
+                bits.append("⚠ %d 条未打标（不计账/不进 plan）" % len(untagged))
             if plan and plan.get("count"):
                 bits.append("今天说好 %d count、已排 %d"
                             % (int(plan["count"]), pj.planned_counts(project, self.day)))
@@ -998,6 +1015,41 @@ class Allocator(object):
                     % (self.allocated(), cap["counts"], self.free_counts()), "cyan"))
         out.append((self.stage_hint(), "cyan"))
         return out
+
+    # -- 这个项目到底有没有可排的活 ---------------------------------------
+
+    @staticmethod
+    def _open_tasks(project):
+        return [t for t in (project or {}).get("tasks") or ()
+                if not t.get("completed") and not t.get("dropped")
+                and not t.get("effective_completed")
+                and not t.get("effective_dropped")]
+
+    def _untagged_open(self, project):
+        if project.get("default_side") is not None:
+            return []
+        return [t for t in self._open_tasks(project)
+                if pj.side_of_tags(t.get("tags") or ()) is None]
+
+    def _project_stat(self, project):
+        invested = {}
+        if self.task_store is not None:
+            try:
+                invested = pj.invested_by_project(self.task_store).get(
+                    project["id"]) or {}
+            except Exception:                  # noqa: BLE001 - 账算不出来不该挡住分资源
+                invested = {}
+        # 和 distribute() 同一口径：side 只看 plan_ops() 填进来的那个键；
+        # 没有它（测试 / 旧调用方的裸 op）就是「不按侧过滤」，不能在这里自己
+        # 补一个 side_for_stage，否则会把没打标的任务误判成 0。
+        return pj.stats(
+            project, self.task_store, invested,
+            side=project.get("side"),
+            default_side=project.get("default_side"))
+
+    def _empty_reason(self, project):
+        """「剩余 0 count」到底是为什么：没打标 / 冻结 / defer / 都做完了。"""
+        return pj.empty_reason(project)
 
     # -- 输入 ---------------------------------------------------------
     def handle(self, line):
@@ -1304,11 +1356,23 @@ class Allocator(object):
         return {"action": "handled"}
 
     def _set(self, project, count):
-        """设一个项目的分配（**覆盖**）；超预算就整条命令都不执行。"""
+        """设一个项目的分配（**覆盖**）；超预算 / 没有可排任务就整条命令都不执行。"""
         count = int(count)
         if count < 0:
             self.say("count 不能是负数。", "warn")
             return False
+        if count and self.task_store is not None:
+            # 分配之前先看这个项目**有没有可排的活**。以前这里只查预算：
+            # 项目清单里的任务全没打 SOP / incubator 标签（或都在 defer 里）时，
+            # 用户照样能「说好 8 count」，complete 之后 0 条任务落进 0 场 session，
+            # 还把这一天已有的排布整片清空（2026-11-22 历史 W13 复习 2 的现场）。
+            stat = self._project_stat(project)
+            if int(stat.get("remaining") or 0) <= 0:
+                self.say("✗ 「%s」现在没有可排的任务（剩余 0 count）：%s —— "
+                         "这条命令没执行（分配一个字都没动）。"
+                         % (project.get("title") or project.get("id"),
+                            self._empty_reason(project)), "error")
+                return False
         others = sum(int(a.get("count") or 0) for a in self.allocations
                      if a.get("project_id") != project["id"])
         other_pins = self.pinned_counts()
@@ -1343,6 +1407,13 @@ class Allocator(object):
             self.say("还没有任何分配 —— 先 `pro 1 4` / `task 5 2`，或者 `q` 放弃这次 plan。",
                      "warn")
             return {"action": "handled"}
+        if not self.allocations and not self.pins and self.stale_dropped:
+            # 上一轮的决定这次全落不了地（项目没活 / 任务没了）：这不是用户
+            # 主动 clear，不能拿它当「回收整天计划」去把排布清空。
+            self.say("这次 plan 没有可执行的内容：上一轮分的 count 都落不了地"
+                     "（原因见上面）；已有排布一个字没动。", "warn")
+            self.closed = True
+            return {"action": "close", "done": "cancel"}
         allocs = []
         for alloc in self.allocations:
             project = next((p for p in self.projects

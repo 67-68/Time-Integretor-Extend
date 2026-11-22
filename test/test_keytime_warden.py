@@ -55,6 +55,11 @@ ks.LOCK_FILE = os.path.join(TMP, "keep_session.lock")
 ks.EXPECTED_FILE = os.path.join(TMP, "keep_session-expected.json")
 ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
 
+# 测试绝不读用户真实的 Focus.app 配置：tick 会检查「桌面被谁锁着」，读到真机
+# 状态会让用例依赖当时有没有 Focus 会话（2026-11-22 现场就是这么被误导的）。
+kt.focus_available = lambda: False
+kt.focus_state = lambda path=None: {"focusing": False, "profile": "", "since": ""}
+
 fails = []
 
 
@@ -349,6 +354,102 @@ check("没有中间层 → 没那行", wd.render_keytime_line(), None)
 check("没有中间层 → 没有整页", wd.render_keytime_takeover(), None)
 wd._keytime_tick()
 check("没有中间层 → tick 也不崩", True, True)
+
+print("== 推送失败：5 分钟退避 + 日志只记一条 ==")
+write_download([kt_row("16:00", "17:00", "休息", title="强制断电")])
+wd = fresh(at(1))
+kt.save_devices([{"name": "iphone", "key": "k1"}])
+kt.left_mac = lambda *a, **k: True
+calls = []
+
+
+def failing_push(*a, **k):
+    calls.append(1)
+    return [("iphone", False, "连不上 https://api.day.app：Connection refused")]
+
+
+kt.push_all = failing_push
+wd._keytime_announcer = FakeAnnouncer()
+wd.keytime_next_announce = 0
+wd.keytime_next_tick = 0
+wd._keytime_tick()
+for _ in range(60):
+    if calls:
+        break
+    time.sleep(0.02)
+check("推了一次", len(calls), 1)
+check("失败后进入 5 分钟退避", wd.keytime_push_backoff_until > time.time() + 200, True)
+wd.keytime_next_announce = 0
+wd.keytime_next_tick = 0
+wd._keytime_tick()
+time.sleep(0.1)
+check("退避期内不再撞一次", len(calls), 1)
+
+# 同一 key 的失败重复发生时，JSONL 里只留一条（log_change 按 key 去重）
+wd.keytime_push_backoff_until = 0.0
+wd._keytime_push(wd.keytime_current(wd.keytime_now_dt()), wd.keytime_now_dt())
+for _ in range(60):
+    if len(calls) >= 2:
+        break
+    time.sleep(0.02)
+lines = []
+try:
+    for line in open(os.path.join(os.environ["TI_LOG_DIR"],
+                                  "%s.jsonl" % TODAY.isoformat()), encoding="utf-8"):
+        if '"push_failed"' in line:
+            lines.append(line.strip())
+except OSError:
+    pass
+check("push_failed 只记了一条（不刷屏）", len(lines), 1)
+
+print("== 手动解锁后 5 秒锁回去：日志说清是「锁回去」不是「到点」==")
+kt.focus_available = lambda: True
+kt.focus_state = lambda path=None: {"focusing": False, "profile": ""}
+kt.focus_start = lambda *a, **k: True
+wd.keytime_focus_on = True          # 之前锁过，用户手动解了
+wd.keytime_next_focus_check = 0.0
+target = wd.keytime_current(wd.keytime_now_dt())
+check("有一个正在进行的 key time", target is not None, True)
+wd._keytime_focus_lock(target, reason="到点")
+for _ in range(60):
+    if not wd._keytime_focus_busy:
+        break
+    time.sleep(0.02)
+lock_lines = []
+try:
+    for line in open(os.path.join(os.environ["TI_LOG_DIR"],
+                                  "%s.jsonl" % TODAY.isoformat()), encoding="utf-8"):
+        if '"focus_lock"' in line:
+            lock_lines.append(json.loads(line))
+except OSError:
+    pass
+check("记了一条 focus_lock", len(lock_lines), 1)
+check("reason 是「锁回去」", lock_lines[-1].get("reason"), "手动解锁后锁回去（这一块还没结束）")
+check("relock 标记为 True", lock_lines[-1].get("relock"), True)
+
+print("== 桌面被 Focus.app 自己的会话锁着：日志必须说清不是我锁的 ==")
+write_download([kt_row("16:00", "17:00", "工作", title="SAT 3H")])
+wd = fresh(at(-10))                    # 没有 key time 在进行（09:00 现场就是这样）
+kt.focus_available = lambda: True
+kt.focus_state = lambda path=None: {"focusing": True, "profile": "Focus",
+                                    "since": "2026-11-22T09:00:00"}
+wd.keytime_next_foreign_check = 0.0
+wd._keytime_tick()
+wd.keytime_next_tick = 0
+wd.keytime_next_foreign_check = 0.0    # 5 秒后再查一次：仍应只留一条
+wd._keytime_tick()
+foreign = []
+try:
+    for line in open(os.path.join(os.environ["TI_LOG_DIR"],
+                                  "%s.jsonl" % TODAY.isoformat()), encoding="utf-8"):
+        if '"focus_foreign"' in line:
+            foreign.append(json.loads(line))
+except OSError:
+    pass
+check("记了一条 focus_foreign", len(foreign), 1)
+check("带上 profile", foreign[0].get("profile"), "Focus")
+check_in("说明不是 keytime 锁的", "不是 keytime 锁的", foreign[0].get("note") or "")
+check("没有 keytime 目标时不会整页接管", wd.render_keytime_takeover(), None)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print()

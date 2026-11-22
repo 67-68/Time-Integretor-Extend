@@ -182,8 +182,17 @@ keytime set <键> <值>               volume / announce_sec / day_end / leave_id
 - **只解自己的锁**：`focus://unfocus` 只在「这一段是我们锁的」时发
   （`keytime_focus_on`）；用户在期间自己开的 Focus session 不接管、也不会被我们关掉。
   warden 退出时在 `finally` 里**同步**发一次 unfocus（daemon 线程会被进程退出砍掉）。
-- **手动解锁会被锁回去**：每分钟 tick 先读 `default.cfg` 的 `activeSessions`；没在锁就
-  重新 `focus://focus` —— 所以「偷偷关掉 Focus」最多管用一分钟。
+- **手动解锁会被锁回去**：每次 tick 先读 `default.cfg` 的 `activeSessions`；没在锁就
+  重新 `focus://focus` —— 所以「偷偷关掉 Focus」最多管用 5 秒（`keytime_next_focus_check`）。
+  日志会区分两种情况：块刚开始记 `reason="到点"`，块中间被手动解锁再锁回记
+  `reason="手动解锁后锁回去（这一块还没结束）"` + `relock=true`；以前两种都写「到点」，
+  看起来像「一场 keytime 莫名其妙又开始了」（2026-11-21 21:00）。
+- **不是我们锁的会说清楚**：`focus_state()` 看到别的 profile 在锁（例如 Focus.app
+  自己的「Focus」）时，warden 不接管也不解锁，但每帧节拍会 `log_change` 一条
+  `focus_foreign`（profile / since /「这不是 keytime 锁的」）。2026-11-22 09:00
+  Focus.app 自己起了一个 profile「Focus」的 09:00–21:00 会话，用户看到桌面又锁了
+  以为是 keytime；当时这条路径一个字都不记，日志里查不到。补日志后至少能回答
+  「是谁锁的」。
 - **状态怎么读**：只读 `default.cfg` 的 `activeSessions` / `activeProfileID`，不走
   AppleScript（sdef 只有查询命令，iTerm → Focus 的自动化授权还要用户点一次；沙箱里也
   一律 `-10004`）。
@@ -208,8 +217,11 @@ keytime set <键> <值>               volume / announce_sec / day_end / leave_id
   `group=keytime`（可整组静音）、`sound=alarm`、`ttl=3600`、`isArchive=1`。
   `stack_notifications=true`（用户选的）→ 每分钟一条新通知；false → 用同一个
   `id` 原地替换成「已超时 N 分钟」。
-- **失败不重试**：Bark 公共服务器的封 IP 规则是「5 分钟内 >5 次 405 或 >1000 次错误
-  请求 → 封 24 小时」。`push_one` 只打一枪，失败进 Recent 的警告，等下一分钟。
+- **失败不重试，5 分钟内不再撞**：Bark 公共服务器的封 IP 规则是「5 分钟内 >5 次
+  405 或 >1000 次错误请求 → 封 24 小时」。`push_one` 只打一枪；失败后
+  `keytime_push_backoff_until = now + 300s`，这 5 分钟里连播报那一轮也不再推
+  （2026-11-21 现场：手机那边 `api.day.app` 连不上，00:05 的「睡觉」块一分钟一条
+  `push_failed`，一夜 64 条）。日志用 `log_change` 按 `key+mode` 去重，只留一条。
 - **代理坑**：macOS 的「系统设置 → 代理」会被 `urllib` 自动读进来（curl 不会），
   它的例外列表里通常只有 `localhost`、没有 `127.0.0.1`。所以 `_urlopen` 对回环地址
   **强制绕过代理**；真机推送仍走系统代理（用户可能就靠它出网）。

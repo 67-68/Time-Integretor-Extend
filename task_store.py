@@ -622,7 +622,7 @@ def session_due(session):
 
 
 def _coerce_omnifocus(raw):
-    """OmniFocus 关联：``{"id": primary key, "url", "title", "linked_at", "writeback", "previous"}``。
+    """OmniFocus 关联：``{"id": primary key, "url", "title", "linked_at", "writeback", "missing", "previous"}``。
 
     只有 ``id``（primary key）是硬的：链接解析不出来就没有关联，
     绝不拿标题去猜一条任务（猜错比没有更糟）。
@@ -645,6 +645,12 @@ def _coerce_omnifocus(raw):
     writeback = raw.get("writeback")
     if isinstance(writeback, dict) and writeback:
         out["writeback"] = {str(k): v for k, v in writeback.items()}
+    missing = raw.get("missing")
+    if isinstance(missing, dict) and missing:
+        # OmniFocus 里那条已经不存在（not_found 终局）：记下时间/原因，写回扫描
+        # 看到它就跳过；`task link` 整块覆盖 omnifocus 时会自然清掉。
+        out["missing"] = {"at": missing.get("at"),
+                          "error": str(missing.get("error") or "not_found")[:200]}
     previous = []
     for item in (raw.get("previous") or []):
         if not isinstance(item, dict):
@@ -1343,6 +1349,29 @@ class TaskStore(object):
             wb = dict(omni.get("writeback") or {})
             wb[str(what)] = at or _now()
             omni["writeback"] = wb
+            task["omnifocus"] = omni
+        return self._mutate(task_id, apply)
+
+    @staticmethod
+    def omnifocus_missing(task):
+        """OmniFocus 那边这条任务是不是已经**不存在**（``not_found`` 终局）。"""
+        return ((task or {}).get("omnifocus") or {}).get("missing") or None
+
+    def mark_omnifocus_missing(self, task_id, error="not_found", at=None):
+        """OmniFocus 里那条任务已经不存在（被删 / 被清掉）：记一笔终局标记。
+
+        ``not_found`` 重试一万次也不会回来。但本地这条记录不能删（它还是今天
+        做完的活，账要算），所以只在 ``omnifocus`` 上打一个 ``missing``，写回
+        扫描看到它就跳过 —— 之前没有这个标记时，一条 11-20 完成、OmniFocus 里
+        已被删掉的任务会让每次 refresh 都重试一遍，十几分钟一条 WARNING，永远
+        不停（2026-11-22 用户报的「写回 OmniFocus（1 条）失败：not_found」）。
+        重新 `task link` 会整块覆盖 ``omnifocus``，标记自然清掉。
+        """
+        info = {"at": at or _now(), "error": str(error or "not_found")[:200]}
+
+        def apply(task):
+            omni = task.get("omnifocus") or {}
+            omni["missing"] = dict(info)
             task["omnifocus"] = omni
         return self._mutate(task_id, apply)
 

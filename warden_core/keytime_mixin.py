@@ -57,6 +57,10 @@ class KeyTimeMixin(object):
         self.keytime_next_announce = 0.0
         self.keytime_next_summon = 0.0
         self.keytime_next_push = 0.0
+        #: 推送失败后的冷却时刻：手机连不上（api.day.app 拒绝）时以前每 60 秒
+        #: 重发一次、各记一条 WARNING，一个通宵能刷出几十上百条（2026-11-21
+        #: 现场：00:05 的「睡觉」块一共 64 条 push_failed）。
+        self.keytime_push_backoff_until = 0.0
         self.keytime_last_key = ""
         self.keytime_acked_left_mac = False
         self.keytime_now = None            # 测试钉死「现在」
@@ -67,6 +71,7 @@ class KeyTimeMixin(object):
         self.keytime_focus_on = False
         self._keytime_focus_busy = False
         self.keytime_next_focus_check = 0.0   # 读 default.cfg 每 5 秒一次就够
+        self.keytime_next_foreign_check = 0.0 # 「这不是我锁的」日志的节流
         self._keytime_notify_failed = False
         self._keytime_state = kt.load_state()
         self.keytime_events = kt.load_config()
@@ -212,6 +217,8 @@ class KeyTimeMixin(object):
             return
         if not self.keytimes or time.time() - self.keytime_loaded_at > 30:
             self.keytime_reload()
+        # 不管现在有没有 key time，桌面被**别人**锁着这件事都要能查（见方法注释）。
+        self._keytime_note_foreign_focus()
         target = self.keytime_target(now) or self.keytime_current(now)
         if target is None:
             self.keytime_last_key = ""
@@ -244,6 +251,7 @@ class KeyTimeMixin(object):
             self.keytime_next_summon = mono + announce_sec
             self._keytime_summon()
         if (self.keytime_acked_left_mac and mono >= self.keytime_next_push
+                and mono >= self.keytime_push_backoff_until
                 and target.end_dt() > now):
             self.keytime_next_push = mono + 300
             self._keytime_push(target, now, mode="acked")
@@ -262,7 +270,9 @@ class KeyTimeMixin(object):
         self.invalidate()
         if kt.left_mac(config=self.keytime_events):
             self.keytime_acked_left_mac = True
-            self._keytime_push(target, now, mode="alarm")
+            # 推送失败后先别每分钟再撞一次（见 _keytime_push 的失败分支）。
+            if time.time() >= self.keytime_push_backoff_until:
+                self._keytime_push(target, now, mode="alarm")
 
     # -- 锁死桌面（Focus.app） + mac 通知 --------------------------------
 
@@ -290,10 +300,25 @@ class KeyTimeMixin(object):
                 # 用户自己在跑别的 profile：那块锁是他的，我们不接管也不解锁
                 # （他挑的 profile 结束时由 Focus.app 自己收）。
                 self.keytime_focus_on = False
+                # 但要说一声：桌面被锁住时，日志必须答得出「是谁锁的」。
+                # 2026-11-22 09:00 Focus.app 自己起了一个 profile「Focus」的
+                # 09:00–21:00 会话，用户看到「桌面又锁了」以为是 keytime —— 当时
+                # 这一支一个字都不记，日志里完全查不到。log_change 按 profile+since
+                # 去重，5 秒一次的检查不会刷屏。
+                rl.log_change(
+                    "keytime", "focus_foreign",
+                    key="%s:%s" % (state.get("profile") or "?", state.get("since") or ""),
+                    level="info",
+                    profile=state.get("profile"), since=state.get("since"),
+                    note="这不是 keytime 锁的：Focus.app 自己的会话，warden 不接管也不解锁")
             return True
         if self._keytime_focus_busy:
             return False
         self._keytime_focus_busy = True
+        # 区分「这一块刚到时」和「用户在块中间手动解锁，被 5 秒后锁回去」：
+        # 以前两种情况都记 reason="到点"，日志看起来就像「一场 keytime 莫名其妙
+        # 又开始了」（2026-11-21 21:00 那条）。说的实话才能查。
+        relock = self.keytime_focus_on
 
         def run():
             try:
@@ -302,10 +327,11 @@ class KeyTimeMixin(object):
                     log=lambda msg: self.say("[keytime] " + msg, "warn"))
                 if ok:
                     self.keytime_focus_on = True
+                    why = "手动解锁后锁回去（这一块还没结束）" if relock else reason
                     rl.log_event("keytime", "focus_lock", profile=profile,
-                                 reason=reason)
+                                 reason=why, relock=bool(relock))
                     self.say("🔒 已锁死桌面：Focus.app profile「%s」，只留 iTerm"
-                             "（%s；解锁：keytime focus off）" % (profile, reason), "cmd")
+                             "（%s；解锁：keytime focus off）" % (profile, why), "cmd")
                 else:
                     rl.log_event("keytime", "focus_lock_failed", level="warning",
                                  profile=profile, reason=reason)
@@ -313,6 +339,33 @@ class KeyTimeMixin(object):
                 self._keytime_focus_busy = False
 
         threading.Thread(target=run, name="keytime-focus", daemon=True).start()
+        return True
+
+    def _keytime_note_foreign_focus(self):
+        """桌面被 Focus.app **自己的** profile 锁着时，日志里记一条。
+
+        设计上我们不接管、也不解锁用户自己开的 Focus 会话。但「桌面为什么锁了」
+        必须答得出来：2026-11-22 09:00 Focus.app 起了一个 profile「Focus」的
+        09:00–21:00 会话，用户以为是 keytime 又在锁桌面，而这条路径以前一个字
+        都不记。只在证据变了时写（log_change 按 profile+since 去重），5 秒节流。
+        """
+        cfg = self.keytime_events.get("focus") or {}
+        if not cfg.get("enabled", True) or not kt.focus_available():
+            return False
+        now = time.time()
+        if now < self.keytime_next_foreign_check:
+            return False
+        self.keytime_next_foreign_check = now + 5.0
+        state = kt.focus_state()
+        if not state.get("focusing"):
+            return False
+        if state.get("profile") == (cfg.get("profile") or "keytime"):
+            return False
+        rl.log_change(
+            "keytime", "focus_foreign",
+            key="%s:%s" % (state.get("profile") or "?", state.get("since") or ""),
+            level="info", profile=state.get("profile"), since=state.get("since"),
+            note="这不是 keytime 锁的：Focus.app 自己的会话，warden 不接管也不解锁")
         return True
 
     def _keytime_focus_release(self, reason="", blocking=False):
@@ -406,12 +459,20 @@ class KeyTimeMixin(object):
                                       timeout=timeout) or []
                 bad = [r for r in results if not r[1]]
                 if bad:
-                    rl.log_event("keytime", "push_failed", level="warning",
-                                 key=target.key(), mode=mode,
-                                 errors=["%s %s" % (name, detail)
-                                         for name, _ok, detail in bad])
-                    self.say("keytime 推送失败：%s" % "；".join(
-                        "%s %s" % (name, detail) for name, _ok, detail in bad), "warn")
+                    # 同一个 key 的同类失败只记一次（log_change 按 key 去重），
+                    # 然后 5 分钟内不再重发：Bark 连不上时每分钟一条 WARNING
+                    # 既没用又会把日志刷爆。
+                    self.keytime_push_backoff_until = time.time() + 300.0
+                    errors = ["%s %s" % (name, detail)
+                              for name, _ok, detail in bad]
+                    rl.log_change("keytime", "push_failed",
+                                  key="%s:%s" % (target.key(), mode),
+                                  level="warning", key_time=target.key(),
+                                  mode=mode, errors=errors,
+                                  backoff_sec=300)
+                    self.say("keytime 推送失败（%s）；5 分钟内不再重发。下一步："
+                             "检查手机网络 / api.day.app 能不能解析。"
+                             % "；".join(errors), "warn")
             finally:
                 self._keytime_push_busy = False
 

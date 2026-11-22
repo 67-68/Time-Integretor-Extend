@@ -678,8 +678,12 @@ class TaskSyncMixin(object):
             except Exception:                   # noqa: BLE001 - 账算不出来不该挡住完成
                 allowed, why = True, ""
             if not allowed:
-                rl.log_event("omnifocus", "complete_blocked", reason="project-partial",
-                             pk=pk, task_id=task.get("id"), source="writeback_scan")
+                # 每次 refresh 都扫一遍：同一条被挡住的完成只该记一次，否则一天
+                # 几十条 INFO（2026-11-22 现场 62 条）。log_change 按 key 去重。
+                rl.log_change("omnifocus", "complete_blocked",
+                              key="%s:%s" % (pk, task.get("id")), level="info",
+                              reason="project-partial", pk=pk,
+                              task_id=task.get("id"), source="writeback_scan")
                 continue
             todo.append(task["id"])
             seen_pks.add(pk)
@@ -722,6 +726,13 @@ class TaskSyncMixin(object):
             pk = ts.TaskStore.omnifocus_id(task)
             if not pk:
                 continue
+            if ts.TaskStore.omnifocus_missing(task):
+                # OmniFocus 里那条已经没了（not_found 终局）：别再排进下一批。
+                rl.log_change("omnifocus", "writeback_skipped_missing",
+                              key="%s:%s" % (pk, task.get("id")), level="debug",
+                              reason="omnifocus_gone", pk=str(pk),
+                              task_id=task.get("id"), source="writeback_scan")
+                continue
             pk = str(pk)
             wb = ((task.get("omnifocus") or {}).get("writeback") or {})
             claimant = claimed.get(pk)
@@ -750,8 +761,10 @@ class TaskSyncMixin(object):
             except Exception:                   # noqa: BLE001 - 账算不出来不该挡住完成
                 allowed = True
             if not allowed:
-                rl.log_event("omnifocus", "complete_blocked", reason="project-partial",
-                             pk=pk, task_id=task.get("id"), source="writeback_scan")
+                rl.log_change("omnifocus", "complete_blocked",
+                              key="%s:%s" % (pk, task.get("id")), level="info",
+                              reason="project-partial", pk=pk,
+                              task_id=task.get("id"), source="writeback_scan")
                 continue
             ops.setdefault("complete:%s" % pk, {
                 "id": pk, "op": "complete", "task_id": task["id"],
@@ -775,5 +788,25 @@ class TaskSyncMixin(object):
         action = self.net_action("omnifocus.flush",
                                  "写回 OmniFocus（%d 条）" % len(ops),
                                  {"ops": ops}, source=SRC_OMNIFOCUS)
-        self.jobs.submit(action, persist=False)
+        # 这条动作**不进失败账**（persist=False）：失败的条目本来就留在 outbox /
+        # 未写回标记里，下一次扫描会自动带上来；写进失败账反而会变成 `re-action`
+        # 里一条永远重放的任务。所以失败提示必须说实话，不能套用默认那句
+        # 「已记进失败账，re-action 可以重放」（2026-11-22 用户看到的假承诺）。
+        self.jobs.submit(action, persist=False,
+                         on_fail=self._omnifocus_flush_failed)
         return True
+
+    def _omnifocus_flush_failed(self, error):
+        """``omnifocus.flush`` 失败：留着下次自动再写，不是进失败账。"""
+        self.had_error = True
+        batches = getattr(self, "_flush_failed_batches", None) or []
+        failed = list(batches.pop(0)) if batches else []
+        gone = self._writeback_mark_gone(failed)
+        rl.log_event("net", "action_failed", level="error",
+                     action="omnifocus.flush", error=str(error)[:500],
+                     retry="next_flush", gone=len(gone))
+        tail = ("；其中 %d 条在 OmniFocus 里已经不存在，已停止重试"
+                "（要改挂用 `task link`）" % len(gone)) if gone else ""
+        self.say("❌ 写回 OmniFocus 失败：%s（失败的那条留在本地账上，"
+                 "下一次刷新 / 空闲时自动重试%s）" % (error, tail), "error")
+        self.invalidate()

@@ -36,7 +36,13 @@ python3 omnifocus_tasks.py set --id <PK> --complete
 python3 omnifocus_tasks.py set --id <PK> --complete --due 2026-10-27T11:50 --yes
 python3 omnifocus_tasks.py set --id <PK> --drop --yes
 python3 omnifocus_tasks.py set --id <PK> --add-tag 写作 --yes
+# 标签不存在时先建出来（只建单段名字；`父/子` 路径不猜父标签，仍然报 tag_problem）
+python3 omnifocus_tasks.py set --id <PK> --add-tag incubator --create-tags --yes
 ```
+
+`batch` 的每条 `set` op 也认 `"tags": {"add": [...], "create": true}`：warden
+补侧别标签（`SOP` / `incubator` / `manual_defer`）就用这条 —— 侧别标签第一次
+用时 OmniFocus 里通常还没建，不建就会每条都 `tag_problem`、外部永远写不进去。
 
 退出码：`0` 成功 / `1` 失败 / `2` 参数错 / `3` **自动化权限被拒（TCC）** /
 `4` 预览未写 / `5` 任务不存在 / `6` 标签问题 / `7` 拒绝改 project_root。
@@ -225,6 +231,13 @@ TUI 里的用法：`task import`（不给参数 = 读剪贴板导入并自动关
 4. 写成功 → 落 `writeback.completed/dropped` + 重复任务按 `repeat_clone_id` 改挂，
    并清掉 outbox 那几条；写失败 → **留在 outbox**（本地不回滚 —— 用户看到的 ✓ 就是
    真的），下一轮再写。
+5. **终局失败不再重试**：`not_found`（OmniFocus 里那条任务已经被删 / 被清掉）和
+   `project_root_refused` 会在本地 `omnifocus.missing = {at, error}` 打一个标记，
+   写回扫描从此跳过它（本地记录保留、账照算；`task link` 重新关联会整块覆盖
+   `omnifocus`，标记自然清掉）。没有这个标记时，一条 11-20 完成、OmniFocus 里
+   已被删掉的任务会让每次 refresh 都重试一遍，一天上百条 WARNING 永远不停
+   （2026-11-22 现场 `task 249`）。这条动作**不进失败账**（`persist=False`），
+   失败提示写的是「留在本地账上，下次自动重试」，不再冒用 `re-action`。
 
 `jobs.sync`（`--exec` / 测试）没有「之后」，仍然当场写，行为不变。
 

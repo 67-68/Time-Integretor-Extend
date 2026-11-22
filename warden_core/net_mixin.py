@@ -667,6 +667,14 @@ class NetMixin(object):
                                 ("；%d 条失败" % len(failed)) if failed else ""),
                 "ok" if not failed else "warn")
         if failed and not written:
+            # 全失败时 apply 那半根本不会跑，但终局失败（not_found）还是要在
+            # 主线程记下来 —— 把明细挂进 FIFO，交给 on_fail 钩子按完成顺序
+            # 逐个取（见 ``_omnifocus_flush_failed``）；只存一个变量的话，下一批
+            # 抢在 drain 之前失败会把它覆盖掉。
+            batches = getattr(self, "_flush_failed_batches", None)
+            if batches is None:
+                batches = self._flush_failed_batches = []
+            batches.append(list(failed))
             raise ValueError("全部写回失败：%s" % failed[0][1])
         return {"done": done, "dropped": dropped, "marked": marked,
                 "failed": failed}
@@ -724,6 +732,10 @@ class NetMixin(object):
         outbox = getattr(self, "omni_outbox", None)
         if outbox is not None:
             outbox.remove([item.get("key") for item in (done + dropped + marked)])
+        # 终局失败：OmniFocus 里那条已经不存在 / 这条根本不能动。留着只会让每次
+        # 刷新都重试一遍（2026-11-22 的 not_found 循环），所以给本地打上
+        # ``missing`` 标记，写回扫描从此跳过；说清楚是「放弃」不是「稍后再写」。
+        gone = self._writeback_mark_gone(failed)
         written = len(done) + len(dropped) + len(marked)
         if written:
             suffix = "、".join(notes)
@@ -732,10 +744,44 @@ class NetMixin(object):
                         if failed else "", ("；" + suffix) if suffix else ""),
                      "ok" if not failed else "warn")
         elif failed:
-            self.say("⚠️ OmniFocus 写回 %d 条全失败（留在本地账上，下次再写）：%s"
-                     % (len(failed), failed[0][1]), "warn")
+            tail = ("；其中 %d 条在 OmniFocus 里已经不存在，已停止重试（要改挂用 "
+                    "`task link`）" % len(gone)) if gone else "（留在本地账上，下次再写）"
+            self.say("⚠️ OmniFocus 写回 %d 条全失败%s：%s"
+                     % (len(failed), tail, failed[0][1]), "warn")
+        if gone:
+            self.say("· OmniFocus 里找不到那 %d 条已完成任务（可能已经删掉/清掉）："
+                     "本地账保留，写回不再重试。" % len(gone), "warn")
         self.invalidate()
         return written
+
+    def _writeback_mark_gone(self, failed):
+        """把「OmniFocus 里那条已经不存在」的失败记成终局标记，返回 task_id 列表。
+
+        为什么不删本地记录：它还算今天做完的活（账、统计都要它），只是远端那条
+        没了。重新 ``task link`` 会整块覆盖 ``omnifocus``，标记自然清掉。
+        """
+        gone = []
+        for pair in failed or ():
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            task_id, message = pair[0], pair[1]
+            text = str(message or "")
+            if not any(word in text for word in ("not_found", "project_root_refused")):
+                continue
+            try:
+                self.task_store.mark_omnifocus_missing(int(task_id), text)
+            except (ValueError, TypeError):
+                continue
+            try:
+                task = self.task_store.get(int(task_id))
+            except (ValueError, TypeError):
+                task = {}
+            gone.append(task_id)
+            rl.log_event("omnifocus", "writeback_missing", level="warning",
+                         task_id=task_id, pk=ts.TaskStore.omnifocus_id(task),
+                         title=(task.get("fields") or {}).get("title"),
+                         error=text[:200], source="writeback_flush")
+        return gone
 
     def net_omnifocus_writeback(self, args, rep):
         """把「Focusmate 说完成了」的那几条一次性写回 OmniFocus。**写**操作。

@@ -381,6 +381,11 @@ class ProjectMixin(object):
             frozen = int(row.get("frozen_count") or 0)
             if frozen:
                 remain_txt += "（+%d 冻结）" % frozen
+            untagged_n = len(row.get("untagged") or ())
+            if untagged_n and not int(row.get("remaining") or 0):
+                # 「剩余 0 count」+「未完成 4 条」看起来像账算不出来：那 4 条没打
+                # SOP / incubator 标签，不属于任何一侧。把差额直接写在格子里。
+                remain_txt += "（%d 条未打标）" % untagged_n
             t.add_row(str(row["number"]),
                       Text("%s → %s" % (row.get("pro_title") or "?", op_title),
                            overflow="crop"),
@@ -606,11 +611,23 @@ class ProjectMixin(object):
             raise ValueError("项目 #%s 关联了 %d 个 op，先手动清理到 1–2 个再 merge。"
                              % (pnum, len(ops)))
         if len(ops) == 2:
-            sop = next((op for op in ops
-                        if (pj.normalize_op_type(op.get("op_type")) or pj.OP_TYPE_SOP)
-                        == pj.OP_TYPE_SOP), ops[0])
-            src = next(op for op in ops if op["id"] != sop["id"])
-            dst = sop
+            # 迁移方向只能由「op 类型」决定：SOP 那条是目标、incubator 那条并进去。
+            # 类型缺失时**不许**拿默认值硬猜（旧代码把 None 当 SOP，两个都没设
+            # 类型时按列表顺序瞎选，方向可能反）。先让用户把类型补上。
+            kinds = [pj.normalize_op_type(op.get("op_type")) for op in ops]
+            if kinds[0] and kinds[1] and kinds[0] == kinds[1]:
+                dst = ops[0]                     # 同侧的两个 op：只是把清单并成一份
+                src = ops[1]
+            elif pj.OP_TYPE_SOP in kinds and pj.OP_TYPE_INCUBATOR in kinds:
+                dst = ops[kinds.index(pj.OP_TYPE_SOP)]
+                src = ops[kinds.index(pj.OP_TYPE_INCUBATOR)]
+            else:
+                missing = [str(self.projects.number_of(op["id"]) or op["id"])
+                           for op, kind in zip(ops, kinds) if not kind]
+                raise ValueError(
+                    "项目 #%s 的两个 op 分不出 SOP / incubator（没设类型的：#%s）。"
+                    "先用 `op <序号> sop` / `op <序号> incubator` 标好类型再 merge，"
+                    "否则迁移方向会猜反。" % (pnum, "、#".join(missing)))
         elif len(ops) == 1:
             src = None
             dst = ops[0]
@@ -663,7 +680,12 @@ class ProjectMixin(object):
             pk = str(item.get("pk") or "")
             if pk.startswith("soft-"):
                 continue
-            omni_ops.append({"id": pk, "op": "set", "tags": {"add": [side]}})
+            # create=True：OmniFocus 里还没有这个标签就先建一个。侧别标签
+            # （SOP / incubator / manual_defer）第一次用时多数都不存在；
+            # 不建的话每条 set 都回 tag_problem，标签永远写不进外部，下一次
+            # `project refresh` 再拿 OmniFocus 的旧标签把本地补的洗掉。
+            omni_ops.append({"id": pk, "op": "set",
+                             "tags": {"add": [side], "create": True}})
         omni_res = {}
         if omni_ops and (self.offline or not self.omnifocus_enabled()):
             # 单 op 补标签 / 冻结：本地照做，OmniFocus 侧跳过并说清楚（别撒谎）。
@@ -672,19 +694,30 @@ class ProjectMixin(object):
                      "等它可用了再跑一次 `pro %d merge --yes` 补写外部。"
                      % pnum, "warn")
         elif omni_ops:
-            res = self.omnifocus.flush(omni_ops)
-            results = res.get("results") or []
-            bad = [r for r in results if not r.get("ok")]
-            omni_res = {"ops": len(omni_ops), "failed": len(bad)}
-            if bad:
-                rl.log_event("project", "merge_partial", level="warning",
-                             pro=pro["id"], failed=len(bad),
-                             first=(bad[0].get("error") or bad[0].get("message") or ""))
-                self.say("⚠ OmniFocus 有 %d 条没处理成功（%s）；本地照常合并，"
-                         "下次 `project refresh` 会对账。"
-                         % (len(bad),
-                            bad[0].get("error") or bad[0].get("message") or "?"),
-                         "warn")
+            try:
+                res = self.omnifocus.flush(omni_ops)
+                results = res.get("results") or []
+                bad = [r for r in results if not r.get("ok")]
+                omni_res = {"ops": len(omni_ops), "failed": len(bad)}
+                if bad:
+                    rl.log_event("project", "merge_partial", level="warning",
+                                 pro=pro["id"], failed=len(bad),
+                                 first=(bad[0].get("error")
+                                        or bad[0].get("message") or ""))
+                    self.say("⚠ OmniFocus 有 %d 条没处理成功（%s）；本地照常合并，"
+                             "下次 `project refresh` 会对账。"
+                             % (len(bad),
+                                bad[0].get("error") or bad[0].get("message") or "?"),
+                             "warn")
+            except Exception as e:                 # noqa: BLE001 - 外部失败不挡本地
+                # 外部写挂了（OmniFocus 没开 / TCC 拒绝 / 超时）也绝不挡本地合并：
+                # 先把本地账理顺、说清「外部没写」，等它可用了再跑一次补。
+                omni_res = {"ops": len(omni_ops), "error": str(e)}
+                rl.log_event("project", "merge_write_failed", level="warning",
+                             pro=pro["id"], error=str(e)[:200])
+                self.say("⚠ OmniFocus 写回失败（%s）：移动 / 标签只改了本地；"
+                         "等它可用了再跑一次 `pro %d merge --yes` 补写外部。"
+                         % (e, pnum), "warn")
         moved = []
         if src is not None:
             _dst, moved = self.projects.merge_ops(dst["id"], src["id"],
@@ -792,7 +825,9 @@ class ProjectMixin(object):
                 continue
             op = {"id": str(pk), "op": "set"}
             if pj.TAG_MANUAL_DEFER in (fields.get("tags") or ()):
-                op["tags"] = {"add": [pj.TAG_MANUAL_DEFER]}
+                # create=True：第一次冻结时 OmniFocus 里还没有 manual_defer，
+                # 不建标签就只能每条失败（本地冻了、外部没冻）。
+                op["tags"] = {"add": [pj.TAG_MANUAL_DEFER], "create": True}
             else:
                 op["tags"] = {"remove": [pj.TAG_MANUAL_DEFER]}
             if "defer" in fields and not fields.get("defer"):
@@ -800,7 +835,12 @@ class ProjectMixin(object):
             ops.append(op)
         if not ops:
             return {}
-        res = self.omnifocus.flush(ops, timeout=timeout)
+        try:
+            res = self.omnifocus.flush(ops, timeout=timeout)
+        except Exception as e:                     # noqa: BLE001 - 外部失败不挡本地
+            rl.log_event("project", "side_write_failed", level="warning",
+                         total=len(ops), error=str(e)[:200])
+            return {"written": 0, "failed": len(ops), "error": str(e)}
         bad = [r for r in (res.get("results") or ()) if not r.get("ok")]
         if bad:
             rl.log_event("project", "side_write_partial", level="warning",
@@ -3261,12 +3301,29 @@ class ProjectMixin(object):
             return False
         allocator.had_decision = True
         by_id = {str(p.get("id")): p for p in (allocator.projects or ())}
+        stale = []
         for pid, count in (rec.get("alloc") or {}).items():
             project = by_id.get(str(pid))
             if project is None or int(count or 0) <= 0:
                 continue
+            try:
+                stat = allocator._project_stat(project)
+            except Exception:                      # noqa: BLE001 - 预填失败就按没活处理
+                stat = {}
+            if int(stat.get("remaining") or 0) <= 0:
+                # 上一轮的「说好 N count」这次已经落不了地（任务被删/改了标签）：
+                # 不能让它以「已分配」的样子回到面板上，否则一敲 complete 又把
+                # 整天的排布清空一遍。
+                stale.append((project, int(count)))
+                continue
             allocator.allocations.append({"project_id": project["id"],
                                           "count": int(count)})
+        if stale:
+            allocator.stale_dropped = True
+        for project, count in stale:
+            self.say("⚠ 上一轮给「%s」分的 %d count 这次作废：%s。"
+                     % (project.get("title") or project.get("id"), count,
+                        pj.empty_reason(project)), "warn")
         keys = ("task_id", "pk", "title", "count", "project_id",
                 "project_title", "priority", "minutes")
         for pin in rec.get("pins") or ():
@@ -4636,6 +4693,48 @@ class ProjectMixin(object):
         if progress is not None:
             progress.begin(0, title=title)
             progress.step("挑任务：%d 个项目分到的 count" % len(allocs))
+        # **落地前的硬闸**：分到 count 的项目必须真的有可排的活。
+        # 2026-11-22 现场：给「历史 W13 复习 2」说好 8 count，但那 4 条任务
+        # 一条侧标签都没有 → distribute 挑出 0 条 → 0 场 session，还把 T2–T4
+        # 已有的排布整片清空。这里在**撤旧计划之前**先筛一遍：一条都排不出的
+        # 项目直接踢掉并说明原因；全都没活就整次 plan 不执行，旧排布一个字不动。
+        usable, unfillable = [], []
+        for alloc in allocs:
+            project = alloc.get("project") or {}
+            try:
+                # 口径必须和 distribute() 一致：side 只读 plan_ops() 填的键，
+                # 没有就不按侧过滤（否则裸 op / 旧调用方会被误判成 0 条可排）。
+                stat = pj.stats(
+                    project, self.task_store,
+                    side=project.get("side"),
+                    default_side=project.get("default_side"))
+                remaining = int(stat.get("remaining") or 0)
+            except Exception:                      # noqa: BLE001 - 算不出来就按没活处理
+                remaining = 0
+            if remaining <= 0:
+                unfillable.append((project, int(alloc.get("count") or 0)))
+            else:
+                usable.append(alloc)
+        if unfillable and not usable and not (allocator.pins or ()):
+            self.say("✗ 这次 plan 没有执行：分到 count 的项目里一条可排的任务都没有 —— %s。"
+                     "已有排布一个字没动。"
+                     % "；".join("「%s」%s" % (p.get("title") or p.get("id"),
+                                              pj.empty_reason(p))
+                                for p, _count in unfillable), "error")
+            rl.log_event("plan", "apply_refused", level="warning",
+                         day=day.isoformat(), reason="no_eligible_tasks",
+                         projects=[p.get("id") for p, _c in unfillable])
+            if progress is not None:
+                progress.step("没有可排的任务，已放弃")
+            return {"placements": 0, "counts": 0, "unscheduled": 0,
+                    "notes": [], "failed": 0, "used_slot_indices": set(),
+                    "refused": "no_eligible_tasks"}
+        if unfillable:
+            for project, count in unfillable:
+                self.say("⚠ 「%s」分到 %d count 作废：%s。"
+                         % (project.get("title") or project.get("id"), count,
+                            pj.empty_reason(project)), "warn")
+            allocs = usable
         # 普通 plan 是整天重排：先撤旧计划，避免旧任务占着场次、和新算法
         # 排出来的内容并存在同一天。sessional plan / project -a 是追加语义，
         # 保留当天已有计划。
