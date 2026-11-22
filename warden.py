@@ -83,7 +83,7 @@
 **项目**时，把它的任务清单存进项目库（`data/projects.json`），**不建本地任务**；
 契约视图的任务面板下面多一张项目表（剩余 count / 进度 / 今天排了多少）。
 一个真正项目只关联一个 OmniFocus 项目（op）；SOP / incubator 是**任务标签**
-（running 只排 SOP 侧、bottleneck 只排 incubator 侧，另一侧 defer 十年冻结）。
+（running 只排 SOP 侧、bottleneck 只排 incubator 侧，另一侧打 manual_defer 标签冻结）。
 `plan` 只把这些关联了 pro 的 op 放进候选，按阶段挑一侧的任务，一次问完每个项目
 「分多少」（`task 1 4` / `task 1 clear` / `complete`），再按分到的 count 唤起任务、
 排进 period：日历 period 不可变，session 由任务时长反推（25/50/75 工作分钟 +

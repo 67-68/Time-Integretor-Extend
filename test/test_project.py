@@ -1506,23 +1506,23 @@ check("running 只挑 SOP 标签的任务",
       ["写正文"])
 wd_untyped.handle("q")
 
-print("== 4) 切阶段：冻结旧侧（defer 十年）/ 解冻新侧；incubator 阶段 dump 软中断 ==")
+print("== 4) 切阶段：冻结旧侧（只打 manual_defer）/ 解冻新侧；incubator 阶段 dump 软中断 ==")
 no_chore(wd_untyped)
 check("pro 1 -a 切到 bottleneck", wd_untyped.handle("pro 1 -a"), True)
 _mix_pro = wd_untyped.projects.pro_by_id(_mix_pro["id"])
 check("阶段已是 bottleneck", _mix_pro["stage"], "bottleneck")
 _mix_op = wd_untyped.projects.by_id(_mix_op["id"])
 _by_title = {t["title"]: t for t in _mix_op["tasks"]}
-check("SOP 任务被冻到十年后",
-      pj.is_frozen_defer(_by_title["写正文"].get("defer")), True)
+check("SOP 任务不带 defer（冻结不碰 defer）",
+      _by_title["写正文"].get("defer"), None)
 check("SOP 任务带上 manual_defer 标签",
       pj.task_has_tag(_by_title["写正文"], "manual_defer"), True)
-check("incubator 任务没有被动 defer",
-      _by_title["试新启发式"].get("defer"), None)
-check("冻结写的是十年后（不是普通 defer）",
-      pj.task_is_frozen(_by_title["写正文"]), True)
-check("普通 defer 不会被当成冻结哨兵",
-      pj.is_frozen_defer("2026-12-01T09:00:00"), False)
+check("incubator 任务没被打标签",
+      pj.task_has_tag(_by_title["试新启发式"], "manual_defer"), False)
+check("冻结只看标签", pj.task_is_frozen(_by_title["写正文"]), True)
+check("普通 defer 不会被当成冻结（旧哨兵判据仍认五年后）",
+      (pj.is_frozen_defer("2026-12-01T09:00:00"),
+       pj.is_frozen_defer("2036-12-01T09:00:00")), (False, True))
 
 # 软中断：攒着，切 incubator 时 dump
 wd_untyped.projects.add_soft_interrupt(_mix_pro["id"], "SAT 双篇对比总超时 2 分钟")
@@ -1532,29 +1532,50 @@ _mix_pro = wd_untyped.projects.pro_by_id(_mix_pro["id"])
 check("阶段已是 running", _mix_pro["stage"], "running")
 _mix_op = wd_untyped.projects.by_id(_mix_op["id"])
 _by_title = {t["title"]: t for t in _mix_op["tasks"]}
-check("切回 running 后 SOP 任务解冻（defer 清掉）",
-      _by_title["写正文"].get("defer"), None)
-check("manual_defer 标签摘掉",
-      pj.task_has_tag(_by_title["写正文"], "manual_defer"), False)
+check("切回 running 后 SOP 任务解冻（标签摘掉、defer 仍没动）",
+      (_by_title["写正文"].get("defer"),
+       pj.task_has_tag(_by_title["写正文"], "manual_defer")), (None, False))
 check("inactive 侧（incubator）现在被冻结",
       pj.task_is_frozen(_by_title["试新启发式"]), True)
 check("软中断还在攒着（2 条）",
       wd_untyped.projects.soft_interrupt_count(_mix_pro["id"]), 2)
 
+# 旧版十年哨兵：解冻时顺手清掉，普通 defer 不动（把任务改成带哨兵 + 标签，
+# 然后切走再切回，模拟旧版本数据）
+_store_legacy = wd_untyped.projects.load()
+for op in _store_legacy.get("projects") or []:
+    if op["id"] != _mix_op["id"]:
+        continue
+    for item in op.get("tasks") or ():
+        if item.get("pk") == _by_title["写正文"]["pk"]:
+            item["defer"] = "2036-11-22T00:00:00"
+            item["tags"] = list(item.get("tags") or []) + ["manual_defer"]
+wd_untyped.projects.save(_store_legacy)
+wd_untyped.handle("pro 1 -a")                 # running → bottleneck（会 dump 软中断）
+wd_untyped.handle("pro 1 -a")                 # bottleneck → running：解冻并清哨兵
+_legacy_task = next(t for t in wd_untyped.projects.by_id(_mix_op["id"])["tasks"]
+                    if t.get("pk") == _by_title["写正文"]["pk"])
+check("旧版十年 defer 在解冻时被清掉",
+      _legacy_task.get("defer"), None)
+check("解冻后标签也没了",
+      pj.task_has_tag(_legacy_task, "manual_defer"), False)
+
+# 新一轮：再攒 2 条软中断，切回 bottleneck 验证 dump
+wd_untyped.projects.add_soft_interrupt(_mix_pro["id"], "SAT 双篇对比总超时 2 分钟")
+wd_untyped.projects.add_soft_interrupt(_mix_pro["id"], "数学错题回顾没有固定入口")
 check("切到 bottleneck 时 dump 软中断", wd_untyped.handle("pro 1 -a"), True)
 _mix_op = wd_untyped.projects.by_id(_mix_op["id"])
-_heads = [t.get("title") for t in _mix_op["tasks"][:2]]
 check("两条软中断各 dump 成一条 25 分钟任务，插在清单最前",
       [(t.get("duration"), t.get("count"), t.get("tags"))
        for t in _mix_op["tasks"][:2]],
       [(25, 1, ["incubator", "软中断"]), (25, 1, ["incubator", "软中断"])])
 check("原来排在最前的 SOP 任务退到它们后面",
       "写正文" in [t.get("title") for t in _mix_op["tasks"][2:]], True)
-check("软中断记录标成 handled",
-      [r["status"] for r in wd_untyped.projects.soft_interrupts(_mix_pro["id"])],
-      ["handled", "handled"])
 check("dump 出来的任务不带 cut_period_id（本地任务）",
       all(t.get("local_only") for t in _mix_op["tasks"][:2]), True)
+check("软中断记录都标成 handled",
+      {r["status"] for r in wd_untyped.projects.soft_interrupts(_mix_pro["id"])},
+      {"handled"})
 
 print("== 4b) pop：最后一条 incubator 任务勾掉 → 自动切回 running 并解冻 ==")
 wd_pop = fresh(_mixed_rows)
@@ -1646,6 +1667,35 @@ check("running 阶段把 incubator 侧冻结",
                          if t["title"] == "试新启发式"][0]), True)
 check_true("离线时说明只改了本地",
            any("OmniFocus 不在线" in t for t in texts(wd_merge1)))
+
+print("== 4e) pro merge all：一次迁移全部项目 ==")
+wd_all = fresh(_merge_rows)
+wd_all.handle("op import sop omnifocus:///project/p-old-sop")
+wd_all.handle("op import incubator omnifocus:///project/p-old-inc")
+no_chore(wd_all)
+wd_all.messages = []
+check("merge all 预览受理", wd_all.handle("pro merge all"), True)
+check_true("预览说清几个项目", any("预览：1 个项目" in t for t in texts(wd_all)))
+check_true("预览说了要加 --yes", any("--yes" in t for t in texts(wd_all)))
+check("预览没动数据（还是两个 op）", len(wd_all.projects.active()), 2)
+wd_all.messages = []
+check("离线 merge all --yes 受理", wd_all.handle("pro merge all --yes"), True)
+check_true("有 move 的项目被拒绝并说明（不静默）",
+           any("没动" in t for t in texts(wd_all)))
+check("被拒绝的项目仍是两个 op", len(wd_all.projects.active()), 2)
+
+wd_all2 = fresh(_mixed_rows)
+wd_all2.handle("op import omnifocus:///project/p-mix-1")
+no_chore(wd_all2)
+wd_all2.messages = []
+check("merge all --yes 在单 op 项目上成功", wd_all2.handle("pro merge all --yes"), True)
+check_true("汇总说了完成几个",
+           any("merge all 完成：1 个项目" in t for t in texts(wd_all2)))
+_wd_all2_sides = {t["title"]: pj.side_of_tags(t.get("tags") or ())
+                  for t in wd_all2.projects.active()[0]["tasks"]}
+check("merge all 补了侧标签",
+      (_wd_all2_sides["写正文"], _wd_all2_sides["试新启发式"]),
+      ("SOP", "incubator"))
 
 print("== 5) plan 一次分配：不同项目按各自阶段挑自己那一侧 ==")
 _two_stage_rows = [

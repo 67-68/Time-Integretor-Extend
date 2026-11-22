@@ -641,7 +641,7 @@ SET_OMNIJS_TEMPLATE = r'''
         afterTask = task;
       }
       // defer 同样是「修饰」：可以跟 complete/drop/标签一起给（warden 的
-      // SOP/incubator 冻结就是「defer 到十年后」，解冻就是清掉 defer）。
+      // 通用能力：warden 的侧别冻结现在只打标签，不再靠 defer）。
       if (hasDefer) {
         task.deferDate = args.defer ? new Date(args.defer) : null;
         afterTask = task;

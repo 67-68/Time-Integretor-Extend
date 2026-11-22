@@ -51,7 +51,8 @@ op -m active id:1
   `pro <序号> op <op序号>` / `op <序号> pro <pro序号>` 手动关联。
 - **一个 pro 只该有一个 op**（用户 2026-11-21：「一个 project 对应两个 SOP 和
   incubator 项目的模式太拖沓了」）。瓶颈期与运行期共用同一个清单，靠**任务标签**
-  分侧，不再开两个 OmniFocus 项目；旧的双 op 数据用 `pro <序号> merge` 迁过来。
+  分侧，不再开两个 OmniFocus 项目；旧的双 op 数据用 `pro <序号> merge` 迁过来，
+  全部项目一起迁是 `pro merge all [--yes]`。
 
 ## 数据形状
 
@@ -81,7 +82,7 @@ op -m active id:1
       "effective_completed": false, "effective_dropped": false,
       "blocked": false, "rank": 0,
       // 侧别 tag：SOP / incubator（必打）；manual_defer = 被冻结
-      // 冻结时 defer 写成十年后，解冻只看「defer 在五年之后」这个哨兵
+      // 冻结 = 打 manual_defer 标签；defer 由用户自己在 OmniFocus 里排除
       "tags": ["project/学术论文", "SOP", "P1"]
     }],
     "plans": {
@@ -170,17 +171,17 @@ op -m active id:1
 - 导入不再问类型：`task import sop|incubator` 仍认（兼容旧脚本），但不再强制，
   也不再弹 `pending_op_type` 补全面板。
 
-#### 冻结：非活跃侧 defer 十年
+#### 冻结：非活跃侧只打 `manual_defer` 标签
 
-为了 OmniFocus 里「只看得到当前该干的活」，用户 2026-11-21 定了冻结规则：
+2026-11-22 用户定稿：「冻结会把任务原本的 defer 覆盖成十年哨兵（整侧暂停的代价）
+→ 算了，还是我这边手动排除吧，不要这个十年冻结了，把这个冻结十年的操作干掉，
+仅打 tag 就行」。所以：
 
-- 非活跃一侧的每个未完成任务：`defer` 推到**十年后**，并打 `manual_defer` 标签；
-- 活跃一侧里 `defer` 在**五年之后**（我们设的哨兵）或带 `manual_defer` 的：
-  清掉 defer、摘掉标签（解冻）；
-- **普通 defer（五年以内）一个字都不动** —— 十年这个值就是用来和用户自己设的
-  普通 defer 区分开的判据；
-- 冻结只影响 `plan` 候选（以及 OmniFocus 里的可见性），**不动**
-  `count_invested`，也不取消已经挂上的 session；
+- 非活跃一侧的未完成任务：只打 `manual_defer` 标签，**不写 defer**；
+- 活跃一侧带 `manual_defer` 的：摘掉标签（解冻）；
+- 旧版遗留的十年 defer 哨兵（defer 在五年之后）：解冻时顺手清掉，普通 defer
+  一个字都不动；
+- 冻结只影响 `plan` 候选，**不动** `count_invested`，也不取消已挂 session；
 - 谁触发：`pro <序号> -a` / `pro <序号> stage ...` 切换时立即执行；`refresh`
   每两分钟做一次幂等检查（`_maybe_sync_sides`），只写有变化的任务。
 
@@ -193,7 +194,7 @@ op -m active id:1
    **每条 dump 成一条 25 分钟任务**（标签 `incubator`，`local_only`，不写
    OmniFocus），按原顺序插到项目清单**最前**；
 2. **defer**：原来排在最前、没做完的 SOP 任务自然退到它们后面；`count_invested`
-   原样保留（干到 1/3 就是 1/3），状态由 `manual_defer` + 十年 defer 表达；
+   原样保留（干到 1/3 就是 1/3），状态由 `manual_defer` 标签表达；
 3. **pop**：bottleneck 下**最后一条 incubator 任务勾掉**时，自动切回 `running`
    并解冻 SOP 侧（不用再手敲 `pro <序号> -a`）。`task done` 那条流水线里做，
    失败只记日志、不挡完成。
@@ -695,7 +696,7 @@ OmniFocus 那条勾完成（那会把剩下的 1 count 抹掉）。所以 `omni_
 | `pro` / `project` | 列出真正项目 pro 和 op 库 |
 | `pro create <名称> [file=<路径>] [stage=running\|bottleneck]` | 新建 / 更新真正项目 pro |
 | `pro <序号> -a` / `--advance` | 切换阶段（running ↔ bottleneck）：冻结旧侧、解冻新侧；切到 incubator 时把软中断 dump 成任务。旧的 `-a op <N>` / `-a task import` 仍可显式关联 op |
-| `pro <序号> merge [--yes]` | 迁移：旧双 op 合成一个项目 + 补侧标签（先预览） |
+| `pro <序号> merge [--yes]` / `pro merge all [--yes]` | 迁移：旧双 op 合成一个项目 + 补侧标签（先预览；`all` 处理所有活跃项目，单个失败不影响其它） |
 | `project <序号> -a <session>` / `-ac` | 直接把该项目第一条任务挂到指定场 / 当前场 |
 | `pro <序号> file <路径\|clear>` | 关联 / 清空“`open` + Enter 顺便打开”的文件 |
 | `pro <序号> open` / `open pro <序号>` | 直接打开关联文件 |
@@ -755,8 +756,8 @@ q 中止
 1. 已入队的条目标为 `queued`，问号继续显示；
 2. 切到 `bottleneck`（`pro <序号> -a`）时，每条软中断 dump 成一条 **25 分钟**
    任务：标签 `incubator`（`local_only`，不写 OmniFocus），按原顺序插到清单最前；
-3. 原来排在最前的 SOP 任务退到后面，`count_invested` 不动（defer 十年 + 
-   `manual_defer` = 冻结，OmniFocus 里看不见）；
+3. 原来排在最前的 SOP 任务退到后面，`count_invested` 不动（打 `manual_defer`
+   标签 = 冻结；defer 不写，由你自己在 OmniFocus 里排除）；
 4. 如果切换时已经在 `bottleneck`，`--check` 结束当场 dump；条目状态改为 `handled`；
 5. `task done` 勾掉最后一条 incubator 任务时，自动切回 `running` 并解冻 SOP 侧。
 

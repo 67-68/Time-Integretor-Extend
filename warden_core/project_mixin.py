@@ -340,8 +340,8 @@ class ProjectMixin(object):
         """契约视图里**任务面板下面**那块项目表。
 
         每个真正项目 ``pro`` 一行，只算**当前活跃侧**的账：``running`` 算 SOP
-        任务，``bottleneck`` 算 incubator 任务。另一侧（已经冻结在十年后）
-        显示成「+N 冻结」，和 OmniFocus 列表里看不到它们一致。
+        任务，``bottleneck`` 算 incubator 任务。另一侧（已打 ``manual_defer``
+        标签）显示成「+N 冻结」；defer 由用户自己在 OmniFocus 里排除。
         """
         rows = self.current_project_rows()
         if not rows:
@@ -407,7 +407,7 @@ class ProjectMixin(object):
         if legacy:
             extra += " · %d 个项目还是双 op，跑 `pro <序号> merge` 合并" % legacy
         t.caption = ("%d 个活跃项目 · 剩余 %s count（%d 分钟）· 只算当前阶段那一侧；"
-                     "另一侧任务 defer 十年、在 OmniFocus 里不可见 · 排序列 = 该项目检测到的 "
+                     "另一侧任务打 manual_defer 标签（不写 defer）· 排序列 = 该项目检测到的 "
                      "OmniFocus 规则（sequential / parallel）· `plan` 也按同一份清单分配"
                      "%s"
                      % (len(rows), left_txt,
@@ -527,6 +527,55 @@ class ProjectMixin(object):
 
     # -- 单项目模型：侧别冻结 / push / pop（2026-11-21） ------------------
 
+    def _merge_all_pros(self, tail_tokens=None):
+        """``pro merge all [--yes]``：把所有活跃项目的旧双 op 一次迁完。
+
+        逐个调用 :meth:`_merge_pro_ops`：不带 ``--yes`` 只逐条预览；执行时
+        单个项目失败（比如离线且有任务要挪）只记下来、继续下一个，末尾汇总。
+        """
+        toks = [str(t).strip() for t in (tail_tokens or ()) if str(t).strip()]
+        yes = any(t.lower() in ("--yes", "-y", "yes", "确认", "执行") for t in toks)
+        pros = [p for p in self.projects.active_pros()
+                if self.projects.ops_for_pro(p)]
+        if not pros:
+            self.say("📁 没有可合并的项目（没有关联 op 的 active pro）。", "info")
+            return []
+        if not yes:
+            self.say("🔀 预览：%d 个项目会被合并 / 补标签（加 `--yes` 执行）"
+                     % len(pros), "cmd")
+            for pro in pros:
+                try:
+                    self._merge_pro_ops(pro, [])
+                except Exception as e:             # noqa: BLE001 - 预览也别中断
+                    self.say("⚠ 项目 #%s 预览失败：%s"
+                             % (self.projects.pro_number_of(pro["id"]) or pro["id"],
+                                e), "warn")
+            self.say("（只预览，没有写入。确认后：pro merge all --yes）", "info")
+            return pros
+        done, failed = [], []
+        for pro in pros:
+            pnum = self.projects.pro_number_of(pro["id"]) or pro["id"]
+            try:
+                self._merge_pro_ops(pro, ["--yes"])
+                done.append(pnum)
+            except Exception as e:                 # noqa: BLE001 - 一个坏了继续
+                reason = str(e) or e.__class__.__name__
+                failed.append("%s：%s" % (pnum, reason))
+                rl.log_event("project", "merge_all_failed", level="warning",
+                             pro=pro["id"], error=reason)
+        if done:
+            self.say("✅ merge all 完成：%d 个项目已合并 / 补标签（#%s）。"
+                     % (len(done), "、#".join(str(x) for x in done)), "ok")
+        if failed:
+            self.say("⚠ %d 个项目没动：%s" % (len(failed), "；".join(failed[:3])
+                                               + ("…" if len(failed) > 3 else "")),
+                     "warn")
+        if not done and not failed:
+            self.say("merge all：没有需要处理的项目。", "info")
+        self.rebuild_rows()
+        self.invalidate()
+        return pros
+
     def _merge_pro_ops(self, pro, tail_tokens=None):
         """``pro <序号> merge [--yes]``：把旧的双 op 迁成「一个项目 + 侧标签」。
 
@@ -619,7 +668,7 @@ class ProjectMixin(object):
         if omni_ops and (self.offline or not self.omnifocus_enabled()):
             # 单 op 补标签 / 冻结：本地照做，OmniFocus 侧跳过并说清楚（别撒谎）。
             omni_res = {"skipped": "offline"}
-            self.say("⚠ OmniFocus 不在线：标签和 defer 只改了本地快照；"
+            self.say("⚠ OmniFocus 不在线：标签只改了本地快照；"
                      "等它可用了再跑一次 `pro %d merge --yes` 补写外部。"
                      % pnum, "warn")
         elif omni_ops:
@@ -672,14 +721,14 @@ class ProjectMixin(object):
     def _side_plan(self, pro, now=None):
         """算出这个 pro 当前该冻结 / 解冻哪些任务（纯计算，不落盘）。
 
-        规则（用户 2026-11-21 定）：
-        * 非活跃一侧的任务 → ``defer`` 推到十年后 + 打 ``manual_defer`` 标签，
-          OmniFocus 列表里就看不见它们了；
-        * 活跃一侧里 ``defer`` 在五年之后（我们设的哨兵）或带标签的 → 清掉
-          defer、摘掉标签（解冻）；
-        * 普通 defer（五年以内）一个字都不动；没有侧标签的任务只记录、不碰。
+        规则（2026-11-22 用户改口后）：
+        * 冻结 = 只给非活跃一侧的任务打 ``manual_defer`` 标签，**不碰 defer**
+          （「算了，还是我这边手动排除吧，不要这个十年冻结了，仅打 tag 就行」）；
+        * 解冻 = 摘掉标签；如果还留着旧版十年 defer 的哨兵（defer 在五年之后），
+          顺手清掉（一次性迁移）；
+        * 普通 defer 一个字都不动；没有侧标签的任务只记录、不碰。
 
-        返回 ``(op, changes, untagged)``；``changes`` = ``{pk: {"defer", "tags"}}``。
+        返回 ``(op, changes, untagged)``；``changes`` = ``{pk: {"tags"[, "defer"]}}``。
         """
         op = self.projects.current_op_for_pro(pro)
         if op is None:
@@ -687,7 +736,6 @@ class ProjectMixin(object):
         now = now or self._now_dt()
         active = pj.side_for_stage(pro.get("stage"))
         default_side = pj.normalize_op_type(op.get("op_type"))
-        frozen_value = pj.frozen_defer_value(now)
         changes = {}
         untagged = []
         for item in op.get("tasks") or ():
@@ -705,19 +753,27 @@ class ProjectMixin(object):
             tags = [str(t).strip() for t in (item.get("tags") or ())
                     if str(t).strip()]
             has_marker = pj.task_has_tag(item, pj.TAG_MANUAL_DEFER)
-            frozen = pj.is_frozen_defer(item.get("defer"), now=now)
+            legacy_defer = pj.is_frozen_defer(item.get("defer"), now=now)
             if side != active:
-                if frozen and has_marker:
+                if has_marker and not legacy_defer:
                     continue                     # 已经冻好了，别每次 refresh 都重写
                 if not has_marker:
                     tags.append(pj.TAG_MANUAL_DEFER)
-                changes[pk] = {"defer": frozen_value, "tags": tags}
+                fields = {"tags": tags}
+                if legacy_defer:
+                    # 旧版十年哨兵：冻结侧也顺手清掉（只留标签）。
+                    fields["defer"] = None
+                changes[pk] = fields
             else:
-                if not (frozen or has_marker):
+                if not (has_marker or legacy_defer):
                     continue
                 kept = [t for t in tags
                         if t.lower() != pj.TAG_MANUAL_DEFER.lower()]
-                changes[pk] = {"defer": None, "tags": kept}
+                fields = {"tags": kept}
+                if legacy_defer:
+                    # 旧版十年冻结留下的 defer 顺手清掉，普通 defer 不动。
+                    fields["defer"] = None
+                changes[pk] = fields
         return op, changes, untagged
 
     def _omni_write_side_changes(self, changes, timeout=None):
@@ -735,12 +791,12 @@ class ProjectMixin(object):
             if str(pk).startswith("soft-"):
                 continue
             op = {"id": str(pk), "op": "set"}
-            if fields.get("defer"):
-                op["defer"] = fields["defer"]
+            if pj.TAG_MANUAL_DEFER in (fields.get("tags") or ()):
                 op["tags"] = {"add": [pj.TAG_MANUAL_DEFER]}
             else:
-                op["clear_defer"] = True
                 op["tags"] = {"remove": [pj.TAG_MANUAL_DEFER]}
+            if "defer" in fields and not fields.get("defer"):
+                op["clear_defer"] = True          # 只清旧版哨兵
             ops.append(op)
         if not ops:
             return {}
@@ -765,7 +821,9 @@ class ProjectMixin(object):
         op, changes, untagged = self._side_plan(pro)
         if op is None:
             return {"frozen": 0, "thawed": 0, "untagged": [], "omni": {}}
-        frozen = sum(1 for f in changes.values() if f.get("defer"))
+        # 冻结 = 新标签里有 manual_defer；解冻 = 这次要把它摘掉（含旧哨兵清理）。
+        frozen = sum(1 for f in changes.values()
+                     if pj.TAG_MANUAL_DEFER in (f.get("tags") or ()))
         thawed = len(changes) - frozen
         if changes:
             self.projects.update_tasks(op["id"], changes)
@@ -1103,6 +1161,7 @@ class ProjectMixin(object):
                                                 把攒的软中断 dump 成 25 分钟任务
             pro <序号> merge [--yes]            迁移：把旧的双 op 并成一个项目、给任务
                                                 补 SOP / incubator 标签（先预览）
+            pro merge all [--yes]               对所有活跃项目一次做上面这件事
             pro <序号> file <路径|clear>        关联/清空项目的打开文件（open + enter 顺便打开）
             pro <序号> open                     打开该项目关联的文件
             pro <序号> stage <running|bottleneck>  直接设置阶段（同 -a 的效果）
@@ -1206,6 +1265,11 @@ class ProjectMixin(object):
                 raise ValueError("用法：pro <序号> -a / --advance [op <序号> | task import]")
             pro = self._ensure_pro_for_token(toks[1])
             return self._start_pro_advance(pro, toks[2:])
+        if action in ("merge", "unify", "合并", "统一"):
+            tail = toks[1:]
+            if tail and str(tail[0]).lower() in ("all", "全部", "*"):
+                return self._merge_all_pros(tail[1:])
+            raise ValueError("用法：pro <序号> merge [--yes] / pro merge all [--yes]")
 
         rest = toks[1:]
         rest_low = [t.lower() for t in rest]
@@ -1271,11 +1335,14 @@ class ProjectMixin(object):
             updated = self._switch_pro_stage(pro["id"], st_val, reason="cmd-stage")
             return updated
 
-        # 迁移：pro <序号> merge [--yes] —— 把旧的 incubator op 并进 SOP op，
+        # 迁移：pro <序号> merge [--yes] / pro merge all —— 把旧的 incubator op 并进 SOP op，
         # 给任务补侧标签，再按当前阶段冻结/解冻。只做一次，之后就只有一个 op。
         if rest and rest_low[0] in ("merge", "unify", "合并", "统一"):
+            tail = rest[1:]
+            if tail and str(tail[0]).lower() in ("all", "全部", "*"):
+                return self._merge_all_pros(tail[1:])
             pro = self._ensure_pro_for_token(toks[0])
-            return self._merge_pro_ops(pro, rest[1:])
+            return self._merge_pro_ops(pro, tail)
 
         # 检查是否是关联已有 op：pro <序号> op <op序号>
         if rest and rest_low[0] in ("op", "link", "关联"):

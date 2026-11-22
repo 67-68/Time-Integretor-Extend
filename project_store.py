@@ -245,8 +245,9 @@ PRO_STAGES = (STAGE_RUNNING, STAGE_BOTTLENECK)
 #     设为十年之后（但解冻的时候检测五年之后 defer 就解锁）」
 # 所以：
 #   * 侧别标签 = ``SOP`` / ``incubator``（大小写不敏感，inc/patch 也认）；
-#   * 冻结 = defer 推到十年后 + 打 ``manual_defer`` 标签（OmniFocus 里就看不见了）；
-#   * 解冻 = 看到 defer 在五年之后（我们设的哨兵）就清掉它，并摘掉标签。
+#   * 冻结 = 只打 ``manual_defer`` 标签（2026-11-22 用户改口：不要十年 defer
+#     覆盖，defer 由用户自己在 OmniFocus 里排除）；
+#   * 解冻 = 摘掉标签；顺手清掉旧版遗留的十年哨兵 defer（见 is_frozen_defer）。
 TAG_SOP = "SOP"
 TAG_INCUBATOR = "incubator"
 TAG_MANUAL_DEFER = "manual_defer"
@@ -256,7 +257,7 @@ SIDE_TAG_ALIASES = {
     "inc": OP_TYPE_INCUBATOR,
     "patch": OP_TYPE_INCUBATOR,
 }
-FROZEN_DEFER_DAYS = 365 * 10
+#: 旧版「十年 defer 冻结」的哨兵阈值（只用于解冻时清理残留 defer）。
 FROZEN_DETECT_DAYS = 365 * 5
 
 
@@ -302,15 +303,13 @@ def item_defer_at(item):
     return ts.task_defer_at({"fields": {"defer": item.get("defer")}})
 
 
-def frozen_defer_value(now=None):
-    """冻结时写进 defer 的值：十年后的同一时刻（去掉微秒，OmniFocus 好认）。"""
-    now = now or datetime.datetime.now()
-    return (now + datetime.timedelta(days=FROZEN_DEFER_DAYS)).replace(
-        microsecond=0).isoformat()
-
-
 def is_frozen_defer(value, now=None):
-    """这个 defer 值是不是我们设的「冻结」哨兵（在五年之后）。"""
+    """旧版「十年 defer 冻结」的哨兵判据（defer 在五年之后）。
+
+    只用于解冻时顺手清掉残留 defer；**不再**判断任务是否冻结 —— 冻结从
+    2026-11-22 起只看 ``manual_defer`` 标签（用户：「不要这个十年冻结了，
+    只打 tag 就行」）。
+    """
     got = ts.task_defer_at({"fields": {"defer": value}})
     if got is None:
         return False
@@ -319,16 +318,13 @@ def is_frozen_defer(value, now=None):
 
 
 def task_is_frozen(item, now=None):
-    """任务是不是被冻结了（不进任何自动排期候选）。
+    """任务是不是被冻结了（不进任何自动排期候选）：只看 ``manual_defer`` 标签。
 
-    判据两条任一成立：defer 在五年之后（我们设的哨兵），或者带着
-    ``manual_defer`` 标签（用户手打的也算）。
+    ``now`` 保留只为兼容调用方，不再参与判定。
     """
     if not isinstance(item, dict):
         return False
-    if task_has_tag(item, TAG_MANUAL_DEFER):
-        return True
-    return is_frozen_defer(item.get("defer"), now=now)
+    return task_has_tag(item, TAG_MANUAL_DEFER)
 
 #: 唤起出来的本地任务用这几个 ``fields`` 键指回项目。字段名就是界面上显示的名字
 #: （任务视图会把 fields 的每个键摊成一列），所以要能一眼看懂。

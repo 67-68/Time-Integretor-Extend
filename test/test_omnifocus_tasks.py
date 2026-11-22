@@ -533,7 +533,7 @@ if shutil.which("node"):
     r = run_set_js(set_payload(clearDue=True, dryRun=True, ops=["clear-due"]))
     check("set JS：dry-run 不改截止时间", r["changed"], [])
 
-    # defer 也是「修饰」：warden 的 SOP/incubator 冻结就靠它（defer 到十年后）
+    # defer 也是「修饰」：通用能力（侧别冻结现在只打标签，不再靠 defer）
     r = run_set_js(set_payload(id="t1", defer="2026-11-01T09:00:00",
                                ops=["defer:2026-11-01T09:00:00"]))
     check("set JS：只设 defer",

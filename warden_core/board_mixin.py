@@ -2733,7 +2733,7 @@ class BoardMixin(object):
         except Exception:                          # noqa: BLE001 - 项目对账坏了也不能没帧
             pass
         try:
-            # 刷新检查：按当前阶段把非活跃侧冻到十年后、把活跃侧解冻。
+            # 刷新检查：按当前阶段给非活跃侧打 manual_defer、把活跃侧解冻。
             self._maybe_sync_sides()
         except Exception:                          # noqa: BLE001 - 冻结坏了也不能没帧
             pass
@@ -3134,10 +3134,10 @@ class BoardMixin(object):
                                  "task = 具体任务 Task（挂到 session 执行的单条任务）"),
             ("pro / project", "管理真正项目 Project (pro)。一个 pro ↔ 一个 OmniFocus 项目；"
                               "SOP / incubator 是**任务标签**：running 只排 SOP 侧，bottleneck 只排 incubator 侧，"
-                              "另一侧的任务 defer 到十年后（OmniFocus 里看不见）"),
+                              "另一侧的任务打 manual_defer 标签（defer 由你在 OmniFocus 里排除）"),
             ("pro <序号> -a / --advance", "切换阶段（running ↔ bottleneck）：冻结旧侧、解冻新侧；"
                                            "切到 bottleneck 时把攒的软中断 dump 成 25 分钟任务插在项目最前"),
-            ("pro <序号> merge [--yes]", "迁移：把旧的双 op 并成一个项目（OmniFocus moveTasks + 补 SOP/incubator "
+            ("pro <序号> merge [--yes] / pro merge all [--yes]", "迁移：把旧的双 op 并成一个项目（OmniFocus moveTasks + 补 SOP/incubator "
                                           "标签），再按当前阶段冻结/解冻；不带 --yes 只预览"),
             ("pro <序号> -m complete|discard", "只改真正项目 pro 的本地状态；completed / dropped "
                                                "不再进入 active 列表、plan 和默认数据视图"),

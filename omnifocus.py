@@ -1303,7 +1303,7 @@ class Client(object):
 
         传 ISO 8601（``2026-11-01T09:00`` / ``2026-11-01``）或任何 JS
         ``new Date()`` 认得、且 Python 的 ``fromisoformat`` 也认得的字符串。
-        warden 的 SOP / incubator 冻结就是 ``set_defer(pk, 十年后)``，
+        任何需要写 defer 的场景（通用能力；warden 的侧别冻结现在只打标签），
         解冻就是 ``set_defer(pk, None)``。
         """
         if defer is None or str(defer).strip() == "":
