@@ -57,6 +57,15 @@ sch.DATA_CSV = os.path.join(TMP, "data.csv")
 sch.BACKUP_CSV = os.path.join(TMP, "data.csv.bak")
 sch.TEMP = TMP
 
+# 工作区真目录里的「罪」（temp/warden-sins.json）会挡住 plan：有未认的罪时
+# 排期会被拦下，于是这条用例只在干净机器上绿、在用户自己的工作区里必红
+# （2026-11-23 实测：把真 temp/*.json 拷进沙盒就能稳定复现）。跟 test_warden.py
+# 一样显式指到临时目录。
+ks = w.ks
+ks.SINS_FILE = os.path.join(TMP, "sins.json")
+ks.SINS_ARCHIVE = os.path.join(TMP, "sins.jsonl")
+ks.TUI_STATE_FILE = os.path.join(TMP, "warden-tui.json")
+
 fails = []
 
 

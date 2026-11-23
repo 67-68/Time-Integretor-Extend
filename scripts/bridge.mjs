@@ -9,6 +9,16 @@
  * 所以这里把浏览器**留在内存里**，命令走 stdin/stdout 的 JSON 行协议，
  * 单条命令降到 ~1-2s。
  *
+ * 两种跑法
+ * --------
+ * 1. ``node bridge.mjs``（stdio）：stdin/stdout 各一行 JSON，给单个前台程序用（老用法，
+ *    测试还靠它）。
+ * 2. ``node bridge.mjs --serve <home>/browser-service.sock``（**默认推荐**）：监听一个
+ *    unix socket，多个客户端（warden TUI / keep_session daemon / 命令行）共用同一只
+ *    Chromium。单实例由 ``listen()`` 兜住 —— 第二个进程会以退出码 3 退出。
+ *    服务是独立进程（客户端用 start_new_session 起），客户端断开不会带走它；
+ *    「还有没有客户端连着」决定何时关浏览器（见下 IDLE_MS），不再是"永远挂着"。
+ *
  * 协议
  * ----
  *   stdin   每行一个 JSON 请求：  {"id":1,"cmd":"snapshot"}
@@ -36,7 +46,10 @@
  *   桥照常执行、响应也发了，但调用方永远等不到自己那个请求号 —— 表现为「卡死」，
  *   而写入其实已经生效。所以「哪一场」一律叫 meetingId。
  *     release                          只关浏览器、进程留着（把 profile 让给 daemon）
- *     shutdown                         关浏览器并退出
+ *     ensure                           把浏览器开起来并回报 ping（幂等；Phase 2 起带 cdpUrl）
+ *     hold [ms]                        登录/维护窗口：关浏览器，并在 ms 内**拒绝**开浏览器
+ *     unhold                           解除 hold
+ *     shutdown                         关浏览器并退出（会删 sock / 门牌文件）
  *
  * 关键实现约束（踩过坑，别改）
  * ---------------------------
@@ -47,9 +60,10 @@
  *    所以用 inCommand 标志把命令执行期间的 process.exit 转成异常。
  * 3. **串行执行**：浏览器和 profile 都不能并发碰，命令进队列一条条跑。
  * 4. 见上：**id 只做请求号**，session 身份用 meetingId。
- * 5. **空闲自动关浏览器**：daemon 也用同一个 Chromium profile，
- *    桥长期把浏览器挂着 = daemon 下单必然抢锁失败。
- *    空闲 IDLE_MS（默认 120s）就把浏览器关掉、释放锁，下次命令再冷启动。
+ * 5. **空闲自动关浏览器**：浏览器长期挂着 = 占着 profile 锁，别人用不了。
+ *    服务模式下判据是**「没有客户端连着」过了 IDLE_MS（默认 120s）**：
+ *    TUI 开着就一直热着（下次命令 ~1-2s），TUI 退出后到点自动放锁。
+ *    老坑：以前 TUI 传 IDLE_MS=0 = 永不关，daemon 下单只能干等到 90–630s。
  *
  * 环境变量：
  *   FOCUSMATE_CONFIG_DIR      运行目录（和 main.py / daemon 同一个；不传就按
@@ -68,6 +82,7 @@
  * 退出码：0 正常 / 1 fatal（playwright 装不上等）
  */
 
+import net from "node:net";
 import readline from "readline";
 import fs from "node:fs";
 import path from "node:path";
@@ -152,6 +167,79 @@ process.stderr.write = (chunk, enc, cb) => {
   return realErr(chunk, enc, cb);
 };
 
+// ---------------------------------------------------------------- 服务模式（--serve）
+
+//: `--serve <sock>`：不再走 stdin/stdout，而是监听一个 unix socket 供**多个**
+//: 客户端（warden TUI / keep_session daemon / 命令行）共用同一只常驻 Chromium。
+//: 谁先起谁起；`listen()` 失败即代表已经有一个在跑 —— 单实例让内核兜住，不用额外锁文件。
+//:
+//: 为什么要有它：以前 warden 一只桥、daemon 每次调用现起一只，两边抢同一个 profile，
+//: 靠 want 标记互相让位；而桥在一条失败命令里能连续占 90s（goto 超时 30s ×3 重试），
+//: 让位轮询又被 `inCommand` 挡着，于是 daemon 下单常等到 90–630s 才失败。
+//: 收成一个 owner 之后，正常路径上根本不存在「等锁」这件事。
+const SERVE_SOCK = (() => {
+  const i = process.argv.indexOf("--serve");
+  if (i < 0) return "";
+  const sock = process.argv[i + 1];
+  if (!sock) {
+    realErr("[bridge] --serve 需要一个 socket 路径\n");
+    process.exit(2); // 这时候 process.exit 还没被下面接管，直接退
+  }
+  return path.resolve(sock);
+})();
+
+/** 找一个空闲的本地端口给 Chromium 的 CDP 用（拿完立刻释放，用了再说）。 */
+function pickFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+// 共用浏览器：服务自己开 Chromium 时把 CDP 端口打开，别的进程（focusmate-mcp）
+// 用 connectOverCDP 复用同一只浏览器，不用再各开一只、各抢一次 profile 锁。
+// 必须在下面 `await import("./_lib.mjs")` **之前**定好 —— _lib 在模块加载时读它。
+if (SERVE_SOCK && !process.env.FOCUSMATE_CDP_PORT) {
+  try {
+    process.env.FOCUSMATE_CDP_PORT = String(await pickFreePort());
+  } catch (e) {
+    realErr(`[bridge] 拿不到 CDP 端口（${String((e && e.message) || e)}）：降级成不共享浏览器\n`);
+  }
+}
+
+/** 往某个「行管道」写一条 JSON 帧（管道没了就安静丢弃）。 */
+function writeLine(out, obj) {
+  try {
+    out(JSON.stringify(obj) + "\n");
+  } catch {
+    /* 客户端已经断了 */
+  }
+}
+
+//: 连上来的客户端（stdio 模式只有一个假客户端，直接写真 stdout）。
+const clients = new Set();
+const stdioClient = { id: "stdio", alive: true };
+
+/** 回给「发这条命令的那个客户端」（stdio 模式 = stdout）。 */
+function reply(client, obj) {
+  if (!client || client === stdioClient) return writeLine(realOut, obj);
+  if (!client.alive) return;
+  writeLine((s) => client.socket.write(s), obj);
+}
+
+/** 事件帧：所有客户端都该看到（stdio 模式 = stdout）。 */
+function broadcast(obj) {
+  if (!SERVE_SOCK) return writeLine(realOut, obj);
+  for (const c of clients) {
+    if (!c.alive) continue;
+    writeLine((s) => c.socket.write(s), obj);
+  }
+}
+
 /** 最后一条像「原因」的行：优先 [ERROR]，没有就空着。 */
 function libDetail() {
   for (let i = libLog.length - 1; i >= 0; i--) {
@@ -169,9 +257,7 @@ function isAuthError(text) {
   );
 }
 
-function send(obj) {
-  realOut(JSON.stringify(obj) + "\n");
-}
+
 
 // ---------------------------------------------------------------- die() 兜底
 
@@ -188,11 +274,11 @@ process.exit = (code) => {
 };
 
 process.on("uncaughtException", (e) => {
-  send({ event: "fatal", error: String(e && e.stack ? e.stack : e) });
+  broadcast({ event: "fatal", error: String(e && e.stack ? e.stack : e) });
   realExit(1);
 });
 process.on("unhandledRejection", (e) => {
-  send({ event: "fatal", error: String(e && e.stack ? e.stack : e) });
+  broadcast({ event: "fatal", error: String(e && e.stack ? e.stack : e) });
   realExit(1);
 });
 
@@ -202,7 +288,7 @@ let lib;
 try {
   lib = await import("./_lib.mjs");
 } catch (e) {
-  send({ event: "fatal", error: "载入 _lib.mjs 失败：" + String((e && e.message) || e) });
+  broadcast({ event: "fatal", error: "载入 _lib.mjs 失败：" + String((e && e.message) || e) });
   realExit(1);
 }
 
@@ -214,6 +300,14 @@ const IDLE_MS = Number(process.env.WARDEN_BRIDGE_IDLE_MS || 120000);
 let ctx = null;
 let page = null;
 let token = null;
+//: hold 截止时间戳：期间**不开**浏览器（auth 要拿 headed 独占 profile，服务先让位）。
+let holdUntil = 0;
+//: 最后一个客户端离开的时刻（排查「浏览器为什么关了」用）。
+let lastClientLeftAt = null;
+
+function held() {
+  return Date.now() < holdUntil;
+}
 let idleTimer = null;
 let startedAt = Date.now();
 
@@ -264,7 +358,7 @@ async function closeBrowser(reason) {
   if (timedOut) {
     const killed = lib.killProfileBrowsers();
     const freed = lib.releaseProfileLock();
-    send({
+    broadcast({
       event: "idle-closed",
       reason: (reason || "idle") + ":hung",
       at: Date.now(),
@@ -273,7 +367,7 @@ async function closeBrowser(reason) {
     });
     return;
   }
-  send({ event: "idle-closed", reason: reason || "idle", at: Date.now() });
+  broadcast({ event: "idle-closed", reason: reason || "idle", at: Date.now() });
 }
 
 function resetIdle() {
@@ -282,8 +376,13 @@ function resetIdle() {
     idleTimer = null;
   }
   if (!IDLE_MS || IDLE_MS <= 0) return;
+  // 服务模式下判据换成「有没有客户端连着」：TUI 开着就一直热着，
+  // TUI 退出后 IDLE_MS 到点自动关 —— 不会再出现「IDLE_MS=0 永久占着 profile」。
+  if (SERVE_SOCK && clients.size > 0) return;
   idleTimer = setTimeout(() => {
     idleTimer = null;
+    if (inCommand) return resetIdle();
+    if (held()) return;
     if (browserUp()) closeBrowser("idle").catch(() => {});
   }, IDLE_MS);
   // 别让这个 timer 拖住事件循环
@@ -292,6 +391,11 @@ function resetIdle() {
 
 async function ensureBrowser() {
   if (browserUp()) return;
+  if (held()) {
+    throw new Error(
+      `浏览器被 hold 到 ${new Date(holdUntil).toLocaleTimeString()}（登录/维护中），这期间不开浏览器`
+    );
+  }
   const s = await lib.openSession({ headless: HEADLESS, role: "bridge" });
   ctx = s.ctx;
   page = s.page;
@@ -302,12 +406,24 @@ async function ensureBrowser() {
 // 没有这一条，daemon 得等 bridge 空闲满 IDLE_MS（120s）才抢得到锁；
 // 有了它，正常让位在 1 秒内完成，而 TUI 那边下次命令只是多一次冷启动。
 const WANT_POLL_MS = Number(process.env.WARDEN_BRIDGE_WANT_POLL_MS || 700);
+//: 别人在等 profile 时，最多让它多久（到点就照常开工，不能让 TUI 无限等）。
+const WANT_MAX_WAIT_MS = Number(process.env.WARDEN_BRIDGE_WANT_MAX_WAIT_MS || 60000);
 const wantTimer = setInterval(() => {
-  if (inCommand) return;
+  if (inCommand) return;      // 命令跑着时不能关浏览器；命令一结束这里就会让位
   if (!browserUp()) return;
   if (!lib.wantPending()) return;
   closeBrowser("yield").catch(() => {});
 }, WANT_POLL_MS);
+
+/** 等别人用完 profile（want 标记消失），最多 maxMs。 */
+async function waitWantClear(maxMs) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (!lib.wantPending()) return true;
+    await sleep(250);
+  }
+  return !lib.wantPending();
+}
 if (wantTimer.unref) wantTimer.unref();
 
 async function getTok() {
@@ -641,6 +757,14 @@ const handlers = {
       profileSource: lib.PROFILE_SOURCE,
       headless: HEADLESS,
       idleMs: IDLE_MS,
+      serve: !!SERVE_SOCK,
+      sock: SERVE_SOCK || null,
+      cdpUrl: lib.cdpUrl ? lib.cdpUrl() : "",
+      clientsNow: clients.size,
+      idleArmed: !!idleTimer,
+      idleSince: lastClientLeftAt,
+      held: held(),
+      holdUntil,
       lock: lib.profileLockInfo(),
       uptimeMs: Date.now() - startedAt,
     };
@@ -882,6 +1006,26 @@ const handlers = {
     return { verified: !still, cancelled: before, source };
   },
 
+  /** 把浏览器开起来并回报状态（daemon 下单前用；不会真的下发命令）。 */
+  async ensure() {
+    await ensureBrowser();
+    return await handlers.ping();
+  },
+
+  /** 登录/维护窗口：先关浏览器放锁，再在 ms 内拒绝开浏览器（auth 要 headed 独占）。 */
+  async hold(req) {
+    const ms = Math.max(1000, Math.min(Number(req.ms || 600000), 3600000));
+    holdUntil = Date.now() + ms;
+    const was = browserUp();
+    await closeBrowser("hold");
+    return { held: true, holdUntil, released: was, browser: browserUp() };
+  },
+
+  async unhold() {
+    holdUntil = 0;
+    return { held: false, holdUntil: 0 };
+  },
+
   async release() {
     // 把浏览器关掉、进程留着。给「马上要启 daemon」用——
     // daemon 下单也要独占同一个 Chromium profile，桥挂着浏览器它就抢不到锁。
@@ -891,8 +1035,11 @@ const handlers = {
   },
 
   async shutdown() {
-    await closeBrowser("shutdown");
-    setTimeout(() => realExit(0), 50);
+    // 真退出统一走 shutdownNow：等队列 → 关浏览器 → 删 sock 和门牌，
+    // 别用 realExit 直接溜（会留下连不上的 sock，下次启动还得靠探活清理）。
+    setTimeout(() => {
+      shutdownNow("shutdown");
+    }, 50);
     return { bye: true };
   },
 };
@@ -911,19 +1058,28 @@ const queue = { p: Promise.resolve() };
 const AUTH_COOLDOWN_MS = 60000;
 let lastAuth = null;
 //: 这些命令本身就是在查救护信息 / 收尾，不该被冷却挡住。
-const BYPASS_COOLDOWN = new Set(["ping", "where", "release", "shutdown"]);
+const BYPASS_COOLDOWN = new Set(["ping", "where", "release", "shutdown", "hold", "unhold"]);
+//: 这些命令本身就是在处理「别人要 profile」，不该再被 want 挡住。
+const BYPASS_WANT = new Set(["ping", "where", "release", "shutdown", "hold", "unhold", "ensure"]);
 
-function handle(req) {
+function handle(req, client) {
   queue.p = queue.p.then(async () => {
     const id = req && req.id !== undefined ? req.id : null;
     const cmd = req && req.cmd;
     const t0 = Date.now();
+    // 有人在等 profile（daemon 下单 / auth）：先把浏览器关掉让位，
+    // 再等它用完。以前只在「命令边界」被动让位，队列一串命令连跑时 daemon 只能干等。
+    if (!BYPASS_WANT.has(cmd) && lib.wantPending()) {
+      await closeBrowser("yield").catch(() => {});
+      const cleared = await waitWantClear(WANT_MAX_WAIT_MS);
+      logEvent("focusmate", "want_wait", { cmd, cleared, waitedMax: WANT_MAX_WAIT_MS });
+    }
     inCommand = true;
     libLog.length = 0; // 这一条命令的日志，别混上一条的
     try {
       if (!BYPASS_COOLDOWN.has(cmd) && lastAuth && Date.now() - lastAuth.at < AUTH_COOLDOWN_MS) {
         const left = Math.ceil((AUTH_COOLDOWN_MS - (Date.now() - lastAuth.at)) / 1000);
-        send({
+        reply(client, {
           id,
           ok: false,
           cmd,
@@ -938,7 +1094,32 @@ function handle(req) {
       if (!fn) throw new Error("未知命令：" + JSON.stringify(cmd));
       const result = await fn(req);
       lastAuth = null; // 有命令成功了，登录态至少目前是活的
-      send({ id, ok: true, cmd, ms: Date.now() - t0, result });
+      // 登录态自愈/备份只在**这一次命令期间**发生时记一笔，平时不刷屏。
+      const rr = lib.authRestoreInfo && lib.authRestoreInfo();
+      if (rr && rr.at >= t0 && rr.restored) {
+        logEvent("focusmate", "auth_restored", {
+          cmd,
+          restored: rr.restored,
+          saved_at: rr.savedAt || null,
+        });
+      }
+      const rf = lib.authRefreshInfo && lib.authRefreshInfo();
+      if (rf && rf.at >= t0) {
+        logEvent("focusmate", rf.ok ? "auth_refreshed" : "auth_refresh_failed", {
+          cmd,
+          reason: rf.reason || null,
+          status: rf.status || null,
+          detail: rf.detail ? String(rf.detail).slice(0, 200) : null,
+        });
+      }
+      const ss = lib.authSnapshotInfo && lib.authSnapshotInfo();
+      if (ss && ss.at >= t0 && ss.saved) {
+        logEvent("focusmate", "auth_backup_saved", {
+          cmd,
+          count: ss.summary ? ss.summary.count : null,
+        });
+      }
+      reply(client, { id, ok: true, cmd, ms: Date.now() - t0, result });
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       // die() 转成异常以后只剩「内部调用了 process.exit(1)」，真因在 stderr。
@@ -949,10 +1130,18 @@ function handle(req) {
       if (detail && !msg.includes(detail)) error = noise ? detail : msg + "｜" + detail;
       if (isAuthError(error)) {
         lastAuth = { at: Date.now(), cmd, error };
+        const rr = lib.authRestoreInfo && lib.authRestoreInfo();
+        logEvent("focusmate", "auth_lost", {
+          cmd,
+          error: error.slice(0, 300),
+          restore_attempted: !!(rr && rr.at >= t0),
+          restore_reason: rr && rr.at >= t0 ? rr.reason : null,
+          backup_exists: !!(lib.authBackupInfo && lib.authBackupInfo()),
+        });
         // 这个浏览器已经是登录页了，留着只会继续误导下一条命令
         await closeBrowser("auth-failed").catch(() => {});
       }
-      send({
+      reply(client, {
         id,
         ok: false,
         cmd,
@@ -969,49 +1158,229 @@ function handle(req) {
   return queue.p;
 }
 
-const rl = readline.createInterface({ input: process.stdin });
-
-rl.on("line", (line) => {
-  const s = line.trim();
-  if (!s) return;
-  let req;
-  try {
-    req = JSON.parse(s);
-  } catch (e) {
-    send({ event: "protocol-error", error: "JSON 解析失败：" + e.message, raw: s.slice(0, 200) });
-    return;
-  }
-  handle(req);
-});
+// ---------------------------------------------------------------- 启动：stdio 或 socket
 
 let closing = false;
-rl.on("close", async () => {
-  // stdin 被关了（TUI 退出）——把浏览器带干净，别留 Chromium 孤儿。
-  // 注意要**先等队列跑完**：stdin 关闭和"正在执行的那条命令"是并发的，
-  // 直接退会把跑到一半的命令连同浏览器一起带走（早期版本就这么丢过响应）。
+let server = null;
+
+function stateFilePath() {
+  return SERVE_SOCK ? path.join(path.dirname(SERVE_SOCK), "browser-service.json") : "";
+}
+
+/** 服务自己的「门牌」：pid / sock / 目录 / 空闲设置，给 Python 侧找它用。 */
+function writeStateFile() {
+  const f = stateFilePath();
+  if (!f) return;
+  try {
+    fs.writeFileSync(
+      f,
+      JSON.stringify(
+        {
+          pid: process.pid,
+          sock: SERVE_SOCK,
+          home: lib.CONFIG_DIR,
+          profileDir: lib.PROFILE_DIR,
+          profileSource: lib.PROFILE_SOURCE,
+          headless: HEADLESS,
+          idleMs: IDLE_MS,
+          cdpPort: Number(process.env.FOCUSMATE_CDP_PORT || 0) || null,
+          startedAt: startedAt,
+        },
+        null,
+        2
+      ) + "\n",
+      "utf8"
+    );
+  } catch (e) {
+    logEvent("focusmate", "state_file_failed", { error: String((e && e.message) || e).slice(0, 200) });
+  }
+}
+
+function removeStateFile() {
+  const f = stateFilePath();
+  if (!f) return;
+  try {
+    fs.unlinkSync(f);
+  } catch {
+    /* 没有就算了 */
+  }
+}
+
+/** 优雅退出：等队列跑完 → 关浏览器 → 删 socket/门牌 → 退出。 */
+async function shutdownNow(reason) {
   if (closing) return;
   closing = true;
   if (idleTimer) clearTimeout(idleTimer);
   await queue.p.catch(() => {});
-  await closeBrowser("stdin-closed").catch(() => {});
+  await closeBrowser(reason).catch(() => {});
+  if (server) {
+    // 先把客户端连接踢掉再 close，否则 server.close() 会一直等它们自然断开
+    for (const c of clients) {
+      try {
+        c.socket.destroy();
+      } catch {
+        /* ignore */
+      }
+    }
+    clients.clear();
+    try {
+      await new Promise((resolve) => server.close(resolve));
+    } catch {
+      /* 已经关了 */
+    }
+  }
+  if (SERVE_SOCK) {
+    try {
+      fs.unlinkSync(SERVE_SOCK);
+    } catch {
+      /* 已经没了 */
+    }
+  }
+  removeStateFile();
   realExit(0);
-});
+}
 
-process.on("SIGTERM", async () => {
-  if (idleTimer) clearTimeout(idleTimer);
-  await closeBrowser("sigterm").catch(() => {});
-  realExit(0);
+function startStdio() {
+  const rl = readline.createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    const t = line.trim();
+    if (!t) return;
+    let req;
+    try {
+      req = JSON.parse(t);
+    } catch (e) {
+      broadcast({ event: "protocol-error", error: "JSON 解析失败：" + e.message, raw: t.slice(0, 200) });
+      return;
+    }
+    handle(req, stdioClient);
+  });
+  // stdin 被关了（TUI 退出）——把浏览器带干净，别留 Chromium 孤儿。
+  // **先等队列跑完**：stdin 关闭和「正在执行的那条命令」是并发的。
+  rl.on("close", () => {
+    shutdownNow("stdin-closed");
+  });
+}
+
+/** 这个 sock 上是不是已经有一个活着的服务。 */
+function socketAlive(sock) {
+  return new Promise((resolve) => {
+    const s = net.connect(sock);
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try {
+        s.destroy();
+      } catch {
+        /* ignore */
+      }
+      resolve(ok);
+    };
+    s.once("connect", () => done(true));
+    s.once("error", () => done(false));
+    const t = setTimeout(() => done(false), 800);
+    if (t.unref) t.unref();
+  });
+}
+
+let clientSeq = 0;
+
+async function startServe(sock) {
+  // 单实例：内核保证只有一个进程能 listen 同一个路径。
+  // 但残留的 socket 文件（上次被 kill -9）会让我们 bind 失败，所以先探活再删。
+  if (fs.existsSync(sock)) {
+    if (await socketAlive(sock)) {
+      realErr(`[bridge] ${sock} 上已经有一个服务在跑（单实例），这次不起第二个\n`);
+      realExit(3);
+    }
+    try {
+      fs.unlinkSync(sock);
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    fs.mkdirSync(path.dirname(sock), { recursive: true });
+  } catch {
+    /* ignore */
+  }
+
+  server = net.createServer((socket) => {
+    const client = { id: "c" + ++clientSeq, socket, alive: true };
+    clients.add(client);
+    resetIdle(); // 有客户端连着 → 解除空闲关浏览器
+    logEvent("focusmate", "client_connected", { client: client.id, clients: clients.size });
+    try {
+      socket.setEncoding("utf8");
+    } catch {
+      /* ignore */
+    }
+    let buf = "";
+    socket.on("data", (chunk) => {
+      buf += chunk;
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        let req;
+        try {
+          req = JSON.parse(line);
+        } catch (e) {
+          reply(client, { event: "protocol-error", error: "JSON 解析失败：" + e.message, raw: line.slice(0, 200) });
+          continue;
+        }
+        handle(req, client);
+      }
+    });
+    const drop = () => {
+      if (!client.alive) return;
+      client.alive = false;
+      clients.delete(client);
+      if (clients.size === 0) lastClientLeftAt = Date.now();
+      logEvent("focusmate", "client_disconnected", { client: client.id, clients: clients.size });
+      resetIdle(); // 最后一个客户端走了 → 开始计时
+    };
+    socket.on("close", drop);
+    socket.on("error", drop);
+    reply(client, { event: "welcome", pid: process.pid, home: lib.CONFIG_DIR, idleMs: IDLE_MS });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(sock, resolve);
+  }).catch((e) => {
+    realErr(`[bridge] socket 监听失败：${String((e && e.message) || e)}\n`);
+    realExit(3);
+  });
+  try {
+    fs.chmodSync(sock, 0o600);
+  } catch {
+    /* 权限改不了也不致命 */
+  }
+  writeStateFile();
+  logEvent("focusmate", "service_start", {
+    pid: process.pid,
+    home: lib.CONFIG_DIR,
+    sock,
+    cdpPort: Number(process.env.FOCUSMATE_CDP_PORT || 0) || null,
+    idleMs: IDLE_MS,
+  });
+}
+
+process.on("SIGTERM", () => {
+  shutdownNow("sigterm");
 });
-process.on("SIGINT", async () => {
-  if (idleTimer) clearTimeout(idleTimer);
-  await closeBrowser("sigint").catch(() => {});
-  realExit(0);
+process.on("SIGINT", () => {
+  shutdownNow("sigint");
 });
 
 resetIdle();
-send({
+resetIdle();
+broadcast({
   event: "ready",
   pid: process.pid,
+  sock: SERVE_SOCK || null,
   home: lib.CONFIG_DIR,
   profileDir: lib.PROFILE_DIR,
   profileSource: lib.PROFILE_SOURCE,
@@ -1019,3 +1388,9 @@ send({
   idleMs: IDLE_MS,
   idleAutoClose: IDLE_MS > 0,
 });
+
+if (SERVE_SOCK) {
+  await startServe(SERVE_SOCK);
+} else {
+  startStdio();
+}

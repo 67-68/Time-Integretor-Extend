@@ -1,0 +1,63 @@
+--- a/src/automation/browser.ts
++++ b/src/automation/browser.ts
+@@ -51,10 +51,60 @@
+   if (fs.existsSync(userDataDir)) {
+     fs.rmSync(userDataDir, { recursive: true, force: true });
+   }
++}
++
++// ---------------------------------------------------------------------------
++// 共享浏览器（ti_extend 的浏览器服务）
++//
++// 背景：同一个 Chromium profile 不能被两只浏览器同时打开（第二只白屏，争抢时还会把
++// IndexedDB 里的 firebase:authUser 踩丢 → 看起来就是「登录态又过期了」）。
++// ti_extend 现在有一个常驻浏览器服务持有 profile，并通过 FOCUSMATE_CDP_URL 告诉这里
++// "别自己开，连我这一只"。
++//
++// 关键点：**别人的页面不能动**。实测（2026-11-23，Playwright connectOverCDP）：
++// page.close() 会把主人的页面一起关掉，browser.close() 直接把整只浏览器杀掉。
++// 所以这里返回一个代理：
++//   pages()   → []（别抢主人的页）
++//   newPage() → 每次新开一页，并记下来
++//   close()   → 只关自己开过的页，绝不关浏览器
++//   browser() → null（不给调用方任何杀掉它的机会）
++// ---------------------------------------------------------------------------
++
++async function borrowContext(cdpUrl: string): Promise<BrowserContext> {
++  const browser = await chromium.connectOverCDP(cdpUrl);
++  const real: any = browser.contexts()[0] || (await browser.newContext());
++  const mine: Page[] = [];
++  const proxy = new Proxy(real, {
++    get(target: any, prop: string | symbol) {
++      if (prop === 'pages') return () => mine.slice();
++      if (prop === 'newPage')
++        return async () => {
++          const page = await target.newPage();
++          mine.push(page);
++          return page;
++        };
++      if (prop === 'close')
++        return async () => {
++          const pages = mine.splice(0);
++          for (const page of pages) await page.close().catch(() => {});
++        };
++      if (prop === 'browser') return () => null;
++      const value = target[prop];
++      return typeof value === 'function' ? value.bind(target) : value;
++    },
++  });
++  return proxy as BrowserContext;
+ }
+ 
+ export async function launchPersistentContext(options: BrowserOptions = {}): Promise<BrowserContext> {
+   const { headless = true, slowMo = 0 } = options;
++
++  // 共享模式：浏览器已经由 ti_extend 的浏览器服务开着，这里只连不启。
++  const shared = (process.env.FOCUSMATE_CDP_URL || '').trim();
++  if (shared) {
++    return await borrowContext(shared);
++  }
++
+   const userDataDir = ensureUserDataDir();
+ 
+   // Launch with persistent context - this preserves ALL browser state including IndexedDB

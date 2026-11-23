@@ -1,12 +1,32 @@
-"""warden_core.bridge —— Focusmate 常驻 Chromium 桥接客户端（scripts/bridge.mjs）。"""
-import json
-import os
-import queue
-import subprocess
-import threading
-import time
+"""warden_core.bridge —— Focusmate 常驻浏览器服务的客户端。
 
-from .common import BRIDGE_JS, BRIDGE_LOG, HERE, TEMP, get_warden_global
+架构（2026-11-23 起）
+--------------------
+以前这里是「起一个 `scripts/bridge.mjs` 子进程、用 stdin/stdout 的 JSON 行跟它说话」，
+桥自己持着 Chromium profile 的锁；daemon 每次下单又现起一只 Chromium，两边靠
+`<home>/.profile-lock.json` + want 标记互相让位。实测代价：桥在一条失败命令里
+（goto 超时 30s ×3 重试）能连续占 90s，让位轮询又被 `inCommand` 挡着，daemon 下单
+等到 90–630s 才失败（`temp/keep_session.log` 2026-11-23 15:18:58 就这么丢掉一场）。
+
+现在只有一个 owner：`scripts/bridge.mjs --serve <home>/browser-service.sock`，
+它才是唯一持有 profile 的常驻进程；warden、daemon、命令行都只是客户端
+（见 `focusmate_service.py`）。本模块保持 **原来的对外接口**：
+
+    Bridge(console, headed=…, idle_ms=…, profile_dir=…)
+    .call(cmd, timeout=…, **kw)   -> result dict
+    .browser_state()              -> (服务在?, 浏览器开着?, 错误)
+    .alive() / .start() / .stop()
+    .last_idle_close / .profile / .stderr_path
+
+`.stop()` 的语义变了：**只断开连接**，不杀服务（服务是独立进程，warden 退出不该
+带走别人正在用的浏览器）。真要停服务用 `.shutdown()`。
+"""
+
+import threading
+
+import focusmate_service as fm_service
+
+from .common import BRIDGE_LOG, get_warden_global
 
 # ---------------------------------------------------------------- bridge 客户端
 
@@ -39,7 +59,7 @@ def explain_bridge_error(msg, profile=""):
     return text
 
 
-#: 进程级缓存：Focusmate 运行目录（bridge 子进程和 daemon 必须同一个）。
+#: 进程级缓存：Focusmate 运行目录（服务、daemon、TUI 必须同一个）。
 _FOCUSMATE_HOME = ""
 _FOCUSMATE_HOME_TRIED = False
 
@@ -65,10 +85,10 @@ def focusmate_home():
 
 
 class Bridge(object):
-    """scripts/bridge.mjs 的客户端：起进程、发命令、收响应。
+    """浏览器服务的客户端（保持老接口，传输层换成 unix socket）。
 
-    stdout 上是 JSON 行。这里用后台线程读，主线程带超时取，
-    这样「浏览器冷启动 15s」不会把 UI 卡死到没救。
+    一条连接串行问答；多线程共用时内部上锁。服务不在就按需拉起
+    （`focusmate_service.Service.start`：daemon 优先、warden 兜底）。
     """
 
     def __init__(self, console, headed=False, idle_ms=None, profile_dir=None):
@@ -76,134 +96,85 @@ class Bridge(object):
         self.headed = headed
         self.idle_ms = idle_ms
         self.profile_dir = profile_dir
+        #: 兼容老代码/测试：以前是 bridge 子进程句柄，现在服务由 focusmate_service 管。
         self.proc = None
-        self.q = queue.Queue()
-        self.reader = None
-        self.next_id = 1
-        self.events = []
-        self.fatal = None
         self.stderr_path = get_warden_global("BRIDGE_LOG", BRIDGE_LOG)
-        #: 桥自己报上来的 profile 目录（ready / ping 里带回来的），报错时告诉人
+        #: 服务报上来的 profile 目录（ping/where 带回来的），报错时告诉人
         self.profile = ""
         self.last_idle_close = None
-        # 命令是串行的（bridge 侧一条条跑），所以这边也上锁：
-        # 收尾的后台核对线程和主线程可能同时说话，协议是「一问一答」的，
-        # 两边同时写 stdin 会让响应和请求号对不上。
+        self.fatal = None
+        self._service = None
         self._lock = threading.Lock()
 
     # -- 生命周期
 
-    def _child_env(self):
-        """给 bridge 子进程的环境。
+    def _svc(self):
+        with self._lock:
+            if self._service is None:
+                home = get_warden_global("focusmate_home", focusmate_home)()
+                if not home:
+                    raise BridgeError(
+                        "不知道 Focusmate 运行目录（FOCUSMATE_CONFIG_DIR）；"
+                        "先跑 `python3 main.py --where` 看一眼")
+                self._service = fm_service.Service(
+                    home=home,
+                    idle_ms=self.idle_ms,
+                    headed=self.headed,
+                    profile_dir=self.profile_dir,
+                    log_path=self.stderr_path,
+                )
+            return self._service
 
-        **必须**把运行目录传下去：不传的话 `scripts/_lib.mjs` 会按自己的优先级
-        猜，而它以前猜的是老位置 `~/.focusmate-mcp` —— 那儿的登录态早过期了。
-        表现是 daemon 一切正常、TUI 每条命令都「未登录」（真踩过，见
-        `focusmate_home()` 的注释）。
+    def _child_env(self):
+        """服务子进程该带的环境（测试用；真正起进程是 focusmate_service 的事）。
+
+        保留这个方法是因为 ``test_warden.py`` 用它验「运行目录必须传给子进程」
+        —— 那条约定本身没变，只是子进程从 stdio 桥换成了 socket 服务。
         """
-        env = dict(os.environ)
-        if self.headed:
-            env["WARDEN_BRIDGE_HEADED"] = "1"
-        if self.idle_ms is not None:
-            env["WARDEN_BRIDGE_IDLE_MS"] = str(self.idle_ms)
-        home = get_warden_global("focusmate_home", focusmate_home)()
-        if home:
-            env["FOCUSMATE_CONFIG_DIR"] = home
-        if self.profile_dir:
-            env["FOCUSMATE_PROFILE_DIR"] = self.profile_dir
-        return env
+        return self._svc()._spawn_env()
 
     def start(self):
-        if self.proc and self.proc.poll() is None:
-            return
-        env = self._child_env()
-        os.makedirs(TEMP, exist_ok=True)
-        self.errf = open(self.stderr_path, "a")
-        self.proc = subprocess.Popen(
-            ["node", BRIDGE_JS],
-            cwd=HERE,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.errf,
-            text=True,
-            bufsize=1,
-        )
-        self.q = queue.Queue()
-        self.reader = threading.Thread(target=self._read_loop, args=(self.proc,), daemon=True)
-        self.reader.start()
-
-    def _read_loop(self, proc):
+        """确保浏览器服务在跑（幂等）。"""
         try:
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    self.q.put(json.loads(line))
-                except ValueError:
-                    self.q.put({"event": "protocol-error", "raw": line[:300]})
-        except Exception as e:  # 进程被杀了之类
-            self.q.put({"event": "reader-died", "error": str(e)})
-        finally:
-            self.q.put({"event": "eof"})
+            self._svc().start()
+        except fm_service.ServiceError as e:
+            raise BridgeError(explain_bridge_error(str(e), self.profile or self.profile_dir or ""))
 
     def alive(self):
-        return bool(self.proc and self.proc.poll() is None)
+        try:
+            return fm_service.is_running(self._svc().home)
+        except (fm_service.ServiceError, BridgeError):
+            return False
 
     def stop(self):
-        if not self.proc:
-            return
-        try:
-            if self.proc.poll() is None:
-                # 关 stdin 就够：bridge 会自己关浏览器再退
-                try:
-                    self.proc.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    self.proc.wait(timeout=20)
-                except subprocess.TimeoutExpired:
-                    self.proc.terminate()
-                    try:
-                        self.proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        self.proc.kill()
-        finally:
-            try:
-                self.errf.close()
-            except Exception:
-                pass
-            self.proc = None
+        """**只断开连接**：服务是独立进程，别的客户端可能还在用。
+
+        想真的停服务（关浏览器、删 sock）用 `.shutdown()`。
+        """
+        if self._service is not None:
+            self._service.close()
+
+    def shutdown(self):
+        """让服务退出（关浏览器 + 删 sock），给「我要独占 profile 跑 auth」之外的场合用。"""
+        if self._service is not None:
+            self._service.shutdown()
+            self._service = None
+
+    def release(self):
+        """关浏览器、把 profile 让出去（服务留着）。"""
+        return self.call("release", timeout=60)
 
     # -- 通信
 
-    def _drain_events(self):
-        """把队列里的事件帧消化掉（响应帧留在队列里给 call 取）。"""
-        kept = []
-        while True:
-            try:
-                f = self.q.get_nowait()
-            except queue.Empty:
-                break
-            if f.get("event"):
-                self.events.append(f)
-                if f["event"] == "idle-closed":
-                    self.last_idle_close = time.time()
-                if f["event"] == "fatal":
-                    self.fatal = f.get("error")
-                if f.get("profileDir"):
-                    self.profile = f["profileDir"]
-            else:
-                kept.append(f)
-        for f in kept:
-            self.q.put(f)
+    @property
+    def events(self):
+        return self._service.events if self._service is not None else []
 
     def call(self, cmd, timeout=240, **kw):
         """发一条命令、等它的响应。
 
         ⚠️ kw 里**不能**出现 `id`：信封的请求号就叫 id，混了会把请求号覆盖掉，
-        桥照常执行、响应也发，但这边永远等不到 —— 表现为卡死，而写入其实已经生效。
+        服务照常执行、响应也发，但这边永远等不到 —— 表现为卡死，而写入其实已经生效。
         （session 身份统一用 meetingId。）这里直接拦住，不给下次踩的机会。
         """
         if "id" in kw:
@@ -211,64 +182,43 @@ class Bridge(object):
                 "内部错误：call() 的 kw 里不能有 id（会和请求号撞名）。"
                 "session 身份请用 meetingId=。"
             )
-        with self._lock:
-            return self._call_locked(cmd, timeout, kw)
-
-    def _call_locked(self, cmd, timeout, kw):
-        self.start()
-        self._drain_events()
-        req_id = self.next_id
-        self.next_id += 1
-        req = {"id": req_id, "cmd": cmd}
-        req.update(kw)
+        svc = self._svc()
         try:
-            self.proc.stdin.write(json.dumps(req) + "\n")
-            self.proc.stdin.flush()
-        except (BrokenPipeError, ValueError) as e:
-            raise BridgeError("bridge 进程没了（%s）；看 %s" % (e, self.stderr_path))
-
-        deadline = time.time() + timeout
-        while True:
-            left = deadline - time.time()
-            if left <= 0:
-                raise BridgeError("bridge 超过 %ds 没回 %s（浏览器卡住了？看 %s）"
-                                  % (timeout, cmd, self.stderr_path))
-            try:
-                f = self.q.get(timeout=min(left, 5))
-            except queue.Empty:
-                if not self.alive():
-                    raise BridgeError("bridge 进程退出了（看 %s）" % self.stderr_path)
-                continue
-            if f.get("event"):
-                self.events.append(f)
-                if f["event"] == "idle-closed":
-                    self.last_idle_close = time.time()
-                if f["event"] == "fatal":
-                    self.fatal = f.get("error")
-                if f.get("profileDir"):
-                    self.profile = f["profileDir"]
-                if f["event"] == "eof":
-                    raise BridgeError("bridge 的 stdout 关了（看 %s）" % self.stderr_path)
-                continue
-            if f.get("id") != req_id:
-                # 不该发生（命令是串行的），但别把响应丢了
-                continue
-            if not f.get("ok"):
-                raise BridgeError(
-                    explain_bridge_error(f.get("error"), self.profile or self.profile_dir or ""))
-            r = f.get("result") or {}
-            if r.get("profileDir"):
-                self.profile = r["profileDir"]
-            return r
+            result = svc.call(cmd, timeout=timeout, **kw)
+        except fm_service.ServiceError as e:
+            raise BridgeError(
+                explain_bridge_error(str(e), self.profile or self.profile_dir or ""))
+        if isinstance(result, dict):
+            if result.get("profileDir"):
+                self.profile = result["profileDir"]
+            if svc.last_idle_close:
+                self.last_idle_close = svc.last_idle_close
+            self.fatal = svc.fatal
+        return result
 
     def browser_state(self):
-        """(bridge 活着?, 浏览器开着?) —— 用 ping，但不启动浏览器。"""
+        """(服务活着?, 浏览器开着?) —— 用 ping，但不启动浏览器。"""
         if not self.alive():
             return False, False, ""
         try:
             r = self.call("ping", timeout=15)
         except BridgeError as e:
             return False, False, str(e)
+        if r.get("profileDir"):
+            self.profile = r["profileDir"]
         return True, bool(r.get("browser")), ""
 
+    def where(self):
+        """服务视角的自述：读的是哪个 profile、锁在谁手上、浏览器开着没。"""
+        return self.call("where", timeout=15)
 
+    def ensure_browser(self):
+        """确保浏览器开着（Phase 2 起返回里会带 cdpUrl）。"""
+        return self.call("ensure", timeout=90)
+
+    def hold(self, ms=600000):
+        """登录/维护窗口：关浏览器 + 期间拒绝开浏览器。"""
+        return self.call("hold", timeout=90, ms=int(ms))
+
+    def unhold(self):
+        return self.call("unhold", timeout=30)

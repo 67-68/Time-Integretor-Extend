@@ -32,6 +32,7 @@ import urllib.parse
 import urllib.request
 
 import focusmate_lock as fm_lock
+import focusmate_service as fm_service
 
 SESSION_REGISTRATION_PATH = "data.csv"
 TOKEN = "8e595973b02a43a58c7e3dbbba477777"
@@ -44,6 +45,9 @@ MCP_SERVER_JS = _os.environ.get(
     "FOCUSMATE_MCP_JS",
     _os.path.join(_HERE, "temp", "focusmate-mcp", "build", "index.js"),
 )
+# 登录态快照/自愈（scripts/auth_store.mjs）。登录成功后跑一次，把
+# IndexedDB 里的 firebase:authUser 备份下来 —— 它被 app 删掉时能自动写回。
+AUTH_STORE_JS = _os.path.join(_HERE, "scripts", "auth_store.mjs")
 
 # 出错截图目录。focusmate-mcp 默认写到 ~/.focusmate-mcp/screenshots，但本机的
 # dsh 沙箱禁止写该目录 —— 截图失败本身还会把真正的预定报错盖成 EPERM。指到
@@ -204,6 +208,13 @@ def mcp_call(tool: str, arguments: dict, timeout: int = 180, wait_ms=None):
     :mod:`focusmate_lock` 的头注释。
     """
     home = ensure_mcp_home()   # 确保 browser-data 可写，否则 dashboard 会空白
+    # **共用浏览器**：ti_extend 的浏览器服务已经握着 profile 时，这里就不要再开一只
+    # （两只 Chromium 抢同一个 profile 会白屏、还会踩坏 IndexedDB），直接用它的 CDP。
+    cdp = shared_browser_cdp(tool, home)
+    if cdp:
+        print("[mcp] home=%s tool=%s 共用浏览器 %s（不自己起 Chromium、不抢锁）"
+              % (home, tool, cdp))
+        return _mcp_call_locked(tool, arguments, timeout, cdp=cdp)
     if wait_ms is None:
         wait_ms = _LOCK_WAIT_MS.get(tool, 30000)
     with fm_lock.profile_lock(home, "mcp:%s" % tool, wait_ms=wait_ms) as held:
@@ -212,8 +223,35 @@ def mcp_call(tool: str, arguments: dict, timeout: int = 180, wait_ms=None):
         return _mcp_call_locked(tool, arguments, timeout)
 
 
-def _mcp_call_locked(tool: str, arguments: dict, timeout: int = 180):
-    """真正跑 MCP 协议；调用方**必须**已经持有 profile 锁。"""
+def shared_browser_cdp(tool, home=None):
+    """让浏览器服务把浏览器开起来并给出 CDP 地址；拿不到就返回 ""（退回自己开）。
+
+    auth 例外：登录要 headed + 独占整个 profile，绝不能借用共用浏览器 ——
+    调用方（:func:`do_auth`）会先让服务 hold/release。
+    """
+    if tool in ("focusmate_auth",):
+        return ""
+    try:
+        svc = fm_service.Service(home=home or mcp_home())
+        st = svc.ensure_browser(timeout=180) or {}
+        url = str(st.get("cdpUrl") or "")
+        if url:
+            print("[mcp] 浏览器服务就绪（pid=%s, cdp=%s）" % (st.get("pid"), url))
+        else:
+            print("[mcp] 浏览器服务在，但没开 CDP（降级：自己起浏览器）")
+        return url
+    except Exception as e:  # noqa: BLE001 - 服务不可用不该拖垮下单路径
+        print("[mcp] 共用浏览器不可用（%s）；这次自己开（要抢 profile 锁）" % e)
+        return ""
+
+
+def _mcp_call_locked(tool: str, arguments: dict, timeout: int = 180, cdp=""):
+    """真正跑 MCP 协议；走共用浏览器时**不要**持有 profile 锁（锁在服务手上）。"""
+    env = dict(_os.environ)
+    if cdp:
+        env["FOCUSMATE_CDP_URL"] = cdp
+    else:
+        env.pop("FOCUSMATE_CDP_URL", None)
     proc = subprocess.Popen(
         ["node", MCP_SERVER_JS],
         stdin=subprocess.PIPE,
@@ -221,6 +259,7 @@ def _mcp_call_locked(tool: str, arguments: dict, timeout: int = 180):
         stderr=sys.stderr,  # MCP 日志走 stderr，直接透出
         text=True,
         bufsize=1,
+        env=env,
     )
     seq = 0
 
@@ -326,6 +365,48 @@ def book_once(start_iso, duration):
     return payload
 
 
+def snapshot_auth_state(timeout=150):
+    """登录成功后立刻开一次浏览器核对 + 备份登录态。
+
+    登录工具（focusmate-mcp）只负责把 Firebase 记录写进 IndexedDB；如果那条
+    记录没落盘（或者第二天被 app 删掉），refresh token 就没了，只能人工重登。
+    ``scripts/auth_store.mjs --snapshot`` 会：
+      * 用同一个 profile 进 /dashboard，读 firebaseLocalStorage；
+      * 读得到 → 写 ``temp/focusmate-home/auth-backup.json``（600 权限）；
+      * 读不到 → 明确报「no-auth-record」，别让「登录成功」变成假象。
+
+    这是旁路：它失败不改 do_auth 的结论。
+    """
+    env = dict(_os.environ)
+    env["FOCUSMATE_CONFIG_DIR"] = mcp_home()
+    try:
+        proc = subprocess.run(
+            ["node", AUTH_STORE_JS, "--snapshot"],
+            cwd=_HERE, env=env, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:  # noqa: BLE001 - 备份失败不该拖垮登录流程
+        print("[auth] 登录态备份没跑起来（%s）；登录本身可能还是好的。" % e)
+        return None
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    payload = None
+    for line in out.splitlines():
+        if line.startswith("RESULT_JSON "):
+            try:
+                payload = json.loads(line[len("RESULT_JSON "):])
+            except ValueError:
+                payload = None
+    if payload is None:
+        print("[auth] 登录态备份输出看不懂：%s" % out[-400:])
+        return None
+    if payload.get("ok"):
+        print("[auth] 登录态已备份：%s 条记录（%s）"
+              % ((payload.get("summary") or {}).get("count"),
+                 (payload.get("backup") or "").replace(_HERE + _os.sep, "")))
+    else:
+        print("[auth] 登录态没备份成功：%s（登录工具说成功，但 profile 里读不到记录）"
+              % (payload.get("reason") or "unknown"))
+    return payload
+
+
 def do_auth(reset=False):
     """触发 focusmate_auth，会弹出 Chromium 让你手动登录，5 分钟内完成即可。
 
@@ -337,22 +418,45 @@ def do_auth(reset=False):
     """
     print("[auth] %s请在弹出的窗口里登录 Focusmate（5分钟有效）..."
           % ("先清空 profile 再" if reset else ""))
+
+    # 登录要 headed + **独占**整个 profile：先请共用浏览器服务关掉浏览器并 hold 住。
+    # 不 hold 的话，服务会在 auth 期间被别的命令（daemon 下单 / TUI 刷新）唤醒，
+    # 把 profile 又抢回去 —— 那正是以前「登录到一半白屏」的来源。
+    holder = None
     try:
-        result = mcp_call("focusmate_auth",
-                          {"force": True, "reset": bool(reset)}, timeout=360)
-    except fm_lock.ProfileBusy as e:
-        print("[auth] 拿不到 profile 锁：%s" % e)
-        print("[auth] 说明另一个 Chromium 正在用这个 profile（下单中/桥还开着）。"
-              "等它让位，或先在 warden 里停一轮再重试。")
-        return False
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+        holder = fm_service.Service(home=mcp_home())
+        holder.hold(600000)
+        print("[auth] 已请共用浏览器让位（hold 10 分钟）")
+    except Exception as e:  # noqa: BLE001 - 服务没跑就不 hold，直接走独占登录
+        print("[auth] 共用浏览器服务没在跑（%s），直接走独占登录" % e)
+        holder = None
+
     try:
-        payload = json.loads(result["content"][0]["text"])
-    except Exception:
-        payload = {}
-    ok = bool(payload.get("success"))
-    print("[auth] %s" % ("登录成功" if ok else "登录失败/超时"))
-    return ok
+        try:
+            result = mcp_call("focusmate_auth",
+                              {"force": True, "reset": bool(reset)}, timeout=360)
+        except fm_lock.ProfileBusy as e:
+            print("[auth] 拿不到 profile 锁：%s" % e)
+            print("[auth] 说明另一个 Chromium 正在用这个 profile（下单中/桥还开着）。"
+                  "等它让位，或先在 warden 里停一轮再重试。")
+            return False
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        try:
+            payload = json.loads(result["content"][0]["text"])
+        except Exception:
+            payload = {}
+        ok = bool(payload.get("success"))
+        print("[auth] %s" % ("登录成功" if ok else "登录失败/超时"))
+        if ok:
+            snapshot_auth_state()
+        return ok
+    finally:
+        if holder is not None:
+            try:
+                holder.unhold()
+                print("[auth] 已解除 hold（共用浏览器恢复可用）")
+            except Exception as e:  # noqa: BLE001 - 解除失败不该改写登录结论
+                print("[auth] 解除 hold 失败：%s（服务可能已经退出）" % e)
 
 
 def main(start, duration):

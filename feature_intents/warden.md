@@ -131,6 +131,42 @@ TUI 的浏览器活儿全在 `scripts/bridge.mjs` 里干，daemon 在 `keep_sess
 看板状态框多一档 `PROFILE_BUSY`：另一只 Chromium 正占着 profile —— 等下一轮自动
 重试（桥会让位），不再说「去 `--auth`」（那是误导）。
 
+### 单一浏览器服务（2026-11-23）
+
+上面的锁仍然在，但**正常路径不再需要它**：浏览器只归一个常驻服务所有。
+
+| 东西 | 改动 |
+|---|---|
+| `scripts/bridge.mjs --serve <home>/browser-service.sock` | stdio 桥升级成 socket 服务：单实例（`listen` 兜住，第二个退出码 3）、多客户端单队列、响应回原客户端、客户端断开不杀服务、`ensure/hold/unhold/where` 四个新命令 |
+| `focusmate_service.py` | Python 客户端：拉起服务（`start_new_session`，warden 退出/daemon 重启都不带走）、`call/ensure/release/hold`、门牌 `browser-service.json` |
+| `warden_core/bridge.py` | 只换传输层（stdio → unix socket），`call()` 签名和 30 处调用点不动；`stop()` 从「杀浏览器」变成「断开连接」，`shutdown()` 才真停 |
+| `scripts/_lib.mjs` | 服务进程带 `--remote-debugging-port`，暴露 `cdpUrl()`；浏览器关掉就清空 |
+| `patches/zz-focusmate-mcp-share-cdp.patch` | 有 `FOCUSMATE_CDP_URL` 就 `connectOverCDP` 复用服务那只浏览器，并用代理 context 保护主人的页面 |
+| `main.py` | `mcp_call` 先问服务要 CDP（拿不到才退回自己开 + 抢锁）；`--auth` 先 `hold` 再 headed 登录，完了 `unhold` |
+| 空闲关浏览器 | 判据从「命令后 IDLE_MS」改成「没有客户端连着满 IDLE_MS」；TUI 开着不会关，TUI 退出后 120s 放锁 |
+
+排障口诀：`python3 focusmate_service.py status` 看服务在不在、`call where` 看它读哪个
+profile / 锁在谁手上、`call ping` 看浏览器开没开、`call ensure` 强制开。
+
+### 登录态自愈（`scripts/auth_store.mjs`）
+
+2026-11-22/23 的第二次事故说明：锁只防「同时开」，防不了「记录已经被删」。
+cookie 全在、`firebase:authUser`（带 refresh token）没了 → app 自己从
+`/dashboard` 跳 `/login` → 之后每条 pull / book 都「未登录」，只能人工重登。
+
+现在登录态是**可备份、可自愈**的：
+
+| 时机 | 动作 |
+|---|---|
+| 拿到有效 token / 登录成功 | 把 IndexedDB 里的 `firebase:authUser` 备份到 `<home>/auth-backup.json`（600、原子写、内容没变不重写） |
+| 发现页面跳 `/login` | 有备份就先写回 IndexedDB、reload 再判一次；救不回来才报「先 `--auth`」，并说清是「备份也过期」还是「没有备份」 |
+| token 剩余 <10 分钟 | 直接用 refresh token 调 Firebase token 接口续期，写回 IDB + 备份。**不指望 app 自己刷**：实测剩 30 分钟时 reload 三次也不会刷 |
+| refresh token 被服务器拒绝 | 明确报 `invalid_grant`（不再无限重试白等） |
+
+`auth-backup.json` 等同凭据（含 refresh token）：600 权限、不进 git、不贴日志。
+手动排查：`node scripts/auth_store.mjs --check / --refresh / --recover / --wipe`。
+真机回归：`python3 -B test/live/test_live_auth_recover.py --yes`（只在 profile 拷贝上做破坏）。
+
 ## 命令
 
 ```

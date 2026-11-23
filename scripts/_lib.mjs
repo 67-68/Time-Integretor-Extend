@@ -14,6 +14,7 @@ import { createRequire } from "module";
 import path from "path";
 import { REPO_ROOT, resolveProfile } from "./mcp_home.mjs";
 import * as LOCK from "./profile_lock.mjs";
+import * as AUTH from "./auth_store.mjs";
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 
@@ -56,6 +57,35 @@ export const CONFIG_DIR = _home.home;
 export const PROFILE_DIR = _home.profileDir;
 /** 这个 profile 是怎么选出来的（env:profile / workspace / legacy …），报错时带上。 */
 export const PROFILE_SOURCE = _home.source;
+
+//: 共用浏览器模式：浏览器服务（`bridge.mjs --serve`）自己开 Chromium 时把
+//: `--remote-debugging-port` 带上，然后别的进程（focusmate-mcp）用
+//: `connectOverCDP` 复用**同一只**浏览器，不再各开一只抢 profile。
+//: 只在服务进程里设这个环境变量；CLI 脚本/warden 子进程都不设。
+export const CDP_PORT = Number(process.env.FOCUSMATE_CDP_PORT || 0);
+
+let _cdpUrl = "";
+
+/** 当前这只浏览器给外人用的 CDP 地址；没开 CDP（或浏览器没起）就是 ""。 */
+export function cdpUrl() {
+  return _cdpUrl;
+}
+
+/** 等 Chromium 的 CDP HTTP 端点上线（--remote-debugging-port 是异步生效的）。 */
+async function waitCdpReady(port, timeoutMs = 15000) {
+  const url = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${url}/json/version`, { signal: AbortSignal.timeout(1500) });
+      if (r.ok) return url;
+    } catch {
+      /* 还没起来 */
+    }
+    await new Promise((res) => setTimeout(res, 200));
+  }
+  return "";
+}
 
 /** 一句话说清「用的是哪个 profile、怎么来的」—— 所有 die() 都带它。 */
 export function describeProfile() {
@@ -175,6 +205,41 @@ export function fmtLocal(d) {
 /** 这一进程当前持有的 profile 锁（同一时刻只有一个浏览器，够用）。 */
 let _heldLock = null;
 
+/** 最近一次「登录态自愈」/「登录态快照」的结果，bridge 写日志用（不含 token）。 */
+let lastRestore = null;
+let lastSnapshot = null;
+let lastRefresh = null;
+export function authRestoreInfo() {
+  return lastRestore;
+}
+export function authSnapshotInfo() {
+  return lastSnapshot;
+}
+export function authRefreshInfo() {
+  return lastRefresh;
+}
+
+/** 备份文件的概况（不含 token），报错/日志里用来说清「有没有备份、新不新」。 */
+export function authBackupInfo() {
+  const b = AUTH.loadAuthBackup(CONFIG_DIR);
+  if (!b) return null;
+  return { savedAt: b.savedAt || null, count: b.rows.length, summary: AUTH.authSummary(b.rows) };
+}
+
+/**
+ * 拿到有效 token 就顺手把登录态备份一次。
+ * 内容没变不会写盘，所以每条命令调也不亏。
+ */
+async function snapshotAuth(page) {
+  try {
+    const res = await AUTH.snapshotFromPage(page, CONFIG_DIR);
+    lastSnapshot = { at: Date.now(), ...res };
+  } catch (e) {
+    lastSnapshot = { at: Date.now(), saved: false, reason: "error", error: String(e && e.message ? e.message : e) };
+  }
+  return lastSnapshot;
+}
+
 // die()/process.exit 也要把锁放掉：不然一次登录失败就把 profile 永久锁死。
 process.once("exit", () => {
   if (_heldLock) {
@@ -189,6 +254,7 @@ process.once("exit", () => {
 
 /** 包一层 ctx.close：关浏览器的同时放锁，调用方不用记得。 */
 function wrapClose(ctx) {
+  // 浏览器关了，CDP 地址也就作废了（不能让 daemon 拿着旧地址连）
   const raw = ctx.close.bind(ctx);
   let closed = false;
   ctx.close = async (...args) => {
@@ -197,6 +263,7 @@ function wrapClose(ctx) {
     try {
       await raw(...args);
     } finally {
+      _cdpUrl = "";
       if (_heldLock) {
         LOCK.release(CONFIG_DIR, _heldLock);
         _heldLock = null;
@@ -245,7 +312,7 @@ export function profileWantInfo() {
  * 打开会白屏，并在争抢中打坏 IndexedDB（见 profile_lock.mjs 头注释）。
  * 锁在 ctx.close() 时自动放掉（wrapClose），所以调用方照旧只写 ctx.close()。
  */
-export async function openSession({ headless = true, viewport, role } = {}) {
+export async function openSession({ headless = true, viewport, role, softAuth = false } = {}) {
   const lockRole = role || process.env.FOCUSMATE_LOCK_ROLE || "cli";
   const waitMs = Number(process.env.FOCUSMATE_LOCK_WAIT_MS || LOCK.DEFAULT_WAIT_MS);
   try {
@@ -263,16 +330,25 @@ export async function openSession({ headless = true, viewport, role } = {}) {
 
   let ctx;
   try {
-    ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+    const launchOpts = {
       headless,
       viewport: viewport || { width: 1600, height: 900 },
-    });
+    };
+    // 共享模式：把 CDP 端口开在本地（服务进程自己用；别的进程连它复用浏览器）。
+    if (CDP_PORT > 0) launchOpts.args = [`--remote-debugging-port=${CDP_PORT}`];
+    ctx = await chromium.launchPersistentContext(PROFILE_DIR, launchOpts);
   } catch (e) {
     LOCK.release(CONFIG_DIR, _heldLock);
     _heldLock = null;
     die(`起不来 Chromium：${e.message}${describeProfile()}`);
   }
   wrapClose(ctx);
+  if (CDP_PORT > 0) {
+    _cdpUrl = await waitCdpReady(CDP_PORT);
+    if (!_cdpUrl) {
+      warn(`CDP 端点没起来（port=${CDP_PORT}）：daemon 下单会退回自己开浏览器（会抢 profile 锁）`);
+    }
+  }
 
   const page = ctx.pages()[0] || (await ctx.newPage());
   try {
@@ -285,11 +361,42 @@ export async function openSession({ headless = true, viewport, role } = {}) {
   await page.waitForTimeout(7000);
 
   if (page.url().includes("/login")) {
-    await ctx.close().catch(() => {});
-    die(
-      `未登录（页面跳到了 /login）。先跑 \`python3 main.py --auth\` 登录一次；` +
-        `要是那边登录过还这样，就是 profile 选错了：${describeProfile()}`
-    );
+    // 登录态被 app 删了（2026-11-22/23 真机：cookie 还在、firebase:authUser 没了）。
+    // 有备份就先写回 IndexedDB 再 reload，让 Firebase 自己用 refresh token 续期。
+    const rec = await AUTH.restoreFromBackup(page, CONFIG_DIR).catch((e) => ({
+      restored: 0,
+      reason: "error",
+      error: String(e && e.message ? e.message : e),
+    }));
+    lastRestore = { at: Date.now(), ...rec };
+    if (rec.restored) {
+      log(
+        `登录态记录不见了，已用 ${rec.savedAt || "旧"} 的备份写回 ${rec.restored} 条，` +
+          `reload 让 Firebase 续期…`
+      );
+      await page.goto(`${APP_URL}/dashboard`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(6000);
+    }
+    if (page.url().includes("/login")) {
+      await ctx.close().catch(() => {});
+      const hint = rec.restored
+        ? "备份里的 refresh token 也救不回来（多半已被服务器作废）"
+        : rec.reason === "no-backup"
+          ? "本地也没有登录态备份（auth-backup.json）"
+          : `恢复失败：${rec.reason}${rec.error ? " " + rec.error : ""}`;
+      const msg =
+        `未登录（页面跳到了 /login）。${hint}。先跑 \`python3 main.py --auth\` 登录一次；` +
+        `要是那边登录过还这样，就是 profile 选错了：${describeProfile()}`;
+      if (softAuth) {
+        // CLI（scripts/auth_store.mjs）要把「未登录」和「浏览器起不来」分开退出码，
+        // 所以这里让调用方决定怎么收场，而不是直接 process.exit。
+        const err = new Error(msg);
+        err.authSoft = true;
+        err.restore = rec;
+        throw err;
+      }
+      die(msg);
+    }
   }
 
   // 白屏 = SPA 没挂载：profile 写不进去，或另一只浏览器正占着它。
@@ -366,15 +473,51 @@ async function looksLoggedOut(page) {
   }
 }
 
-/** 拿一个没过期的 token；过期就让页面自己刷新（reload）。 */
-export async function getToken(page, { attempts = 3 } = {}) {
+/**
+ * 拿一个没过期的 token；剩余不足 refreshBeforeMs 就**主动**续期一次。
+ *
+ * 续期不靠页面 reload：2026-11-23 实测，剩 30 分钟时 reload 三次 Firebase 也不会
+ * 刷（SDK 只在快过期/被调用时才刷）。等它自己刷，就正好撞进「refresh 失败 →
+ * SDK 把 firebase:authUser 删掉 → 只能人工重登」那条路。所以这里直接拿 refresh
+ * token 调 Firebase token 接口，把新 token 写回 IndexedDB + 备份。
+ */
+export async function getToken(page, { attempts = 3, refreshBeforeMs = 10 * 60_000 } = {}) {
   for (let i = 0; i < attempts; i++) {
     const tok = await readToken(page);
-    if (tok && jwtExpMs(tok) > Date.now() + 30_000) return tok;
-    if (await looksLoggedOut(page)) {
+    if (tok && jwtExpMs(tok) > Date.now() + refreshBeforeMs) {
+      await snapshotAuth(page);
+      return tok;
+    }
+    if (tok) {
+      const rr = await AUTH.refreshAuthToken(page, CONFIG_DIR).catch((e) => ({
+        ok: false,
+        reason: "error",
+        error: String(e && e.message ? e.message : e),
+      }));
+      lastRefresh = {
+        at: Date.now(),
+        ok: !!rr.ok,
+        reason: rr.reason || null,
+        status: rr.status || null,
+        detail: rr.detail || rr.error || null,
+      };
+      if (rr.ok && rr.token) {
+        await snapshotAuth(page);
+        return rr.token;
+      }
+      if (rr.reason === "no-refresh-token") {
+        die(`profile 里的登录记录没有 refresh token（只剩 access token），只能重新登录一次。${describeProfile()}`);
+      }
+      if (rr.reason === "http" && (rr.status === 400 || rr.status === 401)) {
+        die(
+          `refresh token 已被服务器拒绝（HTTP ${rr.status}：${rr.detail || "invalid_grant"}），` +
+            `只能重新登录一次（备份里的也作废了）。${describeProfile()}`
+        );
+      }
+      log(`主动续期失败（${rr.reason || "unknown"}），让页面自己再刷一次…`);
+    } else if (await looksLoggedOut(page)) {
       die(`拿不到 Firebase token：页面停在登录页（profile 里没有登录态），先跑一次登录。${describeProfile()}`);
     }
-    log(`token ${tok ? "即将/已过期" : "读不到"}，让页面刷新一次（${i + 1}/${attempts}）…`);
     await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
     await page.waitForTimeout(5000);
   }
@@ -382,6 +525,7 @@ export async function getToken(page, { attempts = 3 } = {}) {
   if (!tok) die(`拿不到 Firebase token：profile 里没有登录态，先跑一次登录。${describeProfile()}`);
   if (jwtExpMs(tok) <= Date.now())
     die(`token 已过期且自动刷新失败，请重新登录一次。${describeProfile()}`);
+  await snapshotAuth(page);
   return tok;
 }
 

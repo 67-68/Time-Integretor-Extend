@@ -4717,6 +4717,80 @@
           }
         ]
       }
+    },
+    {
+      "archived_at": "2026-11-23T00:03:23",
+      "task_id": 282,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-22T23:40:00",
+        "due_source": "session",
+        "exclusive": true,
+        "count_invested": 1
+      },
+      "session": null,
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-count",
+      "actual_minutes": null,
+      "status_at": "2026-11-23T00:03:23",
+      "omnifocus": {
+        "id": "bXBKXt03Pgc",
+        "url": "omnifocus:///task/bXBKXt03Pgc",
+        "title": "flashcard review & new learn",
+        "linked_at": "2026-11-02T15:24:32"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "flashcard review & new learn",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
+    },
+    {
+      "archived_at": "2026-11-23T15:16:55",
+      "task_id": 289,
+      "fields": {
+        "title": "flashcard review & new learn",
+        "duration": 25,
+        "count": 1,
+        "due": "2026-11-23T12:25:00",
+        "due_source": "session",
+        "exclusive": true,
+        "count_invested": 1
+      },
+      "session": {
+        "date": "2026-11-23",
+        "start": "12:00",
+        "duration": 25,
+        "start_min": 720,
+        "end": "12:25",
+        "period_id": "",
+        "source": "extra"
+      },
+      "notes": null,
+      "tags": [],
+      "manual": true,
+      "reason": "review-count",
+      "actual_minutes": null,
+      "status_at": "2026-11-23T15:16:55",
+      "omnifocus": {
+        "id": "bXBKXt03Pgc",
+        "url": "omnifocus:///task/bXBKXt03Pgc",
+        "title": "flashcard review & new learn",
+        "linked_at": "2026-11-02T15:24:32"
+      },
+      "focusmate": {
+        "task_id": null,
+        "title": "flashcard review & new learn",
+        "description": null,
+        "completed_at": null,
+        "attachments": []
+      }
     }
   ]
 }

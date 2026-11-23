@@ -184,11 +184,15 @@ warden 只提供内容。
            `re-action` 重放。
 
 - 写操作（mute / title / cancel）全部走 bridge（内部 API，见 docs/…-notes.md）。
+- **浏览器只归一个常驻服务所有**（`scripts/bridge.mjs --serve <home>/browser-service.sock`）：
+  warden / keep_session daemon / 命令行都只是客户端（`focusmate_service.py`）。
+  以前 warden 一只桥、daemon 每次下单现起一只，靠 want 标记互相让位，实测能等 90–630s。
 - daemon 的启停、`session` 之后的立刻下单，都走 keep_session.py 子进程
   （不 fork 在自己身上，也不在 TUI 里重写"怎么下单"）。
 - `sync` 走 download_calendar.py 子进程（日历 → data.csv），TUI 不重写日历逻辑。
-- **daemon 和 bridge 抢同一个 Chromium profile**：所以 `start` / `session` 之前会先让
-  bridge 释放浏览器；bridge 自己也会在空闲 WARDEN_BRIDGE_IDLE_MS 后自动放开。
+- **服务是唯一持有 Chromium profile 的进程**：`start` / `session` 之前仍会让它释放浏览器
+  （给还没改完的 daemon 兜底）；没有客户端连着满 WARDEN_BRIDGE_IDLE_MS 后它自己也会放开。
+  warden 退出不再带走浏览器 —— 服务是独立进程（`start_new_session`）。
 
 依赖
 ----
@@ -212,8 +216,8 @@ warden 只提供内容。
 
 环境变量：
     FOCUSMATE_PROFILE_DIR     浏览器 profile 目录（默认 ~/.focusmate-mcp/browser-data）
-    WARDEN_BRIDGE_IDLE_MS     bridge 空闲关浏览器的毫秒数（默认 0 = 不关；关掉后
-                              下一枪要等浏览器冷启动十几秒）
+    WARDEN_BRIDGE_IDLE_MS     没有客户端连着之后，多久关浏览器（毫秒）。0 或负数
+                              按 120s 算；TUI 开着期间不会关（下次命令不用冷启动）
     WARDEN_BRIDGE_HEADED=1    有头模式（看它怎么点）
     WARDEN_CLEAR=0            等价 --no-clear
 
@@ -1167,9 +1171,9 @@ def parse_args(argv=None):
     ap.add_argument("--offline", action="store_true", help="不碰浏览器，只用 state.json 里的快照")
     ap.add_argument("--headed", action="store_true", help="浏览器有头模式（看它怎么操作）")
     ap.add_argument("--idle-ms", type=int, default=0,
-                    help="bridge 空闲多少毫秒后放开浏览器（默认 0 = 不放开："
-                         "关掉浏览器下次冷启动要十几秒，用户反馈「网络拉取太慢」；"
-                         "想省内存就传 120000 之类的值）")
+                    help="浏览器服务在「没有客户端连着」之后多久放开浏览器（毫秒）；"
+                         "TUI 开着期间不会关，所以默认 0 会按 120s 算。"
+                         "想更早省内存就传小值")
     ap.add_argument("--profile-dir", default=None, help="浏览器 profile 目录（默认用 _lib 的默认值）")
     ap.add_argument("--install-deps", action="store_true", help="把 rich 装到 temp/pylibs")
     return ap.parse_args(argv)

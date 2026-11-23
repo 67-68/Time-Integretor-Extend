@@ -17,7 +17,7 @@ fixture（沙盒 + mock 数据）
   → cancel 清场
 ```
 
-## 三个入口
+## 入口一览
 
 | 命令 | 会不会真订 | 用途 |
 |---|---|---|
@@ -27,6 +27,8 @@ fixture（沙盒 + mock 数据）
 | `python3 -B test/live/test_live_focusmate.py --yes --plumbing` | 不会（执行区仍是 24h） | 走**真子进程** `warden.py --exec`，验沙盒隔离 + 命令分发 + data.csv 落盘 |
 | `python3 -B test/live/test_live_focusmate.py --yes` | **会真订 2 场并取消** | 端到端：Focusmate 上真有那两场、task 真挂上 |
 | `python3 -B test/live/test_live_omnifocus.py --yes` | 不订场，但**会真建/删 2 个临时 OmniFocus 项目** | 标签写回这一层：`pro merge --yes` 之后 `SOP` / `incubator` / `manual_defer` 真的挂在 OmniFocus 任务上（22 项断言），再切阶段验冻结/解冻，`omni.failed == 0` |
+| `python3 -B test/live/test_live_auth_recover.py --yes` | 不订场，但会起浏览器（**只用 profile 的拷贝**） | 登录态自愈：把 `firebase:authUser` 从拷贝里删掉 → 用 `auth-backup.json` 写回 IndexedDB → 再回到 `/dashboard`；备份也没了时应快速失败并提示先 `--auth` |
+| `python3 -B test/live/test_live_shared_browser.py` | 默认不会；加 `--book` 会真订 1 场「十天后 15:30」再取消 | 单浏览器服务 + CDP 共用：服务持锁时 MCP 经 `connectOverCDP` 干活（锁不易主）、并发读双成功；`--book` 再验下单链路与取消复核 |
 
 不带 `--yes` 只打印计划，什么都不做。
 
@@ -42,6 +44,15 @@ fixture（沙盒 + mock 数据）
 任务，跑真子进程 `warden.py --exec`，用独立 OmniJS 探针回读标签与所属项目，
 最后 `deleteObject` 删掉两个临时项目（`SOP` / `incubator` / `manual_defer`
 这几个侧别标签保留 —— 它们是正式功能要用的）。
+
+### 为什么需要 `test_live_auth_recover.py`
+
+2026-11-22 的事故里，cookie 全是好的，坏的是 IndexedDB 里的
+`firebase:authUser`（带 refresh token）：app 自己从 `/dashboard` 跳回 `/login`，
+此后每条 pull / book 都「未登录」，只能人工重登。单元测试验不了 IndexedDB 的
+读写语义（`fbase_key`、`getAll` 的结构、擦除后能否写回），所以这份真机测试
+直接拿 profile 的**拷贝**做实验：删记录 → 跑一次 `--check` → 它应该从
+`auth-backup.json` 写回并重新进 `/dashboard`。真 profile 全程只读，跑完拷贝删掉。
 
 ## 真实数据回放（`fixtures/midday-1558/`）
 

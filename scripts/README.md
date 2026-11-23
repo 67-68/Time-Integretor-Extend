@@ -12,12 +12,13 @@
 | `set_quiet.mjs` | 开/关 session 的 quiet mode | 内部 API `PUT /v1/session/` |
 | `add_task.mjs` | 给 session 挂一个 task | DOM 自动化（点界面） |
 | `cancel.mjs` | 取消 session | 内部 API `DELETE /v1/session/{id}` |
-| `bridge.mjs` | **常驻**桥：一个 Chromium + JSON 行协议，给 `warden.py` 用 | 复用上面同一套内部 API |
+| `bridge.mjs` | **常驻浏览器服务**：一个 Chromium + JSON 行协议（stdio 或 `--serve <sock>`），warden / daemon / CLI 都是它的客户端 | 复用上面同一套内部 API |
 
 `bridge.mjs` 认的命令（JSON 行协议，详见文件头注释）：
 
 ```
-ping / snapshot / title / mute / cancel / tasks / add_task / complete_task / release / shutdown
+ping / snapshot / title / mute / cancel / tasks / add_task / complete_task /
+ensure / release / hold / unhold / where / shutdown
 ```
 
 - `add_task startMs title? notes? via?` —— 给某场 session 挂 task（API 优先、DOM 兜底，都复核）；
@@ -52,9 +53,17 @@ ping / snapshot / title / mute / cancel / tasks / add_task / complete_task / rel
    `~/.focusmate-mcp`」，于是 daemon 用工作区 profile、bridge 用 9 月的老 profile，
    TUI 每条命令都「未登录」，而界面只显示一句「内部调用了 process.exit(1)」。
    想知道当前读的是哪个：`{"cmd":"where"}`（见下），或看 warden 表头那行红字。
-2. **别和 daemon / MCP 并发跑**：它们共用同一个 Chromium profile，会抢锁。
-   （跑之前 `python3 keep_session.py daemon stop`，或者接受偶发失败。）
-3. `playwright` 能解析到（优先用 `temp/focusmate-mcp/node_modules`，兜底全局）。
+2. **登录态会自己备份/自愈**：`auth_store.mjs` 会在拿到有效 token 时把
+   IndexedDB 里的 `firebase:authUser`（带 refresh token）备份到
+   `<home>/auth-backup.json`（600 权限）；下次发现 app 把页面踢回 `/login`，
+   会先把备份写回 IndexedDB 再 reload，让 Firebase 自己续期。
+   排查/手动操作：`node scripts/auth_store.mjs --check`（校验+刷新备份）、
+   `--wipe`（清掉登录记录，测试用）、`--recover`（只用备份救一次）。
+   **不要**把 `auth-backup.json` 提交或贴进日志 —— 它等同登录凭据。
+3. **别和 daemon 抢同一个 profile**：浏览器现在只归一个常驻服务所有
+   （见下面「单一浏览器服务」）。MCP（下单/取消）会经 CDP 复用服务那只浏览器；
+   只有 `--auth` 要独占 —— 先 `hold` 让服务关浏览器放锁。
+4. `playwright` 能解析到（优先用 `temp/focusmate-mcp/node_modules`，兜底全局）。
 
 ## 时间参数
 
@@ -122,7 +131,43 @@ node scripts/cancel.mjs --start 18:00 --yes     # 真取消
 
 ---
 
-## 5. bridge — 常驻操作桥
+## 5. 单一浏览器服务（`bridge.mjs --serve`）
+
+**跑法**（warden 会自动起，一般不用手敲）：
+
+```bash
+node scripts/bridge.mjs --serve temp/focusmate-home/browser-service.sock
+python3 focusmate_service.py status      # 在不在 / 门牌内容
+python3 focusmate_service.py call ping   # 直接发一条命令
+python3 focusmate_service.py stop        # 让服务退出（关浏览器、删 sock）
+```
+
+- 单实例由 `listen()` 兜住：第二个进程退出码 **3**（不会悄悄起第二只浏览器）；
+  上次被 `kill -9` 留下的 sock 会自动清理；
+- 多个客户端（warden / daemon / CLI）共用**一条**命令队列，响应回给发命令的那一方；
+- 客户端断开**不杀服务**（独立进程，`start_new_session`），
+  「没有客户端连着」满 `WARDEN_BRIDGE_IDLE_MS`（默认 120s，≤0 按 120s）才关浏览器；
+- 门牌文件 `<home>/browser-service.json`：`pid / sock / cdpPort / home / idleMs`。
+
+**共用浏览器（CDP）**：服务开 Chromium 时带 `--remote-debugging-port=<随机空闲端口>`，
+`focusmate-mcp` 只要拿到 `FOCUSMATE_CDP_URL` 就 `connectOverCDP` 复用同一只浏览器，
+不再自己 `launchPersistentContext`（补丁：
+[`patches/zz-focusmate-mcp-share-cdp.patch`](../patches/zz-focusmate-mcp-share-cdp.patch)）。
+补丁给调用方的是**代理 context**：`pages()` 返回空、`newPage()` 自己记、`close()` 只关
+自己开的页、`browser()` 返回 `null` —— 实测直接 `page.close()` / `browser.close()`
+会把主人（服务）的页面/浏览器一起带走。
+
+**让位（auth 专用）**：`hold [ms]` 先关浏览器放锁、期间**拒绝**开浏览器；`unhold` 解除。
+`main.py --auth` 会自动 hold 10 分钟，登录完解除。
+
+> 以前：warden 一只桥、daemon 每次下单现起一只，靠 want 标记互相让位。桥在一条失败
+> 命令里（`goto` 超时 30s ×3 重试）能连续占 90s，让位轮询又被 `inCommand` 挡着，
+> daemon 实测等到 90–630s 才失败（`temp/keep_session.log` 2026-11-23 15:18:58 因此丢了
+> 16:00 那场）。收成一个 owner 之后，正常路径上不存在「等锁」。
+
+---
+
+## 6. bridge — 常驻操作桥（stdio 老用法）
 
 给 `warden.py` 用的**常驻**进程：浏览器留在内存里，命令走 stdin/stdout 的 JSON 行，
 单条热命令 ~1-2s（对比 CLI 的冷启动 ~10s）。
