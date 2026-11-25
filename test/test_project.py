@@ -2524,6 +2524,83 @@ _cleared = sp.load_layouts()["layouts"][wd_manual.sel_date.isoformat()]["T1"]
 check("period T1 clear 清空 session 内容且保留自动重排能力",
       (_cleared.get("source"), _cleared.get("durations")), ("auto", []))
 
+print("== 19) 警告板的项目源：轻量扫描，不算账 ==")
+# 项目警告只问两件事（有旧双 op 吗 / 有任务没打侧别标签吗），不需要 remaining /
+# progress。以前它走 current_project_rows()，每个 pro 两侧各算一次 stats（10 个
+# 项目 ≈ 79ms，每 5 秒跑一次、还在主线程上）。这里钉住三件事：
+#   ① 轻量扫描一次 stats 都不调；② 结论和 current_project_rows() 一致；
+#   ③ current_project_rows() 自己的 invested 每个 op 只算一次。
+_scan_rows = [
+    {"id": "p-scan-1", "name": "扫描项目", "kind": "project_root",
+     "tags": ["project/扫描"], "completed": False, "dropped": False},
+    {"id": "t-scan-tag", "name": "已打标签", "kind": "action", "project": "扫描项目",
+     "project_id": "p-scan-1", "estimated_minutes": 25, "completed": False,
+     "tags": ["SOP"]},
+    {"id": "t-scan-none", "name": "忘了打标签", "kind": "action", "project": "扫描项目",
+     "project_id": "p-scan-1", "estimated_minutes": 25, "completed": False},
+]
+wd_scan = fresh(_scan_rows)
+no_chore(wd_scan)
+wd_scan.handle("op import omnifocus:///project/p-scan-1")
+_scan_store = wd_scan.projects.load()
+for _op in _scan_store.get("projects") or ():
+    _op["op_type"] = None          # 没有默认侧：没打标签的任务才算问题
+wd_scan.projects.save(_scan_store)
+
+_stats_calls = {"n": 0}
+_orig_stats = pj.stats
+
+
+def _counting_stats(*args, **kwargs):
+    _stats_calls["n"] += 1
+    return _orig_stats(*args, **kwargs)
+
+
+pj.stats = _counting_stats
+try:
+    _scan = wd_scan.project_warning_scan()
+finally:
+    pj.stats = _orig_stats
+check("轻量扫描一次项目账都不算", _stats_calls["n"], 0)
+check("轻量扫描的未打标签清单", [row["untagged"] for row in _scan], [["忘了打标签"]])
+
+# 结论必须和「算账那条路」一致 —— 两套逻辑漂移了这条就会红
+_rows_full = wd_scan.current_project_rows()
+check("未打标签结论与 current_project_rows 一致",
+      [row["untagged"] for row in _scan],
+      [row["untagged"] for row in _rows_full])
+
+# 警告真的用到它：没打标签 → 报；打上标签 → 消失
+_warns_scan = wd_scan.collect_warnings()
+check_true("没打标签的任务进警告板",
+           any("没有 SOP / incubator 标签" in ws.text for ws in _warns_scan))
+_scan_store = wd_scan.projects.load()
+for _op in _scan_store.get("projects") or ():
+    for _t in _op.get("tasks") or ():
+        if _t.get("pk") == "t-scan-none":
+            _t["tags"] = ["SOP"]
+wd_scan.projects.save(_scan_store)
+check_true("打完标签后警告消失",
+           not any("没有 SOP / incubator 标签" in ws.text
+                   for ws in wd_scan.collect_warnings()))
+
+# invested 不该为「两侧各算一遍」白扫两次 tasks.json
+_inv_calls = {"n": 0}
+_orig_inv = pj.invested
+
+
+def _counting_invested(*args, **kwargs):
+    _inv_calls["n"] += 1
+    return _orig_inv(*args, **kwargs)
+
+
+pj.invested = _counting_invested
+try:
+    _rows_inv = wd_scan.current_project_rows()
+finally:
+    pj.invested = _orig_inv
+check("每个有 op 的项目只算一次 invested", _inv_calls["n"], len(_rows_inv))
+
 print()
 if fails:
     print("FAILED %d" % len(fails))

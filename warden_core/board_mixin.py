@@ -2689,8 +2689,10 @@ class BoardMixin(object):
                 level="warn", source="琐事",
                 hint="去 OmniFocus 加一条任务并 project refresh；或 set chore-project 换项目"))
         # 6) 单项目模型：还留着旧双 op，或者有任务没打侧别标签。
+        #    只用轻量扫描（不算 invested / count）：这两条警告不要账，而
+        #    `current_project_rows()` 会为每个项目两侧各算一次账（实测 79ms）。
         try:
-            rows = self.current_project_rows()
+            rows = self.project_warning_scan()
         except Exception:                      # noqa: BLE001 - 警告板不能因为这里坏掉
             rows = []
         legacy = [r for r in rows if r.get("legacy_extra_ops")]

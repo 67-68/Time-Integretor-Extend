@@ -668,10 +668,25 @@ PipeInput + 记录型 Output 跑真 App，按键→输出首字节）：
 
 chrome 的 CPU 总量 3930ms/15s → 564ms/15s（一轮渲染从 20 次拼装降到 1 次）。
 
-还剩两处已知抖动（同一个量级，暂未动，见「未验证 / 待办」）：`collect_warnings`
-每 5 秒在主线程跑一次（45–190ms，在 `chrome()` 的 `warnings_refresh` 钩子里），
-和每秒一次的整帧重画。真要再快一档，得把看板从「prompt 的多行 message」改成
-布局里的独立 `Window(FormattedTextControl(...))`（那是 repl_kit 的改动）。
+**警告板的「项目」源也算了一遍白账（同一天修掉）**：`collect_warnings` 91.5ms 里
+79.5ms 来自 `current_project_rows()` —— 它给每个 pro 的两侧各调一次 `pj.stats()`，
+而 `stats()` 不传 `invested_map` 时会自己重扫 `tasks.json`（2.9ms/次），10 个项目
+就是 58ms 白烧；可那两条项目警告只要 `legacy_extra_ops` + `untagged` 两个字段。
+两处改法：
+
+- `current_project_rows()` 里 `invested()` 只算一次，传给两侧 `stats()`
+  （79.5 → 45.5ms）；
+- 新增 `project_warning_scan()` 轻量通道（只扫 op 的任务，不算 count），
+  警告改用它（`collect_warnings` 91.5 → **20.3ms**，剩下是琐事 / 重复任务 / plan
+  各 ~3ms）。
+
+测试钉住三件事：轻量扫描一次 `pj.stats` 都不调、未打标签结论与
+`current_project_rows()` 逐字一致（防两套逻辑漂移）、`invested` 每个 op 只调一次。
+
+还剩两处已知抖动（见「未验证 / 待办」）：每 5 秒一次的 `collect_warnings`
+（现在 ~20ms，在 `chrome()` 的 `warnings_refresh` 钩子里）和每秒一次的整帧重画。
+真要再快一档，得把看板从「prompt 的多行 message」改成布局里的独立
+`Window(FormattedTextControl(...))`（那是 repl_kit 的改动）。
 
 ## 静音时段（`period mute`）
 
@@ -964,13 +979,15 @@ python3 warden.py install-deps
 - **统计视图的高度**：内容比屏幕高时顶部会滚进滚动历史（终端的极限）。面板里
   「最近 14 天」+「按月」+「永不重订」都想要，所以行数不少；嫌高就先砍按月。
 - **打字手感的下一档（2026-11-25 记）**：`chrome()` 同轮记忆 + 帧签名不读盘之后，
-  键入延迟中位 30–65ms。还想再快，得动这两个：
-  ① `collect_warnings` 每 5 秒在主线程跑一次（45–190ms，挂在 `chrome()` 的
-  `warnings_refresh` 钩子上）→ 挪到后台 worker，主线程只应用结果；
+  键入延迟中位 30–65ms；项目警告也改成轻量扫描（`collect_warnings` 91.5 → 20.3ms）。
+  还想再快，得动这两个：
+  ① `collect_warnings` 剩下的 ~20ms（琐事 / 重复任务 / plan 各 ~3ms，外加两次
+  `tasks.json`）仍在主线程、每 5 秒一次 → 挪到后台 worker，主线程只应用结果；
   ② prompt_toolkit 把整块看板当「多行 prompt」，每轮渲染都要重算它的行/宽度/
   行前缀（一次 35–50ms）→ 改成布局里的独立 `Window(FormattedTextControl(...))`，
   输入行单独一个 `BufferControl`。②是 repl_kit 的改动（paper_researcher 也用），
-  要先拍板；①只动 warden。
+  要先拍板；实测收益约 6ms/帧（render 12.5→6.1ms），绝对值不大、风险不小。
+  ①只动 warden。
 
 ## 已删除的历史设计（别再抄回来）
 

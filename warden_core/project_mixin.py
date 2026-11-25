@@ -65,10 +65,14 @@ class ProjectMixin(object):
             other = (pj.OP_TYPE_SOP if side == pj.OP_TYPE_INCUBATOR
                      else pj.OP_TYPE_INCUBATOR)
             default_side = pj.normalize_op_type(op.get("op_type"))
-            stat = pj.stats(op, self.task_store, side=side,
+            # 一个项目的 invested 只算一次：`stats()` 不传 invested_map 时会自己
+            # 调一次 `invested()`（重扫 tasks.json，实测 2.9ms/次），两侧各调一次
+            # 就是白算一遍（10 个项目 → 约 58ms）。
+            invested_map = pj.invested(self.task_store, op)
+            stat = pj.stats(op, self.task_store, invested_map=invested_map, side=side,
                             default_side=default_side)
-            other_stat = pj.stats(op, self.task_store, side=other,
-                                  default_side=default_side)
+            other_stat = pj.stats(op, self.task_store, invested_map=invested_map,
+                                  side=other, default_side=default_side)
             open_tasks = [t for t in (op.get("tasks") or ())
                           if not t.get("completed") and not t.get("dropped")
                           and not t.get("effective_completed")
@@ -102,6 +106,36 @@ class ProjectMixin(object):
                 "legacy_extra_ops": pr.get("legacy_extra_ops") or [],
             })
             out.append(row)
+        return out
+
+    def project_warning_scan(self):
+        """警告板要的那两项：旧双 op / 没打侧别标签的任务（**不算账**）。
+
+        `current_project_rows()` 顺手把每个 pro 两侧的账都算了（每侧一次
+        `stats()`），可警告只问两件事：「还有旧双 op 吗」「有任务没打
+        SOP/incubator 吗」。为这两句话去算 10 个项目 × 两侧的 remaining /
+        progress，实测白烧 79ms（每帧 / 每 5 秒一次），所以单独给一条轻量通道：
+        只扫一遍 op 的任务，不看 invested、不算 count。
+        """
+        out = []
+        for pr in self.projects.pro_preview(self.sel_date, self.task_store):
+            op = pr.get("active_op")
+            if op is None:
+                continue
+            default_side = pj.normalize_op_type(op.get("op_type"))
+            untagged = [
+                t.get("title") or t.get("pk")
+                for t in (op.get("tasks") or ())
+                if not t.get("completed") and not t.get("dropped")
+                and not t.get("effective_completed") and not t.get("effective_dropped")
+                and pj.side_of_tags(t.get("tags") or ()) is None
+                and default_side is None
+            ]
+            out.append({
+                "pro_title": self.pro_display_title(pr, fallback=pr["title"]),
+                "untagged": untagged,
+                "legacy_extra_ops": pr.get("legacy_extra_ops") or [],
+            })
         return out
 
     def pro_display_title(self, pro_or_id, fallback=None):
