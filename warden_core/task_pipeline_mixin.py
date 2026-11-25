@@ -923,7 +923,9 @@ class TaskPipelineMixin(object):
             result["errors"] += 1
             self.say("自动 layout 重算失败（其余照常刷新）：%s" % e, "warn")
         try:
-            projects = self.projects.active()
+            # op + 简单 pro：简单项目的 plan 也要像普通项目一样被对账（场次没了
+            # / 绑定对不上就清掉重排），只是它的条目是项目级虚拟任务。
+            projects = self.projects.plan_refs()
         except Exception as e:                     # noqa: BLE001 - 项目库坏了不挡 formatter
             projects = []
             self.had_error = True

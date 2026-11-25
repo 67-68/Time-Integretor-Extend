@@ -169,6 +169,26 @@ def distribute(allocations, projects, invested_map=None, now=None, exclude_pks=N
         need = int(alloc.get("count") or 0)
         if need <= 0:
             continue
+        if project.get("simple"):
+            # 简单项目：**不挑子任务**（不排序、不要求打标），直接把这次分到的
+            # count 合成一条「项目级虚拟重复任务」——名字就是项目名。
+            # ``pk`` 固定成 ``simple:<pro_id>``：同一天排几次都认同一条身份，
+            # 重排时能复用它、同日做完一场再排一场也不会被「同日去重」吞掉。
+            # ``local_only`` 让 _plan_apply 不挂 OmniFocus（虚拟任务外部不存在）。
+            pk = "simple:%s" % (project.get("pro_id") or pid)
+            out.append({
+                "project_id": pid,
+                "project": project,
+                "pk": pk,
+                "title": project.get("title") or pk,
+                "count": need,
+                "total": need,
+                "remaining": need,
+                "minutes": need * MINUTES_PER_COUNT,
+                "simple": True,
+                "local_only": True,
+            })
+            continue
         budget = need * MINUTES_PER_COUNT
         took = 0
         task_type = pj.task_type_of(project)
@@ -947,11 +967,14 @@ class Allocator(object):
 
     def options(self):
         return ["pro <序号> <count>", "pro <序号> clear",
+                "pro <序号> at <HH:MM> <count>", "pro <序号> period <T1>",
                 "task <任务> <count>", "task <任务> clear",
                 "task <任务> -p <项目序号>", "complete", "q"]
 
     def stage_hint(self):
         return ("pro 1 4 = 项目 #1 分 4 count · pro 1 clear = 清空 · "
+                "pro 1 at 14:00 4 = 从 14:00 起连续占 4 count（限简单项目）· "
+                "pro 1 period T1 = 整段给 #1 · "
                 "task 5 2 = 任务 #5 固定 2 count · task 5 -p 3 = 改归项目 #3 · "
                 "complete = 开始排任务 · q = 放弃（已分配 %d / %d count）"
                 % (self.allocated(), self.cap()["counts"]))
@@ -979,14 +1002,34 @@ class Allocator(object):
             invested_all = pj.invested_by_project(self.task_store)
         for index, project in enumerate(self.projects, 1):
             plan = pj.plan_of(project, self.day)
-            side = project.get("side") or pj.side_for_stage(project.get("stage"))
-            stat = pj.stats(project, self.task_store,
-                            invested_all.get(project["id"]) or {},
-                            side=side, default_side=project.get("default_side"))
             got = self.allocation_of(project["id"])
             pro = self.pro_map.get(project["id"])
             pro_title = ((pro or {}).get("display_title")
                          or (pro or {}).get("title"))
+            entry = next((a for a in self.allocations
+                          if a.get("project_id") == project["id"]), {}) or {}
+            if project.get("simple"):
+                # 简单项目：容量 ∞、不按侧别挑任务；只显示「已投」和这段时间。
+                stat = pj.stats(project, self.task_store,
+                                invested_all.get(project["id"]) or {})
+                bits = ["[简单项目 · 容量 ∞]",
+                        "已投 %d count" % int(stat.get("done") or 0)]
+                window = self._window_text(entry)
+                if window:
+                    bits.append(window)
+                if plan and plan.get("count"):
+                    bits.append("今天说好 %d count、已排 %d"
+                                % (int(plan["count"]),
+                                   pj.planned_counts(project, self.day)))
+                head = "#%d %s" % (index, pro_title or project.get("title") or "?")
+                tail = "→ %d count" % got if got else ""
+                out.append(("  %-24s %s %s" % (head, " · ".join(bits), tail),
+                            "bold green" if got else ""))
+                continue
+            side = project.get("side") or pj.side_for_stage(project.get("stage"))
+            stat = pj.stats(project, self.task_store,
+                            invested_all.get(project["id"]) or {},
+                            side=side, default_side=project.get("default_side"))
             pro_txt = (" · pro:%s(%s)" % (pro_title,
                                           (pro or {}).get("stage")
                                           or project.get("stage"))
@@ -1131,6 +1174,12 @@ class Allocator(object):
         if word in ("clear", "清空", "none", "off", "0"):
             self._set(project, 0)
             return {"action": "handled"}
+        if word in ("at", "from", "从", "起"):
+            self._window_command(project, rest[1:], mode="at")
+            return {"action": "handled"}
+        if word in ("period", "时段", "整段"):
+            self._window_command(project, rest[1:], mode="period")
+            return {"action": "handled"}
         try:
             count = int(rest[0])
         except ValueError:
@@ -1138,6 +1187,154 @@ class Allocator(object):
             return {"action": "handled"}
         self._set(project, count)
         return {"action": "handled"}
+
+    # -- 手动时间段（只给简单项目）----------------------------------
+    #
+    # 用户 2026-11-25：「使用一个命令安排一个简单pro 的时间，接下来几个 session
+    # 时间段都是他的（可以在任何时间开始，延伸到后面的时段直到时间排完，或者
+    # 直接把一个时段分配给他）」。
+    #
+    #     pro 3 at 14:00 4      ← 从 14:00 起连续占 4 count（跨 period 继续）
+    #     pro 3 period T1       ← 整个 T1 时段都给它
+    #
+    # 落成 ``self.allocations`` 里带 ``from`` / ``period_id`` 的那条资源决定；
+    # ``complete`` 时 ``_plan_apply`` 先按它把场次切出来并挂上虚拟任务，其余
+    # 项目只看剩下的空场。**起点必须精确命中一个空场的起点**：layout 只能从
+    # 时段起点接龙，半截起点表达不了（会写成 extras、前缀反而排不进去）。
+
+    @staticmethod
+    def _hhmm_min(text):
+        got = sp.parse_hhmm(text)
+        return got[0] * 60 + got[1] if got else None
+
+    @staticmethod
+    def _hhmm_text(text):
+        got = sp.parse_hhmm(text)
+        return "%02d:%02d" % got if got else str(text or "")
+
+    def _slot_start_min(self, slot):
+        return self._hhmm_min((slot or {}).get("start"))
+
+    def _ordered_slots(self):
+        return sorted(self.slots,
+                      key=lambda s: (self._slot_start_min(s) or 0,
+                                     str(s.get("start") or "")))
+
+    def _window_slots(self, start=None, period_id=None):
+        """从 ``start`` 起（或整段 ``period_id``）连续的空场 → ``(counts, slots)``。"""
+        ordered = self._ordered_slots()
+        if period_id:
+            mine = [s for s in ordered
+                    if str(s.get("period_id") or "") == str(period_id)]
+            return sum(int(s.get("counts") or 0) for s in mine), mine
+        want = self._hhmm_min(start)
+        for index, slot in enumerate(ordered):
+            if self._slot_start_min(slot) == want:
+                picked = ordered[index:]
+                return sum(int(s.get("counts") or 0) for s in picked), picked
+        return 0, []
+
+    @staticmethod
+    def _parse_count(text):
+        """"4" → 4；"100min" / "100m" / "100分" → ceil(100/25)=4。"""
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return None
+        for tail in ("minutes", "minute", "mins", "min", "m", "分钟", "分"):
+            if raw.endswith(tail):
+                raw = raw[:-len(tail)].strip()
+                break
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            return None
+        return value
+
+    def _window_command(self, project, toks, mode="at"):
+        """``pro 3 at 14:00 4`` / ``pro 3 period T1`` 的解析。"""
+        toks = [str(t) for t in toks if str(t).strip()]
+        if not project.get("simple"):
+            self.say("✗ 只有简单项目能按时间段排（普通项目按子清单摊派任务）："
+                     "先 `pro %d simple`。" % (self.projects.index(project) + 1), "warn")
+            return {"action": "handled"}
+        if not toks:
+            self.say("用法：pro <序号> at <HH:MM> [<count>|Nmin] / "
+                     "pro <序号> period <T1>", "warn")
+            return {"action": "handled"}
+        rest = list(toks)
+        start = period_id = None
+        if mode == "at":
+            start = rest.pop(0)
+            if self._hhmm_min(start) is None:
+                self.say("起点要写成 HH:MM（例如 14:00）；你给的是 %r" % start, "warn")
+                return {"action": "handled"}
+        else:
+            period_id = rest.pop(0)
+        count = None
+        if rest:
+            count = self._parse_count(rest[0])
+            if count is None or count <= 0:
+                self.say("count 得是正整数或 Nmin（1 count = 25 分钟）；你给的是 %r"
+                         % rest[0], "warn")
+                return {"action": "handled"}
+        self._set_window(project, start=start, period_id=period_id, count=count)
+        return {"action": "handled"}
+
+    def _set_window(self, project, start=None, period_id=None, count=None):
+        """把一段时间判给这个简单项目（覆盖它原来的分配）。"""
+        available, slots = self._window_slots(start=start, period_id=period_id)
+        if not slots:
+            starts = "、".join(str(s.get("start") or "?") for s in self._ordered_slots()[:8])
+            self.say("✗ %s 不是今天的空场起点%s —— 这条命令没执行。"
+                     % (("「%s」" % start) if start else ("时段「%s」" % period_id),
+                        ("；可用起点：%s" % starts) if start and starts else ""),
+                     "error")
+            return False
+        if count is None:
+            count = available
+        if count > available:
+            self.say("✗ %s 只剩 %d count（%d 分钟），你要 %d —— 这条命令没执行。"
+                     % (("从 %s 起" % self._hhmm_text(start)) if start
+                        else ("时段「%s」" % period_id),
+                        available, available * MINUTES_PER_COUNT, count), "error")
+            return False
+        others = sum(int(a.get("count") or 0) for a in self.allocations
+                     if a.get("project_id") != project["id"])
+        other_pins = self.pinned_counts()
+        cap = self.cap()["counts"]
+        if others + other_pins + count > cap:
+            self.say("✗ 超预算：这一天只有 %d count，别的分配已经占了 %d，「%s」再要 %d "
+                     "就成 %d —— 这条命令没执行。"
+                     % (cap, others + other_pins, project.get("title"), count,
+                        others + other_pins + count), "error")
+            return False
+        entry = {"project_id": project["id"], "count": int(count)}
+        if start:
+            entry["from"] = self._hhmm_text(start)
+        if period_id:
+            entry["period_id"] = str(period_id)
+        self.allocations = [a for a in self.allocations
+                            if a.get("project_id") != project["id"]]
+        self.allocations.append(entry)
+        span = "、".join("%s(%d)" % (s.get("start") or "?",
+                                     int(s.get("counts") or 0)) for s in slots)
+        self.say("✅ #%d %s → %s %d count（%d 分钟），占：%s；已分配 %d / %d。"
+                 % (self.projects.index(project) + 1, project.get("title"),
+                    ("从 %s 起连续" % entry["from"]) if start
+                    else ("整个 %s" % period_id),
+                    count, count * MINUTES_PER_COUNT, span,
+                    self.allocated(), cap), "ok")
+        return True
+
+    @staticmethod
+    def _window_text(entry):
+        """面板上那段「从 14:00 起连续 / 整个 T1」的说明。"""
+        entry = entry or {}
+        if entry.get("from"):
+            return "从 %s 起连续排" % entry["from"]
+        if entry.get("period_id"):
+            return "整个 %s" % entry["period_id"]
+        return ""
 
     # -- 任务级固定项 -------------------------------------------------
     def _task_command(self, toks):
@@ -1332,6 +1529,18 @@ class Allocator(object):
         return out
 
     def _show(self, project):
+        if project.get("simple"):
+            stat = pj.stats(project, self.task_store)
+            entry = next((a for a in self.allocations
+                          if a.get("project_id") == project["id"]), {}) or {}
+            num = self.projects.index(project) + 1
+            self.say("📁 #%d %s：简单项目（容量 ∞，已投 %d count）%s；"
+                     "`pro %d <count>` 按容量摊派，`pro %d at <HH:MM> <count>` "
+                     "从某个起点连续占，`pro %d period T1` 占一整段。"
+                     % (num, project.get("title"), int(stat.get("done") or 0),
+                        ("；今天：" + self._window_text(entry)) if entry else "",
+                        num, num, num), "info")
+            return {"action": "handled"}
         invested = (pj.invested_by_project(self.task_store).get(project["id"]) or {}
                     if self.task_store else {})
         items = pj.remaining_tasks(project, invested,
@@ -1361,8 +1570,8 @@ class Allocator(object):
         if count < 0:
             self.say("count 不能是负数。", "warn")
             return False
-        if count and self.task_store is not None:
-            # 分配之前先看这个项目**有没有可排的活**。以前这里只查预算：
+        if count and self.task_store is not None and not project.get("simple"):
+            # 分配之前先看这个项目**有没有可排的活**（简单项目容量 ∞，不查清单）。以前这里只查预算：
             # 项目清单里的任务全没打 SOP / incubator 标签（或都在 defer 里）时，
             # 用户照样能「说好 8 count」，complete 之后 0 条任务落进 0 场 session，
             # 还把这一天已有的排布整片清空（2026-11-22 历史 W13 复习 2 的现场）。
@@ -1420,8 +1629,14 @@ class Allocator(object):
                             if p["id"] == alloc.get("project_id")), None)
             if project is None:
                 continue
-            allocs.append({"project_id": project["id"], "project": project,
-                           "count": int(alloc.get("count") or 0)})
+            rec = {"project_id": project["id"], "project": project,
+                   "count": int(alloc.get("count") or 0)}
+            # 手动时间段（`pro 3 at 14:00 4` / `pro 3 period T1`）跟着决定一起
+            # 带进去：_plan_apply 要先按它把场次切出来，其余项目只看剩下的空场。
+            for key in ("from", "period_id"):
+                if alloc.get(key):
+                    rec[key] = alloc[key]
+            allocs.append(rec)
         summary = self._hook("apply", self, allocs) or {}
         self.closed = True
         return {"action": "close", "done": "complete",

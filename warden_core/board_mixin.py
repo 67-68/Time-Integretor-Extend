@@ -179,6 +179,10 @@ class BoardMixin(object):
          ("tasktable", "task-table", "task table", "任务表", "任务面板")),
         ("project", "Project",
          ("projecttable", "project-table", "project table", "项目表", "项目面板")),
+        # 简单项目开着一场时，它那份 OmniFocus 清单单独一块（没有就不画）。
+        ("simple", "Simple",
+         ("simple", "simpletable", "simple-table", "简单项目", "简单项目表",
+          "这场的清单")),
     )
 
     def _resolve_block(self, text):

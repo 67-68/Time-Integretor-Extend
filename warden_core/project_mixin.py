@@ -57,6 +57,9 @@ class ProjectMixin(object):
         op_rows = {row["id"]: row for row in self.project_rows(day)}
         out = []
         for pr in self.projects.pro_preview(day, self.task_store):
+            if (pr.get("pro") or {}).get("simple"):
+                out.append(self._simple_project_row(pr, day))
+                continue
             op = pr.get("active_op")
             if op is None:
                 continue
@@ -108,6 +111,43 @@ class ProjectMixin(object):
             out.append(row)
         return out
 
+    def _simple_project_row(self, pr, day):
+        """简单项目的项目行：容量 ∞，不算清单、不报未打标。"""
+        view = pj.simple_project_view(pr.get("pro") or {}, stage=pr.get("stage"))
+        invested_map = pj.invested(self.task_store, view)
+        stat = pj.stats(view, self.task_store, invested_map)
+        plan = pj.plan_of(view, day)
+        return {
+            "number": pr["number"],
+            "pro_id": pr["id"],
+            "pro_number": pr["number"],
+            "op_number": None,
+            "pro": pr.get("pro"),
+            "pro_title": self.pro_display_title(pr, fallback=pr.get("title")),
+            "pro_title_raw": pr.get("title"),
+            "pro_stage": pr.get("stage"),
+            "effective_stage": pr.get("stage"),
+            "stage_mismatch": False,
+            "active_side": None,
+            "active_op": None,
+            "simple": True,
+            "remaining": stat["remaining"],
+            "remaining_high": 0,
+            "remaining_text": stat["remaining_text"],
+            "progress": stat["progress"],
+            "progress_text": stat["progress_text"],
+            "other_remaining": 0,
+            "other_side": None,
+            "frozen_count": 0,
+            "untagged": [],
+            "legacy_extra_ops": [],
+            "tasks_open": 0,
+            "week_count": 0,
+            "week_missing": [],
+            "allocated": int((plan or {}).get("count") or 0),
+            "scheduled": pj.planned_counts(view, day),
+        }
+
     def project_warning_scan(self):
         """警告板要的那两项：旧双 op / 没打侧别标签的任务（**不算账**）。
 
@@ -119,6 +159,9 @@ class ProjectMixin(object):
         """
         out = []
         for pr in self.projects.pro_preview(self.sel_date, self.task_store):
+            if (pr.get("pro") or {}).get("simple"):
+                # 简单项目不查清单、不要求打标 —— 绝不告警。
+                continue
             op = pr.get("active_op")
             if op is None:
                 continue
@@ -163,7 +206,10 @@ class ProjectMixin(object):
         """``op id -> pro`` 展示副本；带 ``display_title``，供 plan 面板使用。"""
         out = {}
         for op in ops or ():
-            pro = self.projects.pro_for_op(op)
+            if (op or {}).get("simple"):
+                pro = self.projects.pro_by_id(op.get("pro_id"))
+            else:
+                pro = self.projects.pro_for_op(op)
             if pro is None:
                 continue
             shown = dict(pro)
@@ -370,6 +416,78 @@ class ProjectMixin(object):
             t.caption = Text("项目安排：" + "；".join(alloc_bits), style="dim")
         return t
 
+    # -- 简单项目的「这一场」清单框 -------------------------------------
+
+    def _live_simple_project(self):
+        """当前这一场挂着简单项目的虚拟任务 → ``(pro, op)``；没有就 None。
+
+        不联网：只看本地任务的 session 时间窗（进行中/正在这一场）。
+        """
+        now = self._now_dt()
+        today = now.date().isoformat()
+        mins = now.hour * 60 + now.minute
+        for task in self.task_store.list():
+            sess = task.get("session") or {}
+            if not sess.get("start") or str(sess.get("date") or "") != today:
+                continue
+            start = th._clock_minutes(sess.get("start"))
+            if start is None:
+                continue
+            if not (start <= mins < start + int(sess.get("duration") or 0)):
+                continue
+            pid = (task.get("fields") or {}).get(pj.PROJECT_ID_FIELD)
+            if not pj.is_simple_project_id(pid):
+                continue
+            pro = self.projects.pro_by_id(pj.pro_id_from_simple(pid))
+            if pro is None:
+                continue
+            ops = self.projects.ops_for_pro(pro)
+            return pro, (ops[0] if ops else None)
+        return None
+
+    def render_simple_project_panel(self):
+        """当前 session 是简单项目的排期时，画它 OmniFocus 项目里的任务。
+
+        简单项目排的是一条**项目级虚拟任务**（名字=项目名），具体做什么还得看
+        它关联的 OmniFocus 清单 —— 所以这一场进行中时，把那份清单原样摆出来
+        （不排序、不按侧别过滤，因为简单项目本来就不排序）。
+
+        「没有就不展示」：没关联 op、或 op 下一条未完成任务都没有 → ``None``，
+        整块不画。
+        """
+        found = self._live_simple_project()
+        if found is None:
+            return None
+        pro, op = found
+        if op is None:
+            return None
+        rows = [task for task in (op.get("tasks") or ())
+                if not task.get("completed") and not task.get("dropped")
+                and not task.get("effective_completed")
+                and not task.get("effective_dropped")]
+        if not rows:
+            return None
+        table = Table(title="Simple · 简单项目「%s」这一场干什么（清单来自 OmniFocus，"
+                            "不排序、不按侧别过滤）" % (pro.get("title") or "?"),
+                      box=box.SIMPLE, header_style="bold magenta",
+                      title_justify="left", expand=False)
+        table.add_column("#", justify="right", style="bold", no_wrap=True)
+        table.add_column("任务", overflow="crop")
+        table.add_column("count", justify="right", no_wrap=True)
+        table.add_column("due", justify="right", no_wrap=True, style="dim")
+        for index, task in enumerate(rows[:12], 1):
+            table.add_row(str(index),
+                          Text(str(task.get("title") or task.get("pk") or "?"),
+                               overflow="crop"),
+                          str(int(task.get("count") or 0) or "—"),
+                          str(task.get("due") or "—")[:16])
+        if len(rows) > 12:
+            table.caption = "…还有 %d 条（`pro %s` 看全部）" % (
+                len(rows) - 12, self.projects.pro_number_of(pro["id"]) or pro["id"])
+        else:
+            table.caption = "虚拟任务只占场；具体做什么从这份清单里挑。"
+        return table
+
     def render_projects_table(self):
         """契约视图里**任务面板下面**那块项目表。
 
@@ -403,13 +521,19 @@ class ProjectMixin(object):
                 plan_txt = "已排 %d count" % row["scheduled"]
             stage = row.get("pro_stage") or "running"
             side = row.get("active_side") or pj.side_for_stage(stage)
-            type_txt = "%s · %s" % (stage, side)
-            type_style = ("magenta" if side == pj.OP_TYPE_INCUBATOR
-                          else "cyan")
-            task_type = pj.task_type_of(row)
+            if row.get("simple"):
+                type_txt = "简单 · 容量 ∞"
+                type_style = "bold magenta"
+                task_type = "项目级虚拟任务"
+            else:
+                type_txt = "%s · %s" % (stage, side)
+                type_style = ("magenta" if side == pj.OP_TYPE_INCUBATOR
+                              else "cyan")
+                task_type = pj.task_type_of(row)
             task_type_style = ("yellow" if task_type == pj.TASK_TYPE_SEQUENTIAL
                                else "cyan")
-            op_title = (row.get("active_op") or {}).get("title") or "?"
+            op_title = ("—" if row.get("simple")
+                        else ((row.get("active_op") or {}).get("title") or "?"))
             remain_txt = str(row.get("remaining_text")
                              or row.get("remaining") or 0)
             frozen = int(row.get("frozen_count") or 0)
@@ -1069,6 +1193,11 @@ class ProjectMixin(object):
 
     def _start_pro_advance(self, pro, tail_tokens=None):
         """执行 ``pro <序号> -a / --advance [op <序号> | task import ...]``。"""
+        if pro.get("simple"):
+            raise ValueError(
+                "「%s」是简单项目：没有 SOP/incubator 活跃侧，不切阶段、也不打 "
+                "manual_defer（容量 ∞，按项目级虚拟任务排）。"
+                % (pro.get("title") or pro.get("id")))
         tail = [str(t).strip() for t in (tail_tokens or ()) if str(t).strip()]
         cur_stage = pj.normalize_pro_stage(pro.get("stage")) or pj.STAGE_RUNNING
         target_stage = (pj.STAGE_BOTTLENECK if cur_stage == pj.STAGE_RUNNING
@@ -1134,6 +1263,43 @@ class ProjectMixin(object):
             op_tok = joined
         op = self.projects.find(op_tok)
         return self._finish_pro_advance(pro["id"], op["id"], target_stage=target_stage)
+
+    def _cmd_pro_simple(self, pro, toks):
+        """``pro <序号> simple [on]``：把项目标成「简单项目」（**单向，切不回去**）。
+
+        用户 2026-11-25：「理论上应该可以不用切回普通项目，直接把这条路径 ban 掉，
+        提示无法切回就行了」。所以这里不做「取消时清理已排场次」那一整套回滚 ——
+        只改一个布尔值，不碰 OmniFocus、不碰标签、不碰任务。
+        """
+        toks = [str(t).strip().lower() for t in (toks or ()) if str(t).strip()]
+        word = toks[0] if toks else ""
+        num = self.projects.pro_number_of(pro["id"]) or pro["id"]
+        shown = self.pro_display_title(pro, fallback=pro.get("title"))
+        if word in ("off", "no", "0", "false", "普通", "恢复", "取消", "关"):
+            rl.log_event("project", "simple_refused", level="warning",
+                         pro_id=pro["id"], reason="irreversible")
+            raise ValueError(
+                "简单项目不可逆：pro #%s「%s」无法切回普通项目（用户定：直接把这条"
+                "路径 ban 掉）。要恢复只能手工改 data/projects.json 里的 "
+                "\"simple\": false。" % (num, shown))
+        if word not in ("", "on", "yes", "1", "true", "开", "开启"):
+            raise ValueError("用法：pro <序号> simple [on]"
+                             "（off 不可用：简单项目不可逆）")
+        if pro.get("simple"):
+            self.say("📂 pro #%s「%s」已经是简单项目了（容量 ∞、不按侧别挑任务）。"
+                     % (num, shown), "info")
+            return pro
+        updated = self.projects.set_pro_simple(pro["id"], True)
+        rl.log_event("project", "simple_toggle", level="info", pro_id=pro["id"],
+                     simple=True, op_id=updated.get("op_id"))
+        self.say("📂 pro #%s「%s」已标成 **简单项目**：不再分 SOP/incubator 侧别、"
+                 "不按子任务排序、容量 ∞（单向，切不回去）。\n"
+                 "   `plan` 里：pro %s <count> 按容量摊派；pro %s at 14:00 <count> "
+                 "从某个起点连续占；pro %s period T1 占一整段。"
+                 % (num, self.pro_display_title(updated, fallback=updated.get("title")),
+                    num, num, num), "ok")
+        self.invalidate()
+        return updated
 
     def _cmd_pro_create(self, toks):
         """``pro create <名称> [file=<路径>] [stage=running|bottleneck] [op=<op序号>]``。"""
@@ -1283,6 +1449,15 @@ class ProjectMixin(object):
                              % (pr["number"], self.pro_display_title(pr),
                                 pr["stage"], pr["number"]), "warn")
                     continue
+                if row.get("simple"):
+                    self.say("📂 Pro #%d %s [简单项目 · 容量 ∞]：进度 %s · "
+                             "不按 SOP/incubator 侧别、不按子任务排序%s%s"
+                             % (pr["number"], self.pro_display_title(pr),
+                                row.get("progress_text") or "0/∞",
+                                (" · 今天说好 %d count（已排 %d）"
+                                 % (row.get("allocated"), row.get("scheduled")))
+                                if row.get("allocated") else "", file_txt), "info")
+                    continue
                 op = row.get("active_op") or {}
                 frozen = int(row.get("frozen_count") or 0)
                 self.say("📂 Pro #%d %s [阶段:%s · 活跃侧 %s → op #%s「%s」]：剩余 %s count%s · "
@@ -1347,6 +1522,11 @@ class ProjectMixin(object):
 
         rest = toks[1:]
         rest_low = [t.lower() for t in rest]
+
+        # 简单项目：单向开关（用户 2026-11-25：「把切回普通项目这条路径 ban 掉」）
+        if rest and rest_low[0] in ("simple", "简单", "--simple", "-s"):
+            pro = self._ensure_pro_for_token(toks[0])
+            return self._cmd_pro_simple(pro, rest[1:])
 
         # 检查是否带 -a / --advance / —advance
         if rest and self._is_advance_flag(rest[0]):
@@ -3201,7 +3381,10 @@ class ProjectMixin(object):
         """
         out = set()
         try:
-            projects = self.projects.list()
+            # op + 简单 pro：简单项目的 items 记在 pro 上，只看 op 会让它上一轮
+            # 排下去的场次在重排时被当成「有人占着」→ 整段没法重切（2 count 的
+            # 旧场次把 T1 钉成 50+50，而不是按新配额切 75+25）。
+            projects = self.projects.plan_refs()
         except Exception:                          # noqa: BLE001 - 坏库不挡正常 plan
             return out
         for project in projects or ():
@@ -3315,8 +3498,15 @@ class ProjectMixin(object):
             alloc = {}
             for project in (getattr(allocator, "projects", None) or ()):
                 alloc[str(project.get("id"))] = counts.get(str(project.get("id")), 0)
+            windows = [{"project_id": a.get("project_id"),
+                        "from": a.get("from"),
+                        "period_id": a.get("period_id"),
+                        "count": int(a.get("count") or 0)}
+                       for a in (allocs or ())
+                       if a.get("from") or a.get("period_id")]
             data[iso] = {"alloc": alloc,
                          "pins": [dict(p) for p in (pins or ())],
+                         "windows": windows,
                          "at": ts._now()}
         try:
             tmp = PLAN_DECISIONS_FILE + ".tmp"
@@ -3335,6 +3525,9 @@ class ProjectMixin(object):
             return False
         allocator.had_decision = True
         by_id = {str(p.get("id")): p for p in (allocator.projects or ())}
+        windows = {str(w.get("project_id")): dict(w)
+                   for w in (rec.get("windows") or ())
+                   if isinstance(w, dict)}
         stale = []
         for pid, count in (rec.get("alloc") or {}).items():
             project = by_id.get(str(pid))
@@ -3344,14 +3537,19 @@ class ProjectMixin(object):
                 stat = allocator._project_stat(project)
             except Exception:                      # noqa: BLE001 - 预填失败就按没活处理
                 stat = {}
-            if int(stat.get("remaining") or 0) <= 0:
+            if not project.get("simple") and int(stat.get("remaining") or 0) <= 0:
                 # 上一轮的「说好 N count」这次已经落不了地（任务被删/改了标签）：
                 # 不能让它以「已分配」的样子回到面板上，否则一敲 complete 又把
                 # 整天的排布清空一遍。
                 stale.append((project, int(count)))
                 continue
-            allocator.allocations.append({"project_id": project["id"],
-                                          "count": int(count)})
+            item = {"project_id": project["id"], "count": int(count)}
+            win = windows.get(str(project["id"])) or {}
+            if win.get("from"):
+                item["from"] = win["from"]
+            if win.get("period_id"):
+                item["period_id"] = win["period_id"]
+            allocator.allocations.append(item)
         if stale:
             allocator.stale_dropped = True
         for project, count in stale:
@@ -3386,7 +3584,9 @@ class ProjectMixin(object):
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
         cleared_plans = cleared_items = detached = 0
         try:
-            projects = self.projects.list()
+            # op + 简单 pro：简单项目的 plans 记在 pro 自己身上，只看 op 会让
+            # 上一轮的场次永远不释放。
+            projects = self.projects.plan_refs()
         except Exception:                          # noqa: BLE001
             return {"plans": 0, "items": 0, "detached": 0}
         for project in projects or ():
@@ -4705,6 +4905,221 @@ class ProjectMixin(object):
             pass
         return sessions
 
+    # -- 手动时间段（只给简单项目）------------------------------------
+
+    @staticmethod
+    def _window_durations(minutes):
+        """把一段分钟数切成 25/50/75 的场次（先整 75，再 50，最后 25）。"""
+        out, left = [], int(minutes)
+        while left >= pp.MINUTES_PER_COUNT:
+            for size in (75, 50, 25):
+                if left >= size:
+                    out.append(size)
+                    left -= size
+                    break
+        return out
+
+    def _window_pick(self, slots, alloc, need):
+        """从空场里按 ``from`` / ``period_id`` 连续取够 ``need`` 个 count。"""
+        want_from = (th._clock_minutes(alloc.get("from"))
+                     if alloc.get("from") else None)
+        want_period = str(alloc.get("period_id") or "")
+        ordered = sorted([s for s in (slots or ())
+                          if int(s.get("counts") or 0) > 0],
+                         key=lambda s: (th._clock_minutes(s.get("start")) or 0))
+        if want_period:
+            mine = [s for s in ordered
+                    if str(s.get("period_id") or "") == want_period]
+        else:
+            mine = []
+            for index, slot in enumerate(ordered):
+                if th._clock_minutes(slot.get("start")) == want_from:
+                    mine = ordered[index:]
+                    break
+        pieces, left = [], int(need)
+        for slot in mine:
+            if left <= 0:
+                break
+            take = min(left, int(slot.get("counts") or 0))
+            if take <= 0:
+                continue
+            pieces.append((slot, take))
+            left -= take
+        return pieces, left
+
+    def _apply_manual_windows(self, day, allocator, window_allocs):
+        """手动时间段：先把这段场次切出来、挂上虚拟任务，其余项目看剩余空场。
+
+        切场走 ``commit_layout`` / ``_commit_window_sessions``（和 plan 同一个
+        落盘口），挂任务走 ``task_store.create`` + ``_assign_task``（和 plan 同一
+        条流水线）；不做「直接塞进已存在 session」的猴子补丁。
+        """
+        iso = day.isoformat()
+        result = {"sessions": 0, "counts": 0, "failed": 0, "task_ids": []}
+        carved = []
+        seen_periods = {}
+        for alloc in window_allocs:
+            project = alloc.get("project") or {}
+            need = int(alloc.get("count") or 0)
+            if need <= 0:
+                continue
+            pieces, left = self._window_pick(allocator.slots, alloc, need)
+            label = (("从 %s 起" % alloc.get("from")) if alloc.get("from")
+                     else ("时段 %s" % alloc.get("period_id")))
+            if not pieces or left > 0:
+                result["failed"] += 1
+                self.say("⚠ 「%s」的手动时间段（%s）空场不够：能排 %d count，少排 %d。"
+                         % (project.get("title"), label, need - left, left), "warn")
+                continue
+            keys = {pp._period_key(s.get("period") or {}) for s, _take in pieces}
+            clash = [key for key in keys if key in seen_periods]
+            if clash:
+                result["failed"] += 1
+                self.say("⚠ 「%s」和「%s」都要占 %s —— 一轮 plan 里一个时段只能给"
+                         "一个手动时间段。" % (project.get("title"),
+                                              seen_periods[clash[0]], clash[0]), "warn")
+                continue
+            for slot, take in pieces:
+                period = dict(slot.get("period") or {})
+                fresh = self._window_durations(take * pp.MINUTES_PER_COUNT)
+                if not fresh:
+                    continue
+                try:
+                    if slot.get("window"):
+                        # 洞后面的窗口：layout 表达不了起点，落成 extras。
+                        wslot = {"period": dict(period, start=slot.get("start"),
+                                                end=slot.get("end")),
+                                 "window": True}
+                        self._commit_window_sessions(day, wslot, fresh)
+                        sessions = sp.plan_period(wslot["period"], fresh)
+                    else:
+                        prefix = (list(slot.get("append_prefix") or ())
+                                  if slot.get("append") else [])
+                        self.commit_layout(day, period, prefix + fresh,
+                                           source="plan", reason="simple-window",
+                                           book=False, announce=False,
+                                           write_csv=False, lock_timeout=5.0)
+                        sessions = sp.plan_period(period, prefix + fresh)[len(prefix):]
+                except Exception as e:             # noqa: BLE001 - 一段坏了不挡其余
+                    result["failed"] += 1
+                    rl.log_event("plan", "window_layout_error", level="error",
+                                 day=iso, period=period.get("id"),
+                                 error="%s: %s" % (type(e).__name__, e))
+                    self.say("⚠ 手动时间段「%s」切场失败：%s"
+                             % (project.get("title"), e), "warn")
+                    continue
+                carved.append((alloc, sessions))
+                seen_periods[pp._period_key(slot.get("period") or {})] = (
+                    project.get("title") or "?")
+        if not carved:
+            return result
+        try:
+            self.rewrite_data_csv_from_plan()
+            self.rebuild_rows()
+        except Exception as e:                     # noqa: BLE001
+            rl.log_event("plan", "window_csv_error", level="error",
+                         day=iso, error="%s: %s" % (type(e).__name__, e))
+            self.say("手动时间段切好了，但重算 data.csv 失败：%s" % e, "warn")
+        by_start = {}
+        for index, row in enumerate(self.rows or (), 1):
+            if str(row.get("date") or "") != iso or not row.get("planned"):
+                continue
+            by_start.setdefault(str(row.get("startLabel") or ""), index)
+        for alloc, sessions in carved:
+            project = alloc.get("project") or {}
+            pid = project.get("id")
+            pk = "simple:%s" % (project.get("pro_id") or pid)
+            total = int(alloc.get("count") or 0)
+            used, records = set(), []
+            for sess in sessions:
+                index = by_start.get(str(sess.get("start") or ""))
+                if not index:
+                    continue
+                minutes = int(sess.get("duration") or 0)
+                count = ts.minutes_to_count(minutes) or 1
+                fields = {"title": project.get("title") or pk,
+                          pj.PROJECT_FIELD: project.get("title") or "",
+                          pj.PROJECT_ID_FIELD: pid,
+                          pj.PROJECT_TASK_FIELD: pk,
+                          "count": count,
+                          "count_total": max(count, total)}
+                source = {"kind": "project", "id": pk,
+                          "title": project.get("title") or pk,
+                          "url": "", "local_only": True}
+                existing = self._plan_mirror_pick(pid, pk, exclude=used)
+                reusable, _why = self._plan_reuse_reason(existing, day, exclude=used)
+                try:
+                    if reusable:
+                        task = self.task_store.apply_project_plan(
+                            existing["id"], fields, source=source)
+                    else:
+                        task = self.task_store.create(fields, omnifocus=None,
+                                                      source=source)
+                except ValueError as e:
+                    result["failed"] += 1
+                    self.say("⚠ 「%s」没建成虚拟任务：%s"
+                             % (project.get("title"), e), "error")
+                    continue
+                used.add(task.get("id"))
+                result["task_ids"].append(task.get("id"))
+                try:
+                    self._assign_task(task, str(index), refresh=False,
+                                      allow_unbooked=True)
+                except ValueError as e:
+                    result["failed"] += 1
+                    self.say("⚠ 「%s」没挂到 session #%s：%s"
+                             % (project.get("title"), index, e), "warn")
+                    continue
+                result["sessions"] += 1
+                result["counts"] += count
+                records.append({"pk": pk, "task_id": task["id"], "count": count,
+                                "start": str(sess.get("start") or ""),
+                                "duration": minutes})
+            if records:
+                self.projects.record_items(pid, day, records, append=True)
+                self.say("📌 手动时间段：「%s」占住 %s（共 %d count）。"
+                         % (project.get("title"),
+                            "、".join("%s(%d)" % (r["start"], r["duration"])
+                                     for r in records),
+                            sum(int(r["count"]) for r in records)), "ok")
+            rl.log_event("plan", "simple_window", level="info", day=iso,
+                         project_id=pid, start=alloc.get("from"),
+                         period=alloc.get("period_id"), need=total,
+                         placed=sum(int(r["count"]) for r in records))
+        return result
+
+    def _prune_simple_ghosts(self, day, used_ids=()):
+        """收掉简单项目「开放、没挂场、这轮也没用」的虚拟任务。
+
+        反复 plan 时同 pk（``simple:<pro_id>``）会按场次数建几条；配额变小或
+        换时段后，多出来的那些不该留在任务库里当幽灵。
+        """
+        used = {int(x) for x in (used_ids or ()) if x is not None}
+        simple_ids = {str(view.get("id")) for view in self.projects.plan_ops()
+                      if view.get("simple")}
+        if not simple_ids:
+            return []
+        dropped = []
+        for task in self.task_store.list():
+            if not ts.TaskStore.is_open(task) or task.get("session"):
+                continue
+            fields = task.get("fields") or {}
+            if str(fields.get(pj.PROJECT_ID_FIELD)) not in simple_ids:
+                continue
+            if not str(fields.get(pj.PROJECT_TASK_FIELD) or "").startswith("simple:"):
+                continue
+            if int(task.get("id") or 0) in used:
+                continue
+            try:
+                self.task_store.drop(task["id"], reason="simple-ghost")
+                dropped.append(task["id"])
+            except (ValueError, TypeError):
+                continue
+        if dropped:
+            rl.log_event("plan", "simple_ghost_pruned", level="info",
+                         day=day.isoformat(), removed=dropped)
+        return dropped
+
     def _plan_apply(self, allocator, allocs, append_to_plan=False, book=True,
                     title="排期（plan complete）", record_decision=True):
         """分配完了：先记资源，再挑任务、排进 session。
@@ -4735,6 +5150,10 @@ class ProjectMixin(object):
         usable, unfillable = [], []
         for alloc in allocs:
             project = alloc.get("project") or {}
+            if project.get("simple"):
+                # 简单项目容量 ∞、不查清单：不存在「一条可排的活都没有」。
+                usable.append(alloc)
+                continue
             try:
                 # 口径必须和 distribute() 一致：side 只读 plan_ops() 填的键，
                 # 没有就不按侧过滤（否则裸 op / 旧调用方会被误判成 0 条可排）。
@@ -4774,6 +5193,28 @@ class ProjectMixin(object):
         # 保留当天已有计划。
         if not append_to_plan:
             self._reset_day_plans(day)
+        all_allocs = list(allocs)
+        window_allocs = [a for a in allocs if a.get("from") or a.get("period_id")]
+        if window_allocs:
+            self.rebuild_rows()
+            carved = self._apply_manual_windows(day, allocator, window_allocs)
+            window_task_ids = set(carved.get("task_ids") or ())
+            if carved.get("sessions"):
+                try:
+                    self.rebuild_rows()
+                    # replan=False：刚切好的手动时间段**必须**留在场次上（它
+                    # 是这一轮的第一阶段占位）。用 replan=True 会把刚建的虚拟
+                    # 任务当「上一轮计划」撤掉，整段又被重切成别人的场次。
+                    fresh_slots, _fresh_notes = self._plan_slots(
+                        day, include_current=False, replan=False)
+                    allocator.slots[:] = fresh_slots
+                except Exception as e:             # noqa: BLE001 - 重读失败就按旧空场
+                    rl.log_event("plan", "window_reslot_failed", level="warning",
+                                 day=day.isoformat(),
+                                 error="%s: %s" % (type(e).__name__, e))
+            # 手订段已经占住了那些场次：剩下的项目只在剩余空场里摊派。
+            allocs = [a for a in allocs
+                      if not (a.get("from") or a.get("period_id"))]
         invested = pj.invested_by_project(self.task_store)
         # formatter 任务 / 尚未到 defer 点的本地任务都不该被项目 plan 再算一遍。
         # 前者已经有自己的时间占位，后者现在根本还没进入可安排队列。
@@ -4915,7 +5356,7 @@ class ProjectMixin(object):
                     row["id"] = None
                     row["focusmate_session_id"] = None
                 slot["index"] = idx
-        for alloc in allocs:
+        for alloc in all_allocs:
             count = int(alloc["count"])
             if append_to_plan:
                 existing = pj.plan_of(alloc["project"], day) or {}
@@ -4924,7 +5365,7 @@ class ProjectMixin(object):
         if record_decision and not append_to_plan:
             # `pro N clear` 之后 complete：这一天的 count 也要真的归 0（不只是
             # 不排任务）。决定台账里记 0，下一次打开面板就不会又亮回旧数字。
-            kept = {str(a.get("project_id")) for a in allocs
+            kept = {str(a.get("project_id")) for a in all_allocs
                     if int(a.get("count") or 0) > 0}
             for project in (getattr(allocator, "projects", None) or ()):
                 if str(project.get("id")) in kept:
@@ -5112,6 +5553,9 @@ class ProjectMixin(object):
         for pid, records in made.items():
             self.projects.record_items(pid, day, records,
                                        append=append_to_plan)
+        # 简单项目的重排幂等：这一轮没用上的开放未挂场虚拟任务收掉。
+        self._prune_simple_ghosts(
+            day, used_ids=set(used_ids) | set(locals().get("window_task_ids") or ()))
         # 固定项单独记台账：它们不一定属于任何 project（记不进项目库的 plans），
         # 但重排 / `plan clear` 必须能把它们解绑。
         if pin_records or pins:
@@ -5119,7 +5563,8 @@ class ProjectMixin(object):
         # 资源决定与时间安排分开存：下次打开 plan 按它预填/复现。
         if record_decision and not append_to_plan:
             try:
-                self._save_plan_decision(day, allocator, pin_records, allocs=allocs)
+                self._save_plan_decision(day, allocator, pin_records,
+                                         allocs=all_allocs)
             except Exception as e:                 # noqa: BLE001 - 台账坏了不挡排期
                 rl.log_event("plan", "decision_error", level="warning",
                              day=day.isoformat(),

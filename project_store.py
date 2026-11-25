@@ -97,6 +97,37 @@ OP_TYPE_SOP = "SOP"
 OP_TYPE_INCUBATOR = "incubator"
 OP_TYPES = (OP_TYPE_SOP, OP_TYPE_INCUBATOR)
 
+#: 简单项目（simple pro）在排期层用的合成项目 id 命名空间。
+#:
+#: 简单项目被排期时**没有**按子任务排序那一步：plan 只给它合成一条「项目级
+#: 虚拟重复任务」，所以它在任务库里也需要一个项目 id。直接用 ``pro`` 的序号
+#: 会和 op 的自增 id 撞车（两者都是 1、2、3…），所以在前面加一个量级：
+#: ``project_id = SIMPLE_ID_BASE + pro_id``。op 的 id 永远到不了这个量级。
+#: 这个数字**只当内部键**用，界面上从不显示。
+SIMPLE_ID_BASE = 1_000_000
+
+
+def simple_project_id(pro_id):
+    """``pro`` 在排期层的合成项目 id；非法输入返回 ``None``。"""
+    try:
+        ident = int(pro_id)
+    except (TypeError, ValueError):
+        return None
+    return SIMPLE_ID_BASE + ident if ident > 0 else None
+
+
+def is_simple_project_id(project_id):
+    """这个 ``project_id`` 是不是简单项目的合成 id。"""
+    try:
+        return int(project_id) >= SIMPLE_ID_BASE
+    except (TypeError, ValueError):
+        return False
+
+
+def pro_id_from_simple(project_id):
+    """合成项目 id → ``pro`` 序号（不是简单项目的 id 返回 ``None``）。"""
+    return int(project_id) - SIMPLE_ID_BASE if is_simple_project_id(project_id) else None
+
 #: OmniFocus 项目自身的任务排序规则：顺序（sequential）或并行（parallel）。
 #: 这是**项目规则**，和上面的 SOP / incubator 类型是两个维度。
 TASK_TYPE_SEQUENTIAL = "sequential"
@@ -1270,6 +1301,25 @@ def _norm_project(raw):
     return out
 
 
+def _norm_plans(raw):
+    """``pro["plans"]``：``{day: {"count", "at", "items"}}``（简单项目的计划账）。
+
+    结构刻意和 op 记录里的 ``plans`` 一模一样 —— ``plan_of()`` / ``planned_counts()``
+    只认这个形状，所以简单项目不需要第二套读法。
+    """
+    out = {}
+    for key, val in (raw or {}).items():
+        if not isinstance(val, dict):
+            continue
+        items = [dict(x) for x in (val.get("items") or ()) if isinstance(x, dict)]
+        out[str(key)] = {
+            "count": _as_int(val.get("count")) or 0,
+            "at": val.get("at") or None,
+            "items": items,
+        }
+    return out
+
+
 def _norm_pro(raw):
     """一条真正项目 Project（``pro``）记录。"""
     if not isinstance(raw, dict):
@@ -1311,6 +1361,8 @@ def _norm_pro(raw):
         "status_at": raw.get("status_at") or None,
         "status_reason": raw.get("status_reason") or None,
         "stage_locked": bool(raw.get("stage_locked", False)),
+        "simple": bool(raw.get("simple", False)),
+        "plans": _norm_plans(raw.get("plans")),
         "created_at": raw.get("created_at") or None,
         "updated_at": raw.get("updated_at") or None,
         "soft_interrupts": [rec for rec in
@@ -1580,6 +1632,10 @@ def completion_guard(task, store, task_store):
     if not pk:
         return True, ""
     pid = _as_int(fields.get(PROJECT_ID_FIELD))
+    if is_simple_project_id(pid):
+        # 简单项目的虚拟任务不对应任何一条 OmniFocus 任务：不存在「只做了一部分
+        # 就把剩下的抹掉」这回事，所以永远放行。
+        return True, ""
     project = store.by_id(pid) if (store is not None and pid) else None
     if project is None:
         return True, ""
@@ -1618,6 +1674,27 @@ def _derived_open_count(item):
     return len(_dv.open_items(_dv.parse(note, title)))
 
 
+def _simple_stats(invested_map=None):
+    """简单项目的账：容量 **∞**，只累计「已投入」。
+
+    ``remaining`` 仍然给 0（库内外到处是 ``int(stat["remaining"])``，给 ``None``
+    会炸），「要不要当成没活」由调用方先看 ``unlimited``。界面上的剩余 count
+    一律读 ``remaining_text``（就是 ``∞``），进度读 ``progress_text``（``已投 X / ∞``）。
+    """
+    done = sum(int(v or 0) for v in (invested_map or {}).values())
+    return {
+        "total": 0,
+        "total_high": 0,
+        "done": done,
+        "remaining": 0,
+        "remaining_high": 0,
+        "remaining_text": "∞",
+        "progress": 0.0,
+        "progress_text": ("%d/∞" % done) if done else "0/∞",
+        "unlimited": True,
+    }
+
+
 def stats(project, task_store=None, invested_map=None, side=None, default_side=None,
           now=None):
     """一个项目的账：``total`` / ``done`` / ``remaining`` / ``progress``。
@@ -1641,6 +1718,11 @@ def stats(project, task_store=None, invested_map=None, side=None, default_side=N
     —— 这正是「项目里不该出现没 tag 的任务」的账务表现。冻结的任务仍然计账
     （它是这个项目还没干的活），只是不进 ``plan``。
     """
+    if project.get("simple"):
+        # 简单项目不查任务清单（不排序、不要求打标），容量恒为 ∞。
+        if invested_map is None and task_store is not None:
+            invested_map = invested(task_store, project)
+        return _simple_stats(invested_map)
     if invested_map is None:
         invested_map = invested(task_store, project)
     tasks = project.get("tasks") or []
@@ -1714,6 +1796,8 @@ def empty_reason(project):
     count、未完成 4 条」看起来就像账算错了，所以要把差额说出来。
     """
     project = project or {}
+    if project.get("simple"):
+        return "简单项目不查任务清单（容量 ∞，排的是项目级虚拟任务）"
     opened = [t for t in (project.get("tasks") or ())
               if isinstance(t, dict)
               and not t.get("completed") and not t.get("dropped")
@@ -1739,6 +1823,34 @@ def empty_reason(project):
     if deferred:
         bits.append("%d 条还没到 defer 时间" % deferred)
     return "、".join(bits) or "任务都在当前活跃侧之外（检查 SOP / incubator 标签）"
+
+
+def simple_project_view(pro, stage=None):
+    """一个简单项目在排期/展示层长什么样（``plan_ops()`` 的合成条目）。
+
+    刻意**不带** op 的 ``tasks``：简单项目不按子任务排序、不要求打标。分配
+    count 之后由 ``project_plan.distribute()`` 合成一条项目级虚拟重复任务，
+    名字就是项目名，归属这个 pro。
+
+    ``plans`` 直接从 pro 记录上带出来 —— ``plan_of()`` 只认 ``project["plans"]``，
+    所以读的时候不需要再回库一次；写的时候由
+    :meth:`ProjectStore.set_allocation` / ``record_items`` 按 id 路由回 pro。
+    """
+    pro = pro or {}
+    return {
+        "id": simple_project_id(pro.get("id")),
+        "title": pro.get("title") or ("项目 %s" % (pro.get("id") or "?")),
+        "simple": True,
+        "pro_id": pro.get("id"),
+        "stage": stage or normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING,
+        "side": None,
+        "default_side": None,
+        "op_type": None,
+        "task_type": TASK_TYPE_PARALLEL,
+        "status": pro.get("status") or STATUS_ACTIVE,
+        "plans": dict(pro.get("plans") or {}),
+        "tasks": [],
+    }
 
 
 def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
@@ -1774,6 +1886,10 @@ def remaining_tasks(project, invested_map=None, now=None, exclude_pks=None,
     （用户 2026-11-21：项目文件夹里不该出现没 tag 的任务，refresh 会报警）。
     冻结的任务（defer 在五年之后 / 带 ``manual_defer``）永远不进候选。
     """
+    if project.get("simple"):
+        # 简单项目不按子任务挑活：它的「任务」是项目级虚拟重复任务，
+        # 由 ``project_plan.distribute()`` 直接合成，不走这份清单。
+        return []
     invested_map = invested_map or {}
     exclude = {str(pk) for pk in (exclude_pks or ())}
     tasks = project.get("tasks") or []
@@ -1992,6 +2108,62 @@ class ProjectStore(object):
             if project["id"] == ident:
                 return project
         return None
+
+    def by_plan_id(self, project_id, store=None):
+        """按**排期层的项目 id** 取记录：op 记录，或简单 pro 的合成视图。
+
+        虚拟任务的 ``project_id`` 字段可能是 ``SIMPLE_ID_BASE + pro_id``；
+        以前所有调用方都走 :meth:`by_id`，那种 id 会静默返回 None（用来算
+        「原任务总 count」的地方就会悄悄降级）。需要「这个 id 到底是谁」时用这里。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        if not is_simple_project_id(project_id):
+            for project in data.get("projects") or ():
+                if project.get("id") == _as_int(project_id):
+                    return project
+            return None
+        pid = pro_id_from_simple(project_id)
+        for pro in data.get("pros") or ():
+            if pro.get("id") == pid and pro.get("simple"):
+                return simple_project_view(pro)
+        return None
+
+    def plan_owner(self, project_id, store=None):
+        """``project_id`` 的「计划账本」拥有者 → ``(kind, record)``。
+
+        ``kind`` 是 ``"op"``（计划记在 op 记录上）或 ``"pro"``（简单项目，计划
+        记在 pro 自己身上）；找不到 → ``(None, None)``。写入方法统一走这里，
+        所以简单项目的 ``plans`` 不需要第二套落盘格式。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        if is_simple_project_id(project_id):
+            pid = pro_id_from_simple(project_id)
+            for pro in data.get("pros") or ():
+                if pro.get("id") == pid and pro.get("simple"):
+                    return "pro", pro
+            return None, None
+        ident = _as_int(project_id)
+        for op in data.get("projects") or ():
+            if op.get("id") == ident:
+                return "op", op
+        return None, None
+
+    def plan_refs(self, store=None):
+        """所有带「当天计划」账本的记录：全部 op + 简单 pro 的合成视图。
+
+        ``_reset_day_plans``（重排前撤旧计划）和 refresh 的对账要同时看到两种：
+        普通 pro 的计划在它的 op 上，简单项目的计划在 pro 上 —— 只看 op 的
+        老写法会让简单项目上一轮的场次永远不释放。
+        """
+        data = store if isinstance(store, dict) else self.load()
+        out = [dict(op) for op in (data.get("projects") or ())]
+        for pro in (data.get("pros") or ()):
+            if not pro.get("simple"):
+                continue
+            if not (pro.get("plans") or {}):
+                continue
+            out.append(simple_project_view(pro))
+        return out
 
     def by_omnifocus(self, pk):
         pk = str(pk or "").strip()
@@ -2569,6 +2741,22 @@ class ProjectStore(object):
         self.save(store)
         return pro
 
+    def set_pro_simple(self, pro_id, simple=True):
+        """把项目（``pro``）标成「简单项目」（只改一个布尔值）。
+
+        **单向**：这里没有「取消时把已经排出去的场次收回来」那段逻辑 —— 命令层
+        直接把取消这条路 ban 掉了（用户 2026-11-25：「直接把这条路径 ban 掉，
+        提示无法切回就行了」）。所以这个方法不碰 OmniFocus、不碰标签、不碰任务。
+        """
+        store = self.load()
+        pro = self.pro_by_id(pro_id, store=store)
+        if pro is None:
+            raise ValueError("没有项目（pro）%s" % pro_id)
+        pro["simple"] = bool(simple)
+        pro["updated_at"] = _now()
+        self.save(store)
+        return pro
+
     def set_pro_stage(self, pro_id, stage):
         """直接修改项目（``pro``）阶段：``running`` 或 ``bottleneck``。"""
         norm_stage = normalize_pro_stage(stage)
@@ -2820,6 +3008,9 @@ class ProjectStore(object):
           - 未关联任何 ``pro`` 的 ``op``：按自身类型（SOP / incubator）放行。
         """
         data = store if isinstance(store, dict) else self.load()
+        if (op or {}).get("simple"):
+            # 简单项目没有活跃侧/阶段门控：永远允许。
+            return True
         pro = self.pro_for_op(op, store=data)
         eff_type = normalize_op_type((op or {}).get("op_type")) or OP_TYPE_SOP
         if pro is None:
@@ -3073,10 +3264,15 @@ class ProjectStore(object):
         for pro in (data.get("pros") or ()):
             if pro.get("status") != STATUS_ACTIVE:
                 continue
+            stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
+            if pro.get("simple"):
+                # 简单项目：不出现它的 op（不按 op 的子任务排序），换成一条
+                # 合成视图 —— 容量 ∞、没有侧别、计划直接记在 pro 上。
+                out.append(simple_project_view(pro, stage=stage))
+                continue
             op = self.current_op_for_pro(pro, store=data)
             if op is None:
                 continue
-            stage = normalize_pro_stage(pro.get("stage")) or STAGE_RUNNING
             view = dict(op)
             view["stage"] = stage
             view["side"] = side_for_stage(stage)
@@ -3424,37 +3620,35 @@ class ProjectStore(object):
     def set_allocation(self, project_id, day, count):
         """记下「这一天给这个项目多少 count」（**只记资源，不排任务**）。"""
         store = self.load()
+        _kind, owner = self.plan_owner(project_id, store=store)
+        if owner is None:
+            raise ValueError("没有项目 %s" % project_id)
         key = day.isoformat() if hasattr(day, "isoformat") else str(day)
-        for project in store["projects"]:
-            if project["id"] != int(project_id):
-                continue
-            plans = project.setdefault("plans", {})
-            if not count:
-                plans.pop(key, None)
-            else:
-                plan = plans.get(key) or {"items": []}
-                plan["count"] = int(count)
-                plan["at"] = _now()
-                plans[key] = plan
-            self.save(store)
-            return project
-        raise ValueError("没有项目 %s" % project_id)
+        plans = owner.setdefault("plans", {})
+        if not count:
+            plans.pop(key, None)
+        else:
+            plan = plans.get(key) or {"items": []}
+            plan["count"] = int(count)
+            plan["at"] = _now()
+            plans[key] = plan
+        self.save(store)
+        return owner
 
     def clear_items(self, project_id, day):
         """只清「这一天的排期条目」，保留 ``count``（资源决定还要用于预填）。"""
         store = self.load()
+        _kind, owner = self.plan_owner(project_id, store=store)
+        if owner is None:
+            raise ValueError("没有项目 %s" % project_id)
         key = day.isoformat() if hasattr(day, "isoformat") else str(day)
-        for project in store["projects"]:
-            if project["id"] != int(project_id):
-                continue
-            plan = (project.get("plans") or {}).get(key)
-            if not plan:
-                return project
-            plan["items"] = []
-            plan["at"] = _now()
-            self.save(store)
-            return project
-        raise ValueError("没有项目 %s" % project_id)
+        plan = (owner.get("plans") or {}).get(key)
+        if not plan:
+            return owner
+        plan["items"] = []
+        plan["at"] = _now()
+        self.save(store)
+        return owner
 
     def record_items(self, project_id, day, items, append=False):
         """记下「这一天真的排了哪些本地任务」（唤起完成的证据）。
@@ -3463,32 +3657,31 @@ class ProjectStore(object):
         已经排过的 items，而不是把整天的计划覆盖成这一次。
         """
         store = self.load()
+        _kind, owner = self.plan_owner(project_id, store=store)
+        if owner is None:
+            raise ValueError("没有项目 %s" % project_id)
         key = day.isoformat() if hasattr(day, "isoformat") else str(day)
-        for project in store["projects"]:
-            if project["id"] != int(project_id):
-                continue
-            plans = project.setdefault("plans", {})
-            plan = plans.get(key) or {"count": 0, "items": []}
-            fresh = [dict(item) for item in items or []]
-            if append:
-                old = [dict(item) for item in plan.get("items") or []]
-                keys = {(str(x.get("pk") or ""), str(x.get("start") or ""),
-                         str(x.get("task_id") or "")) for x in old}
-                for item in fresh:
-                    item_key = (str(item.get("pk") or ""),
-                                str(item.get("start") or ""),
-                                str(item.get("task_id") or ""))
-                    if item_key not in keys:
-                        old.append(item)
-                        keys.add(item_key)
-                plan["items"] = old
-            else:
-                plan["items"] = fresh
-            plan["at"] = _now()
-            plans[key] = plan
-            self.save(store)
-            return project
-        raise ValueError("没有项目 %s" % project_id)
+        plans = owner.setdefault("plans", {})
+        plan = plans.get(key) or {"count": 0, "items": []}
+        fresh = [dict(item) for item in items or []]
+        if append:
+            old = [dict(item) for item in plan.get("items") or []]
+            keys = {(str(x.get("pk") or ""), str(x.get("start") or ""),
+                     str(x.get("task_id") or "")) for x in old}
+            for item in fresh:
+                item_key = (str(item.get("pk") or ""),
+                            str(item.get("start") or ""),
+                            str(item.get("task_id") or ""))
+                if item_key not in keys:
+                    old.append(item)
+                    keys.add(item_key)
+            plan["items"] = old
+        else:
+            plan["items"] = fresh
+        plan["at"] = _now()
+        plans[key] = plan
+        self.save(store)
+        return owner
 
     # -- 给界面用的行 -------------------------------------------------
     def preview(self, day=None, task_store=None, include_inactive=False):

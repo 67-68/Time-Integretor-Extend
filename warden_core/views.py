@@ -271,6 +271,8 @@ class ContractView(View):
         add_block("task", self.w.render_task_index())
         # 任务面板**下面**那块项目表（剩余 count / 进度 / 今天排了多少）。
         add_block("project", self.w.render_projects_table())
+        # 简单项目正在排这一场时，把它的 OmniFocus 清单摆出来（没有就不画）。
+        add_block("simple", self.w.render_simple_project_panel())
         for key, _label, renderable in blocks:
             if not self.w.block_folded(key):
                 out.append(renderable)
