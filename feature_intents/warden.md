@@ -633,6 +633,46 @@ prompt_toolkit 每敲**一个**字就重画一次 chrome（`on_text_changed` →
 注意：别往看板上放**秒以下**的时间（倒计时毫秒、spinner），那会让帧键每秒都对不上、
 缓存等于白做 —— 真需要就放进 `status_line()`（它不在缓存里，逐帧现算）。
 
+### 2026-11-25 追加：键入延迟（0.5s 那种卡手）的第二个根因
+
+上面第 2 条只让「同一秒里的重画」免费，但**没有解决 prompt 被反复求值**：
+prompt_toolkit 把 `PromptSession(message=...)` 当可调用对象，布局每次算高度、
+每次求值 `has_before_fragments` 过滤器都要重新调一遍 —— 实测**一轮渲染里
+会问十四到二十次**（`containers.py` 的 `preferred_height` / `_scroll` /
+`line_prefix`，栈里全是 `dynamic_prompt → shell.chrome`）。`chrome()` 单次
+6.5ms × 20 = 130ms/轮，正好是「敲一个字等半秒」。
+
+两处修（都用真 App 测过，见下）：
+
+1. **`chrome()` 按渲染轮次记忆**（`WardenShell._render_pass_key` + `_chrome_memo`）：
+   键 = prompt_toolkit 自己的 `render_counter` + 输入文字 + `frame_rev` + 视图 +
+   滚动位置。同一轮里从第二次开始直接复用同一个 `FormattedText`；下一轮
+   （`render_counter` 必变）重拼一次。**没有正在跑的 Application（测试 / `--exec` /
+   管道）时不启用**，走原路径。注意存的是**拼完之后**的键：拼这一趟自己会
+   `invalidate()`（重算警告、收消息），拿拼之前的键存，这一轮剩下的十几次调用
+   又全部落空。
+2. **帧签名不许读任务库**：`frame_signature()` 里原来传的是
+   `self.task_store.list()`，而 `.list()` 每次都 `open + json.load`
+   （266 条任务实测 **5.7ms**），每帧跑二十遍。`effective_task_hidden_columns()`
+   的 docstring 本来就写着「`tasks=None` 时不读任务库，只返回偏好里记的列名
+   （frame signature 用）」，改成不传参即可 —— 动态字段要多一列必然伴随命令 /
+   刷新（会 `invalidate`），漏了也最多晚一秒（帧键带整秒）。
+
+实测（隔离沙盒 + 真数据 + 真 `warden.py`，pty 被沙盒挡了所以用 prompt_toolkit 的
+PipeInput + 记录型 Output 跑真 App，按键→输出首字节）：
+
+| | 键入延迟中位 | 最差 |
+|---|---|---|
+| 修前 | 74–117 ms | 157–302 ms |
+| 修后 | **30–65 ms** | 82–172 ms |
+
+chrome 的 CPU 总量 3930ms/15s → 564ms/15s（一轮渲染从 20 次拼装降到 1 次）。
+
+还剩两处已知抖动（同一个量级，暂未动，见「未验证 / 待办」）：`collect_warnings`
+每 5 秒在主线程跑一次（45–190ms，在 `chrome()` 的 `warnings_refresh` 钩子里），
+和每秒一次的整帧重画。真要再快一档，得把看板从「prompt 的多行 message」改成
+布局里的独立 `Window(FormattedTextControl(...))`（那是 repl_kit 的改动）。
+
 ## 静音时段（`period mute`）
 
 「这个时段以后都静音」是**排班意图**，不是单场开关，所以它落在
@@ -923,6 +963,14 @@ python3 warden.py install-deps
   或用 `stat refresh full` 之外的路径。
 - **统计视图的高度**：内容比屏幕高时顶部会滚进滚动历史（终端的极限）。面板里
   「最近 14 天」+「按月」+「永不重订」都想要，所以行数不少；嫌高就先砍按月。
+- **打字手感的下一档（2026-11-25 记）**：`chrome()` 同轮记忆 + 帧签名不读盘之后，
+  键入延迟中位 30–65ms。还想再快，得动这两个：
+  ① `collect_warnings` 每 5 秒在主线程跑一次（45–190ms，挂在 `chrome()` 的
+  `warnings_refresh` 钩子上）→ 挪到后台 worker，主线程只应用结果；
+  ② prompt_toolkit 把整块看板当「多行 prompt」，每轮渲染都要重算它的行/宽度/
+  行前缀（一次 35–50ms）→ 改成布局里的独立 `Window(FormattedTextControl(...))`，
+  输入行单独一个 `BufferControl`。②是 repl_kit 的改动（paper_researcher 也用），
+  要先拍板；①只动 warden。
 
 ## 已删除的历史设计（别再抄回来）
 

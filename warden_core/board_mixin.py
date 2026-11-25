@@ -144,7 +144,11 @@ class BoardMixin(object):
             getattr(self, "data_filter", "disposable"),
             tuple(sorted(self.effective_hidden_columns())),
             tuple(sorted(self.effective_folded_blocks())),
-            tuple(sorted(self.effective_task_hidden_columns(self.task_store.list()))),
+            # 不传 tasks：这里每画一帧都要跑一次（渲染会把 prompt 求值十几遍），
+            # 传任务列表就得把 tasks.json 重新读一遍解析一遍（实测 5.7ms，
+            # 键入延迟的大头）。签名只负责「变没变」，动态字段出现必然伴随
+            # 命令 / 刷新 → invalidate；漏了也最多一秒（帧键带整秒时钟）。
+            tuple(sorted(self.effective_task_hidden_columns())),
             self.task_view_page, self.task_sort_key, self.task_sort_desc,
             self.task_group_by, self.task_search_query,
             isinstance(self.view, ChoreView), self.chore_index,

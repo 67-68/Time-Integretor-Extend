@@ -1203,6 +1203,86 @@ _fast = [(style, text) for style, text in shell_fast.chrome("task ")]
 _slow = [(style, text) for style, text in w.repl_kit.ReplShell.chrome(shell_fast, "task ")]
 check("快路径的提示/状态/提示符和框架原版一致", _fast[-2:], _slow[-2:])
 
+print("== 打字不掉帧：同一轮渲染里 prompt 只拼一次 ==")
+# prompt_toolkit 会把 prompt 当可调用对象反复求值（布局过滤器 + 每行高度 +
+# 行前缀），实测一轮渲染十几到二十次。真实键入延迟的大头就在这里，所以
+# chrome() 按 render_counter 记忆：同一轮里第二次开始直接复用。
+import types  # noqa: E402
+import prompt_toolkit.application.current as _ptc  # noqa: E402
+
+wd_memo = mkwarden()
+shell_memo = wd_memo.shell
+shell_memo._terminal_rows = lambda: 80
+shell_memo._frame_clock = lambda: 6000
+# 「拼了一次」= chrome() 走到 context_hint()（它只被 chrome 调一次；
+# 不用 view.render 计数：打字时看板多半是缓存的，重拼 prompt 不等于重排版）。
+_memo_built = {"n": 0}
+_real_context_hint = shell_memo.context_hint
+
+
+def _count_assembly(text=""):
+    _memo_built["n"] += 1
+    return _real_context_hint(text)
+
+
+shell_memo.context_hint = _count_assembly
+
+_fake_app = types.SimpleNamespace(render_counter=1)
+_real_get_app = _ptc.get_app_or_none
+_ptc.get_app_or_none = lambda: _fake_app
+try:
+    first = shell_memo.chrome("task ")
+    check("第一轮渲染真的拼了一次", _memo_built["n"], 1)
+    again = [shell_memo.chrome("task ") for _ in range(10)]
+    check("同一轮里连问 10 次 → 一次都不重拼", _memo_built["n"], 1)
+    check("同一轮里拿到的是同一个对象（直接复用）",
+          all(item is first for item in again), True)
+
+    _fake_app.render_counter = 2
+    second = shell_memo.chrome("task ")
+    check("下一轮渲染（render_counter 变了）→ 重拼一次", _memo_built["n"], 2)
+    check("重拼的东西和上一轮一样（内容没变）",
+          [(s, t) for s, t in second][-2:], [(s, t) for s, t in first][-2:])
+
+    # 状态一变（invalidate_frame）即使 render_counter 没动也必须重拼
+    shell_memo.invalidate_frame()
+    shell_memo.chrome("task ")
+    check("状态变了 → 同一轮里也重拼", _memo_built["n"], 3)
+
+    # 换了输入文字就是另一块 prompt
+    shell_memo.chrome("task 1 ")
+    check("输入文字变了 → 重拼", _memo_built["n"], 4)
+finally:
+    _ptc.get_app_or_none = _real_get_app
+
+# 没有 Application（测试 / --exec / 管道）时不记忆：每次都真拼
+_before = _memo_built["n"]
+shell_memo.chrome("task ")
+shell_memo.chrome("task ")
+check("没有 App 时不启用记忆（照原路径每次拼）", _memo_built["n"] - _before, 2)
+
+print("== 打字不掉帧：帧签名不读任务库 ==")
+wd_sig = mkwarden()
+_real_task_list = wd_sig.task_store.list
+
+
+def _no_task_list():
+    raise AssertionError("frame_signature 不该读任务库（每帧都要跑）")
+
+
+wd_sig.task_store.list = _no_task_list
+try:
+    sig = wd_sig.frame_signature()
+    check("帧签名在任务库不可读时也能算出来", isinstance(sig, tuple), True)
+    check("签名里有任务表隐藏列那一项", isinstance(sig, tuple) and len(sig) > 10, True)
+finally:
+    wd_sig.task_store.list = _real_task_list
+check("任务库恢复后可读", isinstance(wd_sig.task_store.list(), list), True)
+# 隐藏列偏好变了，签名必须跟着变（否则「关了某列」不会重排版）
+wd_sig.session_hidden_columns.setdefault(w.TASK_UI_MODE, set()).add("标题")
+check("隐藏列偏好变了 → 签名跟着变",
+      wd_sig.frame_signature() != sig, True)
+
 print("== 打字不掉帧：日志只读尾巴（daemon 日志能长到几十 MB）==")
 _real_log = ks.LOG_FILE
 log_path = os.path.join(TMP, "big.log")

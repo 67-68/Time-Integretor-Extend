@@ -47,6 +47,7 @@ class WardenShell(repl_kit.ReplShell):
         self.context_hint_hook = None      # ((text) -> [(style, line), ...])：命令介绍窗
         self._frame_memo = None            # (key, ansi_text)
         self._ansi_memo = None             # (ansi_text, chunks)
+        self._chrome_memo = None           # (render_pass_key, FormattedText)
         # 内部滚动：0 = 贴底（最新内容）。向上翻时离开底部，最多翻到整块
         # 看板的第一行；不会把内容漏到终端 scrollback 里。因为深色终端的
         # Alt-Screen 没有「往上滚」的原生操作，否则超高一截就只能丢顶部。
@@ -120,6 +121,7 @@ class WardenShell(repl_kit.ReplShell):
         """状态变了：下一次 chrome() 必须重新排版（不重排版就是旧画面）。"""
         self.frame_rev += 1
         self._frame_memo = None
+        self._chrome_memo = None
 
     def _frame_clock(self):
         """帧键里的时间位（整秒）。看板上最细的时间粒度就是秒。
@@ -172,7 +174,21 @@ class WardenShell(repl_kit.ReplShell):
         父类每次都把整块看板的 ANSI 交给 prompt_toolkit 的解析器（几十行，
         几毫秒）。看板没变时那几毫秒纯属白烧，所以把 fragments 也存下来。
         拼装顺序和父类一致：看板 → 提示行 → 状态行 → 提示符。
+
+        再看一层：prompt_toolkit 把 prompt 当成**可调用对象**，布局里每算一次
+        高度、每求值一次 ``has_before_fragments`` 都要重新调一遍 —— 实测一轮
+        渲染里会求值十几到二十次（见 ``containers.py`` 的 preferred_height /
+        过滤器）。整块拼装一次只几毫秒，乘二十就成了「敲一个字等半秒」。
+        所以同一轮渲染里只拼一次：键取 prompt_toolkit 自己的
+        ``render_counter``（同一轮渲染内不变，下一轮必变），再加几个状态位，
+        状态一变立刻重拼。没有 Application（测试 / ``--exec`` / 管道）时不记忆，
+        走的还是原路径。
         """
+        pass_key = self._render_pass_key(text)
+        if pass_key is not None:
+            memo = self._chrome_memo
+            if memo is not None and memo[0] == pass_key:
+                return memo[1]
         dashboard = self.frame_text()
         chunks = None
         if dashboard:
@@ -204,7 +220,38 @@ class WardenShell(repl_kit.ReplShell):
         if status:
             chunks.append((self.pt_status_class, status + "\n"))
         chunks.append((self.pt_prompt_class, self.prompt))
-        return FormattedText(chunks) if FormattedText is not None else chunks
+        result = FormattedText(chunks) if FormattedText is not None else chunks
+        if pass_key is not None:
+            # 记的是**拼完之后**的键：拼这一趟本身可能改了状态（重算警告、
+            # 收了条消息 → invalidate），拿拼之前的键存，这一轮剩下的
+            # 十几次调用又全部落空，白拼十几遍 —— 和 frame_text 同一个道理。
+            final_key = self._render_pass_key(text)
+            self._chrome_memo = (final_key, result) if final_key is not None else None
+        return result
+
+    def _render_pass_key(self, text):
+        """这一轮渲染的「轮次键」；没有正在跑的 Application 时返回 ``None``。
+
+        用 prompt_toolkit 自己的 ``render_counter``：它在每次 ``Renderer.render()``
+        时自增，同一轮布局求值里恒定 —— 正是「这一轮里重复问我要 prompt」
+        的那个边界。状态位（frame_rev / 视图 / 滚动）也进键：同一轮里状态若
+        被改动（比如画帧时顺手重排了警告），下次问就重拼，绝不交旧画面。
+        """
+        try:
+            from prompt_toolkit.application.current import get_app_or_none
+        except ImportError:                           # pragma: no cover - 老版本
+            return None
+        try:
+            app = get_app_or_none()
+        except Exception:                             # noqa: BLE001 - 取不到就当没有
+            return None
+        counter = getattr(app, "render_counter", None) if app is not None else None
+        if counter is None:
+            return None
+        # id(app) 也进键：新的 Application 从 0 开始数，光看 counter 会把
+        # 上一次运行存的画面当成这一轮的（同进程重开 App 时踩得到）。
+        return (id(app), counter, text, self.frame_rev, self.view_index,
+                int(self.scroll_offset))
 
     @staticmethod
     def _dashboard_chunks(dashboard):
