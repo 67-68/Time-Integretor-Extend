@@ -32,6 +32,10 @@ def check_true(label, got):
 
 
 TMP = tempfile.mkdtemp(prefix="simple-project-test-")
+# 罪/判决/守场状态都挂在 temp/ 下（keep_session 的 TEMP）——不隔离它，真实工作区
+# 里一条待认罪的场次就会让 `wd.handle(...)` 落进宣言闸门，测试直接假红。
+os.environ["TI_TEMP"] = TMP
+os.environ["TI_DATA_CSV"] = os.path.join(TMP, "data.csv")
 os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")
 os.environ["TI_CALENDAR_DOWNLOAD"] = os.path.join(TMP, "download.json")
 os.environ["TI_SESSION_LAYOUTS"] = os.path.join(TMP, "layouts.json")

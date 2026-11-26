@@ -2,7 +2,8 @@
 """formatter end 的 period-first 回归（2026-11-21 用户确认的口径）。
 
 规则：
-* 自动排序只在「period ∩ 非用户手订 ∩ 非进行中/静音」上做；
+* 自动排序只在「period ∩ 非用户手订 ∩ 非进行中」上做（**静音不影响容量**，
+  2026-11-26 用户口径）；
 * 用户手订场是硬洞：不塞任务、不取消，占用的时间从 period 扣掉；
 * 跨 period 的手订场按交集扣；扣完不足 25 分钟的段直接丢弃；
 * 当天没有计划 session 时，end 从可用窗口的尾巴切；有 session 仍走旧剪断路径。
@@ -296,6 +297,49 @@ check("切出来的那场仍是 25 分钟", cut["session"]["duration"], 25)
 check("T2 的 layout 末尾变成 25（被剪断）",
       sp.get_layout(sp.load_layouts(), TOMORROW, "T2")[-1], 25)
 check("旧路径也把任务挂上了", bool(cut["session"].get("start")), True)
+
+print("\n== 9) end：后面还有没切过的空时段时，不能被「前面那个有 session 的时段」骗走 ==")
+# 真实事故（2026-11-26）：T3 有 19:00 一场，T4 22:15–23:45 还没切过；end 只看
+# 「已经有 session 的时段」，把任务排到 T3 的 21:00，还在剪断 T3 时把前缀算成空、
+# 整段 remove 掉（丢了 75 分钟）。现在空时段也进候选，谁更晚谁赢。
+wd = fresh(periods([
+    {"id": "T3", "date": ISO, "start": "19:00", "end": "21:30",
+     "type": "工作", "name": "晚一", "calendar": "工作", "title": "晚一"},
+    {"id": "T4", "date": ISO, "start": "22:15", "end": "23:45",
+     "type": "工作", "name": "晚二", "calendar": "工作", "title": "晚二"},
+]))
+sp.set_layout(TOMORROW, "T3", [25], source="manual")
+sp.add_extra(TOMORROW, "19:00", 25, note="plan 提醒")
+wd.reload_periods()
+add_rows(wd, [api_row(TOMORROW, "19:00", 25, sid="sess-1900")])
+wd.handle("task create title=夜任务 duration=25 -f end")
+night = task_by_title(wd, "夜任务")
+res = (night.get("formatter") or {}).get("reservation") or {}
+check("切的是当天最后一段 T4 的 23:15（不是 T3 的 21:00）",
+      [res.get("period_id"), res.get("start"), res.get("end")],
+      ["T4", "23:15", "23:45"])
+check("T3 的排布没被 remove（19:00 那场还在）",
+      sp.get_layout(sp.load_layouts(), TOMORROW, "T3"), [25])
+check("T4 写成 [50,25]",
+      sp.get_layout(sp.load_layouts(), TOMORROW, "T4"), [50, 25])
+check("任务挂在 23:15 那场", night["session"]["start"], "23:15")
+
+print("\n== 10) 静音时段照样参与排期（quiet 只是 Focusmate 那一场）==")
+wd = fresh()
+sp.save_mutes({"version": 1, "mutes": [
+    {"date": ISO, "start": "09:00", "end": "12:30", "created_at": "2026-11-26T00:00:00"}]})
+w.forget_mute_cache()
+check("T1 被静音了，但仍算可用窗口",
+      windows_of(wd)[0], ("T1", "09:00", "12:30", True, 7))
+wd.handle("task create title=早上排plan duration=25 -f enlist")
+early = task_by_title(wd, "早上排plan")
+eres = (early.get("formatter") or {}).get("reservation") or {}
+check("enlist 照样排进早上的 T1（09:00）",
+      [eres.get("period_id"), eres.get("start")], ["T1", "09:00"])
+check("只切一场 25 分钟（不占用整段）",
+      sp.get_layout(sp.load_layouts(), TOMORROW, "T1"), [25])
+check("plan 的容量也照样算进这个静音时段",
+      "T1" in [x.get("period_id") for x in wd._plan_slots(TOMORROW)[0]], True)
 
 print("\n" + ("全部通过" if not fails else "失败 %d 条" % len(fails)))
 if fails:

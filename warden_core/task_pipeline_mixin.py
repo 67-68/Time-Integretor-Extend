@@ -169,7 +169,7 @@ class TaskPipelineMixin(object):
         note = "formatter 切的（任务 %s）" % (
             self.task_label(task) if task is not None else "?")
         try:
-            sp.add_extra(day, start, duration, note=note)
+            sp.add_extra(day, start, duration, note=note, source="formatter")
         except ValueError as exc:
             self.say("⚠ 没能把切出来的 %s %dmin 写进当天排期：%s（任务照样挂，"
                      "只是这一场没有计划）" % (start, duration, exc), "warn")

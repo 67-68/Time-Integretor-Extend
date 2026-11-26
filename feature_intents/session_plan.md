@@ -39,6 +39,87 @@ iCloud 日历（只 工作 / 空闲，今天 + 7 天）
 `commit_layout` 按任务反推 session 时长再写回 data.csv。已经过去 / 被静音 /
 被 formatter 硬占 / 有任务挂着的时段仍然照样排除（语义没变）。
 
+### 窗口裁剪：`period T1 09:45-12:30`
+
+用户 2026-11-26 的要求：「提供一个切割时段的命令，允许修改一个时段的开始和
+结束，只要被原本的时段包裹就行」。落地口径：
+
+- 写法 `period T1 09:45-12:30`，落盘 `temp/period-windows.json`
+  （`{"days": {"2026-11-26": {"T1": {"start","end","origin_start","origin_end"}}}}`），
+  `period T1 window [clear]` 查看 / 撤销；
+- 必须被**日历原时段**包裹（09:30–12:30 的 T1 只能往内收），且是 15 分钟整点
+  （Focusmate 槽位颗粒），至少 25 分钟（想关掉这一段请用 `period T1 clear`）；
+- 生效点是 `periods_for_date()` —— 容量、切场、看板、data.csv 全都从这里取时段，
+  所以只改一处就不会出现「看板按新窗口、data.csv 按旧起点」的分叉。`all_sessions()`
+  也必须跟着走（data.csv / daemon 吃的是它，2026-11-26 自测踩到过）；
+- 窗口一变，这一段已有 layout 按新起点重算：装得下就原样搬过去，装不下就清空该段
+  并提示 `plan` 重切（留着排不出来的 layout，下次 plan 会一直报错）。
+
+### 工具切的 layout 记 `auto`，extras 算硬洞
+
+- `commit_layout()` 没传 `source` 时落 `auto`（不是 `manual`）：formatter / watchdog
+  切完的段必须还能被 plan 重算，否则切掉的容量永远补不回来。
+- `available_windows()` 除了手订场，还要扣 `temp/session-extras.json`
+  里的场次（`extra_session_holes()`）：它们不在 layout 里，但是真实占用的时间。
+- 新 layout 覆盖到的起点，同一天的一次性 extras 由 `commit_layout` 收掉，
+  避免同一时刻既在 layout 又在「计划外」出现两次。
+
+### 洞只吃掉自己那段：manual 时段的中间空档也要还给 plan（2026-11-26）
+
+用户现场原话：「**19:25 - 21:25 那里去了？？？？**」「**这两个 session 依旧占掉我
+整一个时间段**」。T3 是 formatter 切的 manual `[25]`（19:00 一场）+ 21:00 一条
+extras：`tail_gap()` 拿**所有**行去验「序列对不对得上」，一条 extras 就让整段
+作废 → 2.5 小时的时段只产出两场 25 分钟，中间 3 个 count 凭空消失。
+
+口径：
+
+- 洞（extras、手订场）只按 `session_span()` 扣自己的占用，**不让整段变成 0 容量**；
+- layout 链上的场次原样保留（manual / formatter 是硬约束，不挪不动）；
+- 链尾之后的空档拆成若干窗口：整条尾巴都空 → 仍旧「原样追加」（`append`，
+  `prefix + 新时长`，一个已订场次都不动）；被洞切开 → 每截 ≥1 count 的窗口
+  各自成一个空场，`window=True`，落盘走 `extras`（layout 表达不了洞后的起点）；
+- 洞的占用从 **extras 账本**取，不只从 data.csv 的行取：extras 刚写进去、csv
+  还没重算的那一瞬，两边会不一致，漏掉就会排上去压住。
+- `_auto_period_slots()` 末尾那条「blocked period 一律 `period_auto=False`」必须
+  跳过窗口 slot，否则它会走固定 group 分支、挂到一条不存在的行上。
+
+### extras 也分「谁切的」：plan 的窗口可以重算
+
+`temp/session-extras.json` 每条记 `source`（`sp.extra_source()`，老记录按 note 认）：
+
+| source | 谁写 | plan 能不能重算 |
+|---|---|---|
+| `plan` | 排期为了避开手订场切出来的窗口 | 能（**任何** layout 的时段里都不算硬洞） |
+| `formatter` | formatter 按任务尾巴切的 | 不能（钉死，只许往里塞任务） |
+| `manual` | 用户 `session HH:MM LEN` 自己加的 | 不能 |
+
+「能不能重算」只看**谁切的**，不看它落在哪种 layout 里（2026-11-26 补）：
+manual layout 的时段（formatter / watchdog 切过）里，上一轮 plan 切的
+`19:30(50)+20:30(25)` 曾经变成永久固定桩 —— 这一轮明明有 19:30–21:00 一整块
+3 count，却只能按 50/25 两个槽填，3 count 的项目只好被「填缝」拆成 25+25+25
+撒进三个不同场次，还把 22:15 的 50 分钟场次填成 1 count（用户：「他为什么被拆成
+三块了？明明 2 和 3 也可以连起来」「让 SAT 和 English Review 完整排期」）。
+
+例外（仍然是硬洞）：**挂着本轮不会撤掉的任务**的 extras —— 那是内容约束，不是
+切分。判据 `_recuttable_extra_starts(day, replan)`：`source` 是 plan/auto，
+且那个起点上的任务全部属于本轮计划（`replan=False` 时只要挂任务就不算）。
+
+配套的两条：
+- `_row_slots()` **不认**这些窗口行当固定槽（否则它们又会以「50 / 25」的形状
+  回到容量里），容量统一由 `_auto_period_slots()` 的尾巴逻辑重算；
+- API 里还没换掉的旧场次（同一场改了时长、或整条被并进前一场的碎片）也不能当
+  资源或内容：`_superseded_row_starts()` 按「计划里这一段应该长什么样」把它们
+  剔掉（`_row_slots` / `_period_session_rows` / `manual_session_rows` 三处一致）。
+  没有这条，「改时长 → daemon 还没取消完 → 再 plan」会把刚合成的整块再切碎一次。
+
+以前不分出处：`plan clear` 之后 plan 自己切的窗口变成了永久硬洞 —— 那截时间
+既不在 layout 里、又被当成手订场，**永远回不到时段容量**（用户 2026-11-26：
+「plan clear 之后 session 没有办法恢复到时段」）。现在：
+- `extra_session_holes()` 在**自动 layout** 的时段里跳过 `plan`/`auto` 来源的 extras；
+- `commit_layout()` 重切一段时顺手把这一段里 `plan`/`auto` 来源的 extras 收掉
+  （配合 `_cancel_stale_period_sessions` 取消对应的旧场），不会留下重复行；
+- formatter / manual 的 extras 语义没变（硬洞 + 不许压）。
+
 契约表也照着这条走：**每个时段至少一行**。没切出 session 的时段由
 `_period_shell_rows()` 画一行占位（`period_only=True`）：时段三列照常显示、
 时长写「整段 Nmin」、状态写「未切 session」；它**不是** session（`id=None`、

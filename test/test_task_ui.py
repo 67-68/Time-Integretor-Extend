@@ -1081,7 +1081,9 @@ check("T1 的行都标了「时段静音」", [r.get("period_muted") for r in t1
 check("T2 的行没标", sorted({r.get("period_muted") for r in wd.rows
                               if r.get("period_id") == "T2"}), [False])
 targets = wd.mute_targets()
-expected_starts = [r["startLabel"] for r in t1_rows]
+# 「所有场次」= 真的 session；12:00 那行是「这一段的尾巴还没切」的占位行
+# （period_only，没有 id），不是 session，本来就不能静音。
+expected_starts = [r["startLabel"] for r in t1_rows if not r.get("period_only")]
 check("T1 当前所有场次都要静音",
       [r["startLabel"] for r in targets], expected_starts)
 wd.offline = False

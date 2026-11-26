@@ -380,7 +380,8 @@ bottleneck → incubator 标签的任务），另一侧显示成「+N 冻结」�
 - **没订上 Focusmate 的也计入** —— 面板会点名「哪几场还没订上」，并照常把它们
   排进空场；任务先本地挂到那场，等 daemon 订上之后 `refresh --check` 再补挂
   Focusmate；
-- 计划里有、没静音；
+- 计划里有；**静音不算排除条件**（`period mute` 只改 Focusmate 的 quiet mode，
+  2026-11-26 用户：「静音时段不应该不排啊，他们静音了又没关系」）；
 - **场次按开始日期归属**：`23:15–00:05` 这种跨午夜的场次算在 23:15 那一天；
   判断用 `startMs` / 开始时间，不看到终点落在哪天，所以今天开始、明天结束的场次
   不会从今天的 plan 里漏掉。
@@ -393,14 +394,48 @@ bottleneck → incubator 标签的任务），另一侧显示成「+N 冻结」�
   `blocked_periods`，尾巴那截被静悄悄吃掉 —— 19:00(75) 之后 20:15–21:30 明明
   还空着 60 分钟（2 count），plan 却说只剩 2 count。现在 `_auto_period_slots`
   的阶段 3.5 用 `session_plan.tail_gap()` 把「最后一场 + 休息 → 时段终点」算成
-  缺口 slot（`append=True`）。**只认尾巴、只追加**：layout 是「从时段起点接龙的
-  duration 列表」，`prefix + 新时长` 不会挪动前面任何一场；中间的空洞不算（插
-  一场会把后面已订上的场次整体挪位 = 取消 + 重订）。现有场次序列必须和
+  缺口 slot（`append=True`）。**整条尾巴都空着时只追加**：layout 是「从时段起点
+  接龙的 duration 列表」，`prefix + 新时长` 不会挪动前面任何一场。尾巴被洞
+  （extras / 手订场）切开时，每一截 ≥1 count 的窗口单独算一个空场
+  （`window=True`，落盘成 extras）——**洞后面插一场不会再挪动任何已订场次**，
+  因为它们本来就是 extras，不是 layout 接龙的一部分（2026-11-26 用户报
+  「这两个 session 依旧占掉我整一个时间段」）。layout 链上的场次序列仍必须和
   `plan_period(prefix)` 完全对得上（计划 16:15 / 实际 16:00 这种对不上的时段
   宁可不追加）。表格里会多一行「剩余 60min（2 count）未切 session」。
 - **plan 自己切出来的段带 `source="plan"`**：契约列显示 `🗂plan`，下一次 plan
-  把它当自动段（可以重算）；用户 `period` / formatter 切的是 `manual`，硬约束。
-  记号的意义就是用户要的「plan 产生的 session 有一个特殊标记」。
+  把它当自动段（可以重算）；用户 `period` 切的是 `manual`，硬约束。
+  **工具切的（formatter / watchdog）落 `auto`**：`commit_layout()` 没收到
+  `source` 时不再回落成 `manual` —— 2026-11-26 事故就是 end 切完的 T3 被记成
+  manual，从此 plan 再也不碰它，丢掉的 100 分钟永远补不回来（「被切开之后没有
+  自动恢复」）。
+- **extras 也是洞，但只吃自己那段**：不在 layout 里的真实场次（被挪过的已订场、
+  formatter 切的尾巴、plan 切的窗口）由 `available_windows()` 从容量里扣掉
+  （`extra_session_holes()`）。2026-11-26 事故一：11:15 那场被挪过的已订场没有
+  layout 来源，plan 按整段容量重切，排出 11:00(50) / 12:00(25) 直接压住它 ——
+  判据是「真实占用的时间就是被占用的时间」，不管它属于谁。
+  事故二（同一天，用户「19:25 - 21:25 那里去了？？？？」）：manual 时段的
+  `tail_gap()` 拿**所有**行验序列，一条 extras 就让整段 0 容量。现在洞只按
+  `session_span()` 扣自己的占用，链尾之后的空档要么原样追加、要么拆成窗口
+  落 extras —— 详见 `feature_intents/session_plan.md`。
+- **extras 记 `source`（谁切的）**：`plan` / `formatter` / `manual`。**任何** layout 的
+  时段里，`plan` 切出来的窗口都不算硬洞、重切时一起收掉；formatter / manual 仍然
+  钉死。否则 `plan clear` 之后那些窗口会变成永久硬洞，那截时间再也回不到时段容量
+  （用户：「plan clear 之后 session 没有办法恢复到时段」）。
+  2026-11-26 追加（用户：「他为什么被拆成三块了？明明 2 和 3 也可以连起来」）：
+  以前这条豁免只在**自动** layout 的时段里生效；manual layout（formatter/watchdog
+  切过）里，上一轮 plan 的 `50+25` 就成了永久固定桩，3 count 的项目只能被填缝拆成
+  `25+25+25` 撒进三场，还把 22:15 的 50 分钟场次填成 1 count。现在判据只看
+  「谁切的」：`_recuttable_extra_starts()` + `_row_slots()` 不认这些窗口行当固定槽，
+  容量由尾巴逻辑重算成整块（19:30–21:00 的 3 count 就切回一条 `19:30(75)`）。
+  挂着**本轮不会撤掉**的任务的 extras 仍是硬洞（内容约束，不是切分）。
+- **API 里的旧场次正在被换掉时不算资源**（`_superseded_row_starts()`）：plan 改了
+  一场的时长（19:30 50→75）或把它并进前一场（20:30 那条），daemon 还没取消完之前
+  API 里还是旧的行。拿它当容量/内容，就会把刚合成的整块再切碎一次；现在按「计划
+  里这一段该长什么样」把同一起点时长不符、以及被计划场次占用包住的碎片剔掉。
+- **挂任务以计划为准**（`_plan_row_index()`）：`rebuild_rows()` 合并时 API 的旧时长
+  会盖住计划（19:30 显示 50），`_assign_task` 就会把任务挂到「50 分钟」那一场，
+  plan 指纹 / due / 界面全错，下一轮 refresh 再判「绑定和计划不一致」整天重排。
+  现在分配前按 (日期, 起点) 对齐计划时长并清掉旧 id（那一场正等着重订）。
 
 容量 = Σ 场次时长 ÷ 25 count（`1 count = 25 分钟`），同时给出「含每块 5 分钟休息」
 的分钟数（用户原话：*4 count = 100 分钟，如果加上 focusmate 25 分钟 session 的
@@ -656,7 +691,7 @@ plan -c -s 1 -p 2       # 需要时可把当前进行中的 session 也纳入
 ```
 
 - session 序号 = 契约表上的 `#`；project 序号 = Project 表 / `plan` 的 `#`；
-- 只接受空格、没挂任务、没被 formatter 占掉、没静音、未结束的 session；
+- 只接受空格、没挂任务、没被 formatter 占掉、未结束的 session（静音不影响）；
 - 该项目自己的 `sequential / parallel` 规则照常生效；
 - 结果**追加**进当天的 `plans[day]`，不会覆盖当天已有的分配和 items；
 - 这条路径不打开交互分配面板，适合「这一场空出来了，就排这个项目」。
@@ -691,7 +726,7 @@ project 1 -ac       # 第一条任务挂到当前/最近一场
 
 1. 项目库里有 active 项目；
 2. **今天一个项目都没分过 count**（`plans[今天].count` 全为 0）；
-3. 今天还有**没开始、没挂任务、没静音**的场次。
+3. 今天还有**没开始、没挂任务**的场次（静音不影响，2026-11-26）。
 
 ```
 今天还没 plan：还有 3 场空闲（6 count）没分给项目（11:00、12:00、15:00）

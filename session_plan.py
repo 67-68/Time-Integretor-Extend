@@ -47,6 +47,8 @@ LAYOUTS_FILE = os.path.join(TEMP, "session-layouts.json")
 EXTRAS_FILE = os.path.join(TEMP, "session-extras.json")
 #: 长期规则（按星期几重复；session --permanent 写这里）
 RULES_FILE = os.path.join(TEMP, "session-rules.json")
+#: 某天某段的**窗口裁剪**（`period T1 09:45-12:30` 写这里；被日历原时段包裹）
+PERIOD_WINDOWS_FILE = os.path.join(TEMP, "period-windows.json")
 DATA_CSV = os.environ.get("TI_DATA_CSV") or os.path.join(HERE, "data.csv")
 DURATIONS = (25, 50, 75)
 #: 1 count = 25 分钟工作；Focusmate 每场结束强制休息 5 分钟/块，所以 25/50/75 的
@@ -187,8 +189,18 @@ def periods_for_date(download_or_path, day):
     data = (load_download(download_or_path)
             if isinstance(download_or_path, (str, type(None))) else download_or_path)
     iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
-    return [p for p in data.get("periods") or []
-            if isinstance(p, dict) and p.get("date") == iso]
+    out = [p for p in data.get("periods") or []
+           if isinstance(p, dict) and p.get("date") == iso]
+    # 用户手工裁过的窗口（`period T1 09:45-12:30`）在这里统一生效：容量、切场、
+    # 看板、data.csv 全都吃同一个 periods_for_date，所以只改这一处就够了。
+    windows = None
+    trimmed = []
+    for period in out:
+        if windows is None:
+            windows = load_period_windows()
+        rec = _window_for(windows, iso, period.get("id"))
+        trimmed.append(_apply_window(period, rec) if rec else period)
+    return trimmed
 
 
 def build_periods(events, start_date, days, profiles=None):
@@ -675,6 +687,9 @@ def load_extras(path=None):
             if duration not in DURATIONS:
                 continue
             rec = {"start": start, "duration": duration}
+            src = str(item.get("source") or "").strip().lower()
+            if src in EXTRA_SOURCES:
+                rec["source"] = src
             if item.get("note"):
                 rec["note"] = str(item["note"])
             if item.get("created_at"):
@@ -699,8 +714,33 @@ def _drop_old_extras(data, today=None):
     return data
 
 
-def add_extra(day, hhmm, duration, note=None, path=None):
-    """往某一天加一场一次性 session（重复就报错）。返回 (dates_key, rec)。"""
+#: extras 的三种来源：谁切的，决定它下一次 plan 能不能被重算。
+#:   * ``plan``      —— 排期为了避开手订场切出来的窗口（TI 自己切的，可重切）；
+#:   * ``formatter`` —— formatter 按任务尾巴切的（硬约束，只许往里塞任务）；
+#:   * ``manual``    —— 用户 `session <HH:MM> <dur>` 自己加的（硬约束）。
+EXTRA_SOURCES = ("plan", "formatter", "manual", "auto")
+
+
+def extra_source(rec):
+    """这一条 extras 是谁切的：先读 ``source``，老记录按 note 认。"""
+    rec = rec or {}
+    src = str(rec.get("source") or "").strip().lower()
+    if src in EXTRA_SOURCES:
+        return src
+    note = str(rec.get("note") or "")
+    if note.startswith("plan 切"):
+        return "plan"
+    if note.startswith("formatter"):
+        return "formatter"
+    return "manual"
+
+
+def add_extra(day, hhmm, duration, note=None, path=None, source=None):
+    """往某一天加一场一次性 session（重复就报错）。返回 (dates_key, rec)。
+
+    ``source`` 记「谁切的」（见 :data:`EXTRA_SOURCES`）：auto/plan 的窗口下一次
+    排期可以重算，formatter/manual 是硬约束。
+    """
     iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
     got = parse_hhmm(hhmm)
     if got is None:
@@ -721,6 +761,8 @@ def add_extra(day, hhmm, duration, note=None, path=None):
     if any(r.get("start") == start for r in rows):
         raise ValueError("%s 已经有一场一次性 session 在 %s 了" % (iso, start))
     rec = {"start": start, "duration": duration, "created_at": _now()}
+    if source:
+        rec["source"] = str(source)
     if note:
         rec["note"] = str(note)
     rows.append(rec)
@@ -749,6 +791,151 @@ def remove_extra(day, hhmm, path=None):
 def extras_for_date(data, day):
     iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
     return list((data.get("dates") or {}).get(iso) or [])
+
+
+# ---------------------------------------------------------------- 窗口裁剪
+#
+# 「这个时段的开始/结束我想自己改」——例如早上两场 Focusmate 被挪到 09:45 /
+# 11:15 之后，09:30–12:30 的 T1 已经装不下原来那三场了。于是允许按天把某个
+# 时段的窗口裁到 [start, end]，**只要被日历原时段包裹**：
+#
+#     period T1 09:45-12:30     ← 裁窗口（落盘到 temp/period-windows.json）
+#     period T1 window clear    ← 撤销，回到日历原窗口
+#
+# 为什么落在单独一份表、而不是改 calendar-download.json：下载层是**外部真相**，
+# 每次 download_calendar 都会整份重写；用户的裁剪是本地意图，必须能和它并存。
+# 为什么只改 periods_for_date：容量/切场/看板/data.csv 全都从这里取时段，改一处
+# 就不会出现「看板按新窗口、plan 按旧窗口」的分叉。
+
+
+def period_windows_path(path=None):
+    if path:
+        return path
+    env = os.environ.get("TI_PERIOD_WINDOWS")
+    if env:
+        return env
+    # 测试老习惯只重定向 TI_SESSION_EXTRAS（不动 TI_TEMP）：新账本跟着同一目录走，
+    # 否则所有单测都会读写用户真实的 temp/period-windows.json。
+    extras = os.environ.get("TI_SESSION_EXTRAS")
+    if extras:
+        return os.path.join(os.path.dirname(extras), "period-windows.json")
+    return PERIOD_WINDOWS_FILE
+
+
+def empty_period_windows():
+    return {"version": 1, "days": {}}
+
+
+def load_period_windows(path=None):
+    try:
+        with open(period_windows_path(path), encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return empty_period_windows()
+    if not isinstance(raw, dict):
+        return empty_period_windows()
+    raw.setdefault("version", 1)
+    if not isinstance(raw.get("days"), dict):
+        raw["days"] = {}
+    return raw
+
+
+def save_period_windows(data, path=None):
+    _atomic_json(period_windows_path(path), data)
+    return period_windows_path(path)
+
+
+def _window_for(data, iso, period_id):
+    rec = ((data.get("days") or {}).get(str(iso)) or {}).get(str(period_id))
+    if not isinstance(rec, dict):
+        return None
+    try:
+        start = "%02d:%02d" % parse_hhmm(rec.get("start"))
+        end = "%02d:%02d" % parse_hhmm(rec.get("end"))
+    except (TypeError, ValueError):
+        return None
+    return {"start": start, "end": end}
+
+
+def _apply_window(period, rec):
+    """把裁剪窗口贴到 period 的副本上，原窗口留在 origin_start/origin_end。"""
+    out = dict(period)
+    out["origin_start"] = period.get("start")
+    out["origin_end"] = period.get("end")
+    out["start"] = rec["start"]
+    out["end"] = rec["end"]
+    out["windowed"] = True
+    for key, val in (("start_iso", rec["start"]), ("end_iso", rec["end"])):
+        old = period.get(key)
+        if isinstance(old, str) and len(old) >= 16 and old[10:11] == "T":
+            out[key] = old[:11] + val + old[16:]
+    return out
+
+
+def _minute_of(hhmm):
+    got = parse_hhmm(hhmm)
+    if got is None:
+        return None
+    return got[0] * 60 + got[1]
+
+
+def set_period_window(day, period, start, end, path=None):
+    """把 ``day`` 这一天的时段窗口裁到 ``start``–``end``。返回落盘记录。
+
+    只做三件事：校验（必须被原时段包裹、15 分钟整点）、落盘、返回。
+    不碰 layout —— 装不下新窗口的旧排布由调用方（`cmd_period_layout`）清掉，
+    因为「改窗口」和「重切 session」是两件事，混在一起的报错会更难读。
+    """
+    iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+    period_id = str(period.get("id") or "").strip().upper()
+    if not period_id:
+        raise ValueError("这个时段没有 ID，裁不了")
+    got_s, got_e = parse_hhmm(start), parse_hhmm(end)
+    if got_s is None or got_e is None:
+        raise ValueError("窗口要写成 HH:MM-HH:MM（例如 09:45-12:30）")
+    if got_s[1] % 15 or got_e[1] % 15:
+        raise ValueError("Focusmate 只认 15 分钟整点（:00/:15/:30/:45）；"
+                         "你给的是 %s-%s" % (fmt_hhmm(*got_s), fmt_hhmm(*got_e)))
+    s_min, e_min = got_s[0] * 60 + got_s[1], got_e[0] * 60 + got_e[1]
+    p_s = _minute_of(period.get("start"))
+    p_e = _minute_of(period.get("end"))
+    if p_s is None or p_e is None:
+        raise ValueError("%s 的原窗口读不出来（%r–%r）"
+                         % (period_id, period.get("start"), period.get("end")))
+    if p_e <= p_s:
+        p_e += 24 * 60
+    if e_min <= s_min:
+        e_min += 24 * 60
+    if s_min < p_s or e_min > p_e:
+        raise ValueError("窗口必须被原时段 %s–%s 包裹；你给的是 %s–%s"
+                         % (fmt_hhmm(*parse_hhmm(period.get("start"))),
+                            fmt_hhmm(*parse_hhmm(period.get("end"))),
+                            fmt_hhmm(*got_s), fmt_hhmm(*got_e)))
+    if e_min - s_min < MINUTES_PER_COUNT:
+        raise ValueError("窗口只有 %d 分钟，装不下 1 count（%d 分钟）"
+                         % (e_min - s_min, MINUTES_PER_COUNT))
+    data = load_period_windows(path)
+    days = data.setdefault("days", {})
+    days.setdefault(iso, {})[period_id] = {
+        "start": fmt_hhmm(*got_s), "end": fmt_hhmm(*got_e),
+        "origin_start": period.get("start"), "origin_end": period.get("end"),
+        "updated_at": _now(),
+    }
+    save_period_windows(data, path)
+    return dict(days[iso][period_id])
+
+
+def clear_period_window(day, period_id, path=None):
+    iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+    pid = str(period_id).strip().upper()
+    data = load_period_windows(path)
+    days = data.get("days") or {}
+    removed = (days.get(iso) or {}).pop(pid, None)
+    if removed is not None:
+        if not days.get(iso):
+            days.pop(iso, None)
+        save_period_windows(data, path)
+    return removed
 
 
 # ---------------------------------------------------------------- 长期规则
@@ -843,9 +1030,20 @@ def remove_rule(weekday, hhmm, path=None):
 
 
 def all_sessions(download, layouts):
-    """下载结果 + 自定义 layout → 所有日期的 session（不写任何文件）。"""
+    """下载结果 + 自定义 layout → 所有日期的 session（不写任何文件）。
+
+    窗口裁剪（``period T1 09:45-12:30``）在这里也要生效：data.csv / 看板 / daemon
+    都从这份 session 列表来，漏了这一步就会出现「看板按新窗口、data.csv 还是旧
+    起点」的分叉（2026-11-26 自测踩到）。
+    """
+    windows = None
     out = []
     for period in download.get("periods") or []:
+        if windows is None:
+            windows = load_period_windows()
+        window = _window_for(windows, period.get("date"), period.get("id"))
+        if window:
+            period = _apply_window(period, window)
         try:
             out.extend(sessions_for_period(period, layouts))
         except ValueError:

@@ -241,6 +241,279 @@ def case_4_pin_standalone_task():
     return paths
 
 
+
+def case_5_period_window_trim():
+    """裁时段窗口（`period T1 13:15-15:00`）：真子进程 + 只看落盘。
+
+    2026-11-26 用户要求：「提供一个切割时段的命令，允许修改一个时段的开始和
+    结束，只要被原本的时段包裹就行」。这里验三件事：
+
+    1. 裁完窗口，plan 的场次全都落在新窗口里（data.csv 是证据）；
+    2. 原来的 layout 装不下新窗口 → 被清掉而不是留着排不出来；
+    3. 越界（12:00 早于原起点 13:00）→ 整条拒绝，窗口一个字节都不动。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+
+    first = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
+                           "pro 1 2", "pro 2 2", "pro 3 1", "complete"])
+    check("裁之前 plan 退出码 0", first["rc"], 0)
+    check("裁之前用满 13:00–15:30", bb.csv_rows(paths),
+          [("13:00", 75), ("14:30", 50)])
+
+    trim = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                          "period T1 13:15-15:00",
+                          "plan %d" % bb.DEFAULT_OFFSET, "complete"])
+    check("裁窗口+重排 退出码 0", trim["rc"], 0)
+    saved = bb._read_json(paths["period_windows"])
+    check("窗口落盘（13:15–15:00）",
+          (saved["days"][iso]["T1"]["start"], saved["days"][iso]["T1"]["end"]),
+          ("13:15", "15:00"))
+    rows = bb.csv_rows(paths)
+    check("重排后一场都不早于 13:15", all(r[0] >= "13:15" for r in rows), True)
+    check("重排后总时长 ≤ 新窗口容量（105 分钟 → 3 count）",
+          sum(r[1] for r in rows) <= 75, True)
+    check("新窗口排得下 3 count", sum(r[1] for r in rows), 75)
+
+    bad = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                         "period T1 12:00-15:00"])
+    check("越界被拒（12:00 早于原起点 13:00）", "包裹" in (bad.get("out") or ""), True)
+    still = bb._read_json(paths["period_windows"])
+    check("拒绝之后窗口没被改", still["days"][iso]["T1"]["start"], "13:15")
+
+    back = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                          "period T1 window clear", "plan %d" % bb.DEFAULT_OFFSET])
+    check("撤销窗口 退出码 0", back["rc"], 0)
+    cleared = bb._read_json(paths["period_windows"])
+    check("撤销之后落盘里没有这一天了",
+          (cleared.get("days") or {}).get(iso), None)
+    check("撤销之后又能用满 13:00–15:30",
+          [r for r in bb.csv_rows(paths) if r[0] < "13:15"], [("13:00", 75)])
+    return paths
+
+
+def case_7_manual_period_hole_keeps_capacity():
+    """手动 layout + 中间一条 extras：洞只占自己那段，别把整段吞掉。
+
+    2026-11-26 现场（用户原话「19:25 - 21:25 那里去了？？？？」）：T3 是
+    ``[25]``（formatter 切的）+ 21:00 一条 extras，``tail_gap`` 拿所有行验序列，
+    一错就整段放弃 —— 2.5 小时的时段只产出两场 25 分钟，中间 3 个 count 消失。
+
+    这里用黑盒复刻同一形状（13:00–15:30 + 手动 ``[25]`` + 15:00 的 extras）：
+    1. plan 面板把 13:30(75) 那截算成空场，容量 125 分钟 = 5 count；
+    2. 排进去之后落成 extras（layout 表达不了洞后的起点），data.csv 三场都在；
+    3. 原来的 manual layout 不被重切（硬约束）。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+    # 先把 extras 写进账本，再由 `period` 那次落盘把 data.csv 一起重算出来
+    # （真实流程里 extras 一写就会重算 csv，黑盒里要显式给这一步）。
+    extras = bb._read_json(paths["extras"])
+    extras.setdefault("dates", {})[iso] = [
+        {"start": "15:00", "duration": 25, "note": "formatter 切的（黑盒）"}]
+    bb._write_json(paths["extras"], extras)
+    made = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "period T1 25"])
+    check("手动切 [25] 退出码 0", made["rc"], 0)
+    check("切完之后 data.csv 有 13:00 和 15:00",
+          bb.csv_rows(paths), [("13:00", 25), ("15:00", 25)])
+
+    opened = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                            "plan %d" % bb.DEFAULT_OFFSET])
+    check("plan 打开 退出码 0", opened["rc"], 0)
+    check("面板把 13:30 的空档算成空场", say(opened, "13:30(75)"), True)
+    check("容量 125 分钟 = 5 count（不是只剩两个 25）",
+          say(opened, "125 分钟 = 5 count"), True)
+    check("三场空场都列出来了", say(opened, "13:00(25) 13:30(75) 15:00(25)"), True)
+
+    done = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                          "plan %d" % bb.DEFAULT_OFFSET,
+                          "pro 1 2", "complete"])
+    check("排完 退出码 0", done["rc"], 0)
+    rows = bb.csv_rows(paths)
+    check("data.csv 是 13:00(25) / 13:30(50) / 15:00(25)",
+          rows, [("13:00", 25), ("13:30", 50), ("15:00", 25)])
+    saved = bb._read_json(paths["extras"])["dates"].get(iso) or []
+    check("13:30 那场落成 extras（不是改 layout）",
+          any(str(r.get("start")) == "13:30" and int(r.get("duration") or 0) == 50
+              for r in saved), True)
+    check("plan 切的 extras 记了 source=plan",
+          any(str(r.get("start")) == "13:30" and (r.get("source") == "plan")
+              for r in saved), True)
+    check("原来的 extras 还在（15:00）并标成 formatter",
+          any(str(r.get("start")) == "15:00" for r in saved), True)
+    layout = (bb.layouts(paths, day).get("T1") or {})
+    check("manual layout 没被重切", layout.get("durations"), [25])
+    check("manual layout 来源还是 manual", layout.get("source"), "manual")
+    return paths
+
+
+def case_8_plan_window_extra_recovers_after_clear():
+    """plan 自己切的窗口 extra，`plan clear` 之后必须还能重算（不是永久硬洞）。
+
+    2026-11-26 用户原话：「你还是没有处理 plan clear 之后 session 没有办法恢复
+    到时段的问题」。以前 extras 不分出处：plan 为了避开手订场切出来的那一截，
+    clear 之后被当成手订场钉死 —— 那截时间既不在 layout 里、又不在容量里。
+
+    黑盒复刻：自动时段 13:00–15:30 + 13:00 一条 formatter 的 extras（硬洞），
+    首轮 plan 在 13:30 切出窗口 → clear → 再 plan，容量仍是 4 count、
+    data.csv 不出现重复行、plan 的 extras 只有一条。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+    extras = bb._read_json(paths["extras"])
+    extras.setdefault("dates", {})[iso] = [
+        {"start": "13:00", "duration": 25, "note": "formatter 切的（黑盒）"}]
+    bb._write_json(paths["extras"], extras)
+
+    first = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                           "plan %d" % bb.DEFAULT_OFFSET,
+                           "pro 1 2", "complete"])
+    check("首轮 plan 退出码 0", first["rc"], 0)
+    check("首轮把窗口落成 13:30(50)",
+          bb.csv_rows(paths), [("13:00", 25), ("13:30", 50)])
+    saved = bb._read_json(paths["extras"])["dates"].get(iso) or []
+    check("13:30 那条 extras 记了 source=plan",
+          [(r.get("start"), r.get("source")) for r in saved],
+          [("13:00", None), ("13:30", "plan")])
+
+    cleared = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "plan clear"])
+    check("plan clear 退出码 0", cleared["rc"], 0)
+    check("clear 之后 extras 一条没少",
+          len((bb._read_json(paths["extras"])["dates"].get(iso) or [])), 2)
+
+    again = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                           "plan %d" % bb.DEFAULT_OFFSET])
+    check("clear 之后再 plan 退出码 0", again["rc"], 0)
+    check("容量没缩水（还是 4 count = 13:30–15:30）",
+          say(again, "100 分钟 = 4 count"), True)
+    check("13:30 的窗口还在空场里", say(again, "13:30(100)"), True)
+
+    replan = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                            "plan %d" % bb.DEFAULT_OFFSET,
+                            "pro 1 2", "complete"])
+    check("再排一次退出码 0", replan["rc"], 0)
+    check("data.csv 没有重复行",
+          bb.csv_rows(paths), [("13:00", 25), ("13:30", 50)])
+    saved = bb._read_json(paths["extras"])["dates"].get(iso) or []
+    check("plan 的 extras 仍然只有一条",
+          [(r.get("start"), int(r.get("duration") or 0))
+           for r in saved if r.get("source") == "plan"], [("13:30", 50)])
+    return paths
+
+
+def case_6_extras_are_hard_holes():
+    """不在 layout 里的真实场次（extras）必须是硬洞，plan 不许压上去。
+
+    2026-11-26 事故：11:15 那场被挪过的已订场在本地没有 layout 来源，plan 按
+    整段容量重切，排出 11:00(50) / 12:00(25) 两场直接压住它。判据：plan 出来的
+    每一场，都不和 extras 的实际占用（含 5 分钟休息）重叠。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+    extras = bb._read_json(paths["extras"])
+    extras.setdefault("dates", {})[iso] = [{"start": "14:00", "duration": 50,
+                             "note": "被挪过的已订场（黑盒）"}]
+    bb._write_json(paths["extras"], extras)
+
+    res = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
+                         "pro 1 2", "pro 2 2", "pro 3 1", "complete"])
+    check("有 extras 时 plan 退出码 0", res["rc"], 0)
+    rows = bb.csv_rows(paths)
+    check("extras 本身还在", [r for r in rows if r[0] == "14:00"], [("14:00", 50)])
+
+    def span(start, dur):
+        h, m = (int(x) for x in start.split(":"))
+        s = h * 60 + m
+        return s, s + dur // 25 * 5 + dur
+
+    hole = span("14:00", 50)                       # 14:00 → 15:00（含休息）
+    overlaps = [r for r in rows
+                if r[0] != "14:00" and span(*r)[0] < hole[1] and span(*r)[1] > hole[0]]
+    check("没有任何 plan 场次压住 extras", overlaps, [])
+    check("容量只按洞扣完的算（2 + 1 = 3 count）",
+          sum(r[1] for r in rows if r[0] != "14:00"), 75)
+    return paths
+
+def case_9_plan_own_windows_recut_in_manual_period():
+    """手动 layout 的时段里，plan 上一轮自己切的窗口必须能重切成整块。
+
+    2026-11-26 现场（用户原话「他为什么被拆成三块了？明明 2 和 3 也可以连起来」
+    「让 SAT 和 English Review 完整排期」）：T3 是 manual ``[25]`` + 21:00 的
+    formatter 洞，上一轮 plan 为了避开洞把中间切成 ``19:30(50)+20:30(25)`` 两条
+    window extras。下一轮 plan 把这两条当成固定桩：3 count 的项目找不到一整场，
+    被填缝拆成 25+25+25 撒到 20:30 / 21:00 / 22:15，22:15 的 50 分钟场次只填了
+    1 count。
+
+    黑盒复刻（13:00–15:30 + 手动 ``[25]`` + 15:00 的 formatter 洞）：
+    1. 第一轮 2 count → 窗口 13:30(50)；
+    2. 第二轮 3 count → 必须**重切**成 13:30(75) 一条，而不是 14:30 再来一条；
+    3. 第三轮再排一次：幂等，data.csv / extras 一个字不变。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+    extras = bb._read_json(paths["extras"])
+    extras.setdefault("dates", {})[iso] = [
+        {"start": "15:00", "duration": 25, "note": "formatter 切的（黑盒）"}]
+    bb._write_json(paths["extras"], extras)
+    # fixture 里「A · 写方案骨架」只有 2 count；这一场要验证「3 count 整场放得下」，
+    # 用简单项目（容量 ∞、每次 plan 一条虚拟任务），不掺 invested 账。
+    made = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "pro 1 simple",
+                          "period T1 25"])
+    check("手动切 [25] 退出码 0", made["rc"], 0)
+    check("切完之后 data.csv 是 13:00 / 15:00", bb.csv_rows(paths),
+          [("13:00", 25), ("15:00", 25)])
+
+    first = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                           "plan %d" % bb.DEFAULT_OFFSET,
+                           "pro 1 2", "complete"])
+    check("第一轮 2 count 排完 退出码 0", first["rc"], 0)
+    check("第一轮把窗口落成 13:30(50)", bb.csv_rows(paths),
+          [("13:00", 25), ("13:30", 50), ("15:00", 25)])
+    saved = bb._read_json(paths["extras"])["dates"].get(iso) or []
+    check("13:30 那条记了 source=plan",
+          [(r.get("start"), int(r.get("duration") or 0), r.get("source"))
+           for r in saved], [("13:30", 50, "plan"), ("15:00", 25, None)])
+
+    opened = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                            "plan %d" % bb.DEFAULT_OFFSET])
+    check("第二轮打开 退出码 0", opened["rc"], 0)
+    check("面板把上一轮切的 50+25 还原成一整块 13:30(75)",
+          say(opened, "13:30(75)"), True)
+    check("容量 = 125 分钟 = 5 count", say(opened, "125 分钟 = 5 count"), True)
+
+    second = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                            "plan %d" % bb.DEFAULT_OFFSET,
+                            "pro 1 3", "complete"])
+    check("第二轮 3 count 排完 退出码 0", second["rc"], 0)
+    check("重切成一条 13:30(75)（不是 50+25）", bb.csv_rows(paths),
+          [("13:00", 25), ("13:30", 75), ("15:00", 25)])
+    saved = bb._read_json(paths["extras"])["dates"].get(iso) or []
+    check("plan 的 extras 只剩一条 13:30(75)",
+          [(r.get("start"), int(r.get("duration") or 0))
+           for r in saved if r.get("source") == "plan"], [("13:30", 75)])
+    check("formatter 的 15:00 洞还在",
+          any(str(r.get("start")) == "15:00" for r in saved), True)
+    layout = (bb.layouts(paths, day).get("T1") or {})
+    check("manual layout 没被重切", layout.get("durations"), [25])
+
+    third = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET,
+                           "plan %d" % bb.DEFAULT_OFFSET,
+                           "pro 1 3", "complete"])
+    check("第三轮再排一次 退出码 0", third["rc"], 0)
+    check("幂等：data.csv 一个字不变", bb.csv_rows(paths),
+          [("13:00", 25), ("13:30", 75), ("15:00", 25)])
+    saved = bb._read_json(paths["extras"])["dates"].get(iso) or []
+    check("幂等：extras 还是两条",
+          [(r.get("start"), int(r.get("duration") or 0)) for r in saved],
+          [("13:30", 75), ("15:00", 25)])
+    return paths
+
+
 def main(argv):
     keep = "--keep" in argv
     print("== 场景 1：plan → 重新 plan（上一轮场次必须释放）==")
@@ -266,6 +539,46 @@ def main(argv):
     except Exception as e:                         # noqa: BLE001
         import traceback
         fails.append("场景 4 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 5：裁时段窗口（period T1 13:15-15:00）==")
+    try:
+        case_5_period_window_trim()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 5 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 6：extras 是硬洞（plan 不许压上去）==")
+    try:
+        case_6_extras_are_hard_holes()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 6 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 7：手动 layout + 中间 extras（洞别吞掉整段）==")
+    try:
+        case_7_manual_period_hole_keeps_capacity()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 7 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 8：plan 切的窗口 extra 在 clear 之后要能重算 ==")
+    try:
+        case_8_plan_window_extra_recovers_after_clear()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 8 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 9：手动 layout 时段里 plan 自己的窗口可重切 ==")
+    try:
+        case_9_plan_own_windows_recut_in_manual_period()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 9 异常：%s: %s" % (type(e).__name__, e))
         traceback.print_exc()
 
     print("\n== 场景 2：plan → plan clear → 再 plan（幂等）==")

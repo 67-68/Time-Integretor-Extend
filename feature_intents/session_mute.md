@@ -5,6 +5,11 @@
 `period mute T1 --permanent` = **这个时段以后都静音**；设置之后，落在那个窗口里
 的 session 自动切到**静音模式（Focusmate 的 quiet mode）**。
 
+⚠️ 静音**不影响排期**（2026-11-26 用户原话：「静音时段不应该不排啊，他们静音了
+又没关系」）：`available_windows` / `_plan_slots` / `pending_plan` / formatter
+都不再因为「这段被静音」而跳过它。以前周四的 T1/T2 被整段排除，`plan` 的提醒任务
+只能落到 19:00 —— 那是把 quiet mode 误当成了「不可用时间」。
+
 ⚠️ 「静音」的范围**只有 Focusmate 那一场**。用户明确过：*「daemon 应该在静音时段
 发通知，拉音量和放嘶吼，静音只是指 focusmate session」*。所以本地一概不变 ——
 分心看门狗照旧通知、照旧拉音量到 10%、照旧播放 `赵小六嘶吼.mp3`；

@@ -31,6 +31,9 @@ from .common import (
 )
 from .hints import forget_mute_cache
 
+#: `period T1 09:45-12:30` 里的窗口写法（也容忍两边空格）
+_RN_RANGE = re.compile(r"^\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}$")
+
 
 class SessionMixin(object):
     # -- 找行
@@ -1536,7 +1539,11 @@ class SessionMixin(object):
                 if announce:
                     self.say("已撤销 %s 的自定义排布 —— 这一段回到「未切 session」，容量照样算；下次 plan 会按任务重新切。" % period_id, "ok")
             else:
-                kwargs = {"source": source} if source else {}
+                # source 缺省 = auto：**工具切的段必须保持可重切**。
+                # 以前这里回落成 set_layout 的默认 manual，于是 end / watchdog
+                # 切完的段被当成「人手钉死」，容量缺口永远补不回来（2026-11-26
+                # 事故：T3 被切掉 100 分钟后 plan 再也不敢碰它）。
+                kwargs = {"source": source or "auto"}
                 sp.set_layout(day, period_id, effective, **kwargs)
                 if announce:
                     body = "  ".join("%s–%s(%d)" % (s["start"], s["end"], s["duration"])
@@ -1545,6 +1552,30 @@ class SessionMixin(object):
 
             # 排布落盘之后才动任务绑定：没写进去就什么都不清。
             cleared = self.clear_task_bindings_for_layout(period, new_sessions)
+
+            # 新排布已经覆盖到的起点，把同一天的一次性 extras 收掉 —— 否则
+            # 21:00 会同时作为「layout 里的场次」和「计划外」各出现一次。
+            for session in new_sessions:
+                try:
+                    sp.remove_extra(day, session.get("start"))
+                except Exception:                  # noqa: BLE001 - 收尾巴失败不挡排布
+                    pass
+
+            # 上一轮 plan 自己切出来的窗口（extras source=plan/auto）也一起收掉：
+            # 它们是「上一轮排期」的一部分，重切之后不该留成永久的硬洞 —— 否则
+            # 那截时间既不在 layout 里、又被当成手订场，永远回不到容量里。
+            try:
+                span = th._range_of(period)
+                if span is not None:
+                    for rec in list(sp.extras_for_date(sp.load_extras(), day)):
+                        if not sp.is_auto_source(sp.extra_source(rec)):
+                            continue
+                        got_min = th._clock_minutes(rec.get("start"))
+                        if got_min is None or not (span[0] <= got_min < span[1]):
+                            continue
+                        sp.remove_extra(day, rec.get("start"))
+            except Exception:                      # noqa: BLE001 - 收窗口失败不挡排布
+                pass
 
             # 从下载层 + 所有 layout + 一次性 + 长期规则重新生成 data.csv。
             if write_csv and self.rewrite_data_csv_from_plan() and announce:
@@ -1562,6 +1593,98 @@ class SessionMixin(object):
             self.book(day, why="排布变了，要把新场次订上")
         return {"ok": True, "sessions": new_sessions, "cancelled": cancelled,
                 "dropped": dropped, "cleared": cleared, "failed": False}
+
+    def _period_window_of(self, period):
+        """时段的原窗口（裁剪过就还原成日历给的那一份）。"""
+        if not period:
+            return None, None
+        if period.get("windowed"):
+            return (period.get("origin_start") or period.get("start"),
+                    period.get("origin_end") or period.get("end"))
+        return period.get("start"), period.get("end")
+
+    def _cmd_period_window(self, period_id, args):
+        """`period T1 09:45-12:30` / `period T1 window [clear]` —— 裁时段窗口。
+
+        契约（2026-11-26 用户要求「允许修改一个时段的开始和结束，只要被原本的
+        时段包裹」）：
+
+        * 窗口必须被**日历原时段**包裹（09:30–12:30 的 T1：09:45–12:30 可以，
+          09:00–12:30 不行），且是 15 分钟整点（Focusmate 的槽位颗粒）；
+        * 至少装得下 1 count（25 分钟），否则等于把这段关掉 —— 那种事请用
+          `period T1 clear`；
+        * 窗口改完，这一段**已有的排布**按新起点重算：装得下就原样搬过去，
+          装不下就清空这一段并提示跑 `plan` 重切（不清空 = 留着一段排不出来的
+          layout，下次 plan 会一直报错）。
+        """
+        day = self.sel_date
+        iso = day.isoformat()
+        periods = self.periods_for_day(day)
+        period = next((p for p in periods if p.get("id") == period_id), None)
+        if period is None:
+            raise ValueError("没有时段 %s（%s 的时段：%s）"
+                             % (period_id, iso,
+                                "、".join(p.get("id", "?") for p in periods) or "无"))
+        origin_start, origin_end = self._period_window_of(period)
+        toks = [str(a).strip() for a in (args or []) if str(a).strip()]
+        if not toks or toks[0].lower() in ("show", "status", "看", "查看"):
+            now_win = "%s–%s" % (period.get("start"), period.get("end"))
+            if period.get("windowed"):
+                self.say("%s %s：日历 %s–%s → 现在裁到 %s"
+                         % (iso, period_id, origin_start, origin_end, now_win), "info")
+            else:
+                self.say("%s %s：%s（日历原窗口；用 `period %s 09:45-12:30` 裁）"
+                         % (iso, period_id, now_win, period_id), "info")
+            return True
+        removing = toks[0].lower() in ("clear", "reset", "撤销", "清空", "清除",
+                                       "off", "none")
+        if removing:
+            removed = sp.clear_period_window(day, period_id)
+            if removed is None:
+                self.say("%s %s 本来就没裁过窗口（日历原窗口 %s–%s）。"
+                         % (iso, period_id, origin_start, origin_end), "warn")
+                return True
+            self.reload_periods()
+            self.say("↩️ %s %s 窗口恢复成日历原窗口 %s–%s。"
+                     % (iso, period_id, origin_start, origin_end), "ok")
+        else:
+            got = _RN_RANGE.match(toks[0])
+            if not got:
+                raise ValueError("窗口要写成 HH:MM-HH:MM（例如 `period T1 09:45-12:30`）")
+            start, end = [x.strip() for x in toks[0].split("-", 1)]
+            rec = sp.set_period_window(day, period, start, end)
+            self.reload_periods()
+            minutes = (sp.parse_hhmm(rec["end"])[0] * 60 + sp.parse_hhmm(rec["end"])[1]
+                       - sp.parse_hhmm(rec["start"])[0] * 60
+                       - sp.parse_hhmm(rec["start"])[1])
+            self.say("✂️ %s %s 窗口：%s–%s → %s–%s（%d 分钟 / %d count）"
+                     % (iso, period_id, origin_start, origin_end,
+                        rec["start"], rec["end"], minutes, minutes // 30), "ok")
+        rl.log_event("period", "window", day=iso, period=period_id,
+                     action="clear" if removing else "set",
+                     start=(origin_start if removing else rec["start"]),
+                     end=(origin_end if removing else rec["end"]))
+
+        new_period = next((p for p in self.periods_for_day(day)
+                           if p.get("id") == period_id), None)
+        rec_layout = sp.get_layout_record(sp.load_layouts(), day, period_id)
+        if rec_layout is not None and new_period is not None:
+            durations = list(rec_layout.get("durations") or [])
+            source = rec_layout.get("source") or "auto"
+            try:
+                # 装得下：原样搬到新起点（commit_layout 会取消不再匹配的旧场）。
+                self.commit_layout(day, new_period, durations, source=source,
+                                   mode="set", book=False, announce=False,
+                                   missing_ok=True)
+            except ValueError as e:
+                self.commit_layout(day, new_period, [], source="auto",
+                                   mode="clear", book=False, announce=False,
+                                   missing_ok=True)
+                self.say("新窗口装不下原来的排布（%s），已清空 %s 这一段；"
+                         "跑一次 `plan` 会按新窗口重切。" % (e, period_id), "warn")
+        if not self.offline:
+            self.rebuild_rows()
+        return True
 
     def cmd_period_layout(self, args):
         """period T1 50 50 / session T1 50 50 —— 改一个时段的 session 排布。
@@ -1583,7 +1706,8 @@ class SessionMixin(object):
         toks = [str(a).strip() for a in args if str(a).strip()]
         if not toks:
             raise ValueError("用法：period T1 50 50（时段 ID 看表格第一列）"
-                             " / period mute T1 [--permanent]")
+                             " / period T1 09:45-12:30（裁窗口）"
+                             " / period T1 window clear / period mute T1 [--permanent]")
         # `period mute T1 --permanent` 走静音那条路（同一个命令名词，两个动作）
         if toks[0].lower() in ("mute", "unmute", "静音", "解除静音", "取消静音"):
             return self.cmd_period_mute(toks)
@@ -1592,6 +1716,12 @@ class SessionMixin(object):
             raise ValueError("时段 ID 要像 T1 / T2；你给的是 %r" % period_id)
         period_id = period_id.upper()
         durations = toks[1:]
+        # `period T1 window [clear]` —— 看/撤销用户裁过的窗口
+        if durations and str(durations[0]).lower() in ("window", "窗口"):
+            return self._cmd_period_window(period_id, durations[1:])
+        # `period T1 09:45-12:30` —— 裁窗口（不是排布；排布仍是 25/50/75 列表）
+        if durations and _RN_RANGE.match(str(durations[0])):
+            return self._cmd_period_window(period_id, [durations[0]])
         # `period T1 clear` = 把这一段的 session 内容清空，但保留 period 本身；
         # 之后可以重新 plan，让任务按 period 容量自动生成新 session。
         clearing = bool(durations and str(durations[0]).lower()
@@ -1665,7 +1795,7 @@ class SessionMixin(object):
                      % sp.rules_path(), "info")
             row_token = weekday
         else:
-            iso, rec = sp.add_extra(day, hhmm, dur)
+            iso, rec = sp.add_extra(day, hhmm, dur, source="manual")
             self.say("✅ 只加在 %s 这一天：%s %dmin（一次性，不进日历）"
                      % (iso, rec["start"], rec["duration"]), "ok")
             self.say("   想让它每周都出现，用 session --permanent %s %d。"

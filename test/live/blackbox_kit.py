@@ -145,7 +145,7 @@ def projects_store(day):
 
 PATHS_KEYS = ("root", "day", "temp", "data", "csv", "tasks", "projects", "archive",
               "settings", "project_sync", "calendar", "layouts", "extras", "rules",
-              "mutes", "keytime_json", "keytime_state", "keytime_devices",
+              "mutes", "period_windows", "keytime_json", "keytime_state", "keytime_devices",
               "keytime_rules", "nostart", "postsession", "failed_actions",
               "of_outbox", "plan_pins", "plan_decisions", "plan_watchdog", "logs")
 
@@ -164,6 +164,7 @@ def _paths_for(root, day):
         "calendar": os.path.join(temp, "calendar-download.json"),
         "layouts": os.path.join(temp, "session-layouts.json"),
         "extras": os.path.join(temp, "session-extras.json"),
+        "period_windows": os.path.join(temp, "period-windows.json"),
         "rules": os.path.join(temp, "session-rules.json"),
         "mutes": os.path.join(temp, "session-mutes.json"),
         "keytime_json": os.path.join(temp, "keytime.json"),
@@ -199,6 +200,7 @@ def make_sandbox(root=None, offset=DEFAULT_OFFSET):
     _write_json(paths["projects"], projects_store(day))
     _write_json(paths["calendar"], calendar_download(day))
     _write_json(paths["layouts"], {"version": 1, "days": {}})
+    _write_json(paths["period_windows"], {"version": 1, "days": {}})
     for key in ("extras", "rules", "mutes"):
         _write_json(paths[key], {"version": 1, "rows": []})
     _write_json(paths["keytime_json"],
@@ -217,6 +219,7 @@ SNAPSHOT_FILES = (
     "data/project-sync.json", "data/settings.json",
     "temp/calendar-download.json", "temp/session-layouts.json",
     "temp/session-extras.json", "temp/session-rules.json", "temp/session-mutes.json",
+    "temp/period-windows.json",
     "temp/keep_session-state.json", "temp/keep_session-verdicts.json",
     "temp/keep_session-expected.json", "temp/keep_session-nostart.json",
     "temp/keep_session-postsession.json", "temp/keep_session-relocations.json",
@@ -298,6 +301,7 @@ def env_for(paths, offset=DEFAULT_OFFSET, with_node=False, extra_env=None):
         "TI_CALENDAR_DOWNLOAD": paths["calendar"],
         "TI_SESSION_LAYOUTS": paths["layouts"],
         "TI_SESSION_EXTRAS": paths["extras"],
+        "TI_PERIOD_WINDOWS": paths["period_windows"],
         "TI_SESSION_RULES": paths["rules"],
         "TI_SESSION_MUTES": paths["mutes"],
         "TI_TASKS_FILE": paths["tasks"],

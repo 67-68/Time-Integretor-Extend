@@ -1,5 +1,6 @@
 """warden_core.hints —— 命令提示行（repl_kit.Hint）、Tab 补全器与 OmniFocus 重复规则解析。"""
 import datetime
+import re
 import time
 
 from .common import (
@@ -78,7 +79,7 @@ _CONTEXT_HEADS = {
     "plan": "排期：资源分配 → 唤起任务 → 排进 session",
     "conscription": "快速征召：按剩余时间挑一条合适任务",
     "session": "session 管理：新增 / 改排 / 永久写进日历",
-    "period": "时段排布：按 T1/T2 重排当天 session",
+    "period": "时段排布：按 T1/T2 重排当天 session，或裁时段窗口（09:45-12:30）",
     "help": "帮助：当前视图全部命令与用法",
     "open": "打开：切数据模型 / 看板口径 / 展开列",
     "keytime": "Key Time：规则匹配的日历时间块到点锁死桌面（只留 iTerm）+ 置顶 + 播报 + 横幅 + 手机推送",
@@ -91,7 +92,7 @@ _CONTEXT_USAGES = {
     "plan": "plan [-c|--current] [天数]  |  plan -s <场> -p <项目>",
     "conscription": "conscription / cst [session序号|current]",
     "session": "session <HH:MM> <25|50|75> [--permanent]",
-    "period": "period <T1> [25|50|75 ...] | period T1 clear",
+    "period": "period <T1> [25|50|75 ...] | period T1 clear | period T1 09:45-12:30 | period T1 window clear",
     "keytime": "keytime [ack|refresh|rules|on|off] | keytime focus [setup|on|off] | "
                "keytime notify [文字] | keytime rules reset | "
                "keytime device add <名字> <key> | keytime set <键> <值>",
@@ -537,10 +538,14 @@ def _hint_period(parts):
         return repl_kit.Hint("参数", ("T1", "--permanent", "--off"),
                              note="静音这个时段（--permanent = 以后每个这个星期几都静音）")
     if len(parts) >= 2:
+        if any(re.match(r"^\d{1,2}:\d{2}-\d{1,2}:\d{2}$", str(p)) for p in parts[1:]):
+            return repl_kit.Hint("窗口", ("09:45-12:30",),
+                                 note="把这一天的窗口裁到这段（必须被日历原时段包裹；15 分钟整点）")
         return repl_kit.Hint("时长", ("25", "50", "75", "clear"),
                              note="可连续给多个；超时就报错；clear = 清空这一段的 session")
-    return repl_kit.Hint("参数", ("T1", "50", "50", "clear", "mute T1"), note="按 25/50/75 排这个时段；"
-                             "period mute T1 --permanent = 这个时段以后都静音")
+    return repl_kit.Hint("参数", ("T1", "50", "50", "09:45-12:30", "clear", "window clear"),
+                         note="按 25/50/75 排这个时段；HH:MM-HH:MM = 裁窗口；"
+                              "period mute T1 --permanent = 这个时段以后都静音")
 
 
 def _hint_set(parts):

@@ -655,6 +655,63 @@ class BoardMixin(object):
 
     # -- 可用时间窗：period 减去「用户手动预定」的场次 -------------------
 
+    def _superseded_row_starts(self, day=None):
+        """API 里还挂着、但已经被**新的规划**换掉的那些场次起点。
+
+        改排布是「取消旧场 → 写新排布 → 补订新场」三步，中间有一段时间 API 里
+        还是旧的：plan 把 19:30 的 50 分钟切成 75 分钟，20:30 那场整条被合并，
+        但 daemon 还没取消完。这时如果拿 API 行当容量，就又把旧切分当成固定桩
+        —— 下一轮 plan 会把刚合成的整块窗口再切碎一次（2026-11-26 现场：同一段
+        时间每 plan 一次就碎一次）。
+
+        判据两条，都只看「计划里这一段应该长什么样」：
+          * 同一**起点**、时长和计划不一致 → 那是这一场被改过，旧的作废；
+          * 起点不在计划里、但整条落在某个计划场次的占用（含强制休息）之内
+            → 那是旧切分留下的碎片（计划已经把它并进前一场）。
+        真正的用户手订场（起点在计划之外、也不被计划场次覆盖）不在此列。
+        """
+        day = day or self.sel_date
+        try:
+            plan = [(str(s.get("start")), int(s.get("duration") or 0))
+                    for s in self.plan_rows_for(day)]
+        except Exception:                          # noqa: BLE001 - 算不出就都不动
+            return set()
+        by_start = dict(plan)
+        spans = []
+        for start, dur in plan:
+            got = th._clock_minutes(start)
+            if got is None:
+                continue
+            try:
+                span = sp.session_span(dur)
+            except (TypeError, ValueError):
+                span = dur
+            spans.append((got, got + max(1, int(span))))
+        out = set()
+        for row in self.rows or ():
+            if str(row.get("date") or "") != day.isoformat():
+                continue
+            start = str(row.get("startLabel") or "")
+            if not start:
+                continue
+            if start in by_start:
+                if int(row.get("durationMin") or 0) != by_start[start]:
+                    out.add(start)
+                continue
+            got = th._clock_minutes(start)
+            if got is None:
+                continue
+            try:
+                span = sp.session_span(int(row.get("durationMin") or 0))
+            except (TypeError, ValueError):
+                continue
+            if any(a <= got and got + max(1, int(span)) <= b for a, b in spans):
+                out.add(start)
+        for start in sorted(out):
+            rl.log_event("plan", "row_superseded", level="debug",
+                         day=day.isoformat(), start=start)
+        return out
+
     def manual_session_rows(self, day=None):
         """这一天**用户手动预定**的场次（自动排序要当硬洞的）。
 
@@ -670,12 +727,16 @@ class BoardMixin(object):
         except Exception:                          # noqa: BLE001 - 坏排布按没有来源
             plan_starts = set()
         now_ms = int(time.time() * 1000)
+        superseded = self._superseded_row_starts(day)
         out = []
         for row in self.rows or ():
             if str(row.get("date") or "") != iso:
                 continue
             if row.get("period_only"):
                 continue
+            if str(row.get("startLabel") or "") in superseded:
+                continue                           # 被新规划换掉的旧场次
+
             if row.get("planned") or row.get("contract"):
                 continue                           # 本地契约行 = TI 排的，可重排
             label = str(row.get("startLabel") or "")
@@ -696,12 +757,105 @@ class BoardMixin(object):
             out.append(dict(row))
         return out
 
+    def _recuttable_extra_starts(self, day=None, replan=False):
+        """plan 自己切出来的窗口 extras（``source=plan``/``auto``）→ 可以重切。
+
+        判据是「**谁切的**」，不是「在哪种 layout 里」：窗口是上一轮 plan 为了
+        避开手订场临时切的一截，下次 plan 必须能把它还原成一整块再重新切。
+        以前只在自动 layout 的时段里免掉它 —— 一旦时段是 manual（formatter /
+        watchdog 切过），上一轮 plan 的 50+25 就变成了永久形状：这一轮明明有
+        一整块 3 count 的空档，却只能按 50 / 25 两个固定槽填，3 count 的项目
+        只好被拆成 25+25+25 塞进三个不同的场次（2026-11-26 用户：
+        「他为什么被拆成三块了？明明 2 和 3 也可以连起来」）。
+
+        仍然钉死：
+          * ``source=formatter`` / ``manual``（工具或人的硬约束）；
+          * 已经挂了**不会被本轮撤掉**的任务的 extras（``replan=False`` 时任何
+            绑定都算钉死，``replan=True`` 时只放过本轮计划自己的任务）。
+        """
+        day = day or self.sel_date
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        try:
+            recs = sp.extras_for_date(sp.load_extras(), day)
+        except Exception:                          # noqa: BLE001 - 坏表按没有 extras
+            return set()
+        owned = set()
+        if replan:
+            try:
+                owned = set(self._plan_owned_task_ids(day, rescindable_only=True)
+                            or ())
+            except Exception:                      # noqa: BLE001 - 算不出就都不放过
+                owned = set()
+        out = set()
+        for rec in recs:
+            if not sp.is_auto_source(sp.extra_source(rec)):
+                continue
+            start = str(rec.get("start") or "")
+            if not start:
+                continue
+            try:
+                tasks = self.tasks_for_session(iso, start)
+            except Exception:                      # noqa: BLE001 - 读不到按没任务
+                tasks = []
+            if any(int(t.get("id") or 0) not in owned for t in tasks):
+                continue                           # 有活任务压着，这一截是内容约束
+            out.add(start)
+            rl.log_event("plan", "extra_recuttable", level="debug",
+                         day=iso, start=start,
+                         source=sp.extra_source(rec))
+        return out
+
+    def extra_session_holes(self, day=None):
+        """当天 ``temp/session-extras.json`` 里的场次 → ``[(start_min, end_min)]``。
+
+        为什么 extras 也必须算硬洞：它们**不在 layout 里**，是按天加的真实场次
+        （formatter 切的尾巴、plan 避开手订场切出来的窗口、被挪过的已订场）。
+        自动排布按「整段容量」重切时会把它们整段丢掉，于是排出 11:00(50) 压住
+        11:15(50) 这种叠加（2026-11-26 事故）。占用按 ``session_span`` 算，
+        和手订场同一口径（含 5 分钟强制休息）。
+        """
+        day = day or self.sel_date
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        try:
+            data = sp.load_extras()
+        except Exception:                          # noqa: BLE001 - 坏表按没有 extras
+            return []
+        # plan 自己上一轮切的窗口不算洞（见 :meth:`_recuttable_extra_starts`）：
+        # 那些分钟要能回到时段容量里重新算。formatter / 用户自己加的仍然钉死。
+        recut = self._recuttable_extra_starts(day)
+        out = []
+        for rec in sp.extras_for_date(data, day):
+            if str(rec.get("start") or "") in recut:
+                rl.log_event("plan", "extra_auto_skip", level="debug",
+                             day=iso, start=rec.get("start"))
+                continue
+            start_min = th._clock_minutes(rec.get("start"))
+            if start_min is None:
+                continue
+            try:
+                duration = int(rec.get("duration"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                span = sp.session_span(duration)
+            except (TypeError, ValueError):
+                span = duration
+            out.append((int(start_min), int(start_min + max(1, int(span)))))
+            rl.log_event("plan", "extra_hole", level="debug", day=iso,
+                         start=rec.get("start"), duration=duration)
+        return out
+
     def available_windows(self, day=None):
         """period 减去手订/进行中场次后的可用时间窗（跨午夜按绝对分钟）。
 
         规则（2026-11-21 用户定）：自动排序只在「period ∩ 非用户手订」上做；
         跨 period 的手订场按交集从每个 period 扣；扣完不足 25 分钟的段直接
         丢弃（不硬塞、不报错）。
+
+        **静音不参与容量**（2026-11-26 用户：「静音时段不应该不排啊，他们静音了
+        又没关系」）：`period mute` 只改 Focusmate 那一场的 quiet mode，不改变这
+        段时间能不能排任务。以前这里按静音表把整段挖掉，结果周四 T1/T2 全被排除，
+        「排今天–后天的 plan」提醒只能落到 19:00。
         """
         day = day or self.sel_date
         iso = day.isoformat()
@@ -725,6 +879,8 @@ class BoardMixin(object):
                     span = int(duration or 0)
                 got = (start_min, start_min + max(1, int(span)))
             holes.append((int(got[0]), int(got[1])))
+        # extras（不在 layout 里的真实场次）同样是硬洞，见 extra_session_holes()。
+        holes.extend(self.extra_session_holes(day))
         out = []
         for period in self.periods_for_day(day):
             got = th._range_of(period)
@@ -732,15 +888,6 @@ class BoardMixin(object):
                 continue
             p_start, p_end = int(got[0]), int(got[1])
             pieces = [(p_start, p_end)]
-            try:
-                muted = mute_window_for(day, period.get("start"), period.get("end"))
-            except Exception:                      # noqa: BLE001 - 静音表坏了照排
-                muted = None
-            if muted:
-                muted_got = th._range_of(muted)
-                if muted_got is not None:
-                    pieces = self._subtract_minute_window(
-                        pieces, (int(muted_got[0]), int(muted_got[1])))
             for h_start, h_end in holes:
                 pieces = self._subtract_minute_window(pieces, (h_start, h_end))
             for s, e in pieces:
@@ -1936,8 +2083,12 @@ class BoardMixin(object):
 
     @staticmethod
     def _row_blocks_period(row):
-        """这一行是否让所在时段不能再「整段重排」（已订上 / 挂任务 / 已过去 / 静音）。"""
-        return bool(row.get("id") or row.get("tasks") or row.get("period_muted")
+        """这一行是否让所在时段不能再「整段重排」（已订上 / 挂任务 / 已过去）。
+
+        静音**不算**阻塞：`period mute` 只改 Focusmate 那一场的 quiet mode，
+        不会让这段时间变成不可重排（2026-11-26 用户口径）。
+        """
+        return bool(row.get("id") or row.get("tasks")
                     or row.get("phase") == "已结束")
 
     def _period_shell_rows(self, rows, day, now_ms=None):
@@ -1974,10 +2125,6 @@ class BoardMixin(object):
             existing = [r for r in (have.get(pid) or ())
                         if not r.get("period_only")]
             s_dt = datetime.datetime.combine(day, datetime.time(*start))
-            if existing and mute_window_for(day, period.get("start"),
-                                            period.get("end")):
-                # 静音时段 plan 整段不排，别画「剩余 Nmin 可以排」的假容量。
-                continue
             src = (getattr(self, "_layout_sources", {}) or {}).get(pid)
             if existing and (src is None or sp.is_auto_source(src)) \
                     and not any(self._row_blocks_period(r) for r in existing):
@@ -2037,6 +2184,17 @@ class BoardMixin(object):
         st = ks.load_state()
         snap = st.get("api_snapshot") or {}
         iso = snap.get("sessions") or []
+        # ``details`` 里带每场的 duration（keep_session 2026-11-23 起写）。
+        # 以前这里一律填 ``durationMin=None``，于是快照模式下**所有真实场次
+        # 都变成 0 分钟**：尾巴追加、extras 洞、按场次算容量全部失真（排期面板
+        # 上出现「19:00(0)」、手订段只剩两场 25 分钟）。能读到就按真实时长。
+        durations = {}
+        for det in (snap.get("details") or ()):
+            start_iso = str((det or {}).get("start") or "")
+            try:
+                durations[start_iso] = int((det or {}).get("duration"))
+            except (TypeError, ValueError):
+                continue
         now_ms = int(time.time() * 1000)
         want = self.sel_date.isoformat()
         api_rows = []
@@ -2049,14 +2207,16 @@ class BoardMixin(object):
             if dt.date().isoformat() != want:
                 continue
             s_ms = int(dt.timestamp() * 1000)
-            # 快照里没有 duration，先用 50min 占位；这个值只影响显示
-            e_ms = s_ms + 50 * 60 * 1000
+            dur = durations.get(str(t)) or durations.get(t)
+            e_ms = s_ms + int(dur or 50) * 60 * 1000
             api_rows.append({
                 "startMs": s_ms,
                 "endMs": e_ms,
                 "startLabel": dt.strftime("%H:%M"),
-                "endLabel": (dt + datetime.timedelta(minutes=50)).strftime("%H:%M"),
-                "durationMin": None,
+                "endLabel": (dt + datetime.timedelta(minutes=int(dur or 50))
+                             ).strftime("%H:%M"),
+                # 老快照（没有 details）仍按未知时长处理，别凭空造一个 50。
+                "durationMin": dur,
                 "id": None,
                 "title": "",
                 "quiet": None,

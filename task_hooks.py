@@ -566,34 +566,55 @@ def _format_end_over_windows(ctx, windows, task, duration, break_got, fit,
         end = int(window.get("end_min") or 0)
         if end - start < int(fit) + int(break_got):
             continue
-        carve_start = grid_floor(end - int(break_got) - int(fit))
-        if carve_start < start:
+        base = grid_floor(end - int(break_got) - int(fit))
+        if base < start:
             continue
-        carve_end = carve_start + int(fit) + int(break_got)
-        if carve_end > end:
-            continue
-        if _already_past(ctx, carve_start):
-            continue
-        if not is_free({"start_min": carve_start, "end_min": carve_end},
-                       reservations):
-            continue
-        prefix, prefix_exact, cut_pid = None, False, None
-        if window.get("full"):
-            pref, exact = _cut_prefix_for(
-                (int(window.get("period_start_min") or start),
-                 int(window.get("period_end_min") or end)),
-                carve_start, reservations)
-            if exact and pref:
-                prefix, prefix_exact, cut_pid = pref, True, window.get("period_id")
-        if cut_pid is None:
-            span = (carve_start, carve_end)
-            if any(_range_of(sess) is not None and overlaps(span, _range_of(sess))
+        full = bool(window.get("full"))
+        period_range = (int(window.get("period_start_min") or start),
+                        int(window.get("period_end_min") or end))
+
+        def _free_span(probe):
+            carve_end = probe + int(fit) + int(break_got)
+            return (carve_end <= end
+                    and not _already_past(ctx, probe)
+                    and is_free({"start_min": probe, "end_min": carve_end},
+                                reservations))
+
+        picked = None
+        if full:
+            # 从窗口尾巴往前试：**能精确剪断的最晚切点**才是对的。只看尾巴
+            # 会漏掉「前一场 50 分钟要留 10 分钟休息」这种约束 —— 22:15–00:05
+            # 的尾巴算出来是 23:30，但 22:15(50) 之后 23:15 才接得上（前缀
+            # [50]），23:30 只能当一次性 session 补场。旧剪断路径一直往前探，
+            # 这里对齐同一口径。
+            probe = base
+            for _try in range(24):
+                if probe < start:
+                    break
+                if _free_span(probe):
+                    pref, exact = _cut_prefix_for(period_range, probe, reservations)
+                    if exact and pref:
+                        picked = (probe, probe + int(fit) + int(break_got),
+                                  pref, True, window.get("period_id"))
+                        break
+                probe -= 15
+        if picked is None:
+            # 兜底：窗口尾巴补一场一次性 session（窗口被手订场切过，或满窗口
+            # 但前缀接不上）。**不许和任何已有 session 重叠。**
+            carve_end = base + int(fit) + int(break_got)
+            if carve_end > end or _already_past(ctx, base):
+                continue
+            if not is_free({"start_min": base, "end_min": carve_end}, reservations):
+                continue
+            if any(_range_of(sess) is not None
+                   and overlaps((base, carve_end), _range_of(sess))
                    for sess in sessions):
                 continue
-        key = (-end, -carve_start, 0 if cut_pid else 1)
+            picked = (base, carve_end, None, False, None)
+        probe, carve_end, prefix, prefix_exact, cut_pid = picked
+        key = (-end, -probe, 0 if cut_pid else 1)
         if best is None or key < best[0]:
-            best = (key, window, carve_start, carve_end, prefix, prefix_exact,
-                    cut_pid)
+            best = (key, window, probe, carve_end, prefix, prefix_exact, cut_pid)
     if best is None:
         raise HookError(
             "formatter end：%s 没有能放下 %d 分钟（含 %d 分钟休息）的空位；"
@@ -662,7 +683,16 @@ def _format_end_over_windows(ctx, windows, task, duration, break_got, fit,
         "cut_prefix_exact": bool(prefix_exact),
     }
     return {"name": "end", "reservation": reservation, "session": session,
-            "new_session": existing is None, "conflicts": conflicts}
+            "new_session": existing is None,
+            # 选段比较用：这个候选所在的**时段终点**（end = 当天最后一段）。
+            "window_end_min": int(window.get("end_min") or 0),
+            # 和旧剪断路径同一个对外形状：测试/调用方会读 result 上的
+            # cut_period_id / cut_prefix，两条路径必须长得一样。
+            "cut_period_id": cut_pid,
+            "cut_prefix": list(prefix or []),
+            "cut_prefix_exact": bool(prefix_exact),
+            "carved_from": fmt_minutes(carve_start),
+            "conflicts": conflicts}
 
 
 @register_formatter(
@@ -737,15 +767,38 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
 
     fit = fit_session_duration(duration)
 
-    # 2026-11-21：当天**一场计划 session 都没有**时，直接在「可用时间窗」
-    # （period 减去用户手订场次）的尾巴切 —— 旧逻辑要求先有 session，导致
-    # 只有真实订场/只有 period 的那天直接报「没有已排的 session」。
-    # 有 session 时仍走原来的尾巴/剪断路径（period-first 的大改另做，避免
-    # 一次动到表格、对账和剪断三条已覆盖的路径）。
-    windows = ctx.get("windows") if not sessions else None
-    if windows is not None:
-        return _format_end_over_windows(ctx, windows, task, duration, break_got,
-                                        fit, reservations, task_id)
+    # 2026-11-21 / 2026-11-26：**空时段**（还没有任何 session 的 period）也要
+    # 进候选。旧逻辑只从「已经有 session 的时段」里挑尾巴，于是「当天最后一段」
+    # 被认成「最后一个已经有 session 的时段」：Nov 26 的 T4(22:15–23:45) 还没切过，
+    # end 把闪卡任务排到 T3 的 21:00，剪断 T3 时前缀算成空、把整个 T3 排布 remove
+    # 掉（丢了 75 分钟）。
+    #
+    # 口径：有 session 的时段仍走旧剪断路径（它已经覆盖了「非最后一场 / 前缀接龙 /
+    # 跨午夜」这些边角）；**没有 session 的时段**用 period-first 的窗口尾巴切。
+    # 两边各自给出候选，谁的时间窗终点更晚谁赢（end 的定义就是「当天最后一段」）。
+    windows = ctx.get("windows") if ctx.get("windows") is not None else None
+    empty_win = None
+    if windows:
+        busy = {str(s.get("period_id") or "") for s in sessions
+                if s.get("period_id")}
+        free_windows = [w for w in windows if isinstance(w, dict)
+                        and str(w.get("period_id") or "") not in busy]
+        if free_windows:
+            try:
+                empty_win = _format_end_over_windows(
+                    ctx, free_windows, task, duration, break_got, fit,
+                    reservations, task_id)
+            except HookError:
+                empty_win = None
+    if not sessions:
+        if empty_win is not None:
+            return empty_win
+        raise HookError(
+            "formatter end：%s 没有能放下 %d 分钟（含 %d 分钟休息）的空位；"
+            "可用时间窗：%s"
+            % (ctx.get("date") or "这一天", duration, int(break_got),
+               "、".join("%s–%s" % (w.get("start"), w.get("end"))
+                         for w in windows or () if isinstance(w, dict)) or "无"))
 
     # 每个时段里**起点最靠后的那一场** = 这个时段的尾巴（end 要的就是它）。
     last_start = {}
@@ -841,6 +894,11 @@ def format_end(ctx, break_minutes=DEFAULT_BREAK_MINUTES, date=None):
     candidates.sort(key=lambda row: (-row["window_end"], -row["carve_start"],
                                      row["session_duration"]))
     pick = candidates[0]
+    # 空时段的窗口候选如果更晚（end = 当天最后一段），就用它 —— 这正是
+    # 「T4 还没切过、但它是当天最后一段」那条 bug 的修法。
+    if empty_win is not None and int(empty_win.get("window_end_min") or 0) > int(
+            pick.get("window_end") or 0):
+        return empty_win
     carved_start = int(pick["carve_start"])
     session_duration = int(pick["session_duration"])
     reserve_end = int(pick["carve_end"])
