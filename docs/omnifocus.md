@@ -270,8 +270,8 @@ TUI 里的用法：`task import`（不给参数 = 读剪贴板导入并自动关
 2. `task sync`（拉 Focusmate 完成状态后补写）；
 3. 收尾自动核对（session 结束后）；
 4. **任何一次同步完成状态的 `refresh`**（`sync_task_completions` 末尾，含裸 `refresh`
-   和 `refresh --check`）。`refresh` 仍然**不在外面新造东西**（不订场、不在
-   Focusmate 建 task、不改 data.csv），但「Focusmate 勾掉了」是一条已经发生的
+   和 `refresh --check`）。`refresh` 仍然**不订场、不在 Focusmate 建 task**，
+   但「Focusmate 勾掉了」是一条已经发生的
    事实，本地打 ✓ 的同时 OmniFocus 那条也得完成 —— 否则本地一 ✓，收尾就再也
    不会问它，**没有任何命令会再想起这条任务**（真实踩过：用户只能人肉 `task sync`）。
 

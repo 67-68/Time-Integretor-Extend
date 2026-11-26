@@ -514,6 +514,69 @@ def case_9_plan_own_windows_recut_in_manual_period():
     return paths
 
 
+def case_10_refresh_reclaims_idle_auto_sessions():
+    """refresh 把「TI 自己切出来、没挂任务」的场次收回成未切分容量。
+
+    2026-11-26 用户要求：「我希望 refresh 之后直接把零散 session 变成一个统一的
+    时间块，如果没有任务」「不是两场 25 合并 50，而是两场被自动切出来的 25 换成
+    一个 50 分钟的无切分时段，相当于资源回收」。
+
+    黑盒要证明的是**落盘终态**（不是屏幕上那句话）：
+    1. 挂着任务的场次原样保留；
+    2. plan 切出来的窗口 extras（source=plan）被收掉，那截时间回到时段容量；
+    3. 任务全撤掉之后，整段 layout 也回收到「未切」（csv 里那一天没有 session 行）；
+    4. 再 refresh 一次：幂等，一个字都不变。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+
+    made = bb.run(paths, ["task create title=有活的场次 duration=25"])
+    check("建独立任务退出码 0", made["rc"], 0)
+    solo = [t for t in bb.tasks(paths) if bb.task_title(t) == "有活的场次"]
+    tid = solo[0]["id"]
+    first = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
+                           "task id:%d 1" % tid, "complete"])
+    check("plan + 固定 1 count 退出码 0", first["rc"], 0)
+    check("排出一场 13:00(25)", bb.csv_rows(paths), [("13:00", 25)])
+    check("layout 是 [25]、来源 plan",
+          (bb.layouts(paths).get("T1") or {}).get("durations"), [25])
+
+    # 上一轮排期留下的窗口碎片：TI 自己切的（source=plan）、没任务
+    extras = bb._read_json(paths["extras"]) or {}
+    extras.setdefault("dates", {})[iso] = [
+        {"start": "13:30", "duration": 50, "source": "plan",
+         "note": "plan 切的（避开手订场）"}]
+    bb._write_json(paths["extras"], extras)
+
+    refreshed = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "refresh"])
+    check("refresh 退出码 0", refreshed["rc"], 0)
+    left = (bb._read_json(paths["extras"]) or {}).get("dates", {}).get(iso) or []
+    check("plan 的窗口碎片被回收（extras 清空）", left, [])
+    check("挂着任务的那场原样保留", bb.csv_rows(paths), [("13:00", 25)])
+    check("layout 一个字没动（还有活挂着）",
+          (bb.layouts(paths).get("T1") or {}).get("durations"), [25])
+    check("任务还挂在 13:00",
+          [(t[0], t[1]) for t in bb.bound_tasks(paths)], [("有活的场次", "13:00")])
+
+    # 任务撤掉之后：整段也回收到「未切」
+    cleared = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "plan clear"])
+    check("plan clear 退出码 0", cleared["rc"], 0)
+    after = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "refresh"])
+    check("清空后 refresh 退出码 0", after["rc"], 0)
+    check("整段回到未切分（csv 里这一天没有 session 行）",
+          bb.csv_rows(paths), [])
+    check("layout 变成空排布、来源还是可重切的 plan",
+          (bb.layouts(paths).get("T1") or {}).get("durations"), [])
+
+    again = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "refresh"])
+    check("再 refresh 一次 退出码 0", again["rc"], 0)
+    check("幂等：csv 还是空的", bb.csv_rows(paths), [])
+    check("幂等：layout 还是空的",
+          (bb.layouts(paths).get("T1") or {}).get("durations"), [])
+    return paths
+
+
 def main(argv):
     keep = "--keep" in argv
     print("== 场景 1：plan → 重新 plan（上一轮场次必须释放）==")
@@ -579,6 +642,14 @@ def main(argv):
     except Exception as e:                         # noqa: BLE001
         import traceback
         fails.append("场景 9 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 10：refresh 回收没任务的自动场次（变成未切分容量）==")
+    try:
+        case_10_refresh_reclaims_idle_auto_sessions()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 10 异常：%s: %s" % (type(e).__name__, e))
         traceback.print_exc()
 
     print("\n== 场景 2：plan → plan clear → 再 plan（幂等）==")

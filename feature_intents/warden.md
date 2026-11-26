@@ -289,8 +289,10 @@ TUI 里唯一会「让 daemon 去订」的动作是改完排布/加单场之后�
 （用户报的「plan complete 卡死」）。
 `_release_browser()` 也只在它里面出现一次。两个守卫：
 
-- `_suppress_book`：refresh 的对账轮整段置位 —— **只对账、不新造外部动作**
-  （这是 `refresh` 原有的契约，现在由 `reconcile_schedule_pipeline` 一处守住）。
+- `_suppress_book`：refresh 的对账轮整段置位 —— **不订场、不建 task**（这是
+  `refresh` 原有的契约，现在由 `reconcile_schedule_pipeline` 一处守住）。
+  它挡的是「新造」，不挡「回收」：回收没任务的零散自动场次时会取消旧场
+  （走 `_cancel_stale_period_sessions` 那条唯一取消路径，带挂号单）。
 - `_booking`：防重入，已经在订就不再嵌套。
 
 `offline` 守卫留在**调用方**（`cmd_period_layout` 本来就是 `if not self.offline`

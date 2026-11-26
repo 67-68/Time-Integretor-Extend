@@ -848,12 +848,18 @@ class TaskPipelineMixin(object):
            对得上当前场次、本地绑定和未取消的 API session；对不上就清空 plan，
            让用户重新 `plan`。没有 plan 的项目直接跳过。
         3. defer 还没到点的任务不进入任何排期队列；本地任务 / 项目清单两边都查。
+        4. 资源回收：TI 自己切的、**没挂任务**的零散场次先收回去（见
+           :meth:`reclaim_idle_auto_sessions`）—— 那段时间还给时段容量，下一轮
+           plan 可以按任务重切。放在 formatter 之前，刚切的窗口不会当场被收掉。
 
-        返回 ``{"formatters": n, "invalidated": n, "detached": n, "errors": n}``。
+        返回 ``{"formatters": n, "invalidated": n, "detached": n, "errors": n,
+        "pruned": n, "reclaimed": n}``。
 
-        整段包在 ``_suppress_book`` 里：refresh 是对账轮，**不新造外部动作**
-        （不订场）。这一轮里 formatter / 自动重排改出来的 data.csv 由 daemon
-        下一轮吃进去，或者由随后的 ``refresh --check`` 补订。
+        整段包在 ``_suppress_book`` 里：refresh 是对账轮，**不订场**（不新造外部
+        动作）。回收/剪枝会**取消**对应的旧场次 —— 那是把时间还回去，不是新决定，
+        走的仍是 :meth:`_cancel_stale_period_sessions` 那条带挂号单的唯一取消路径。
+        这一轮里 formatter / 自动重排改出来的 data.csv 由 daemon 下一轮吃进去，
+        或者由随后的 ``refresh --check`` 补订。
         """
         day = day or self.sel_date
         if hasattr(day, "datetime"):
@@ -868,7 +874,7 @@ class TaskPipelineMixin(object):
     def _reconcile_schedule_pipeline(self, day, quiet=False):
         """`reconcile_schedule_pipeline` 的实作（不负责 _suppress_book 守卫）。"""
         result = {"formatters": 0, "invalidated": 0, "detached": 0, "errors": 0,
-                  "unbooked": 0, "pruned": 0}
+                  "unbooked": 0, "pruned": 0, "reclaimed": 0}
         # 先清掉过期且从未处理的重复 occurrence：它们绝不能再进入今天/明天的
         # formatter 队列（否则同名任务会越积越多，互相抢同一场 session）。
         try:
@@ -890,6 +896,15 @@ class TaskPipelineMixin(object):
         except Exception as e:                     # noqa: BLE001 - 剪枝失败不挡刷新
             result["pruned"] = 0
             self.say("排期流水线：剪掉废弃场次失败（继续刷新）：%s" % e, "warn")
+        # 再把「TI 自己切出来、已经没任务」的零散场次收回去（用户 2026-11-26：
+        # 「两场被自动切出来的 25 换成一个 50 分钟的无切分时段，相当于资源回收」）。
+        # 放在 formatter 之前：formatter 这一轮刚切的窗口不该在同一轮里被收掉。
+        try:
+            result["reclaimed"] = self.reclaim_idle_auto_sessions(day, quiet=quiet)
+        except Exception as e:                     # noqa: BLE001 - 回收失败不挡刷新
+            result["reclaimed"] = 0
+            self.had_error = True
+            self.say("排期流水线：回收空闲场次失败（继续刷新）：%s" % e, "warn")
         for task in self.formatter_tasks_for_day(day):
             spec = dict(task.get("formatter") or {})
             try:

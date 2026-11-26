@@ -126,6 +126,39 @@ manual layout 的时段（formatter / watchdog 切过）里，上一轮 plan 切
 `planned=False`），`_row_slots` / `check_bookings` / 取消 / mute / 挂任务
 全都不认它 —— 只用来回答「这一段到底有没有被算进去」。
 
+### 资源回收：没任务的零散自动场次收回成「未切分容量」（2026-11-26）
+
+用户口径：「我希望 refresh 之后直接把零散 session 变成一个统一的时间块，如果没有
+任务」「不是两场 25 合并 50，而是两场被自动切出来的 25 换成一个 50 分钟的无切分
+时段，相当于资源回收」。
+
+所以回收的终态是**那段时间一场 session 都没有**（不预约、不新建）：容量还给时段，
+下一轮 plan 想切几场切几场（可以 2×25，也可以 1×50）。实现是
+`SessionMixin.reclaim_idle_auto_sessions(day)`，挂在 refresh 的排期流水线里
+（`_reconcile_schedule_pipeline`，剪枝之后、formatter 之前）。
+
+能收 / 不能收：
+
+| 形状 | 收不收 |
+|---|---|
+| layout 链的**尾巴**上、`source` 是 plan/auto、没任务、还没开始 | 收 |
+| layout 链的**中间**（后面还有场次） | 不收（layout 是从起点接龙，中间摘一场会把后面全挪位） |
+| extras `source=plan/auto`、没任务、还没开始 | 收（窗口各自独立） |
+| `source=manual`（手敲 `period`）/ `formatter` | 不收（硬约束） |
+| 挂着任何任务（含 formatter / plan 提醒任务） | 不收（那是内容，不是碎片） |
+| 已经开始 / 已经过去 | 不收（不回头改历史） |
+| 已经订上、且 60 分钟内就要开始（`RECLAIM_LEAD_MINUTES`） | 不收（别把已经匹配上的人踢出去）；没订上的照样收 |
+| 已经订上、但这一轮**取消不掉**（离线 / 取消失败 / 被手订保护） | 不收，整段跳过（`plan.reclaim_booked_kept`）—— 撤了契约又没取消，daemon 只会认成「booked but missing」并记 sin |
+
+落盘顺序和 `commit_layout` 同一条：`_cancel_stale_period_sessions`（挂号单 + 清
+state，daemon 不会记成「你手动取消」）→ 写 layout（**`source` 和 `plan_sig` 原样
+保留**，否则下一次 refresh 以为计划变了，把刚回收的整段又切回来）→ 收 extras →
+`rewrite_data_csv_from_plan()`。幂等：收干净之后第二次 refresh 一场都不收。
+
+`refresh` 因此会写 data.csv、会取消旧场 —— 这是它唯一的「减项」副作用，契约从
+「只对账、不改 data.csv」改成「不订场、不建 task，但会回收」。容量前后相等
+（这些场次在排期层本来就已经被当成可重切的），所以回收不丢 count。
+
 ## session 的作用范围（一次性 vs 长期）
 
 `data.csv` 是**生成物**（下载层 + layout + 一次性 + 长期规则 → 重算），所以临时加的

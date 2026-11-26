@@ -1594,6 +1594,202 @@ class SessionMixin(object):
         return {"ok": True, "sessions": new_sessions, "cancelled": cancelled,
                 "dropped": dropped, "cleared": cleared, "failed": False}
 
+    #: 回收空闲场次时的保护期：**已经订上**、且这么多分钟内就要开始的场次不动。
+    #: 取消它 = 把已经匹配上的人从那一场里踢出去；契约是 TI 自己切的，但那一刻
+    #: 它已经是别人的现场了。
+    RECLAIM_LEAD_MINUTES = 60
+
+    def _row_is_booked(self, day, start):
+        """这一场是不是已经订上了（有 Focusmate id）。"""
+        iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
+        for row in self.rows or ():
+            if (str(row.get("date") or "") == iso
+                    and str(row.get("startLabel") or "") == str(start)):
+                return bool(row.get("id"))
+        return False
+
+    def _reclaimable_session(self, day, session, now_min, is_today):
+        """这一场能不能回收成「未切分的时段容量」（:meth:`reclaim_idle_auto_sessions`）。"""
+        start = str((session or {}).get("start") or "")
+        got = th._clock_minutes(start)
+        if not start or got is None:
+            return False
+        try:
+            int((session or {}).get("duration"))
+        except (TypeError, ValueError):
+            return False
+        if is_today and got <= now_min:
+            return False                     # 已经开始 / 已经过去：不回头改历史
+        try:
+            if self.task_store.tasks_for_session(day.isoformat(), start):
+                return False                 # 挂着任务 = 这一场是内容，不是碎片
+        except Exception:                    # noqa: BLE001 - 查不到绑定就当有内容
+            return False
+        if (is_today and got - now_min < self.RECLAIM_LEAD_MINUTES
+                and self._row_is_booked(day, start)):
+            return False                     # 快开始的已订场次别动
+        return True
+
+    def reclaim_idle_auto_sessions(self, day=None, quiet=True):
+        """TI 自己切出来、**没挂任务**的零散场次 → 收回成「未切分的时段容量」。
+
+        用户口径（2026-11-26）：「两场被自动切出来的 25 换成一个 50 分钟的无切分
+        时段，相当于资源回收」。所以回收**不是**把 25+25 合成一场 50（那样还要再
+        预约一次），而是把这几场从契约里撤掉：那段时间还给时段，下一轮 plan 想
+        切几场切几场（可以 2×25，也可以 1×50）。
+
+        只回收 TI 自己切的（layout ``source`` / extras ``source`` 是 auto/plan）：
+        手敲 ``period`` 的 manual、formatter 切的都是硬约束。
+
+        三条「这一场已经在被别人用」的保护：
+          * 挂了任务（含 formatter / plan 提醒任务）→ 这是内容，不是碎片；
+          * 已经开始 / 已经过去 → 不回头改历史；
+          * 已经订上、且 ``RECLAIM_LEAD_MINUTES`` 分钟内就要开始 → 不动。
+
+        layout 链只能从**尾巴**回收：它是从时段起点接龙的 duration 列表，中间摘掉
+        一场会让后面每场起点都变（= 取消 + 重订一堆已订场次）。extras（窗口）各自
+        独立，任意一条都能单独收。
+
+        取消走 :meth:`_cancel_stale_period_sessions`（唯一那份实现：挂号单 + 清
+        state，daemon 不会把这次改动记成「你手动取消」的罪）；落盘完 data.csv
+        重算一次。返回被回收的场次数。
+        """
+        day = day or self.sel_date
+        if hasattr(day, "datetime"):
+            day = day.date()
+        iso = day.isoformat()
+        now = self._now_dt()
+        now_min = now.hour * 60 + now.minute
+        if day < now.date():
+            return 0                          # 过去的日子不动
+        is_today = (day == now.date())
+        try:
+            self.reload_periods()
+            self.rebuild_rows()
+        except Exception:                     # noqa: BLE001 - 拿不到最新账就按旧账
+            pass
+        try:
+            extras_today = list(sp.extras_for_date(sp.load_extras(), day))
+        except Exception:                     # noqa: BLE001 - 坏表按没有 extras
+            extras_today = []
+        reclaimed, events = 0, []
+        for period in self.periods_for_day(day):
+            pid = str(period.get("id") or "")
+            span = th._range_of(period)
+            if not pid or span is None:
+                continue
+            p_start, p_end = span
+            rec = sp.get_layout_record(self.layouts, day, pid)
+            try:
+                chain = sp.sessions_for_period(period, self.layouts)
+            except ValueError:                # 坏 layout 不碰（别人负责报警）
+                chain = []
+            chain_starts = {str(s.get("start")) for s in chain}
+            keep_durations = None
+            keep_count = len(chain)
+            if rec and chain and sp.is_auto_source(rec.get("source")):
+                while (keep_count > 0
+                       and self._reclaimable_session(day, chain[keep_count - 1],
+                                                     now_min, is_today)):
+                    keep_count -= 1
+                if keep_count < len(chain):
+                    keep_durations = [int(s["duration"]) for s in chain[:keep_count]]
+            doomed, kept_extra = [], []
+            for ex in extras_today:
+                got = th._clock_minutes(ex.get("start"))
+                if got is None or not (p_start <= got < p_end):
+                    continue
+                if str(ex.get("start")) in chain_starts:
+                    continue                  # 和 layout 链撞了：csv 以链为准
+                sess = {"start": str(ex.get("start")),
+                        "duration": int(ex.get("duration") or 0)}
+                if (sp.is_auto_source(sp.extra_source(ex))
+                        and self._reclaimable_session(day, sess, now_min, is_today)):
+                    doomed.append(sess)
+                else:
+                    kept_extra.append(sess)
+            if keep_durations is None and not doomed:
+                continue
+            # 「撤完之后这一段应该长什么样」：取消旧场只认它，别的一律保留。
+            try:
+                new_chain = (sp.plan_period(period, keep_durations)
+                             if keep_durations is not None else list(chain))
+            except ValueError:                # 理论上不会：keep 是原链的前缀
+                continue
+            desired = ([{"start": s["start"], "duration": int(s["duration"])}
+                        for s in new_chain] + kept_extra)
+            lock = self._acquire_round_lock(timeout=5.0)
+            try:
+                cancelled, failed = self._cancel_stale_period_sessions(
+                    day, period, desired, reason="reclaim-idle")
+                if failed:
+                    rl.log_event("plan", "reclaim_cancel_failed", level="warning",
+                                 day=iso, period=pid)
+                    continue
+                # 撤契约之前先确认「该取消的真的取消了」：只要有一场**已订上**却
+                # 没进取消名单（离线 / 取消失败 / 被手订保护掉），就不能把契约收走
+                # —— 那会留下「booked but missing」，daemon 只认这一条会记一笔 sin
+                # 并锁死 TUI。
+                done_starts = {str(r.get("startLabel")) for r in (cancelled or [])}
+                risky = [s for s in (chain[keep_count:] + doomed)
+                         if str(s["start"]) not in done_starts
+                         and self._row_is_booked(day, s["start"])]
+                if risky:
+                    rl.log_event("plan", "reclaim_booked_kept", level="warning",
+                                 day=iso, period=pid,
+                                 starts=[str(s["start"]) for s in risky])
+                    continue
+                if keep_durations is not None:
+                    # source 原样保留（plan / auto），plan_sig 也带上：否则下一次
+                    # refresh 会以为计划变了，把刚回收的整段又切回来。
+                    sp.set_layout(day, pid, keep_durations,
+                                  source=str(rec.get("source") or "auto"),
+                                  plan_sig=rec.get("plan_sig"))
+                for sess in doomed:
+                    sp.remove_extra(day, sess["start"])
+            finally:
+                if lock is not None:
+                    lock.__exit__(None, None, None)
+            gone = len(chain) - len(new_chain) + len(doomed)
+            if gone <= 0:
+                continue
+            reclaimed += gone
+            events.append({
+                "period": pid,
+                "sessions": [{"start": s["start"], "duration": s["duration"]}
+                             for s in chain[keep_count:]] + doomed,
+                "cancelled": len(cancelled or []),
+            })
+            rl.log_event("plan", "reclaim_idle", day=iso, period=pid,
+                         sessions=gone, cancelled=len(cancelled or []),
+                         kept=len(new_chain), extras_kept=len(kept_extra),
+                         starts=[s["start"] for s in chain[keep_count:]]
+                         + [s["start"] for s in doomed])
+        if not reclaimed:
+            return 0
+        try:
+            self.rewrite_data_csv_from_plan()
+        except Exception as e:                # noqa: BLE001 - 回收了但 csv 没重算
+            self.had_error = True
+            self.say("回收空闲场次：data.csv 重算失败（%s），下次 refresh 会再对一次。"
+                     % e, "warn")
+        try:
+            self.reload_periods()
+            self.rebuild_rows()
+            self.invalidate()
+        except Exception:                     # noqa: BLE001
+            pass
+        if not quiet:
+            bits = []
+            for ev in events:
+                names = "、".join("%s(%d)" % (s["start"], s["duration"])
+                                 for s in ev["sessions"][:4])
+                bits.append("%s %s" % (ev["period"], names)
+                            + (" 等" if len(ev["sessions"]) > 4 else ""))
+            self.say("♻ 回收 %d 场没任务的自动场次 → 那段时间回到未切分容量（下次 plan "
+                     "可以重切）：%s" % (reclaimed, "；".join(bits)), "info")
+        return reclaimed
+
     def _period_window_of(self, period):
         """时段的原窗口（裁剪过就还原成日历给的那一份）。"""
         if not period:
@@ -1848,11 +2044,16 @@ class SessionMixin(object):
            就落在这一条上，不然任务永远不会出现在 Focusmate 的 Task Manager 里）。
         6. 有问题的都修完之后再拉一次，表格显示的就是**修完之后**的样子。
 
-        不带 ``--check`` 的 ``refresh`` **不在外面新造东西**（不订场、不在 Focusmate
-        建 task、不改 data.csv），但它不是只管一行数：它把看板上每块组件的状态都
-        重新对一遍账（见 :meth:`refresh_all`）——表格、任务完成状态、统计、收尾面板、
-        各种缓存。其中「Focusmate 已经说完成了」的 task 会**顺手写回 OmniFocus**
-        （幂等；这不是新决定，是同一条事实的第二个账本）。
+        不带 ``--check`` 的 ``refresh`` **不订场、不在 Focusmate 建 task**，但它不是
+        只管一行数：它把看板上每块组件的状态都重新对一遍账（见 :meth:`refresh_all`）
+        ——表格、任务完成状态、统计、收尾面板、各种缓存。其中「Focusmate 已经说完成了」
+        的 task 会**顺手写回 OmniFocus**（幂等；这不是新决定，是同一条事实的第二个
+        账本）。
+
+        唯一的「减项」副作用是**资源回收**（2026-11-26 用户要求「refresh 之后直接把
+        零散 session 变成一个统一的时间块，如果没有任务」）：TI 自己切的、没挂任务
+        的零散场次会被收回去，那段时间回到未切分容量，于是 data.csv 会变、对应的旧
+        场次会被取消（见 :meth:`reclaim_idle_auto_sessions`）。它只做回收，不做新决定。
         """
         toks = [str(tok).lower() for tok in (args or [])]
         want_check = any(tok in ("--check", "-c", "check", "查", "对账", "核对")
@@ -1869,8 +2070,9 @@ class SessionMixin(object):
         """``refresh`` 实作的**全量**那一半：把屏幕上**每块组件**的状态都对一遍。
 
         需求：「refresh 需要刷新这个界面每个组件的状态」。所以不再只是「重拉 session
-        列表、重算表格」，而是一条命令把看板上每一块拆开重新对账（**不新造东西**：
-        不订场、不挂任务、不改 data.csv）：
+        列表、重算表格」，而是一条命令把看板上每一块拆开重新对账（**不订场、不挂任务**；
+        唯一会写盘的是「回收没任务的零散自动场次」，见
+        :meth:`reclaim_idle_auto_sessions`）：
 
         ==================  ============================================
         组件                刷什么

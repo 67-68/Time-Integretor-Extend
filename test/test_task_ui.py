@@ -33,6 +33,7 @@ def task_panel_of(panels):
 
 
 TMP = tempfile.mkdtemp(prefix="task-ui-test-")
+print("TMPDIR", TMP)
 os.environ["TI_LOG_DIR"] = os.path.join(TMP, "logs")   # 测试日志别写进真 temp/logs
 os.environ["TI_CALENDAR_DOWNLOAD"] = os.path.join(TMP, "download.json")
 os.environ["TI_SESSION_LAYOUTS"] = os.path.join(TMP, "layouts.json")
@@ -1862,7 +1863,17 @@ try:
     # (4) 执行区里有契约、API 里没有 → 叫 daemon 补一轮
     #     只有执行区里的「缺」才值得补（草稿区本来就还没轮它），所以把区域判据
     #     钉成 execute：否则这条用例会随当前钟点变红。
+    #
+    #     这里要的是一场「TI 排了、就该订上」的场次，所以先把 T2 钉成**手敲**的
+    #     ``[50]``：前面几节可能在这里留下过 plan/auto 切的自动排布，而 refresh
+    #     现在会把「没挂任务的自动场次」回收掉（那是资源回收，不是缺订），
+    #     留着它会让这条用例失去「契约还在、只是没订上」的前提。
     ran[:] = []
+    sp.set_layout(TODAY, "T2", [50], source="manual")
+    wd3.rewrite_data_csv_from_plan()
+    wd3.reload_periods()
+    wd3.reload_entries()
+    wd3.rebuild_rows()
     wd3.bridge.sessions = plan_sessions(wd3, drop=("15:00",))
     wd3.bridge.calls = []
     _orig_zone = wd3.effective_zone
@@ -2331,6 +2342,7 @@ def _demo_trigger(ctx, task_id):
     return {"ctx": ctx, "task_id": task_id}
 
 wdh.messages = []
+wdh.bridge.calls = []        # 前面几节的 refresh 会回收/取消空闲场次，别算到这条头上
 check("注册后 task -t 列出 demo_after_task", wdh.handle("task -t"), True)
 check_true("列表里有 demo_after_task",
            any("demo_after_task" in m[2] for m in wdh.messages))

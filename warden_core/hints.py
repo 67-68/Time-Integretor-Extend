@@ -560,7 +560,8 @@ def _hint_refresh(parts):
         return repl_kit.Hint("参数", ("（跑起来了）",),
                              note="查「该订没订上」「该挂没挂上」，能修的当场修")
     return repl_kit.Hint("选项", ("--check", "-c"),
-                         note="不光重拉：还叫 daemon 查一遍、把不对的修掉")
+                         note="不光重拉：还叫 daemon 查一遍、把不对的修掉"
+                              "（顺带把没任务的零散自动场次收回成未切分容量）")
 
 
 TASK_ACTION_WORDS = ("create", "import", "delete", "modify", "note", "assign", "select",

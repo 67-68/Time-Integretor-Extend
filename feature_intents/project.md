@@ -705,7 +705,8 @@ plan -c -s 1 -p 2       # 需要时可把当前进行中的 session 也纳入
 执行区里排出来的场次订上。重构前这条链是断的 —— `period` / `session` 会立刻订，
 `plan` 排好了却要等 daemon 下一轮（或手动 `refresh --check`），同一条流水线两个
 待遇。现在所有「改了 data.csv」的命令层写入者末尾都走同一个 `book()`；
-refresh 的自动重排例外（`_suppress_book`：只对账、不新造外部动作）。
+refresh 的自动重排例外（`_suppress_book`：不订场、不建 task；但会做资源回收 ——
+没挂任务的零散自动场次被收回成未切分容量，见 `session_plan.md`「资源回收」）。
 
 ### 快捷挂第一条：`project <序号> -a <session>` / `-ac`
 
