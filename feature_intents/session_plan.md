@@ -126,6 +126,16 @@ manual layout 的时段（formatter / watchdog 切过）里，上一轮 plan 切
 `planned=False`），`_row_slots` / `check_bookings` / 取消 / mute / 挂任务
 全都不认它 —— 只用来回答「这一段到底有没有被算进去」。
 
+切了一半的时段同理：**剩下的每一截**（前缀 / 中间 / 尾巴）各画一行占位
+（`partial_gap=True`，时长写「空档 Nmin（K count）」）。以前只算尾巴
+（`tail_gap`，还要求已有场次从时段起点接龙），于是「前面空、后面被任务钉住」
+的形状整段消失 —— 2026-11-26 T4：`22:15(50)` 被回收成未切分容量、`23:15(25)`
+挂着 flashcard，表里只剩 23:15 一行，用户当场问「为什么现在这个时段压根不显示了？？」。
+口径：空档 = 时段减去已有场次的 `session_span`（25/50/75 → 30/60/90，含强制
+休息），不足 1 count（<30 分钟）的碎块不画；`source` 是 auto/plan 且整段都
+没有阻塞场次（挂任务 / 已订上 / 已结束）时仍旧不画（plan 会整体重切，见
+`_plan_slots` 同一口径）。
+
 ### 资源回收：没任务的零散自动场次收回成「未切分容量」（2026-11-26）
 
 用户口径：「我希望 refresh 之后直接把零散 session 变成一个统一的时间块，如果没有
@@ -141,13 +151,14 @@ manual layout 的时段（formatter / watchdog 切过）里，上一轮 plan 切
 
 | 形状 | 收不收 |
 |---|---|
-| layout 链的**尾巴**上、`source` 是 plan/auto、没任务、还没开始 | 收 |
-| layout 链的**中间**（后面还有场次） | 不收（layout 是从起点接龙，中间摘一场会把后面全挪位） |
+| layout 链的**尾巴**上、`source` 是 plan/auto、没任务、还没开始 | 收（`mode=tail`） |
+| layout 链**前面空着、后面被任务钉住**（例：`22:15(50)` 空着 + `23:15(25)` 挂着 flashcard） | 收（`mode=window`）：整段 layout 清空退回未切分，钉住的那几场挪成**独立窗口** extras（起点/时长/任务绑定不变），空着的前缀取消。用户原话「他应该变成 50 分钟的待分配时段等我 plan」 |
+| layout 链**中间有空、后面还有空场**（不是连续钉住） | 不收（接龙表达不了这种形状） |
 | extras `source=plan/auto`、没任务、还没开始 | 收（窗口各自独立） |
 | `source=manual`（手敲 `period`）/ `formatter` | 不收（硬约束） |
 | 挂着任何任务（含 formatter / plan 提醒任务） | 不收（那是内容，不是碎片） |
 | 已经开始 / 已经过去 | 不收（不回头改历史） |
-| 已经订上、且 60 分钟内就要开始（`RECLAIM_LEAD_MINUTES`） | 不收（别把已经匹配上的人踢出去）；没订上的照样收 |
+| **已经订上**（包括马上就要开始的） | 照收 —— 先取消再撤契约。用户 2026-11-26：「回收所有 plan + 没有任务的 session」「就算那一段时间不行，这一个 session 为什么还留着？」。以前有条「60 分钟内开始时不动」的保险，结果 T2 16:30(75) 明明没任务也回收不掉 |
 | 已经订上、但这一轮**取消不掉**（离线 / 取消失败 / 被手订保护） | 不收，整段跳过（`plan.reclaim_booked_kept`）—— 撤了契约又没取消，daemon 只会认成「booked but missing」并记 sin |
 
 落盘顺序和 `commit_layout` 同一条：`_cancel_stale_period_sessions`（挂号单 + 清
@@ -158,6 +169,20 @@ state，daemon 不会记成「你手动取消」）→ 写 layout（**`source` �
 `refresh` 因此会写 data.csv、会取消旧场 —— 这是它唯一的「减项」副作用，契约从
 「只对账、不改 data.csv」改成「不订场、不建 task，但会回收」。容量前后相等
 （这些场次在排期层本来就已经被当成可重切的），所以回收不丢 count。
+
+### 剪枝（prune）只剪「未来 + 没订上 + 有 abandoned/missed 证据」的幽灵（2026-11-26 修）
+
+`_prune_dead_auto_slots` 的原意是剪掉「永远订不上」的幽灵场次。2026-11-26 它把 T1
+09:30 那场**真实上完**的 session 剪了：计划 09:30，Focusmate 实际落在 09:45
+（`state`：`booked + match=shifted + 实际 09:45 75min（计划 09:30）`），人上完了，
+但 10:03 留了一条过期的 `abandoned/nostart` 判决 —— 剪枝先看「09:30 不在 API 快照
+里」，再拿那条判决当证据 → 整段 `mode=clear`，data.csv 那行消失，daemon 之后每轮
+都在报「计划外 1 场：09:45」。
+
+现在三条保护（`plan.prune_dead` 日志记 why / starts）：
+* **已经过去的场次一律不剪**：它是已经发生的事实；
+* `state.status == booked` 或带 `match`（被挪过时间、daemon 已认账）→ 不剪；
+* 只有「未来 + 没订上 + abandoned/missed 证据」才剪。
 
 ## session 的作用范围（一次性 vs 长期）
 

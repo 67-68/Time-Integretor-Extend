@@ -1594,11 +1594,6 @@ class SessionMixin(object):
         return {"ok": True, "sessions": new_sessions, "cancelled": cancelled,
                 "dropped": dropped, "cleared": cleared, "failed": False}
 
-    #: 回收空闲场次时的保护期：**已经订上**、且这么多分钟内就要开始的场次不动。
-    #: 取消它 = 把已经匹配上的人从那一场里踢出去；契约是 TI 自己切的，但那一刻
-    #: 它已经是别人的现场了。
-    RECLAIM_LEAD_MINUTES = 60
-
     def _row_is_booked(self, day, start):
         """这一场是不是已经订上了（有 Focusmate id）。"""
         iso = day.isoformat() if hasattr(day, "isoformat") else str(day)
@@ -1607,6 +1602,13 @@ class SessionMixin(object):
                     and str(row.get("startLabel") or "") == str(start)):
                 return bool(row.get("id"))
         return False
+
+    def _session_has_task(self, day, start):
+        """这一场挂着任务吗（回收判断用：挂任务的场次是内容，不是碎片）。"""
+        try:
+            return bool(self.task_store.tasks_for_session(day.isoformat(), str(start)))
+        except Exception:                    # noqa: BLE001 - 查不到绑定就当有内容
+            return True
 
     def _reclaimable_session(self, day, session, now_min, is_today):
         """这一场能不能回收成「未切分的时段容量」（:meth:`reclaim_idle_auto_sessions`）。"""
@@ -1625,9 +1627,6 @@ class SessionMixin(object):
                 return False                 # 挂着任务 = 这一场是内容，不是碎片
         except Exception:                    # noqa: BLE001 - 查不到绑定就当有内容
             return False
-        if (is_today and got - now_min < self.RECLAIM_LEAD_MINUTES
-                and self._row_is_booked(day, start)):
-            return False                     # 快开始的已订场次别动
         return True
 
     def reclaim_idle_auto_sessions(self, day=None, quiet=True):
@@ -1641,10 +1640,15 @@ class SessionMixin(object):
         只回收 TI 自己切的（layout ``source`` / extras ``source`` 是 auto/plan）：
         手敲 ``period`` 的 manual、formatter 切的都是硬约束。
 
-        三条「这一场已经在被别人用」的保护：
+        收的判据只有两条（用户 2026-11-26 定：「回收所有 plan + 没有任务的 session」）：
           * 挂了任务（含 formatter / plan 提醒任务）→ 这是内容，不是碎片；
-          * 已经开始 / 已经过去 → 不回头改历史；
-          * 已经订上、且 ``RECLAIM_LEAD_MINUTES`` 分钟内就要开始 → 不动。
+          * 已经开始 / 已经过去 → 不回头改历史。
+
+        **已订上、马上就要开始，也照收**：订上不代表有人要做它，没任务的场次留着
+        只是占着那截时间；回收会先取消它（走挂号单），下一轮 plan 再决定要不要。
+        以前这里有一条「60 分钟内开始的已订场次不动」的保险 —— 结果是 T2 16:30(75)
+        明明没任务、也回收不掉，用户当场问「就算那一段时间不行，这一个 session
+        为什么还留着？」
 
         layout 链只能从**尾巴**回收：它是从时段起点接龙的 duration 列表，中间摘掉
         一场会让后面每场起点都变（= 取消 + 重订一堆已订场次）。extras（窗口）各自
@@ -1686,14 +1690,31 @@ class SessionMixin(object):
                 chain = []
             chain_starts = {str(s.get("start")) for s in chain}
             keep_durations = None
+            pinned, removed_chain = [], []
             keep_count = len(chain)
             if rec and chain and sp.is_auto_source(rec.get("source")):
-                while (keep_count > 0
-                       and self._reclaimable_session(day, chain[keep_count - 1],
-                                                     now_min, is_today)):
+                flags = [self._reclaimable_session(day, s, now_min, is_today)
+                         for s in chain]
+                while keep_count > 0 and flags[keep_count - 1]:
                     keep_count -= 1
                 if keep_count < len(chain):
                     keep_durations = [int(s["duration"]) for s in chain[:keep_count]]
+                    removed_chain = chain[keep_count:]
+                else:
+                    # 尾巴上没得收，但可能是「**前面空着、后面被任务钉住**」：
+                    # 22:15(50) 空着、23:15(25) 挂着 flashcard。layout 是接龙，
+                    # 摘掉前面那场会把 23:15 挪位 —— 所以换一种表示：整段 layout
+                    # 清空（回到未切分容量），被任务钉住的场次挪成**独立窗口**
+                    # （extras，起点/时长/任务绑定都不变）。
+                    # 用户 2026-11-26：「他应该变成 50 分钟的待分配时段等我 plan」。
+                    idx = len(chain)
+                    while (idx > 0 and not flags[idx - 1]
+                           and self._session_has_task(day, chain[idx - 1]["start"])):
+                        idx -= 1
+                    if 0 < idx < len(chain) and all(flags[:idx]):
+                        pinned = chain[idx:]
+                        removed_chain = chain[:idx]
+                        keep_durations = []
             doomed, kept_extra = [], []
             for ex in extras_today:
                 got = th._clock_minutes(ex.get("start"))
@@ -1708,7 +1729,7 @@ class SessionMixin(object):
                     doomed.append(sess)
                 else:
                     kept_extra.append(sess)
-            if keep_durations is None and not doomed:
+            if keep_durations is None and not doomed and not removed_chain:
                 continue
             # 「撤完之后这一段应该长什么样」：取消旧场只认它，别的一律保留。
             try:
@@ -1717,7 +1738,9 @@ class SessionMixin(object):
             except ValueError:                # 理论上不会：keep 是原链的前缀
                 continue
             desired = ([{"start": s["start"], "duration": int(s["duration"])}
-                        for s in new_chain] + kept_extra)
+                        for s in new_chain]
+                       + [{"start": s["start"], "duration": int(s["duration"])}
+                          for s in pinned] + kept_extra)
             lock = self._acquire_round_lock(timeout=5.0)
             try:
                 cancelled, failed = self._cancel_stale_period_sessions(
@@ -1731,7 +1754,7 @@ class SessionMixin(object):
                 # —— 那会留下「booked but missing」，daemon 只认这一条会记一笔 sin
                 # 并锁死 TUI。
                 done_starts = {str(r.get("startLabel")) for r in (cancelled or [])}
-                risky = [s for s in (chain[keep_count:] + doomed)
+                risky = [s for s in (removed_chain + doomed)
                          if str(s["start"]) not in done_starts
                          and self._row_is_booked(day, s["start"])]
                 if risky:
@@ -1745,25 +1768,40 @@ class SessionMixin(object):
                     sp.set_layout(day, pid, keep_durations,
                                   source=str(rec.get("source") or "auto"),
                                   plan_sig=rec.get("plan_sig"))
+                have_extras = {str(r.get("start"))
+                               for r in sp.extras_for_date(sp.load_extras(), day)}
+                for sess in pinned:
+                    if str(sess["start"]) in have_extras:
+                        continue
+                    try:
+                        sp.add_extra(day, sess["start"], int(sess["duration"]),
+                                     note="任务钉住的场次（回收时从 layout 挪成窗口）",
+                                     source="manual")
+                    except ValueError as e:   # 同起点已有 extras：跳过，别重复
+                        rl.log_event("plan", "reclaim_pin_extra_failed",
+                                     level="warning", day=iso, period=pid,
+                                     start=str(sess["start"]), error=str(e))
                 for sess in doomed:
                     sp.remove_extra(day, sess["start"])
             finally:
                 if lock is not None:
                     lock.__exit__(None, None, None)
-            gone = len(chain) - len(new_chain) + len(doomed)
+            gone = len(removed_chain) + len(doomed)
             if gone <= 0:
                 continue
             reclaimed += gone
+            mode = "window" if pinned else "tail"
             events.append({
-                "period": pid,
+                "period": pid, "mode": mode,
                 "sessions": [{"start": s["start"], "duration": s["duration"]}
-                             for s in chain[keep_count:]] + doomed,
+                             for s in removed_chain] + doomed,
                 "cancelled": len(cancelled or []),
             })
-            rl.log_event("plan", "reclaim_idle", day=iso, period=pid,
+            rl.log_event("plan", "reclaim_idle", day=iso, period=pid, mode=mode,
                          sessions=gone, cancelled=len(cancelled or []),
-                         kept=len(new_chain), extras_kept=len(kept_extra),
-                         starts=[s["start"] for s in chain[keep_count:]]
+                         kept=len(new_chain), pinned=[s["start"] for s in pinned],
+                         extras_kept=len(kept_extra),
+                         starts=[s["start"] for s in removed_chain]
                          + [s["start"] for s in doomed])
         if not reclaimed:
             return 0

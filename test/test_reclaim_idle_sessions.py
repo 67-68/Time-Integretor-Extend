@@ -9,7 +9,8 @@
 下次 plan 想切几场切几场。要守住的几件事：
 
 * 只收 TI 自己切的（layout / extras 的 source 是 plan/auto）；manual、formatter 不动；
-* 挂着任务 / 已经开始 / 已经过去 / 已订上且快开始 的一律不动；
+* 挂着任务 / 已经开始 / 已经过去 的一律不动；**已经订上、马上就要开始的照收**
+  （用户 2026-11-26：「就算那一段时间不行，这一个 session 为什么还留着？」）；
 * layout 链只能收尾巴（中间摘一场会让后面每场起点都变）；
 * 回收**不改变 plan 看到的容量**（这些场次在排期层本来就已经被当成可重切的）；
 * 幂等：第二次 refresh 一场都不收；plan_sig 保持，不会触发无谓重排。
@@ -89,7 +90,11 @@ def check(label, got, want):
 
 
 class FakeBridge(object):
+    def __init__(self):
+        self.calls = []
+
     def call(self, cmd, timeout=240, **kw):
+        self.calls.append((cmd, kw))
         if cmd == "snapshot":
             return {"date": kw.get("date"),
                     "now": int(datetime.datetime.now().timestamp() * 1000),
@@ -128,18 +133,19 @@ class FakeOmniFocus(object):
         pass
 
 
-def fresh(day=DAY):
-    """干净的沙盒 + 一个时段 T3 19:00–21:30（够 5 count）。"""
+def fresh(day=DAY, extra_periods=()):
+    """干净的沙盒 + 一个时段 T3 19:00–21:30（够 5 count）；extra_periods 可加。"""
+    periods = [
+        {"id": "T3", "date": day.isoformat(), "start": "19:00",
+         "end": "21:30", "type": "空闲", "name": "其他项目",
+         "calendar": "空闲", "title": "其他项目"},
+    ] + [dict(p, date=day.isoformat()) for p in extra_periods]
     sp.save_extras(sp.empty_extras())
     sp.save_layouts(sp.empty_layouts())
     sp.save_download({
         "version": 1, "generated_at": "x", "start_date": day.isoformat(),
         "days": 8, "profiles": ["工作"], "events": [],
-        "periods": [
-            {"id": "T3", "date": day.isoformat(), "start": "19:00",
-             "end": "21:30", "type": "空闲", "name": "其他项目",
-             "calendar": "空闲", "title": "其他项目"},
-        ]})
+        "periods": periods})
     with open(sch.DATA_CSV, "w", encoding="utf-8") as fh:
         fh.write("# 空\n")
     store = ts.TaskStore()
@@ -159,9 +165,9 @@ def layout_of(wd, pid="T3", day=DAY):
     return list(rec.get("durations") or []), rec.get("source"), rec.get("plan_sig")
 
 
-def set_auto_layout(wd, durations, source="plan", day=DAY):
+def set_auto_layout(wd, durations, source="plan", day=DAY, pid="T3"):
     sig = wd._auto_plan_signature(day)
-    sp.set_layout(day, "T3", durations, source=source, plan_sig=sig)
+    sp.set_layout(day, pid, durations, source=source, plan_sig=sig)
     wd.rewrite_data_csv_from_plan()
     wd.rebuild_rows()
 
@@ -306,16 +312,20 @@ check("csv 只剩已经开打的两场", csv_rows(wd, day=TODAY),
       [("19:00", 25), ("19:30", 25)])
 check("layout 变成 [25, 25]", layout_of(wd, day=TODAY)[0], [25, 25])
 
-print("\n== 7) 快开始的**已订**场次不动（别把已经匹配上的人踢出去）==")
+print("\n== 7) 已订上、而且马上就要开始：也照收（先取消，下一轮 plan 再决定）==")
 wd = fresh(day=TODAY)
-wd.clock_now = datetime.datetime.combine(TODAY, datetime.time(19, 0))
+wd.clock_now = datetime.datetime.combine(TODAY, datetime.time(18, 45))
 set_auto_layout(wd, [25, 75], day=TODAY)
 book_all(wd)
+wd.offline = False                # 要真的走取消（FakeBridge 会立刻回 verified）
 check("19:00/19:30 都订上了", [bool(r.get("id")) for r in wd.rows
                               if r.get("startLabel") in ("19:00", "19:30")],
       [True, True])
-check("60 分钟内开始的两场都不动",
-      wd.reclaim_idle_auto_sessions(TODAY), 0)
+check("15 分钟后就要开始的两场也照收", wd.reclaim_idle_auto_sessions(TODAY), 2)
+check("layout 清空（整段回到未切分）", layout_of(wd, day=TODAY)[0], [])
+check("data.csv 这一天没有 session 行", csv_rows(wd, day=TODAY), [])
+check("取消走的是那条唯一路径（有 cancel 调用）",
+      [c for c in getattr(wd.bridge, "calls", []) if c[0] == "cancel"] != [], True)
 
 print("\n== 8) 同样形状但**没订上**：照样收（纯契约碎片，没人被影响）==")
 wd = fresh(day=TODAY)
@@ -343,6 +353,36 @@ check("流水线报告回收 2 场", res.get("reclaimed"), 2)
 check("csv 收干净了", csv_rows(wd), [])
 check("没有产生预订动作（refresh 不新造外部动作）",
       wd._suppress_book, False)
+
+print("\n== 9.5) 前面空着、后面被任务钉住：整段退回未切分，钉住的那场变独立窗口 ==")
+# 现场：T4 22:15–23:45，layout [50,25]，23:15 挂着 flashcard（重复任务），22:15 空着。
+# layout 是接龙，摘不掉 22:15 那场；解法是 layout 清空 + 23:15 挪成 extras（起点不变），
+# 于是 22:15–23:15 变成 plan 眼里的 2 count「待分配」。
+T4 = {"id": "T4", "start": "22:15", "end": "23:45", "type": "工作",
+      "name": "其他项目", "calendar": "工作", "title": "其他项目"}
+wd = fresh(extra_periods=[T4])
+wd.clock_now = datetime.datetime.combine(DAY, datetime.time(16, 0))
+set_auto_layout(wd, [50, 25], day=DAY, pid="T4")
+keep_task = bind(DAY_ISO, "23:15", 25, title="flashcard review")
+wd.rebuild_rows()
+check("回收前 csv：22:15(50) + 23:15(25)", csv_rows(wd),
+      [("22:15", 50), ("23:15", 25)])
+check("只收 22:15 那场", wd.reclaim_idle_auto_sessions(DAY), 1)
+check("T4 layout 清空（回到未切分）", layout_of(wd, "T4")[0], [])
+check("source 原样保留（还是 plan，可重切）/ plan_sig 没丢",
+      (layout_of(wd, "T4")[1], layout_of(wd, "T4")[2] is not None), ("plan", True))
+check("23:15 那场变成独立窗口（起点/时长不变）",
+      [(r.get("start"), int(r.get("duration") or 0))
+       for r in sp.extras_for_date(sp.load_extras(), DAY)],
+      [("23:15", 25)])
+check("csv 只剩挂着任务的那场", csv_rows(wd), [("23:15", 25)])
+check("任务绑定没动（还在 23:15）",
+      (ts.TaskStore().get(keep_task["id"])["session"] or {}).get("start"), "23:15")
+slots, _n = wd._plan_slots(DAY)
+free = [(s.get("start"), int(s.get("counts") or 0)) for s in slots
+        if str(s.get("period_id") or "") == "T4"]
+check("plan 眼里 T4 有 2 count「待分配」、起点 22:15", free, [("22:15", 2)])
+check("再回收一次是幂等的（0 场）", wd.reclaim_idle_auto_sessions(DAY), 0)
 
 print("\n== 10) 过去的日子一律不动 ==")
 yesterday = TODAY - datetime.timedelta(days=1)

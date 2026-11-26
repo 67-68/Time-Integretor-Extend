@@ -577,6 +577,139 @@ def case_10_refresh_reclaims_idle_auto_sessions():
     return paths
 
 
+def case_11_refresh_does_not_prune_real_session():
+    """refresh 不许把「真实发生过 / daemon 认账了」的场次当幽灵剪掉。
+
+    2026-11-26 现场：T1 计划 09:30(75)，Focusmate 实际落在 **09:45**（
+    `state.slots`：``booked + match=shifted + 实际 09:45 75min``），人上完了；
+    但 10:03 留了一条过期的 ``abandoned/nostart`` 判决。16:08 一次 refresh 的
+    ``_prune_dead_auto_slots`` 先看「09:30 不在 API 快照里」，再拿那条判决当证据
+    → 整段 clear，T1 变「整段未切 session」，用户的真实场次从契约里消失了。
+
+    黑盒复刻（两段）：T1 的场次挂着任务且 state 说 booked/match（不许剪）；
+    T2 第二场 state 说 missed（真死，必须剪）。断言落在日志事件与落盘文件上。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+
+    # 两段：T1 13:00–14:30（放 75）、T2 15:00–16:30（放 25+50）
+    data = bb.calendar_download(day)
+    data["periods"] = [
+        {"id": "T1", "date": iso, "start": "13:00", "end": "14:30",
+         "type": "空闲", "name": "真场", "calendar": "空闲", "title": "真场"},
+        {"id": "T2", "date": iso, "start": "15:00", "end": "16:30",
+         "type": "空闲", "name": "幽灵", "calendar": "空闲", "title": "幽灵"},
+    ]
+    bb._write_json(paths["calendar"], data)
+
+    # T1 那场挂一条真任务（不然资源回收会把它收掉，验不了剪枝）
+    made = bb.run(paths, ["task create title=真场任务 duration=75"])
+    tid = [t for t in bb.tasks(paths) if bb.task_title(t) == "真场任务"][0]["id"]
+    first = bb.run(paths, ["plan %d" % bb.DEFAULT_OFFSET,
+                           "task id:%d 3" % tid, "complete"])
+    check("先排出 13:00(75)", bb.csv_rows(paths), [("13:00", 75)])
+    # 再手工加上 T2 的两场（模拟排期切过）
+    lay = bb._read_json(paths["layouts"])
+    # 注意接龙按 session_span：50(占 60 分钟) → 下一场 16:00，state 的 key 才对得上
+    lay.setdefault("layouts", {}).setdefault(iso, {})["T2"] = {
+        "durations": [50, 25], "source": "plan"}
+    bb._write_json(paths["layouts"], lay)
+    with open(paths["csv"], "a", encoding="utf-8") as fh:
+        fh.write("%s,15:00,50\n%s,16:00,25\n" % (iso, iso))
+
+    # daemon 的结论：13:00 是 booked＋被挪到 13:15（真场）；16:00 是 missed（幽灵）
+    bb._write_json(os.path.join(paths["temp"], "keep_session-state.json"), {
+        "date": iso, "slots": {
+            "%sT13:00" % iso: {"status": "booked", "duration": "75",
+                               "match": "shifted",
+                               "actual": "实际 13:15 75min（计划 13:00）"},
+            "%sT16:00" % iso: {"status": "missed", "duration": "25"},
+        }})
+    # 两条都在「永不重订」判决里（现场那条过期判决就是它）
+    bb._write_json(os.path.join(paths["temp"], "keep_session-verdicts.json"), {
+        "abandoned": {
+            "%sT13:00" % iso: {"at": "%sT10:03:58" % iso, "why": "nostart",
+                               "note": "到点没开始，我选了「不去了」"},
+            "%sT16:00" % iso: {"at": "%sT10:03:58" % iso, "why": "nostart",
+                               "note": "到点没开始，我选了「不去了」"},
+        }})
+
+    res = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET, "refresh"])
+    check("refresh 退出码 0", res["rc"], 0)
+    pruned = [r for r in bb.log_events(paths, area="plan", event="prune_dead")]
+    check("真死那场被剪了（plan.prune_dead 记在 T2）",
+          [(r.get("period"), r.get("why"), r.get("starts")) for r in pruned],
+          [("T2", "status=missed", ["16:00"])])
+    check("T1 一次都没被剪（no prune_dead for T1）",
+          [r for r in pruned if r.get("period") == "T1"], [])
+    check("T1 的 75 分钟场次还在（挂着任务，剪枝和回收都不该动它）",
+          bb.csv_rows(paths), [("13:00", 75)])
+    check("T1 layout 还是 [75]",
+          (bb.layouts(paths).get("T1") or {}).get("durations"), [75])
+    check("T2 的 16:00 已经从契约里没了",
+          [r for r in bb.csv_rows(paths) if r[0] == "16:00"], [])
+    return paths
+
+
+def case_12_uncut_prefix_is_visible_on_board():
+    """契约表：**切了一半**的时段，剩下的空档必须有一行占位。
+
+    2026-11-26 现场（T4）：22:15 那一场被回收成「未切分容量」，23:15 那场挂着
+    flashcard（窗口，extras）。回收之后表里只剩 23:15 一行 —— 用户原话：
+    「为什么现在这个时段压根不显示了？？」。占位逻辑以前只算尾巴
+    （``tail_gap``），而它要求已有场次从时段起点接龙；窗口钉在中间必然对不上
+    → 一行都不画，22:15–23:15 那 2 count 在界面上彻底消失。
+
+    黑盒：读的是一份真实的现场形状（时段 22:15–23:45 + extras 窗口 + 挂任务的
+    csv 行），跑 `day N` 渲一次表，断言**用户看见的那一行**在（`空档 60min（2 count）`
+    + `未切 session`），而且不是整段占位。
+    """
+    paths = bb.make_sandbox(offset=bb.DEFAULT_OFFSET)
+    day = paths["day"]
+    iso = day.isoformat()
+    data = bb.calendar_download(day)
+    data["periods"] = [{"id": "T1", "date": iso, "start": "22:15", "end": "23:45",
+                        "type": "工作", "name": "其他项目", "calendar": "工作",
+                        "title": "其他项目"}]
+    data["events"] = [{"date": iso, "start": "22:15", "end": "23:45",
+                       "calendar": "工作", "title": "其他项目", "all_day": False,
+                       "start_iso": "%sT22:15:00" % iso,
+                       "end_iso": "%sT23:45:00" % iso}]
+    bb._write_json(paths["calendar"], data)
+    # 回收之后的样子：layout 清空（退回未切分），被任务钉住的 23:15 挪成窗口
+    bb._write_json(paths["layouts"], {"version": 1, "days": {iso: {
+        "T1": {"durations": [], "source": "auto"}}}})
+    bb._write_json(paths["extras"], {"version": 1, "dates": {iso: [
+        {"start": "23:15", "duration": 25, "source": "manual",
+         "note": "任务钉住的场次（回收时从 layout 挪成窗口）"}]}})
+    with open(paths["csv"], "w", encoding="utf-8") as fh:
+        fh.write("# 黑盒现场\n%s,23:15,25\n" % iso)
+    bb._write_json(paths["tasks"], {"version": 1, "next_id": 2, "tasks": [{
+        "id": 1, "status": "active",
+        "created_at": "%sT17:00:00" % iso, "updated_at": "%sT17:00:00" % iso,
+        "fields": {"title": "flashcard review", "duration": 25, "count": 1},
+        "session": {"date": iso, "start": "23:15", "end": "23:40", "duration": 25},
+        "tags": []}]})
+
+    res = bb.run(paths, ["day %d" % bb.DEFAULT_OFFSET],
+                 extra_env={"COLUMNS": "240"})
+    check("渲表退出码 0", res["rc"], 0)
+    lines = (res.get("out") or "").splitlines()
+    gap = [ln for ln in lines if "22:15–23:15" in ln]
+    check_true("表里画出 22:15–23:15 这一截（空档占位）", gap)
+    check("这一行写着空档长度 + 容量（60min = 2 count）",
+          bool(gap) and "空档 60min（2 count）" in gap[0], True)
+    check("这一行是「未切 session」占位，不是 session",
+          bool(gap) and "未切 session" in gap[0], True)
+    check("不许把它画成整段（整段会写 90min / 3 count）",
+          [ln for ln in lines if "整段 90min" in ln], [])
+    check_true("23:15 那场照旧在表里（flashcard 仍然钉着）",
+               [ln for ln in lines
+                if "23:15–23:40" in ln and "flashcard review" in ln])
+    return paths
+
+
 def main(argv):
     keep = "--keep" in argv
     print("== 场景 1：plan → 重新 plan（上一轮场次必须释放）==")
@@ -650,6 +783,22 @@ def main(argv):
     except Exception as e:                         # noqa: BLE001
         import traceback
         fails.append("场景 10 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 11：refresh 不许剪掉真实发生过的场次（booked / 被挪过时间）==")
+    try:
+        case_11_refresh_does_not_prune_real_session()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 11 异常：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    print("\n== 场景 12：切了一半的时段，剩下的空档要在契约表里看得见 ==")
+    try:
+        case_12_uncut_prefix_is_visible_on_board()
+    except Exception as e:                         # noqa: BLE001
+        import traceback
+        fails.append("场景 12 异常：%s: %s" % (type(e).__name__, e))
         traceback.print_exc()
 
     print("\n== 场景 2：plan → plan clear → 再 plan（幂等）==")

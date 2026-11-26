@@ -2092,18 +2092,20 @@ class BoardMixin(object):
                     or row.get("phase") == "已结束")
 
     def _period_shell_rows(self, rows, day, now_ms=None):
-        """没有 session 的时段 → 一行占位（``period_only=True``）。
+        """没有 session 的**时段 / 空档** → 各画一行占位（``period_only=True``）。
 
         以前契约表的行**只来自 data.csv / API**：一段时段如果还没被 plan 切出
         session（或者 plan 把这一段分到 0 count，例如今天 19:00–21:30），它就
         整段从表里消失 —— 用户看到的是「今天的时段被忽略了」，而不是「这一段
-        还没切」。
+        还没切」。切了一半的时段同理：只有被任务钉住的那几场有行，剩下能排的
+        那几截（前缀 / 中间 / 尾巴）无声消失，看起来像容量被吃掉了（2026-11-26
+        T4：22:15 回收成未切容量 + 23:15 flashcard）。
 
-        这些行的身份是**时段**，不是 session：
+        这些行的身份是**时段里的空档**，不是 session：
           * ``id=None``、``planned=False`` → ``check_bookings`` / 取消 / mute /
             挂任务都不认它们（那几条路都要求 ``planned`` 或 ``id``）；
-          * ``durationMin`` 是**整段长度**，``period_only`` 标记让渲染写「整段」
-            而不是把它当成一场 195 分钟的 session；
+          * ``durationMin`` 是这一截空档的长度，``period_only`` 标记让渲染写
+            「整段」/「空档」而不是把它当成一场 session；
           * 只占位，不改任何账。
         """
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
@@ -2131,52 +2133,92 @@ class BoardMixin(object):
                 # 自动 layout 且整段都还能重排：plan 会把这一段整体重切，
                 # 尾巴不是独立缺口，不画占位（同一条口径跟 _plan_slots 对齐）。
                 continue
+            # 要画的空档：整段没切就是整段；切了一半就是**剩下的每一截**
+            # （前缀 / 中间 / 尾巴都算）。以前只算尾巴（tail_gap），于是
+            # 「前面空、后面被任务钉住」的形状（今天 T4：22:15 回收成未切容量 +
+            # 23:15 flashcard 那场）在表里整段消失 —— 用户 2026-11-26：
+            # 「为什么现在这个时段压根不显示了？？」。
             if existing:
-                # 时段已经切了一半，但尾巴还空着（19:00(75) 之后到 21:30）——
-                # 那截同样要显示成「未切 session」，否则用户看到的是「20:15 之后
-                # 什么都没有」，plan 也像是把它忽略了。
-                gap = sp.tail_gap(period, [
-                    {"start": r.get("startLabel"),
-                     "duration": r.get("durationMin")} for r in existing])
-                if gap is None:
-                    continue
-                s_dt = datetime.datetime.combine(
-                    day, datetime.time(*sp.parse_hhmm(gap["start"])))
-                window = int(gap["minutes"])
-                plan_counts = int(gap["blocks"])
-                end_dt = s_dt + datetime.timedelta(minutes=window)
+                spans = []
+                for p_start, p_end in self._uncut_gaps(period, existing):
+                    blocks = min((p_end - p_start) // 30,
+                                 pp._period_blocks(period))
+                    if blocks <= 0:
+                        continue
+                    spans.append((p_start, p_end, blocks))
             else:
                 window = 0
                 if end is not None:
                     window = (end[0] * 60 + end[1]) - (start[0] * 60 + start[1])
                     if window <= 0:
                         window += 24 * 60
-                plan_counts = max(0, window // 30)
-                end_dt = s_dt + datetime.timedelta(minutes=max(0, window))
-            s_ms = int(s_dt.timestamp() * 1000)
-            e_ms = int(end_dt.timestamp() * 1000)
-            out.append({
-                "startMs": s_ms, "endMs": e_ms,
-                "startLabel": s_dt.strftime("%H:%M"),
-                "endLabel": end_dt.strftime("%H:%M"),
-                "durationMin": window, "id": None, "title": "", "quiet": None,
-                "matched": None, "phase": self.phase_of(s_ms, e_ms, now_ms),
-                "planned": False, "period_only": True, "lineno": None,
-                "raw": "", "contract": "",
-                "zone": self.effective_zone(sch.zone_name(s_dt, now_dt), day),
-                "zone_raw": sch.zone_name(s_dt, now_dt),
-                "date": day.isoformat(),
-                # 占位行自己就是这一段的「第一行」：时段三列照常显示。
-                # 尾巴缺口（partial_gap）不是整段，时段三列交给前面已有的行。
-                "period": dict(period), "period_id": pid,
-                "period_first": not existing,
-                "period_muted": bool(mute_window_for(day, period.get("start"),
-                                                     period.get("end"))),
-                "partial_gap": bool(existing),
-                "plan_counts": plan_counts,
-                "task": None, "tasks": [], "task_text": "",
-            })
+                p_start = start[0] * 60 + start[1]
+                spans = [(p_start, p_start + max(0, window), max(0, window) // 30)]
+            for p_start, p_end, plan_counts in spans:
+                s_dt = datetime.datetime.combine(day, datetime.time(0, 0)) \
+                    + datetime.timedelta(minutes=p_start)
+                end_dt = datetime.datetime.combine(day, datetime.time(0, 0)) \
+                    + datetime.timedelta(minutes=p_end)
+                window = p_end - p_start
+                s_ms = int(s_dt.timestamp() * 1000)
+                e_ms = int(end_dt.timestamp() * 1000)
+                out.append({
+                    "startMs": s_ms, "endMs": e_ms,
+                    "startLabel": s_dt.strftime("%H:%M"),
+                    "endLabel": end_dt.strftime("%H:%M"),
+                    "durationMin": window, "id": None, "title": "", "quiet": None,
+                    "matched": None, "phase": self.phase_of(s_ms, e_ms, now_ms),
+                    "planned": False, "period_only": True, "lineno": None,
+                    "raw": "", "contract": "",
+                    "zone": self.effective_zone(sch.zone_name(s_dt, now_dt), day),
+                    "zone_raw": sch.zone_name(s_dt, now_dt),
+                    "date": day.isoformat(),
+                    # 占位行自己就是这一段的「第一行」：时段三列照常显示。
+                    # 切了一半的缺口（partial_gap）不是整段，时段三列交给前面
+                    # 已有的行，别重复画时段 ID/名称。
+                    "period": dict(period), "period_id": pid,
+                    "period_first": not existing,
+                    "period_muted": bool(mute_window_for(day, period.get("start"),
+                                                         period.get("end"))),
+                    "partial_gap": bool(existing),
+                    "plan_counts": plan_counts,
+                    "task": None, "tasks": [], "task_text": "",
+                })
         return out
+
+    def _uncut_gaps(self, period, rows):
+        """这个时段里**还没被任何 session 占用**的空档（``[(start_min, end_min)]``）。
+
+        占用按 :func:`session_plan.session_span` 算（25/50/75 → 30/60/90 分钟），
+        和 ``available_windows()`` / 尾巴追加用的是同一把尺子：一场 25 分钟的
+        场次后面那 5 分钟休息不能排下一场。
+
+        用途只有一个：契约表画「未切 session」占位行。空档可以在**任何位置**
+        （前缀 / 中间 / 尾巴）：layout 只存接龙，但 plan 对「被任务钉住的场次」
+        前面那截走窗口（``window=True``，落 extras），所以前缀同样是可排容量，
+        不画出来用户就会以为那段时间不存在。
+        """
+        got = th._range_of(period)
+        if got is None:
+            return []
+        p_start, p_end = int(got[0]), int(got[1])
+        pieces = [(p_start, p_end)]
+        for row in rows or ():
+            s_min = th._clock_minutes(row.get("startLabel"))
+            if s_min is None:
+                continue
+            s_min = int(s_min)
+            if s_min < p_start and p_end > 24 * 60:
+                s_min += 24 * 60                  # 跨午夜时段里的 00:05
+            try:
+                span = sp.session_span(int(row.get("durationMin") or 0))
+            except (TypeError, ValueError):
+                span = int(row.get("durationMin") or 0)
+            if span <= 0:
+                continue
+            pieces = self._subtract_minute_window(
+                pieces, (s_min, s_min + int(span)))
+        return [(s, e) for s, e in pieces if e > s]
 
     def _fallback_rows(self, why):
         """拿不到 bridge 时，用 daemon 写下的 state.json 快照（只有时间，没有标题/静音）。"""
@@ -2535,7 +2577,7 @@ class BoardMixin(object):
             else:
                 dur_text = ("%dmin" % dur) if dur else "?"
             if r.get("partial_gap") and dur:
-                dur_text = "剩余 %dmin" % dur
+                dur_text = "空档 %dmin" % dur
             if (r.get("period_only") and r.get("plan_counts")
                     and r.get("phase") != "已结束"):
                 dur_text += "（%d count）" % int(r.get("plan_counts"))

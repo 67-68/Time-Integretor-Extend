@@ -777,6 +777,9 @@ class TaskPipelineMixin(object):
         recs = (layouts.get("layouts") or {}).get(iso) or {}
         if not recs:
             return 0
+        now = self._now_dt()
+        now_min = now.hour * 60 + now.minute
+        is_today = (day == now.date())
         slots = self.daemon_slots() or {}
         actual = set()
         for row in getattr(self, "api_rows", ()) or ():
@@ -797,6 +800,7 @@ class TaskPipelineMixin(object):
                 continue
             durations = [int(sess.get("duration") or 0) for sess in sessions]
             dead_at = None
+            why = ""
             for idx, sess in enumerate(sessions):
                 start = str(sess.get("start") or "")
                 if start in actual:
@@ -804,14 +808,32 @@ class TaskPipelineMixin(object):
                         dead_at = -1           # 后面还有订上的场次：整段跳过
                         break
                     continue
+                # ①**已经过去的场次不剪**：它是已经发生过的事实（2026-11-26 现场：
+                #    计划 09:30、实际被 Focusmate 落在 09:45，75 分钟那场人上完了），
+                #    不是「永远订不上的幽灵」。剪掉它只会让这一天看起来「这一段
+                #    根本没排过」，还把「计划外 09:45」永远挂在 daemon 每轮日志里。
+                start_min = th._clock_minutes(start)
+                if is_today and start_min is not None and start_min <= now_min:
+                    continue
                 state = slots.get("%sT%s" % (iso, start)) or {}
-                if (str(state.get("status") or "") in ("abandoned", "missed")
-                        or self._session_cancel_evidence(iso, start)):
-                    dead_at = idx
+                # ②daemon 说这场在（booked / match=shifted「实际 09:45」）→ 不是幽灵。
+                #    以前只看「起点在不在 API 快照里」，被挪过 15 分钟的场次就会
+                #    被当成「没了」，再拿一条过期的 abandoned 判决当证据剪掉。
+                if (str(state.get("status") or "") == "booked"
+                        or state.get("match")):
+                    continue
+                if str(state.get("status") or "") in ("abandoned", "missed"):
+                    dead_at, why = idx, "status=%s" % state.get("status")
+                    break
+                if self._session_cancel_evidence(iso, start):
+                    dead_at, why = idx, "cancel-evidence"
                     break
             if dead_at is None or dead_at < 0 or dead_at >= len(durations):
                 continue
             keep = durations[:dead_at]
+            rl.log_event("plan", "prune_dead", level="warning", day=iso, period=pid,
+                         why=why, keep=list(keep),
+                         starts=[str(s.get("start")) for s in sessions[dead_at:]])
             try:
                 result = self.commit_layout(
                     day, period, keep,

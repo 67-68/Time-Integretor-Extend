@@ -211,13 +211,33 @@ check("任务仍然在 23:15",
       [night["session"]["start"], night["session"]["duration"]], ["23:15", 25])
 check_true("refresh 明确说了重新剪断",
            any("剪断成" in m[2] for m in wd.messages))
-# 再 refresh 一次必须幂等：排布、绑定都不动，也不取消/新建任何东西。
+# 再 refresh 一次：formatter 的切割里，**没任务的那半截要被回收成容量**
+# （用户 2026-11-26：「他应该变成 50 分钟的待分配时段等我 plan」）。回收的方式是
+# 整段退回未切分 + 被任务钉住的 23:15 那场挪成独立窗口（起点/绑定都不动）。
 wd.bridge.calls = []
 check("第二次 refresh 受理", wd.handle("refresh"), True)
-check("第二次 refresh 没有取消/新建 session",
-      [c[0] for c in wd.bridge.calls if c[0] in ("cancel", "add_task")], [])
-check("第二次 refresh 后排布仍然是 [50,25]",
-      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [50, 25])
+_cancels = [c for c in wd.bridge.calls if c[0] == "cancel"]
+check("只取消了一场（那场没任务的 22:15）", len(_cancels), 1)
+check("取消的就是 22:15 那场",
+      [_cancels[0][1].get("meetingId")] if _cancels else [], ["sess-22:15"])
+check("T1 排布退回未切分（22:15 变成待分配容量）",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [])
+_ex = [r for r in (sp.load_extras()["dates"].get(ISO) or [])
+       if r.get("start") == "23:15"]
+check("23:15 那场变成独立窗口（起点不变）",
+      [(int(r.get("duration") or 0), r.get("source")) for r in _ex], [(25, "manual")])
+night = wd.task_store.get(night["id"])
+check("任务绑定没动",
+      [night["session"]["start"], night["session"]["duration"]], ["23:15", 25])
+# 第三次必须幂等：不再取消、不再改任何东西。
+wd.bridge.calls = []
+check("第三次 refresh 受理", wd.handle("refresh"), True)
+check("第三次 refresh 一场都不再取消",
+      [c for c in wd.bridge.calls if c[0] == "cancel"], [])
+check("第三次 refresh 排布还是空的",
+      sp.get_layout(sp.load_layouts(), TODAY, "T1"), [])
+check("第三次 refresh 窗口还是一条",
+      [r.get("start") for r in (sp.load_extras()["dates"].get(ISO) or [])], ["23:15"])
 
 print("== 项目 plan：formatter 任务不进项目队列，defer 未到也不进 ==")
 _proj = {"id": 1, "title": "P", "tasks": [
