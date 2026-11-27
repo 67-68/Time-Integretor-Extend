@@ -213,15 +213,15 @@ detail_tbl = render_table("detail")
 check_true("时段 ID 列被折叠", "时段 ID" in headers_of(detail_tbl), False)
 check("open 时段 ID 受理", wd.handle("open 时段 ID"), True)
 
-# --permanent 写盘，新建 Warden 仍然记得（同一份 TI_SETTINGS_FILE 目录）
-check("close 契约 --permanent 受理", wd.handle("close 契约 --permanent"), True)
-check_true("永久折叠写进 warden-ui.json",
+# 不敲 --permanent 也写盘，新建 Warden 仍然记得（同一份 TI_SETTINGS_FILE 目录）
+check("close 契约 受理（不写 --permanent）", wd.handle("close 契约"), True)
+check_true("折叠立刻写进 warden-ui.json",
            os.path.exists(wd.ui_prefs_path()))
 wd2 = mkwarden()
-check("新 warden 读到永久折叠", "契约" in wd2.effective_hidden_columns("detail"), True)
-check("open 契约 --permanent 受理", wd2.handle("open 契约 --permanent"), True)
+check("新 warden 读到折叠", "契约" in wd2.effective_hidden_columns("detail"), True)
+check("open 契约 --permanent 仍被接受", wd2.handle("open 契约 --permanent"), True)
 wd3 = mkwarden()
-check("永久展开也会被记住", "契约" in wd3.effective_hidden_columns("detail"), False)
+check("展开也会被记住", "契约" in wd3.effective_hidden_columns("detail"), False)
 check_true("无效表头会报错不改状态", wd3.handle("close 不存在的列"), True)
 check_true("错误消息列出可选表头",
            any("只认表头名" in m[2] for m in wd3.messages))

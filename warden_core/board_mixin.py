@@ -204,22 +204,23 @@ class BoardMixin(object):
         return key
 
     def effective_folded_blocks(self):
-        return set(self.permanent_folded_blocks) | set(self.folded_blocks)
+        return set(self.folded_blocks)
 
     def block_folded(self, key):
         return key in self.effective_folded_blocks()
 
     def _set_block_folded(self, key, folded, permanent=False):
+        """折叠/展开一整块表格，**改完立刻落盘**。
+
+        ``permanent`` 只是给旧命令保留的兼容参数（以前必须写 `--permanent`
+        才会写进 warden-ui.json），现在写不写都一样：改了就是改了，
+        下次启动仍然按这个状态画。想反悔用 `open <块名>` 或 `ui reset`。
+        """
         if folded:
             self.folded_blocks.add(key)
         else:
             self.folded_blocks.discard(key)
-        if permanent:
-            if folded:
-                self.permanent_folded_blocks.add(key)
-            else:
-                self.permanent_folded_blocks.discard(key)
-            self._save_ui_prefs()
+        self._save_ui_prefs()
 
     def render_blocks_line(self, blocks):
         """块状态行（放在这些块下面）：``Day Plan [展示] · Task [折叠]``。
@@ -263,9 +264,9 @@ class BoardMixin(object):
             if key not in valid_blocks:
                 key = self._resolve_block(key)
             if key:
-                self.permanent_folded_blocks.add(key)
-        for section, target in (("hidden", self.permanent_hidden_columns),
-                                ("visible", self.permanent_visible_columns)):
+                self.folded_blocks.add(key)
+        for section, target in (("hidden", self.hidden_columns),
+                                ("visible", self.visible_columns)):
             data = raw.get(section) or {}
             if not isinstance(data, dict):
                 continue
@@ -284,11 +285,9 @@ class BoardMixin(object):
     def _save_ui_prefs(self):
         path = self.ui_prefs_path()
         data = {
-            "hidden": {m: sorted(self.permanent_hidden_columns[m])
-                       for m in UI_PREF_MODES},
-            "visible": {m: sorted(self.permanent_visible_columns[m])
-                        for m in UI_PREF_MODES},
-            "folded_blocks": sorted(self.permanent_folded_blocks),
+            "hidden": {m: sorted(self.hidden_columns[m]) for m in UI_PREF_MODES},
+            "visible": {m: sorted(self.visible_columns[m]) for m in UI_PREF_MODES},
+            "folded_blocks": sorted(self.folded_blocks),
         }
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -298,7 +297,7 @@ class BoardMixin(object):
                 f.write("\n")
             os.replace(tmp, path)
         except OSError as e:
-            self.say("列折叠偏好没存下来：%s" % e, "warn")
+            self.say("显示偏好没存下来：%s" % e, "warn")
 
     def auto_hidden_columns(self, mode=None):
         mode = mode or self.session_ui_mode
@@ -307,36 +306,30 @@ class BoardMixin(object):
         return set()
 
     def effective_hidden_columns(self, mode=None):
-        """当前口径实际不展示的列（自动 + 永久 + 本次 close - 手动 open）。"""
+        """当前口径实际不展示的列（默认收敛 + 手动 close − 手动 open）。"""
         mode = mode or self.session_ui_mode
         hidden = set(self.auto_hidden_columns(mode))
-        hidden |= self.permanent_hidden_columns.get(mode, set())
-        hidden |= self.session_hidden_columns.get(mode, set())
-        hidden -= self.permanent_visible_columns.get(mode, set())
-        hidden -= self.session_visible_columns.get(mode, set())
+        hidden |= self.hidden_columns.get(mode, set())
+        hidden -= self.visible_columns.get(mode, set())
         return {col for col in hidden
                 if any(col == header for header, _kw in SESSION_TABLE_COLUMNS)}
 
     def _set_column_open(self, col, permanent=False, mode=None):
+        """展开一列并立刻落盘（``permanent`` 只是旧命令的兼容参数）。"""
         mode = mode or self.session_ui_mode
-        self.session_hidden_columns[mode].discard(col)
-        self.session_visible_columns[mode].add(col)
-        if permanent:
-            self.permanent_hidden_columns[mode].discard(col)
-            self.permanent_visible_columns[mode].add(col)
-            self._save_ui_prefs()
+        self.hidden_columns[mode].discard(col)
+        self.visible_columns[mode].add(col)
+        self._save_ui_prefs()
 
     def _set_column_closed(self, col, permanent=False, mode=None):
+        """折叠一列并立刻落盘（``permanent`` 只是旧命令的兼容参数）。"""
         mode = mode or self.session_ui_mode
-        self.session_visible_columns[mode].discard(col)
-        self.session_hidden_columns[mode].add(col)
-        if permanent:
-            self.permanent_visible_columns[mode].discard(col)
-            self.permanent_hidden_columns[mode].add(col)
-            self._save_ui_prefs()
+        self.visible_columns[mode].discard(col)
+        self.hidden_columns[mode].add(col)
+        self._save_ui_prefs()
 
     def effective_task_hidden_columns(self, tasks=None):
-        """任务表当前不展示的任务表头（默认收敛 + 永久 + 本次 close - 手动 open）。
+        """任务表当前不展示的任务表头（默认收敛 + 手动 close − 手动 open）。
 
         ``tasks=None`` 时不读任务库，只返回偏好里记的列名（frame signature 用）；
         渲染和 close 校验会传入当前任务，于是还能过滤掉已经不存在的动态字段。
@@ -349,10 +342,8 @@ class BoardMixin(object):
             # 需要单独看时仍可 `open <字段>`。
             fixed = {header for header, _kw in TASK_TABLE_COLUMNS}
             hidden |= {key for key in task_dynamic_keys(tasks) if key not in fixed}
-        hidden |= self.permanent_hidden_columns.get(TASK_UI_MODE, set())
-        hidden |= self.session_hidden_columns.get(TASK_UI_MODE, set())
-        hidden -= self.permanent_visible_columns.get(TASK_UI_MODE, set())
-        hidden -= self.session_visible_columns.get(TASK_UI_MODE, set())
+        hidden |= self.hidden_columns.get(TASK_UI_MODE, set())
+        hidden -= self.visible_columns.get(TASK_UI_MODE, set())
         return {col for col in hidden if headers is None or col in headers}
 
     def task_flags_text(self, task):
@@ -3151,11 +3142,12 @@ class BoardMixin(object):
 
     def cmd_open(self, args=None):
         """``open task|project|op`` 切数据模型；``open working|detail`` 切口径；
-        ``open <表头> [--permanent]`` 展开列；直接敲 ``open`` + 回车时顺便
-        打开项目（``pro``）关联的文件。
+        ``open <表头>`` 展开列；直接敲 ``open`` + 回车时顺便打开项目（``pro``）
+        关联的文件。
 
-        working 默认自动折叠「时段类型 / 时段名称 / 契约」；手动 open 只是
-        本次运行的覆盖，加 ``--permanent`` 才会写进偏好、以后也不再自动折叠。
+        working 默认自动折叠「时段类型 / 时段名称 / 契约」；手动展开/折叠的列和
+        整块表格都会**立刻写进** warden-ui.json，下次启动照样生效（`ui reset`
+        清空）。``--permanent`` 仍然接受，但已经没区别（不写也一样记住）。
         在数据视图里，``open/close`` 作用于任务表的表头。
         """
         text, permanent, toks = self._column_command_args(args)
@@ -3171,9 +3163,8 @@ class BoardMixin(object):
         block = self._resolve_block(text)
         if block is not None:
             self._set_block_folded(block, False, permanent=permanent)
-            self.say("已展开块「%s」%s"
-                     % (self._block_label(block),
-                        "并写入偏好" if permanent else "（本次运行）"), "cmd")
+            self.say("已展开块「%s」（已记住，ui reset 可清空）"
+                     % self._block_label(block), "cmd")
             self.invalidate()
             return block
         # 三个数据模型优先于同名的任务表表头：open project = 看 pro 数据，
@@ -3228,14 +3219,14 @@ class BoardMixin(object):
             if not isinstance(self.view, ContractView):
                 self.go_to_view(ContractView)
             detail = "（%s 口径）" % self.session_ui_mode
-        self.say("已打开列「%s」%s%s"
-                 % (col, "并写入偏好" if permanent else "（本次运行）", detail), "cmd")
+        self.say("已打开列「%s」（已记住）%s" % (col, detail), "cmd")
         self.invalidate()
         return col
 
     def cmd_close(self, args=None):
-        """``close <表头> [--permanent]``：折叠一列；永久偏好写 warden-ui.json。
+        """``close <表头|块名>``：折叠一列或契约表下方的一整块表格。
 
+        改完立刻写 warden-ui.json（``--permanent`` 保留但不再需要）。
         在任务视图里折叠任务表列；其他视图折叠契约表列。
         """
         text, permanent, _toks = self._column_command_args(args)
@@ -3247,9 +3238,8 @@ class BoardMixin(object):
         block = self._resolve_block(text)
         if block is not None:
             self._set_block_folded(block, True, permanent=permanent)
-            self.say("已折叠块「%s」%s"
-                     % (self._block_label(block),
-                        "并写入偏好" if permanent else "（本次运行）"), "cmd")
+            self.say("已折叠块「%s」（已记住，ui reset 可清空）"
+                     % self._block_label(block), "cmd")
             self.invalidate()
             return block
         task_mode = isinstance(self.view, TaskView)
@@ -3277,8 +3267,7 @@ class BoardMixin(object):
             if not isinstance(self.view, ContractView):
                 self.go_to_view(ContractView)
             detail = "（%s 口径）" % self.session_ui_mode
-        self.say("已折叠列「%s」%s%s"
-                 % (col, "并写入偏好" if permanent else "（本次运行）", detail), "cmd")
+        self.say("已折叠列「%s」（已记住，ui reset 可清空）%s" % (col, detail), "cmd")
         self.invalidate()
         return col
     def cmd_help(self, args=None):
@@ -3300,8 +3289,10 @@ class BoardMixin(object):
             ("filter disposable|all", "数据视图过滤器：默认 disposable 只显示 active，"
                                       "隐藏被 mark complete / discard 的 task / pro / op；"
                                       "all 显示全部"),
-            ("open/close <表头>", "展开/折叠契约表或任务表的一列；加 --permanent 写进偏好，"
+            ("open/close <表头>", "展开/折叠契约表或任务表的一列；改完立刻记住（下次启动照样），"
                                   "working 默认折叠 时段类型 / 时段名称 / 契约"),
+            ("ui / ui reset", "看现在记下的显示偏好（块折叠 / 列折叠 + 落盘路径）；"
+                              "ui reset = 全清回默认"),
             ("stat [refresh]", "切到「统计」视图：生涯累计 / 每天分布 / 永不重订名单（只读 API）"),
             ("stat refresh full", "统计：丢掉缓存、全量重拉（默认只增量拉缺口 + 最近几天）"),
             ("Shift+Tab（专注视图）", "循环切换专注模式：普通 / 做题 / 写作"),

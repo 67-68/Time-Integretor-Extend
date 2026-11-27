@@ -454,13 +454,15 @@ working 模式下表格左侧的 `ID` 仍然保留它在 `self.rows` 里的原�
 - 契约视图 → 契约 session 表；
 - 任务视图 → 任务表（固定列 + `title` / `duration` 等字段列都认）；
 - 从任务视图敲契约列名、或从契约视图敲任务专有列名，会切到对应视图再操作；
-- `close <表头> [--permanent]`：这一列不再渲染；
-- `open <表头> [--permanent]`：重新显示；
+- `close <表头>`：这一列不再渲染；
+- `open <表头>`：重新显示；
 - 被折叠的列在 table 下方用一行 caption 说明：`已折叠列：…（open <表头名> 打开）`；
 - 任务表即使一条任务都没有，也先画固定表头和 `内容` 列，不会只剩一个说明框；
-- `--permanent` 写进 `data/warden-ui.json`（跟 `settings.json` 同目录；测试用
-  `TI_SETTINGS_FILE` 一起隔离）。永久折叠/展开跨重启保留；不带 `--permanent`
-  只覆盖本次运行；
+- **改完立刻写** `data/warden-ui.json`（跟 `settings.json` 同目录；测试用
+  `TI_SETTINGS_FILE` 一起隔离），下次启动照样生效。`--permanent` 仍然接受，
+  但已经没区别（2026-11-27 之前必须带它才落盘，用户抱怨「改了不记得」，
+  于是砍掉「永久 / 本次运行」双轨，只留一份状态）；
+- `ui`：列出记下的块折叠与列折叠 + 落盘路径；`ui reset`：全清回默认；
 - `open working` / `open detail` 仍然优先解释为切看板口径；列名不会和它们冲突。
 
 working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列；手动
@@ -483,8 +485,9 @@ working 口径默认自动折叠 **时段类型 / 时段名称 / 契约** 三列
 - 这些块下面固定有一行状态：`块：Conditions [展示] · Day Plan [展示] · Task [折叠] · Project [展示]`；
   折叠只改这一行的 `[展示]/[折叠]` 标记，并且不再画对应块本身。
 - 只有**这一屏真的存在**的块才出现在状态行里（今天没有 Day Plan，就不列）。
-- `--permanent` 写进 `data/warden-ui.json` 的 `folded_blocks`（和列折叠共用文件、
-  同样跟 `TI_SETTINGS_FILE` 隔离）；不带 `--permanent` 只覆盖本次运行。
+- `open/close <块名>` 改完立刻写进 `data/warden-ui.json` 的 `folded_blocks`
+  （和列折叠共用文件、同样跟 `TI_SETTINGS_FILE` 隔离），下次启动照样生效；
+  `--permanent` 保留但不再需要。`ui reset` 一键清空两种折叠。
 - 故意不认裸 `task` / `project`：`open task` / `open project` 仍是切数据模型，
   `close task` 仍是折叠契约表的 task 列。
 

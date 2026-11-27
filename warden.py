@@ -460,15 +460,13 @@ class Warden(
         # 看板口径：detail = 计划 + 实际全量（默认，保持原行为）；
         # working = 实际为主并收起旧场次。
         self.session_ui_mode = "detail"
-        # 列折叠：每个口径单独记；--permanent 落盘到 settings.json 同目录的
-        # warden-ui.json。session_* 是本次运行里的临时 open/close 覆盖。
-        self.permanent_hidden_columns = {m: set() for m in UI_PREF_MODES}
-        self.permanent_visible_columns = {m: set() for m in UI_PREF_MODES}
-        self.session_hidden_columns = {m: set() for m in UI_PREF_MODES}
-        self.session_visible_columns = {m: set() for m in UI_PREF_MODES}
-        # 整块表格的折叠（Day Plan / Task / Project / Conditions）：
-        # 和列折叠同一套偏好文件；`--permanent` 写进 warden-ui.json。
-        self.permanent_folded_blocks = set()
+        # 显示偏好（列折叠 + 块折叠）：**只有一份**，改完立刻写 settings.json
+        # 同目录的 warden-ui.json，启动时 _load_ui_prefs() 读回来。
+        # 以前是「永久 / 本次运行」两张表叠着算，一次改动要在四个集合上做
+        # 并集差集，用户还得记 `--permanent`；现在只剩这两张表。
+        self.hidden_columns = {m: set() for m in UI_PREF_MODES}
+        self.visible_columns = {m: set() for m in UI_PREF_MODES}
+        # 整块表格的折叠（Day Plan / Task / Project / Conditions / Simple）。
         self.folded_blocks = set()
         self._load_ui_prefs()
         # 视图（Shift+Tab 切换）：默认「契约」视图，第二个是「专注」视图。

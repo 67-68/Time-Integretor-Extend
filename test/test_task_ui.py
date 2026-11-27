@@ -2618,19 +2618,26 @@ check_true("open tasktable 受理", wdblk.handle("open tasktable"))
 
 _prefs_path = os.path.join(os.path.dirname(os.path.abspath(w.cfg.settings_path())),
                            "warden-ui.json")
-check_true("close tasktable --permanent 受理",
-           wdblk.handle("close tasktable --permanent"))
-check_true("偏好里记了折叠 task",
+check_true("再 close 一次（不写 --permanent）", wdblk.handle("close tasktable"))
+check_true("不敲 --permanent，close 也立刻落盘",
            "task" in (json.load(open(_prefs_path, encoding="utf-8"))
                       .get("folded_blocks") or []))
-wdblk.permanent_folded_blocks.clear()
+wdblk.folded_blocks.clear()
 wdblk._load_ui_prefs()
 check("重新加载偏好后 task 仍是折叠", wdblk.block_folded("task"), True)
-check_true("open tasktable --permanent 受理",
-           wdblk.handle("open tasktable --permanent"))
+check_true("close tasktable --permanent 仍被接受（只是不再需要）",
+           wdblk.handle("close tasktable --permanent"))
+check_true("open tasktable 立刻落盘（不写 --permanent）",
+           wdblk.handle("open tasktable"))
 check_true("偏好里删掉了 task",
            "task" not in (json.load(open(_prefs_path, encoding="utf-8"))
                           .get("folded_blocks") or []))
+# 一键清空：块折叠 + 列折叠都回到默认
+wdblk.handle("close conditions")
+wdblk.handle("ui reset")
+check("ui reset 后块回到展示", wdblk.block_folded("conditions"), False)
+check("ui reset 后偏好文件里没有折叠块",
+      json.load(open(_prefs_path, encoding="utf-8")).get("folded_blocks"), [])
 
 # Day Plan：造明天的时段 + 一场，切到明天才看得到。
 _tomorrow_iso = (TODAY + datetime.timedelta(days=1)).isoformat()

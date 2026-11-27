@@ -1279,7 +1279,7 @@ finally:
     wd_sig.task_store.list = _real_task_list
 check("任务库恢复后可读", isinstance(wd_sig.task_store.list(), list), True)
 # 隐藏列偏好变了，签名必须跟着变（否则「关了某列」不会重排版）
-wd_sig.session_hidden_columns.setdefault(w.TASK_UI_MODE, set()).add("标题")
+wd_sig.hidden_columns.setdefault(w.TASK_UI_MODE, set()).add("标题")
 check("隐藏列偏好变了 → 签名跟着变",
       wd_sig.frame_signature() != sig, True)
 

@@ -105,10 +105,10 @@ class View(object):
                  usage="view", hint=_hint_actions("view", note="等同 Shift+Tab")),
             _cmd("open", w.cmd_open,
                  "open task|project|op 切换数据模型；open working|detail 切口径；"
-                 "open <表头> [--permanent] 打开当前表的一列；"
-                 "open <块名> [--permanent] 展开表下方的整块表格",
+                 "open <表头> 打开当前表的一列（改完立刻记住）；"
+                 "open <块名> 展开表下方的整块表格",
                  ("看板",), "通用",
-                 usage="open task|project|op | open working|detail | open <列名> <块名> [--permanent]",
+                 usage="open task|project|op | open working|detail | open <列名> <块名>",
                  options=tuple(dict.fromkeys(
                      ("task", "project", "op", "working", "detail")
                      + tuple(h for h, _kw in SESSION_TABLE_COLUMNS)
@@ -121,8 +121,8 @@ class View(object):
                                          "open 表头名 = 展开列；"
                                          "open dayplan/tasktable/projecttable = 展开块")),
             _cmd("close", w.cmd_close,
-                 "close <表头|块名> [--permanent]：折叠当前表的一列或契约表下方的整块表格",
-                 ("关闭",), "通用", usage="close <列名|块名> [--permanent]",
+                 "close <表头|块名>：折叠当前表的一列或契约表下方的整块表格（改完立刻记住）",
+                 ("关闭",), "通用", usage="close <列名|块名>",
                  options=tuple(dict.fromkeys(
                      tuple(h for h, _kw in SESSION_TABLE_COLUMNS)
                      + tuple(h for h, _kw in TASK_TABLE_COLUMNS)
@@ -156,6 +156,13 @@ class View(object):
                  usage="set <设置 id> <value>",
                  completer=lambda prior: [row["id"] for row in w.settings.rows()],
                  hint=_hint_set),
+            _cmd("ui", w.cmd_ui,
+                 "ui：看记下的显示偏好（块折叠 / 列折叠）；ui reset 全清",
+                 usage="ui | ui reset",
+                 options=("reset",),
+                 completer=lambda prior: ["reset"],
+                 hint=_hint_actions("reset",
+                                    note="open/close 改完就自动记住；这里只看和清空")),
             _cmd("warn", w.cmd_warn,
                  "状态框里的警告：warn on|off（不写 = 取反）",
                  ("warnings",), "通用", usage="warn [on|off]",

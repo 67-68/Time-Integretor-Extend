@@ -13,6 +13,7 @@ from .common import (
     SRC_KEEP,
     Table,
     Text,
+    UI_PREF_MODES,
     beep,
     box,
     cfg,
@@ -732,6 +733,37 @@ class SessionMixin(object):
                      "task create title=明日时间安排 --repeat %s" % value, "info")
         self.refresh_warnings(force=True)
         return value
+
+    def cmd_ui(self, args=None):
+        """ui —— 看现在记下的显示偏好；``ui reset`` 清空（块折叠 + 列折叠）。
+
+        warden 里每一个显示动作（close conditions / open 时段类型 / close 列）
+        改完就写 warden-ui.json，下次启动照样生效。这条命令是唯一的出口：
+        列出记了什么、落在哪个文件、怎么一键清空。
+        """
+        toks = [str(a).strip().lower() for a in (args or []) if str(a).strip()]
+        if toks and toks[0] not in ("reset", "clear", "清空", "重置"):
+            raise ValueError("用法：ui（看记下的显示偏好）/ ui reset（全部清空）")
+        if toks:
+            self.folded_blocks.clear()
+            for mode in UI_PREF_MODES:
+                self.hidden_columns[mode].clear()
+                self.visible_columns[mode].clear()
+            self._save_ui_prefs()
+            self.say("🧽 显示偏好已清空：块折叠与列折叠都回到默认", "ok")
+            self.invalidate()
+            return None
+        folded = sorted(self.folded_blocks)
+        self.say("块折叠：%s" % ("、".join(self._block_label(k) for k in folded)
+                                or "（无）"), "info")
+        for mode in UI_PREF_MODES:
+            self.say("%-7s close %s ｜ open %s"
+                     % (mode,
+                        "、".join(sorted(self.hidden_columns.get(mode, ()))) or "（无）",
+                        "、".join(sorted(self.visible_columns.get(mode, ()))) or "（无）"),
+                     "info")
+        self.say("落在 %s ｜ ui reset 清空" % self.ui_prefs_path(), "info")
+        return {"folded": folded}
 
     def cmd_warn(self, args):
         """warn on|off —— 状态框里的警告要不要显示（不写 = 取反）。"""

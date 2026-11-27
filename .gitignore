@@ -16,3 +16,5 @@ data/failed-actions.json
 data/projects.json
 data/projects.json.bak
 data/project-sync.json
+# 显示偏好（块折叠 / 列折叠）：每台机器的屏幕不一样，别互相覆盖
+data/warden-ui.json
